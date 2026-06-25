@@ -1192,7 +1192,23 @@ OPENAI_TOOLS_SCHEMA = [
                     "message": {"type": "string", "description": "Tu respuesta directa al usuario"}
                 },
                 "required": ["message"]
-            }
-        }
-    }
-]
+             }
+         }
+     }
+ ]
+
+
+def resolve_user_events_dirs(user_id: str, camera_id: str = None) -> list:
+    """Resuelve los directorios de eventos para un usuario/cámara."""
+    base = STORAGE_ROOT / "users" / user_id / "cameras"
+    if camera_id:
+        events_dir = base / camera_id / "events"
+        return [events_dir] if events_dir.exists() else []
+    dirs = []
+    if base.exists():
+        for cam_dir in base.iterdir():
+            if cam_dir.is_dir():
+                events_dir = cam_dir / "events"
+                if events_dir.exists():
+                    dirs.append(events_dir)
+    return dirs

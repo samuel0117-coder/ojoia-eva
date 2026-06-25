@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import os, sys
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 """
 OjoIA API Eva v7.1 — "Cámara Primero, Reglas Después"
 Flujo optimizado: conectar cámara en turno 3-5, reglas basadas en imagen real.
@@ -367,11 +371,13 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
         except:
             pass
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
+    yolo_count = grid.get_last_yolo_count()
+    yolo_detections = grid.get_last_yolo_detections()
     return {
         "success": bool(frame_bytes),
         "image_b64": image_b64,
         "camera_id": last_cam,
-        "yolo": {"count": grid.get_last_yolo_count()},
+        "yolo": {"count": yolo_count, "detections": yolo_detections},
         "metadata": {"timestamp": int(time.time())}
     }
 

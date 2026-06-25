@@ -530,6 +530,7 @@ class FrameGrid:
         self.last_frame_bytes: bytes = b''
         self.last_camera_id: str = ""
         self.last_yolo_count: int = 0
+        self.last_yolo_detections: list = []
         self.lock = threading.Lock()
         self.last_analysis_ts = 0
         self.analysis_callback = None
@@ -582,9 +583,10 @@ class FrameGrid:
                 "timestamp": time.time()
             })
             is_full = len(self.frames) == self.max_frames
-        self.last_frame_bytes = image_bytes
-        self.last_camera_id = camera_id
-        self.last_yolo_count = yolo_count
+            self.last_frame_bytes = image_bytes
+            self.last_camera_id = camera_id
+            self.last_yolo_count = yolo_count
+            self.last_yolo_detections = yolo_detections
         return is_full
 
     def get_and_reset(self) -> List[Dict[str, Any]]:
@@ -612,6 +614,11 @@ class FrameGrid:
         """Get the yolo_count of the most recently received frame"""
         with self.lock:
             return self.last_yolo_count
+    
+    def get_last_yolo_detections(self) -> list:
+        """Get the yolo_detections of the most recently received frame"""
+        with self.lock:
+            return self.last_yolo_detections.copy() if self.last_yolo_detections else []
     
     def get_grid_image(self) -> bytes:
         """Get a 4x4 grid image of all frames"""

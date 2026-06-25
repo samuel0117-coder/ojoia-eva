@@ -299,3 +299,7 @@ def save_camera_config(user_id: str, config: Dict[str, Any], storage_root: Path)
     except Exception as e:
         logger.error(f"Error guardando camera config: {e}")
         return False
+
+
+# Alias para compatibilidad con api_eva.py viejo
+build_vigilance_prompt = build_witness_prompt
