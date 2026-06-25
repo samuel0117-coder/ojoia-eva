@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+<title>🎬 Centro de Mando Audiovisual</title>
+<script>window.APP_VERSION='v4_final';</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0a;color:#e0e0e0;font-size:14px}
+:root{--accent:#0ff;--bg:#111;--bg2:#1a1a1a;--border:#333;--ok:#0f0;--err:#f44}
+
+/* Layout principal - grid fijo */
+.app{display:grid;grid-template-columns:320px 1fr;height:100vh;width:100vw;overflow:hidden}
+
+/* Sidebar fijo */
+.sidebar{background:var(--bg);border-right:2px solid var(--border);padding:16px;overflow-y:auto;height:100vh;display:flex;flex-direction:column}
+.sidebar h1{font-size:1.1em;color:var(--accent);margin-bottom:8px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.sidebar h2{font-size:0.75em;color:#666;margin:16px 0 8px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
+
+/* Lista de proyectos */
+.proj-list{display:flex;flex-direction:column;gap:6px;margin-bottom:16px;overflow-y:auto;max-height:300px}
+.proj-item{padding:12px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;cursor:pointer;transition:all 0.2s}
+.proj-item:hover{border-color:var(--accent);background:#0a1a1a}
+.proj-item.active{border-color:var(--accent);background:#0a2a2a;box-shadow:0 0 8px rgba(0,255,255,0.1)}
+.proj-item .name{font-weight:600;font-size:0.95em;color:#fff}
+.proj-item .meta{font-size:0.75em;color:#555;margin-top:4px}
+
+/* Botones */
+.btn{display:inline-block;padding:8px 16px;border:1px solid var(--border);border-radius:5px;background:var(--bg2);color:#e0e0e0;cursor:pointer;font-size:0.85em;margin:3px;transition:all 0.2s;text-align:center}
+.btn:hover{border-color:var(--accent);background:#0a1a1a}
+.btn-primary{background:var(--accent);color:#000;border-color:var(--accent);font-weight:700}
+.btn-primary:hover{background:#3ff;color:#000}
+.btn-danger{border-color:var(--err);color:var(--err)}
+.btn-danger:hover{background:var(--err);color:#fff}
+.btn-sm{padding:5px 10px;font-size:0.75em}
+.btn-block{display:block;width:100%;text-align:center;margin:6px 0}
+
+/* GPU Status */
+.gpu-status{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:16px;font-size:0.8em}
+.gpu-row{display:flex;justify-content:space-between;margin:4px 0}
+.gpu-bar{height:6px;background:#222;border-radius:3px;margin:6px 0;overflow:hidden}
+.gpu-bar-fill{height:100%;border-radius:3px;transition:width 0.5s}
+.gpu-bar-fill.low{background:var(--ok)}.gpu-bar-fill.mid{background:#ff0}.gpu-bar-fill.high{background:var(--err)}
+
+/* Main content */
+.main{padding:20px;overflow-y:auto;height:100vh;background:#0d0d0d}
+
+/* Secciones */
+.section{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:20px}
+.section h3{font-size:1.05em;color:var(--accent);margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+
+/* Formularios */
+label{display:block;font-size:0.8em;color:#998;margin:12px 0 5px;font-weight:500}
+input,textarea,select{width:100%;background:#0a0a0a;border:1px solid var(--border);color:#e0e0e0;padding:10px 12px;border-radius:5px;font-family:inherit;font-size:0.9em;transition:border-color 0.2s}
+textarea{resize:vertical;min-height:70px}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);outline:none;box-shadow:0 0 0 2px rgba(0,255,255,0.1)}
+.row{display:flex;gap:12px}.row>*{flex:1}
+
+/* Preview */
+.preview-container{background:#000;border:1px solid var(--border);border-radius:6px;min-height:280px;display:flex;align-items:center;justify-content:center;margin:12px 0;position:relative;overflow:hidden}
+.preview-container img,.preview-container video{max-width:100%;max-height:500px;display:block}
+.preview-placeholder{color:#444;font-size:0.9em;text-align:center;padding:60px}
+
+/* Scenes */
+.scene-list{display:flex;flex-direction:column;gap:6px;max-height:400px;overflow-y:auto}
+.scene-item{padding:12px 14px;background:#0a0a0a;border:1px solid var(--border);border-radius:5px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;transition:all 0.2s}
+.scene-item:hover{border-color:#555}
+.scene-item.active{border-color:var(--accent)}
+.scene-item .scene-info{flex:1}
+.scene-item .scene-title{font-size:0.9em;font-weight:600}
+.scene-item .scene-meta{font-size:0.75em;color:#555}
+.scene-item .scene-status{font-size:0.75em;padding:3px 10px;border-radius:4px;font-weight:500}
+.scene-status.pending{background:#222;color:#888}
+.scene-status.generating{background:#ff8c00;color:#000}
+.scene-status.done{background:var(--ok);color:#000}
+.scene-status.error{background:var(--err);color:#fff}
+
+/* Log */
+.log-list{max-height:280px;overflow-y:auto;font-size:0.75em}
+.log-item{padding:6px 10px;border-bottom:1px solid #1a1a1a}
+.log-item .time{color:#555;margin-right:12px;font-family:monospace}
+.log-item.ok{color:var(--ok)}.log-item.err{color:var(--err)}
+
+/* Model selector */
+.model-select{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+.model-btn{padding:8px 14px;border:1px solid var(--border);border-radius:5px;background:var(--bg);cursor:pointer;font-size:0.8em;transition:all 0.2s;text-align:center}
+.model-btn:hover{border-color:#555}
+.model-btn.active{border-color:var(--accent);background:#0a2a2a;color:var(--accent);box-shadow:0 0 8px rgba(0,255,255,0.1)}
+.model-btn .vram{font-size:0.65em;color:#555;display:block;margin-top:2px}
+
+/* Toast */
+.toast{position:fixed;bottom:24px;right:24px;padding:14px 20px;border-radius:6px;font-size:0.9em;z-index:9999;animation:fadeIn 0.3s;font-weight:500}
+.toast.ok{background:var(--ok);color:#000}.toast.err{background:var(--err);color:#fff}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track;background:#111}
+::-webkit-scrollbar-thumb{background:#333;border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:#555}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <h1>🎬 Centro de Mando</h1>
+    
+    <div class="gpu-status" id="gpu-status">
+      <div class="gpu-row"><span>GPU 2</span><span id="gpu-mem">...</span></div>
+      <div class="gpu-bar"><div class="gpu-bar-fill low" id="gpu-bar" style="width:0%"></div></div>
+      <div class="gpu-row"><span>Modelo: <span id="gpu-model" style="color:var(--accent)">ninguno</span></span><span id="gpu-free">...</span></div>
+    </div>
+
+    <h2>Proyectos</h2>
+    <button class="btn btn-primary btn-block" onclick="createProject()">+ Nuevo Proyecto</button>
+    <div class="proj-list" id="proj-list"><div style="color:#444;font-size:0.75em">Cargando...</div></div>
+
+    <h2>Audio</h2>
+    <button class="btn btn-sm" onclick="speak()">🔊 TTS</button>
+    <button class="btn btn-sm" onclick="genAudio()">🎵 Música</button>
+    
+    <h2>Proyecto Actual</h2>
+    <div id="current-proj" style="font-size:0.75em;color:#666">
+      <div>Selecciona un proyecto</div>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main" id="main-area">
+    
+    <!-- Create project wizard - MODAL -->
+    <div id="wizard-create" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:1000;overflow-y:auto">
+      <div style="max-width:600px;margin:40px auto;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:24px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <h3 style="color:#0ff;margin:0">📁 Crear Nuevo Proyecto</h3>
+          <button class="btn btn-sm" onclick="cancelWizard()" style="background:#333;color:#fff">✕</button>
+        </div>
+        <label>Nombre del proyecto</label>
+        <input type="text" id="new-proj-name" placeholder="Ej: Mi película de ciencia ficción">
+        <label>Descripción</label>
+        <textarea id="new-proj-desc" rows="3" placeholder="Breve descripción del proyecto..."></textarea>
+        <label>Estilo visual</label>
+        <input type="text" id="new-proj-style" value="cinematic, warm colors, detailed" placeholder="Ej: cinematic, warm colors">
+        <div class="row" style="margin-top:16px">
+          <button class="btn btn-primary" onclick="doCreateProject()">✅ Crear Proyecto</button>
+          <button class="btn" onclick="cancelWizard()">Cancelar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Project editor -->
+    <div id="proj-editor" style="display:none">
+      
+      <!-- Scene creation -->
+      <div class="section">
+        <h3>🎬 Nueva Escena</h3>
+        <label>Prompt (qué quieres ver en esta escena)</label>
+        <textarea id="scene-prompt" rows="3" placeholder="Ej: A cinematic shot of a woman walking through a neon-lit city at night, rain falling, reflections on wet pavement"></textarea>
+        
+        <div class="row">
+          <div>
+            <label>Modelo</label>
+            <div class="model-select" id="model-select">
+              <div class="model-btn active" data-model="wan_i2v" onclick="selectModel('wan_i2v')">🎬 Wan I2V<div class="vram">~12GB</div></div>
+              <div class="model-btn" data-model="wan_t2v" onclick="selectModel('wan_t2v')">📝 Wan T2V<div class="vram">~12GB</div></div>
+              <div class="model-btn" data-model="sdxl_turbo" onclick="selectModel('sdxl_turbo')">⚡ SDXL Turbo<div class="vram">~6GB</div></div>
+              <div class="model-btn" data-model="sdxl_juggernaut" onclick="selectModel('sdxl_juggernaut')">🎬 SDXL Jugg<div class="vram">~8GB</div></div>
+            </div>
+          </div>
+          <div>
+            <label>Imagen de referencia (opcional para I2V)</label>
+            <input type="file" id="scene-image" accept="image/*">
+          </div>
+        </div>
+
+        <div class="row">
+          <div><label>Resolución</label>
+            <select id="scene-res">
+              <option value="256x256">256×256 (rápido)</option>
+              <option value="320x320" selected>320×320 (estándar)</option>
+              <option value="480x480">480×480 (mejor)</option>
+              <option value="720x480">720×480 (ancho)</option>
+            </select>
+          </div>
+          <div><label>Frames</label>
+            <select id="scene-frames">
+              <option value="5" selected>5 (1.25s)</option>
+              <option value="9">9 (2.25s)</option>
+              <option value="13">13 (3.25s)</option>
+            </select>
+          </div>
+          <div><label>Pasos</label>
+            <select id="scene-steps">
+              <option value="2">2 (borrador)</option>
+              <option value="4">4 (normal)</option>
+              <option value="6" selected>6 (bueno)</option>
+              <option value="10">10 (calidad)</option>
+            </select>
+          </div>
+          <div><label>CFG</label>
+            <select id="scene-cfg">
+              <option value="4">4 (creativo)</option>
+              <option value="6" selected>6 (balance)</option>
+              <option value="8">8 (preciso)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="margin-top:10px">
+          <button class="btn btn-primary" onclick="generateScene()" id="btn-generate">🎬 Generar</button>
+          <button class="btn btn-danger btn-sm" onclick="clearGPU()">🗑️ Liberar GPU</button>
+          <span id="gen-status" style="margin-left:10px;font-size:0.8em;color:#888"></span>
+        </div>
+      </div>
+
+      <!-- Preview -->
+      <div class="section">
+        <h3>👁️ Preview</h3>
+        <div class="preview-container" id="preview">
+          <div class="preview-placeholder">La preview aparecerá aquí después de generar</div>
+        </div>
+      </div>
+
+      <!-- Scenes list -->
+      <div class="section">
+        <h3>📋 Escenas del Proyecto</h3>
+        <div class="scene-list" id="scene-list">
+          <div style="color:#444;font-size:0.75em;text-align:center;padding:20px">Sin escenas aún. Crea la primera arriba.</div>
+        </div>
+      </div>
+
+      <!-- Context -->
+      <div class="section">
+        <h3>📝 Contexto del Proyecto</h3>
+        <label>Personajes (uno por línea)</label>
+        <textarea id="ctx-characters" rows="2" placeholder="Maria: mujer joven, pelo largo negro"></textarea>
+        <label>Ubicaciones</label>
+        <textarea id="ctx-locations" rows="2" placeholder="Ciudad neon, playa al atardecer"></textarea>
+        <label>Notas de continuidad</label>
+        <textarea id="ctx-notes" rows="2" placeholder="Mantener iluminación cálida, mismo ángulo de cámara"></textarea>
+        <button class="btn btn-sm" onclick="saveContext()">💾 Guardar Contexto</button>
+      </div>
+
+      <!-- Generation Log -->
+      <div class="section">
+        <h3>📜 Historial</h3>
+        <div class="log-list" id="log-list">
+          <div style="color:#444;text-align:center;padding:10px">Sin actividad aún</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Welcome when no project -->
+    <div id="welcome" style="text-align:center;padding:60px 20px">
+      <h2 style="color:var(--accent);font-size:1.5em;margin-bottom:10px">🎬 Centro de Mando Audiovisual</h2>
+      <p style="color:#666;margin-bottom:20px">Crea un proyecto para empezar a generar videos, imágenes y audio</p>
+      <button class="btn btn-primary" onclick="createProject()">+ Crear Primer Proyecto</button>
+    </div>
+
+  </main>
+</div>
+
+<script>
+const PROJECTS = "/api/projects";
+let currentProject = null;
+let currentModel = "wan_i2v";
+let pollInterval = null;
+
+async function init(){
+  loadProjects();
+  updateGPUStatus();
+  setInterval(updateGPUStatus, 5000);
+}
+
+async function updateGPUStatus(){
+  try{
+    let d=await(await fetch("/api/gpu2/status")).json();
+    let pct=(d.gpu_mem_used_mb/d.gpu_mem_total_mb*100).toFixed(1);
+    document.getElementById("gpu-mem").textContent=d.gpu_mem_used_mb+"MB / "+d.gpu_mem_total_mb+"MB";
+    document.getElementById("gpu-free").textContent=(d.gpu_mem_total_mb-d.gpu_mem_used_mb)+"MB libre";
+    document.getElementById("gpu-bar").style.width=pct+"%";
+    document.getElementById("gpu-bar").className="gpu-bar-fill "+(pct<50?"low":pct<80?"mid":"high");
+    currentModel=d.model||"ninguno";
+    document.getElementById("gpu-model").textContent=currentModel;
+  }catch(e){}
+}
+
+async function loadProjects(){
+  try{
+    let d=await(await fetch(PROJECTS+"/list")).json();
+    let el=document.getElementById("proj-list");
+    if(d.length===0){
+      el.innerHTML='<div style="color:#444;font-size:0.75em;text-align:center;padding:10px">Sin proyectos</div>';
+      return;
+    }
+    let html="";
+    for(let i=0;i<d.length;i++){
+      let p=d[i];
+      let active=(currentProject&&currentProject.id===p.id)?"active":"";
+      let meta=p.scenes+" escenas";
+      if(p.created) meta+=" · "+p.created.substring(0,10);
+      html+='<div class="proj-item '+active+'" onclick="openProject(\''+p.id+'\')">';
+      html+='<div class="name">'+p.name+'</div>';
+      html+='<div class="meta">'+meta+'</div>';
+      html+='</div>';
+    }
+    el.innerHTML=html;
+  }catch(e){console.error("loadProjects:",e);}
+}
+
+function createProject(){
+  document.getElementById("wizard-create").style.display="block";
+  document.getElementById("proj-editor").style.display="none";
+  document.getElementById("welcome").style.display="none";
+}
+
+function cancelWizard(){
+  document.getElementById("wizard-create").style.display="none";
+  if(!currentProject) document.getElementById("welcome").style.display="block";
+  else document.getElementById("proj-editor").style.display="block";
+}
+
+async function doCreateProject(){
+  let name=document.getElementById("new-proj-name").value.trim();
+  if(!name)return toast("Escribe un nombre","err");
+  let desc=document.getElementById("new-proj-desc").value.trim();
+  try{
+    let d=await(await fetch(PROJECTS+"/create",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,description:desc})})).json();
+    currentProject={id:d.project_id,name:d.name};
+    document.getElementById("wizard-create").style.display="none";
+    document.getElementById("proj-editor").style.display="block";
+    loadProjects();
+    toast("Proyecto creado","ok");
+  }catch(e){toast("Error: "+e.message,"err");}
+}
+
+async function openProject(pid){
+  currentProject={id:pid};
+  loadProjects();
+  document.getElementById("welcome").style.display="none";
+  document.getElementById("wizard-create").style.display="none";
+  document.getElementById("proj-editor").style.display="block";
+  loadScenes();
+}
+
+async function loadScenes(){
+  if(!currentProject)return;
+  try{
+    let d=await(await fetch(PROJECTS+"/"+currentProject.id+"/scenes")).json();
+    let el=document.getElementById("scene-list");
+    if(d.length===0){
+      el.innerHTML='<div style="color:#444;font-size:0.75em;text-align:center;padding:20px">Sin escenas</div>';
+      return;
+    }
+    let html="";
+    for(let i=0;i<d.length;i++){
+      let s=d[i];
+      let pid=s.id||s.scene_num||i;
+      let status=s.status||"pending";
+      let title=s.prompt? s.prompt.substring(0,60):"Sin prompt";
+      html+='<div class="scene-item" onclick="viewScene('+pid+')">';
+      html+='<div class="scene-info">';
+      html+='<div class="scene-title">'+title+'...</div>';
+      html+='<div class="scene-meta">'+(s.resolution||"?")+' · seed:'+(s.seed||"?")+'</div>';
+      html+='</div>';
+      html+='<span class="scene-status '+status+'">'+status+'</span>';
+      html+='</div>';
+    }
+    el.innerHTML=html;
+  }catch(e){console.error("loadScenes:",e);}
+}
+
+function viewScene(sid){console.log("viewScene:",sid);}
+
+function selectModel(m){
+  currentModel=m;
+  let btns=document.querySelectorAll(".model-btn");
+  for(let i=0;i<btns.length;i++) btns[i].classList.remove("active");
+  let btn=document.querySelector("[data-model=\""+m+"\"]");
+  if(btn) btn.classList.add("active");
+}
+
+async function generateScene(){
+  if(!currentProject)return toast("Selecciona un proyecto","err");
+  let prompt=document.getElementById("scene-prompt").value.trim();
+  if(!prompt)return toast("Escribe un prompt","err");
+  
+  let model=currentModel||"wan_i2v";
+  let w=320,h=320,f=5,s=6,c=6;
+  try{
+    let resEl=document.getElementById("scene-res").value.split("x");
+    w=parseInt(resEl[0]);h=parseInt(resEl[1]);
+    f=parseInt(document.getElementById("scene-frames").value);
+    s=parseInt(document.getElementById("scene-steps").value);
+    c=parseFloat(document.getElementById("scene-cfg").value);
+  }catch(ignore){}
+  
+  let btn=document.getElementById("btn-generate");
+  btn.disabled=true;
+  btn.textContent="⏳ Generando...";
+  
+  try{
+    // SDXL Turbo y Juggernaut usan el servidor SDXL directo (GPU 1)
+    if(model==="sdxl_turbo"||model==="sdxl_jugg"){
+      document.getElementById("gen-status").textContent="Generando en GPU 1 (SDXL)...";
+      let sdxlModel=(model==="sdxl_turbo")?"turbo":"juggernaut";
+      let resp=await fetch("/api/sdxl/generate",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({prompt:prompt,model:sdxlModel,width:parseFloat(document.getElementById("scene-res").value.split("x")[0])||512,height:parseFloat(document.getElementById("scene-res").value.split("x")[1])||512,steps:s,cfg:c})});
+      let data=await resp.json();
+      if(data.success){
+        document.getElementById("preview").innerHTML='<img src="data:image/png;base64,'+data.image_b64+'" style="max-width:100%;max-height:400px">';
+        btn.disabled=false;
+        btn.textContent="🎬 Generar";
+        document.getElementById("gen-status").textContent="OK";
+      }else{
+        throw new Error(data.error||"Error SDXL");
+      }
+      loadScenes();
+      return;
+    }
+    
+    // Wan y otros modelos usan ComfyUI (GPU 2)
+    document.getElementById("gen-status").textContent="Preparando GPU..."
+    await fetch("/admin/gpu2/prepare-heavy",{method:"POST"});
+    await new Promise(r=>setTimeout(r,3000));
+    let scene=await(await fetch(PROJECTS+"/"+currentProject.id+"/scenes/create",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:prompt,model:model,width:w,height:h,frames:f,steps:s,cfg:c})})).json();
+    let seed=parseInt(scene.seed)||Math.floor(Math.random()*2147483647);
+    
+    let imgName="example.png";
+    if(imgFile){
+      document.getElementById("gen-status").textContent="Subiendo imagen...";
+      let imgForm=new FormData();
+      imgForm.append("image",imgFile,imgFile.name);
+      let up=await fetch("/api/comfyui/upload/image",{method:"POST",body:imgForm});
+      let ud=JSON.parse(await up.text());
+      imgName=ud.name||"example.png";
+    }
+    
+    document.getElementById("gen-status").textContent="Preparando GPU..."
+    
+    // Paso 1: Preparar GPU 2 para modelo grande
+    await fetch("/admin/gpu2/prepare-heavy",{method:"POST"});
+    await new Promise(r=>setTimeout(r,3000));
+    
+    document.getElementById("gen-status").textContent="Generando en GPU...";
+    
+    let wf={};
+    wf["1"]={"class_type":"WanVideoModelLoader","inputs":{"model":"wan2.1-i2v-14b-480p-Q3_K_S.gguf","base_precision":"bf16","quantization":"disabled","load_device":"main_device","attention_mode":"sdpa"}};
+    wf["2"]={"class_type":"LoadWanVideoT5TextEncoder","inputs":{"model_name":"umt5_xxl_fp16.safetensors","precision":"bf16","load_device":"offload_device"}};
+    wf["3"]={"class_type":"WanVideoTextEncode","inputs":{"positive_prompt":prompt,"negative_prompt":"blur,low quality,static","t5":["2",0],"force_offload":true}};
+    wf["4"]={"class_type":"WanVideoVAELoader","inputs":{"model_name":"wan_2.1_vae.safetensors","precision":"fp16"}};
+    wf["5"]={"class_type":"LoadImage","inputs":{"image":imgName}};
+    wf["6"]={"class_type":"WanVideoImageToVideoEncode","inputs":{"vae":["4",0],"start_image":["5",0],"width":w,"height":h,"num_frames":f,"force_offload":true,"noise_aug_strength":0.05,"start_latent_strength":1.0,"end_latent_strength":1.0}};
+    wf["7"]={"class_type":"WanVideoSampler","inputs":{"model":["1",0],"image_embeds":["6",0],"text_embeds":["3",0],"steps":s,"cfg":c,"shift":3,"seed":seed,"scheduler":"unipc","riflex_freq_index":0,"force_offload":true}};
+    wf["8"]={"class_type":"WanVideoDecode","inputs":{"vae":["4",0],"samples":["7",0],"enable_vae_tiling":true,"tile_x":32,"tile_y":32,"tile_stride_x":16,"tile_stride_y":16}};
+    wf["9"]={"class_type":"VHS_VideoCombine","inputs":{"images":["8",0],"frame_rate":4,"loop_count":0,"filename_prefix":"WanOut","format":"video/h264-mp4","pixel_format":"yuv420p","crf":20,"save_metadata":false,"pingpong":false,"save_output":true}};
+    
+    let pr=await fetch("/api/comfyui/prompt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:wf})});
+    let pd=JSON.parse(await pr.text());
+    
+    if(!pd.prompt_id) throw new Error("Error: "+(pd.error&&pd.error.message?pd.error.message:JSON.stringify(pd).substring(0,100)));
+    
+    document.getElementById("gen-status").textContent="Generando...";
+    let pollCount=0;
+    if(pollInterval) clearInterval(pollInterval);
+    pollInterval=setInterval(async function(){
+      pollCount++;
+      if(pollCount>60){clearInterval(pollInterval);btn.disabled=false;btn.textContent="🎬 Generar";document.getElementById("gen-status").textContent="Timeout";return;}
+      try{
+        let response=await fetch("/api/comfyui/history/"+pd.prompt_id);
+         let hist=await response.json();
+         if(hist.outputs){
+           let nids=Object.keys(hist.outputs);
+           for(let ni=0;ni<nids.length;ni++){
+             let out=hist.outputs[nids[ni]];
+             let media=[];
+             if(out.videos) media=media.concat(out.videos);
+             if(out.gifs) media=media.concat(out.gifs);
+             if(out.images) media=media.concat(out.images);
+             if(media.length>0){
+               clearInterval(pollInterval);
+               let file=media[0];
+               let url="/api/comfyui/view?filename="+file.filename+"&subfolder="+(file.subfolder||"")+"&type=output";
+               let isVideo=/\.(mp4|webm|mov)$/i.test(file.filename);
+               let isGif=/\.gif$/i.test(file.filename);
+               if(isVideo){
+                 document.getElementById("preview").innerHTML='<video controls src="'+url+'" style="max-width:100%;max-height:400px"></video>';
+               } else if(isGif){
+                 document.getElementById("preview").innerHTML='<img src="'+url+'" style="max-width:100%;max-height:400px">';
+               } else {
+                 document.getElementById("preview").innerHTML='<img src="'+url+'" style="max-width:100%;max-height:400px">';
+               }
+               btn.disabled=false;
+               btn.textContent="🎬 Generar";
+                document.getElementById("gen-status").textContent="OK";
+                // Restaurar servicios ligeros en GPU 2
+                await fetch("/admin/gpu2/restore",{method:"POST"});
+                loadScenes();
+                return;
+             }
+           }
+         }
+        document.getElementById("gen-status").textContent="Generando...("+(pollCount*5)+"s)";
+      }catch(ignore){}
+    },5000);
+  }catch(e){
+    btn.disabled=false;
+    btn.textContent="🎬 Generar";
+    document.getElementById("gen-status").textContent="Error";
+    toast("Error: "+e.message,"err");
+  }
+}
+
+async function clearGPU(){
+  try{await fetch("/api/gpu2/clear",{method:"POST"});toast("GPU liberada","ok");}catch(e){toast("Error","err");}
+  updateGPUStatus();
+}
+
+function toast(msg,type){
+  let el=document.createElement("div");
+  el.className="toast "+(type||"ok");
+  el.textContent=msg;
+  document.body.appendChild(el);
+  setTimeout(function(){el.remove();},3000);
+}
+
+async function speak(){
+  let text=prompt("Texto para TTS:","Hello world");
+  if(!text)return;
+  try{
+    let r=await fetch("/api/voxtral/v1/audio/speech",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({input:text,voice:"tara",response_format:"wav"})});
+    let blob=await r.blob();
+    let url=URL.createObjectURL(blob);
+    document.getElementById("preview").innerHTML='<audio controls src="'+url+'" style="width:100%;margin-top:4px"></audio>';
+    toast("Audio generado","ok");
+  }catch(e){toast("Error: "+e.message,"err");}
+}
+
+async function genAudio(){
+  let p=prompt("Prompt para audio:","techno music");
+  if(!p)return;
+  try{
+    let r=await fetch("/api/audioldm2/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:p,num_inference_steps:10,audio_length_in_s:10})});
+    let blob=await r.blob();
+    let url=URL.createObjectURL(blob);
+    document.getElementById("preview").innerHTML='<audio controls src="'+url+'" style="width:100%;margin-top:4px"></audio>';
+    toast("Audio generado","ok");
+  }catch(e){toast("Error: "+e.message,"err");}
+}
+
+init();
+
+</script>
+</body>
+</html>

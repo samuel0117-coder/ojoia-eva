@@ -302,7 +302,7 @@ const App = {
         }
     },
 
-    go(page) {
+    go(page, eventId) {
         if (this.page !== page) this._clearAllPolls();
         this.page = page;
         const c = document.getElementById('app-content');
@@ -316,7 +316,7 @@ const App = {
         if (page !== 'eva') this._removeStaleEvaChat();
         c.scrollTop = 0;
         document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.page === page));
-        ({ home: () => this._pageHome(c), cameras: () => this._pageHome(c), eva: () => this._pageEva(c), events: () => this._pageEvents(c), settings: () => this._pageSettings(c) })[page]?.();
+        ({ home: () => this._pageHome(c), cameras: () => this._pageHome(c), eva: () => this._pageEva(c), events: () => this._pageEvents(c, eventId), settings: () => this._pageSettings(c) })[page]?.();
     },
 
     _clearAllPolls() { Object.values(this._polls).forEach(id => clearInterval(id)); this._polls = {}; if (this._configViewerPoll) { clearInterval(this._configViewerPoll); this._configViewerPoll = null; } },
@@ -439,13 +439,27 @@ const App = {
             const heroClass = on > 0 ? 'ok' : 'off';
 
             let lastAlertHTML = '';
-            if (lastEvt && lastEvt.qwen?.violation) {
-                const ts = lastEvt.timestamp ? new Date(lastEvt.timestamp * 1000).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit', hour12:true}) : '--';
-                lastAlertHTML = `<div class="last-alert" onclick="App.go('events')">
-                    <div style="font-size:.75rem;color:var(--danger);font-weight:600;margin-bottom:4px">🚨 ÚLTIMA ALERTA — ${ts}</div>
-                    <div style="font-size:.88rem">${lastEvt.qwen?.description || 'Actividad detectada'}</div>
-                    <div style="font-size:.75rem;color:var(--text-secondary);margin-top:4px">Toca para ver →</div>
-                </div>`;
+            if (lastEvt) {
+                const isViolation = lastEvt.qwen?.violation || lastEvt.event_type === 'violation';
+                const isAttention = (lastEvt.attention_hits && lastEvt.attention_hits.length > 0) || lastEvt.event_type === 'attention';
+                const isSentinel = lastEvt.event_type === 'sentinel' || (lastEvt.qwen_json?.after_hours && lastEvt.qwen_json?.importancia === 'alta');
+                if (isViolation || isAttention || isSentinel) {
+                    const ts = lastEvt.timestamp ? new Date(lastEvt.timestamp * 1000).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit', hour12:true}) : '--';
+                    const evtDesc = lastEvt.description || lastEvt.summary || (lastEvt.qwen_json?.summary || '');
+                    const evtHits = lastEvt.attention_hits || [];
+                    const alertColor = isSentinel ? 'var(--warning, #f5a623)' : 'var(--danger)';
+                    const alertIcon = isSentinel ? '🛡️' : '📷';
+                    const alertTitle = isSentinel ? 'FUERA DE HORARIO — Se detectó presencia' : (isAttention ? '🔍 Observación relevante' : '🚨 Alerta');
+                    lastAlertHTML = `<div class="last-alert" onclick="App._openEvent('${lastEvt.event_id}')" style="background:${isSentinel ? 'rgba(245,166,35,0.08)' : 'rgba(255,59,48,0.06)'};border:1px solid ${alertColor};padding:14px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer">
+                        <div style="font-size:.78rem;color:${alertColor};font-weight:700;margin-bottom:6px">${alertIcon} ${alertTitle} — ${ts}</div>
+                        <div style="font-size:.92rem;line-height:1.4;margin-bottom:6px">${evtDesc.substring(0, 180) || 'Se detectó actividad en la zona'}</div>
+                        ${evtHits.length ? `<div style="font-size:.78rem;color:var(--text-secondary);margin-bottom:6px">🔍 ${evtHits.slice(0, 2).join(', ')}</div>` : ''}
+                        <div style="display:flex;gap:8px;margin-top:8px">
+                            <button class="btn btn-sm" onclick="event.stopPropagation();App._openEvent('${lastEvt.event_id}')" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:8px;font-size:.82rem">Ver detalle</button>
+                            <button class="btn btn-sm" onclick="event.stopPropagation();App._dismissEvent('${lastEvt.event_id}');App.go('home')" style="background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-size:.82rem">✓ Falsa alarma</button>
+                        </div>
+                    </div>`;
+                }
             }
 
             const defaultCam = cams.find(c => c.active) || cams[0] || null;
@@ -1748,7 +1762,7 @@ const App = {
     },
 
     // ── EVENTS ───────────────────────────────────────────────
-    async _pageEvents(c) {
+    async _pageEvents(c, openEventId) {
         this._resetScrollContent(c);
         c.innerHTML = `<div class="filters">
             <button class="filter-btn active" onclick="App._filterEvents(this,'recent')">🕒 Últimas 24h</button>
@@ -1772,6 +1786,9 @@ const App = {
         }, 10000);
         // Load camera list for filter
         this._loadCamFilter();
+        if (openEventId) {
+            setTimeout(() => this._openEvent(openEventId), 500);
+        }
     },
 
     async _loadCamFilter() {
@@ -1967,7 +1984,10 @@ const App = {
             const r = await apiFetch(`${this.API}/api/events/${eventId}?user_id=${uid}`);
             const d = await r.json();
             if (!d || d.error) return;
-            const violation = d.qwen?.violation;
+            const violation = d.qwen?.violation || d.event_type === 'violation';
+            const isAttention = (d.attention_hits && d.attention_hits.length > 0) || d.event_type === 'attention';
+            const isSentinel = d.event_type === 'sentinel' || (d.qwen_json?.after_hours && d.qwen_json?.importancia === 'alta');
+            const attentionHits = d.attention_hits || [];
             const modal = document.createElement('div');
             modal.style.cssText = 'position:fixed;inset:0;z-index:500;background:#000;display:flex;flex-direction:column;overflow-y:auto';
             
@@ -1982,11 +2002,11 @@ const App = {
             title.textContent = d.camera_name || 'Evento';
             header.appendChild(closeBtn);
             header.appendChild(title);
-            if (violation) {
+            if (violation || isAttention || isSentinel) {
                 const badge = document.createElement('span');
                 badge.className = 'badge badge-alert';
                 badge.style.marginLeft = 'auto';
-                badge.textContent = '🚨 Alerta';
+                badge.textContent = isSentinel ? '🛡️ Fuera de horario' : (isAttention ? '🔍 Observación' : '🚨 Alerta');
                 header.appendChild(badge);
             }
             
@@ -2071,17 +2091,30 @@ const App = {
             cardTitle.className = 'card-title';
             cardTitle.textContent = '🤖 Análisis de Eva';
             const qa = d.qwen_analysis || {};
-            const desc = this._cleanEventDescription(qa.summary || qa.description || d.qwen?.description || d.description);
+            const qjson = d.qwen_json || {};
+            const desc = this._cleanEventDescription(qa.summary || qa.description || qjson.summary || qjson.description || d.qwen?.description || d.description);
             if (desc) {
                 const p = document.createElement('p');
                 p.style.cssText = 'font-size:.9rem;margin-bottom:8px;line-height:1.45;white-space:pre-wrap';
                 p.textContent = desc;
                 card.appendChild(p);
             }
+            if (attentionHits.length) {
+                const hitsDiv = document.createElement('div');
+                hitsDiv.style.cssText = 'background:rgba(245,166,35,0.08);border:1px solid rgba(245,166,35,0.3);border-radius:10px;padding:10px 14px;margin-bottom:12px';
+                hitsDiv.innerHTML = `<div style="font-size:.78rem;color:var(--warning,#f5a623);font-weight:600;margin-bottom:4px">🔍 Observaciones detectadas:</div><div style="font-size:.85rem;line-height:1.4">${attentionHits.map(h => `• ${h}`).join('<br>')}</div>`;
+                card.appendChild(hitsDiv);
+            }
+            if (isSentinel) {
+                const sentinelDiv = document.createElement('div');
+                sentinelDiv.style.cssText = 'background:rgba(245,166,35,0.08);border:1px solid rgba(245,166,35,0.3);border-radius:10px;padding:10px 14px;margin-bottom:12px';
+                sentinelDiv.innerHTML = `<div style="font-size:.82rem;color:var(--warning,#f5a623);font-weight:600">🛡️ Modo centinela — Se detectó presencia fuera del horario de trabajo</div>`;
+                card.appendChild(sentinelDiv);
+            }
             const aiRow = document.createElement('div');
             aiRow.className = 'ai-row';
                 const yoloCount = (d.yolo?.count ?? 0) || (Array.isArray(d.yolo?.detections) ? d.yolo.detections.length : 0);
-                aiRow.innerHTML = `<div class="ai-card"><div class="ai-label">👁 Detección</div><div class="ai-val">${yoloCount} obj.</div></div><div class="ai-card"><div class="ai-label">👥 Personas</div><div class="ai-val">${d.persons ?? d.qwen_analysis?.persons ?? '—'}</div></div><div class="ai-card"><div class="ai-label">🧠 Eva</div><div class="ai-val">${violation ? '🚨 Alerta' : '✅ Normal'}</div></div>`;
+                aiRow.innerHTML = `<div class="ai-card"><div class="ai-label">👁 Detección</div><div class="ai-val">${yoloCount} obj.</div></div><div class="ai-card"><div class="ai-label">👥 Personas</div><div class="ai-val">${d.persons ?? d.qwen_analysis?.persons ?? '—'}</div></div><div class="ai-card"><div class="ai-label">🧠 Eva</div><div class="ai-val">${isSentinel ? '🛡️ Centinela' : (isAttention || violation ? '🔍 Observación' : '✅ Normal')}</div></div>`;
             card.appendChild(aiRow);
             content.appendChild(card);
             
@@ -2093,11 +2126,11 @@ const App = {
             dismissBtn.innerHTML = '✓ Falsa alarma';
             dismissBtn.onclick = () => { this._dismissEvent(eventId); modal.remove(); };
             btnRow.appendChild(dismissBtn);
-            if (violation) {
+            if (violation || isAttention) {
                 const confirmBtn = document.createElement('button');
                 confirmBtn.className = 'btn';
-                confirmBtn.style.cssText = 'flex:1;background:var(--danger)';
-                confirmBtn.innerHTML = '⚠️ Confirmar alerta';
+                confirmBtn.style.cssText = 'flex:1;background:var(--accent)';
+                confirmBtn.innerHTML = isAttention ? '🏷️ Marcar como falta real' : '⚠️ Confirmar alerta';
                 confirmBtn.onclick = () => { this._confirmThreat(eventId); modal.remove(); };
                 btnRow.appendChild(confirmBtn);
             }

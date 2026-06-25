@@ -432,6 +432,12 @@ const EvaChat = {
 
     async openEventDetail(eventId) {
         this.stopEventAutoplay();
+        if (typeof App !== 'undefined' && App.go) {
+            App._pendingEventId = eventId;
+            if (App.go('events', eventId)) {
+                return;
+            }
+        }
         try {
             const r = await fetch(`${this.API}/api/events/${eventId}?user_id=${this.userId}`);
             if (!r.ok) return;
@@ -449,7 +455,12 @@ const EvaChat = {
             const fallbackImgHtml = !videoUrl && !frameCount ? `<img src="${frameUrl}" onerror="this.style.display='none'" style="width:100%;border-radius:8px;margin-bottom:12px;background:#000">` : '';
             const carouselHtml = frameCount ? `<div style="text-align:center;margin-bottom:8px"><img id="eva-event-frame-img" src="${this.API}/api/events/${eventId}/frame/0?user_id=${this.userId}" style="width:100%;border-radius:8px;background:#000"><div class="meta" id="eva-event-frame-status">1/${frameCount}</div><input id="eva-event-frame-range" type="range" min="0" max="${frameCount - 1}" value="0" oninput="EvaChat._showEventFrame('${eventId}', this.value, ${frameCount})" style="width:100%;margin-top:8px"><button class="eva-frame-play-btn" onclick="EvaChat.toggleEventAutoplay('${eventId}', ${frameCount})" id="eva-frame-play-btn">Pausar video</button></div>` : '';
             const cameraLiveButton = event.camera_id ? `<button class="feedback-btn confirm" onclick="EvaChat.openCameraLive('${event.camera_id}')">📹 Ver cámara en vivo</button>` : '';
-            modal.innerHTML = `<div class="modal-overlay" onclick="EvaChat.closeEventModal(this.closest('.eva-event-modal'))"></div><div class="modal-content"><div class="modal-header"><span>📅 ${this.escapeHtml(event.datetime || '')} — ${this.escapeHtml(event.camera_name || event.camera_id || '')}</span><button onclick="EvaChat.closeEventModal(this.closest('.eva-event-modal'))">✕</button></div><div class="modal-body">${videoHtml}${fallbackImgHtml}${carouselHtml}<div class="event-description">${this.formatText(desc)}</div><div class="event-meta"><span>👥 ${this.escapeHtml(String(persons))} persona${String(persons) === '1' ? '' : 's'}</span><span>📷 ${this.escapeHtml(event.camera_name || event.camera_id || '')}</span>${event.qwen?.violation || qjson.violation || qa.anomalias?.length ? '<span class="anomaly-tag">⚠️ Alerta</span>' : ''}</div><div class="feedback-buttons">${cameraLiveButton}<button class="feedback-btn confirm" onclick="EvaChat.sendFeedback('${eventId}', true, this)">✅ Alerta real</button><button class="feedback-btn dismiss" onclick="EvaChat.sendFeedback('${eventId}', false, this)">❌ Falsa alarma</button></div></div></div>`;
+            const attentionHits = event.attention_hits || [];
+            const isSentinel = event.event_type === 'sentinel' || (qjson.after_hours && qjson.importancia === 'alta');
+            const alertTag = isSentinel ? '<span class="anomaly-tag" style="background:var(--warning,#f5a623)">🛡️ Fuera de horario</span>' : (attentionHits.length ? '<span class="anomaly-tag">🔍 Observación</span>' : (event.qwen?.violation || qjson.violation || qa.anomalias?.length ? '<span class="anomaly-tag">⚠️ Alerta</span>' : ''));
+            const hitsHtml = attentionHits.length ? `<div style="background:rgba(245,166,35,0.08);border:1px solid rgba(245,166,35,0.3);border-radius:10px;padding:10px 14px;margin-bottom:12px"><div style="font-size:.78rem;color:var(--warning,#f5a623);font-weight:600;margin-bottom:4px">🔍 Observaciones detectadas:</div><div style="font-size:.85rem;line-height:1.4">${attentionHits.map(h => `• ${this.escapeHtml(h)}`).join('<br>')}</div></div>` : '';
+            const sentinelHtml = isSentinel ? `<div style="background:rgba(245,166,35,0.08);border:1px solid rgba(245,166,35,0.3);border-radius:10px;padding:10px 14px;margin-bottom:12px"><div style="font-size:.82rem;color:var(--warning,#f5a623);font-weight:600">🛡️ Modo centinela — Se detectó presencia fuera del horario de trabajo</div></div>` : '';
+            modal.innerHTML = `<div class="modal-overlay" onclick="EvaChat.closeEventModal(this.closest('.eva-event-modal'))"></div><div class="modal-content"><div class="modal-header"><span>📅 ${this.escapeHtml(event.datetime || '')} — ${this.escapeHtml(event.camera_name || event.camera_id || '')}</span><button onclick="EvaChat.closeEventModal(this.closest('.eva-event-modal'))">✕</button></div><div class="modal-body">${videoHtml}${fallbackImgHtml}${carouselHtml}<div class="event-description">${this.formatText(desc)}</div>${hitsHtml}${sentinelHtml}<div class="event-meta"><span>👥 ${this.escapeHtml(String(persons))} persona${String(persons) === '1' ? '' : 's'}</span><span>📷 ${this.escapeHtml(event.camera_name || event.camera_id || '')}</span>${alertTag}</div><div class="feedback-buttons">${cameraLiveButton}<button class="feedback-btn confirm" onclick="EvaChat.sendFeedback('${eventId}', true, this)">${attentionHits.length ? '🏷️ Marcar como falta' : '✅ Alerta real'}</button><button class="feedback-btn dismiss" onclick="EvaChat.sendFeedback('${eventId}', false, this)">❌ Falsa alarma</button></div></div></div>`;
             document.body.appendChild(modal);
             if (frameCount) this.startEventAutoplay(eventId, frameCount);
         } catch (e) { console.error('Error loading event detail:', e); }

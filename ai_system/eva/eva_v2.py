@@ -1,22 +1,27 @@
 """
 eva/eva_v2.py — Motor unificado de Eva v2.
 
+NUEVA ARQUITECTURA (Testigo Puro):
+   Qwen es TESTIGO, no juzga. Solo narra hechos observables.
+   El sistema NO acusa, NO dice "violación", NO juzga a nadie.
+   El usuario decide si algo es falta o no.
+
 DOS MODOS:
-  1. SETUP: Flujo conversacional camera-first para configurar el sistema.
-     Eva guía paso a paso, extrae datos del negocio, construye el
-     system_prompt narrativo de cada cámara.
-  2. OS: Eva responde preguntas del usuario consultando el diario de
-     eventos (JSON rico).
+   1. SETUP: Flujo conversacional camera-first para configurar el sistema.
+      Eva identifica zona + tipo de negocio → selecciona plantilla.
+      Pregunta abierta: "¿Qué te gustaría que vigile aquí?"
+      Usuario responde libre → Eva convierte en frases de atención cortas.
+   2. OS: Eva responde preguntas del usuario consultando el diario de
+      eventos (JSON rico con narrativa + conteos).
 
 FLUJO SETUP (fases deterministas):
-  GREET → ZONE → HARDWARE → WAIT_IMAGE → ANALYZE → CONTEXT → PROMPT_BUILD → CONFIRM → DONE
+   GREET → ZONE → HARDWARE → WAIT_IMAGE → ANALYZE → CONTEXT → PROMPT_BUILD → CONFIRM → DONE
 
-*El usuario debe dar datos reales en el chat (preocupación, qué vigilar, horario).
+*El usuario da datos reales en el chat (qué vigilar, horario, notas).
 *Eva NO inventa nada — solo usa lo que el usuario dijo.
 
 Una vez DONE, cualquier mensaje va a modo OS.
-El system_prompt narrativo reemplaza al sistema de reglas.
-Cada evento del orquestador se guarda como JSON rico (diario del vigilante).
+Cada evento del orquestador se guarda como JSON rico (diario del testigo).
 """
 
 import asyncio
@@ -38,12 +43,12 @@ from eva.tools import OPENAI_TOOLS_SCHEMA
 _TOOLS_JSON_SCHEMA = """
 Herramientas disponibles (responde SOLO JSON con "tool" y "params"):
 - search_events: Busca eventos en el diario. params: query (texto, vacío=todos), date (today/yesterday/YYYY-MM-DD), camera_id (opcional), limit (1-10)
-- get_activity_summary: Resume actividad del día. params: date (today/yesterday), camera_id (opcional)
-- find_anomalies: Busca actividad sospechosa. params: min_severity (baja/media/alta/critica), date, camera_id, limit
+- get_activity_summary: Resume actividad del día (conteos, personas, platos, fundas). params: date (today/yesterday), camera_id (opcional)
+- find_anomalies: Busca eventos con attention_hits (observaciones relevantes). params: min_severity (baja/media/alta/critica/observacion), date, camera_id, limit
 - latest_events: Lista últimos análisis. params: limit (1-10), date, camera_id
 - find_risks: Busca riesgos incendio/humo. params: date, camera_id, limit
-- get_vigilance_config: Lee configuración protección. params: camera_id
-- update_vigilance_config: Actualiza protección. params: camera_id, mode (normal/sentinel), schedule, sensitivity, alert_behaviors, ignore_behaviors
+- get_vigilance_config: Lee configuración de observación. params: camera_id
+- update_vigilance_config: Actualiza observación. params: camera_id, mode (normal/sentinel), schedule, attention_phrases (lista), owner_notes (lista)
 - get_latest_frame: Obtiene imagen reciente. params: camera_id
 - analyze_frame: Analiza frame. params: camera_id, prompt
 - identify_face: Identifica quién en cámara. params: camera_id
@@ -443,42 +448,40 @@ def _parse_json_response(content: str) -> dict:
 # =============================================================================
 
 async def _build_system_prompt(session: Dict) -> str:
-    biz = session.get("business_name", "el negocio")
-    btype = session.get("business_type", "negocio")
-    zone = session.get("zone", "la zona")
-    concern = session.get("concern", "seguridad general")
-    forbidden = session.get("forbidden_events", "actividad sospechosa o no autorizada")
-    normal = session.get("normal_state", "actividad normal de la zona")
-    authorized = session.get("authorized_people", "empleados autorizados")
-    objects = session.get("important_objects", "dinero, productos, puerta, caja registradora")
-    severity = session.get("severity_rules", "robo, incendio y persona no autorizada son críticos")
-    sched = session.get("schedule", {"open": "08:00", "close": "22:00"})
-    owner = session.get("owner_name", "el dueño")
-    img_desc = session.get("image_desc", "")
-
+    """Construye el prompt de testigo puro para una cámara (vía Qwen)."""
+    cfg = {
+        "zone": session.get("zone", "la zona"),
+        "business_name": session.get("business_name", "el negocio"),
+        "business_type": session.get("business_type", "negocio"),
+        "schedule": session.get("schedule", {"open": "08:00", "close": "22:00"}),
+        "concern": session.get("concern", "seguridad general"),
+        "attention_phrases": session.get("attention_phrases", []),
+        "owner_notes": session.get("owner_notes", []),
+    }
     prompt = (
         f"Eres un experto en seguridad comercial en República Dominicana.\n"
-        f"Diseña el system_prompt de protección para una cámara.\n\n"
+        f"Diseña un system_prompt de observación para una cámara.\n\n"
         f"=== DATOS DEL NEGOCIO ===\n"
-        f"- Nombre: {biz}\n- Tipo: {btype}\n- Dueño: {owner}\n"
-        f"- Zona de la cámara: {zone}\n"
-        f"- Horario: {sched.get('open','08:00')} a {sched.get('close','22:00')}\n"
-        f"- Preocupación principal: {concern}\n"
-        f"- Lo que NUNCA debe pasar: {forbidden}\n"
-        f"- Estado normal esperado: {normal}\n"
-        f"- Personas autorizadas: {authorized}\n"
-        f"- Objetos importantes: {objects}\n"
-        f"- Reglas de severidad: {severity}\n"
+        f"- Nombre: {cfg['business_name']}\n- Tipo: {cfg['business_type']}\n"
+        f"- Zona: {cfg['zone']}\n"
+        f"- Horario: {cfg['schedule'].get('open','08:00')} a {cfg['schedule'].get('close','22:00')}\n"
+        f"- Preocupación: {cfg['concern']}\n"
     )
-    if img_desc: prompt += f"\n=== LO QUE LA CÁMARA VE ===\n{img_desc}\n"
+    if cfg["attention_phrases"]:
+        prompt += f"- Frases de atención del dueño:\n"
+        for p in cfg["attention_phrases"]:
+            prompt += f"  • {p}\n"
     prompt += (
         f"\n=== TU TAREA ===\n"
-        f"Genera el system_prompt que usará un vigilante de IA para analizar grids de imágenes.\n"
-        f"1. Rol del vigilante\n2. Contexto del negocio y zona\n"
-        f"3. Qué es normal y qué no es normal\n4. Preocupaciones del dueño\n"
-        f"5. Eventos críticos que deben generar alerta\n6. Severidad baja/media/alta/critica\n"
-        f"7. Formato de respuesta JSON\n\n"
-        f"IMPORTANTE: NO analizar cada frame. Solo reportar anomalías o resúmenes.\n"
+        f"Genera el system_prompt que usará un TESTIGO de IA para observar grids de imágenes.\n"
+        f"El testigo NUNCA juzga — solo describe hechos visibles.\n"
+        f"1. Rol del testigo (observador neutral)\n"
+        f"2. Contexto del negocio y zona\n"
+        f"3. Frases de atención del dueño (qué debe observar específicamente)\n"
+        f"4. Qué describir en cada análisis\n"
+        f"5. Qué NO decir (nunca juzgar, nunca decir 'violación', 'anomalía', 'sospechoso')\n"
+        f"6. Formato de respuesta JSON\n\n"
+        f"IMPORTANTE: El testigo solo narra hechos. No juzga. No acusa. No dice si está bien o mal.\n"
         f"Responde SOLO el system_prompt en texto plano. Máx 600 palabras."
     )
     msgs = [{"role": "system", "content": prompt}]
@@ -488,9 +491,9 @@ async def _build_system_prompt(session: Dict) -> str:
         sb64 = base64.b64encode(small).decode()
         msgs.append({"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{sb64}"}},
-            {"type": "text", "text": "Basándote en esta imagen y el contexto, genera el system_prompt."}]})
+            {"type": "text", "text": "Basándote en esta imagen y el contexto, genera el system_prompt de testigo."}]})
     else:
-        msgs.append({"role": "user", "content": "Genera el system_prompt basándote en los datos."})
+        msgs.append({"role": "user", "content": "Genera el system_prompt de testigo basándote en los datos."})
     result = await _call_qwen(msgs, 600)
     return result.get("content", "") if result.get("content") else _build_fallback_prompt(session)
 
@@ -501,17 +504,14 @@ def _build_fallback_prompt(session: Dict) -> str:
     authorized = session.get("authorized_people", "empleados autorizados")
     objects = session.get("important_objects", "dinero, productos, puerta, caja registradora")
     severity = session.get("severity_rules", "robo, incendio y persona no autorizada son críticos")
-    return (f"Eres vigilante de seguridad en {session.get('zone','zona')} de "
+    return (f"Eres testigo observando {session.get('zone','zona')} de "
             f"{session.get('business_name','negocio')}. "
             f"Horario: {session.get('schedule',{}).get('open','08:00')}-"
             f"{session.get('schedule',{}).get('close','22:00')}. "
-            f"Preocupación: {concern}. "
-            f"Nunca debe pasar: {forbidden}. "
-            f"Normal: {normal}. Autorizados: {authorized}. "
-            f"Objetos: {objects}. Severidad: {severity}. "
-            f"Analiza solo cuando detectes anomalías. "
-            f"Responde SOLO JSON: {{'summary':'...','details':{{...}},"
-            f"'anomalias':[...],'importancia':'baja/media/alta/critica'}}")
+            f"Describe solo hechos visibles. Nunca juzgues."
+            f"Responde SOLO JSON: {{'personas':[...],'transaccion':{{...}},"
+            f"'counts':{{'clientes':0,'platos_visibles':0}},"
+            f"'attention_hits':[...],'resumen':'...'}}")
 
 # =============================================================================
 # DETECCIÓN DE INTENCIONES
@@ -555,11 +555,8 @@ def _is_frame_problem(m):
 
 _CONTEXT_STEPS = [
     "concern",
-    "forbidden_events",
-    "normal_state",
-    "authorized_people",
-    "important_objects",
-    "severity_rules",
+    "attention_phrases",
+    "owner_notes",
 ]
 
 def _is_skippable_answer(m):
@@ -572,6 +569,21 @@ def _clean_context_answer(m, default):
     if not m or _is_yes(m) or _is_skippable_answer(m):
         return default
     return m
+
+def _parse_attention_phrases(text):
+    """Parsea frases de atención desde texto libre del usuario.
+    Separa por comas, 'y', 'que', punto y coma.
+    """
+    if not text:
+        return []
+    text = text.replace(";", ",").replace("\n", ",")
+    parts = re.split(r",\s*|\s+y\s+|\s+que\s+", text)
+    phrases = []
+    for p in parts:
+        p = p.strip().strip(".").strip()
+        if len(p) > 3 and len(p) < 200:
+            phrases.append(p)
+    return phrases[:10]
 
 def _next_context_step(session):
     step = session.get("context_step") or "concern"
@@ -587,31 +599,33 @@ def _context_question(session, step, first):
     examples = _get_concern_examples(biz_type, zone)
     if step == "concern":
         return f"Perfecto.\n\n¿Qué es lo que más te preocupa de seguridad en {zone}?\nPor ejemplo: {examples}"
-    if step == "forbidden_events":
-        return f"Perfecto. Ya anoté: {session.get('concern','')}\n\nAhora dime qué es lo que NUNCA debería pasar en {zone}.\nPor ejemplo: que roben, que entren personas sin permiso, que apaguen la cámara..."
-    if step == "normal_state":
-        return f"Perfecto.\n\n¿Qué debería verse normalmente en {zone}?\nPor ejemplo: cajero, clientes, productos, caja registradora, puerta..."
-    if step == "authorized_people":
-        return f"Perfecto.\n\n¿Quiénes tienen permiso de estar o entrar en {zone}?\nPor ejemplo: cajeros, administrador, empleados autorizados..."
-    if step == "important_objects":
-        return f"Perfecto.\n\n¿Qué objetos debe vigilar especialmente en {zone}?\nPor ejemplo: caja registradora, efectivo, inventario, puerta, extintor..."
-    if step == "severity_rules":
-        return f"Perfecto.\n\n¿Qué cosas son críticas para ti?\nPor ejemplo: robo o dinero fuera de lugar = crítica; persona no autorizada = alta; cajero sin uniforme = media."
-    return f"Gracias {first}. Ya tengo el contexto. Voy a crear el sistema de protección para tu {zone}..."
+    if step == "attention_phrases":
+        return (
+            f"Perfecto. Ya anoté tu preocupación: {session.get('concern','')}\n\n"
+            f"Ahora dime QUÉ QUIERES QUE VIGILE en {zone}.\n"
+            f"Escríbelo con tus palabras, como si me contaras:\n"
+            f"• ¿Qué hace el cajero que no debería hacer?\n"
+            f"• ¿Qué acción quieres que te notifique?\n"
+            f"• ¿Qué comportamiento te parece raro ver aquí?\n\n"
+            f"Por ejemplo: 'que el cajero se meta la mano en el bolsillo después de cobrar', "
+            f"'que el dinero no entre en la caja', 'que un cliente se lleve algo sin pagar'..."
+        )
+    if step == "owner_notes":
+        return (
+            f"Perfecto. Ya tengo lo que quieres vigilar.\n\n"
+            f"¿Hay algo que me quieras aclarar? Algo que veas a veces y NO sea falta.\n"
+            f"Por ejemplo: 'el cajero se toca el bolsillo para sacar el teléfono, eso es normal'.\n\n"
+            f"Si no hay nada más, dime 'no' o 'listo'."
+        )
+    return f"Gracias {first}. Ya tengo el contexto. Voy a crear el sistema de observación para tu {zone}..."
 
 def _context_default(step, zone):
     if step == "concern":
         return f"seguridad general en {zone}"
-    if step == "forbidden_events":
-        return f"actividad sospechosa o no autorizada en {zone}"
-    if step == "normal_state":
-        return f"actividad normal de {zone}"
-    if step == "authorized_people":
-        return "empleados autorizados"
-    if step == "important_objects":
-        return "dinero, productos, puerta, caja registradora"
-    if step == "severity_rules":
-        return "robo, incendio y persona no autorizada son críticos"
+    if step == "attention_phrases":
+        return ""
+    if step == "owner_notes":
+        return ""
     return "seguridad general"
 
 def _is_edit_request(m):
@@ -680,23 +694,24 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
         elif "media" in m:
             sensitivity = "media"
         vigilance["normal_mode"] = {**(vigilance.get("normal_mode") or {}), "sensitivity": sensitivity}
-    for marker in ("quita falsas alarmas", "quitar falsas alarmas", "no alertes por", "no alertar por"):
+    for marker in ("quita falsas alarmas", "quitar falsas alarmas", "no alertes por", "no alertar por", "es normal", "no es falta"):
         behavior = _clean_behavior(_extract_behavior_after(message, [marker]))
         if behavior:
             current = _load_current_vigilance_normal(user_id, camera_id)
-            existing = _list_from_config(current.get("ignore_behaviors", []))
-            if behavior not in existing:
-                existing.append(behavior)
-            vigilance["normal_mode"] = {**(vigilance.get("normal_mode") or {}), "ignore_behaviors": existing}
+            existing = current.get("owner_notes", [])
+            note = f"Nota del dueño: cuando pasa '{behavior}', es normal, no lo menciones."
+            if note not in existing:
+                existing.append(note)
+            vigilance["owner_notes"] = existing
             break
-    for marker in ("solo alerta si", "alerta si", "alertar si"):
+    for marker in ("solo alerta si", "alerta si", "alertar si", "notifícame cuando", "vigila cuando"):
         behavior = _clean_behavior(_extract_behavior_after(message, [marker]))
         if behavior:
             current = _load_current_vigilance_normal(user_id, camera_id)
-            existing = _list_from_config(current.get("alert_behaviors", []))
+            existing = current.get("attention_phrases", [])
             if behavior not in existing:
                 existing.append(behavior)
-            vigilance["normal_mode"] = {**(vigilance.get("normal_mode") or {}), "alert_behaviors": existing}
+            vigilance["attention_phrases"] = existing
             break
     if any(w in m for w in ("horario", "abre", "cierra", "apertura", "cierre")):
         schedule = _parse_schedule(message)
@@ -745,11 +760,29 @@ def _config_summary_text(session, first):
     biz = session.get("business_name","")
     concern = session.get("concern","")
     sched = session.get("schedule",{"open":"08:00","close":"22:00"})
-    return (f"Perfecto {first}. Configuración 📋\n\n"
-            f"📷 Cámara: {zone}\n🏢 Negocio: {biz}\n"
-            f"🔒 Preocupación: {concern}\n"
-            f"⏰ Horario: {sched.get('open','08:00')} a {sched.get('close','22:00')}\n\n"
-            f"¿Apruebas esta configuración?")
+    attention_phrases = session.get("attention_phrases", [])
+    owner_notes = session.get("owner_notes", [])
+    lines = [
+        f"Perfecto {first}. Configuración 📋",
+        f"",
+        f"📷 Cámara: {zone}",
+        f"🏢 Negocio: {biz}",
+        f"🔒 Preocupación: {concern}",
+        f"⏰ Horario: {sched.get('open','08:00')} a {sched.get('close','22:00')}",
+    ]
+    if attention_phrases:
+        lines.append(f"")
+        lines.append(f"🔍 Frases de atención ({len(ph_attention_phrases)}):")
+        for p in attention_phrases[:5]:
+            lines.append(f"  • {p}")
+    if owner_notes:
+        lines.append(f"")
+        lines.append(f"📝 Notas del dueño:")
+        for n in owner_notes[:3]:
+            lines.append(f"  • {n}")
+    lines.append(f"")
+    lines.append(f"¿Apruebas esta configuración?")
+    return "\n".join(lines)
 
 # =============================================================================
 # HANDLER PRINCIPAL
@@ -921,11 +954,12 @@ async def _handle_daily_summary(session, user_id, message, session_id):
     from eva.tools import tool_get_activity_summary
     result = await tool_get_activity_summary(user_id, "today")
     total = result.get("total_events", 0)
-    violations = result.get("violations", 0)
+    attention_events = result.get("attention_events", 0)
     persons_total = result.get("persons_total", 0)
     last_summary = result.get("last_summary", "")
     details = result.get("details", {})
     last_yolo = result.get("last_yolo", {})
+    counts_total = result.get("counts_total", {})
 
     if total == 0:
         text = f"Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta a cualquier actividad."
@@ -937,13 +971,27 @@ async def _handle_daily_summary(session, user_id, message, session_id):
     lines.append(f"Resumen del día: Hoy se realizaron {total} análisis de seguridad.")
     lines.append("")
 
-    if violations > 0:
-        lines.append(f"⚠️ Se detectaron {violations} alerta(s) de actividad sospechosa.")
+    if attention_events > 0:
+        lines.append(f"🔍 {attention_events} evento(s) coincidieron con lo que me pediste vigilar.")
     else:
-        lines.append("✅ No se detectaron alertas de actividad sospechosa.")
+        lines.append("✅ No se detectaron coincidencias con lo que me pediste vigilar.")
 
     if persons_total > 0:
-        lines.append(f"👥 Personas detectadas: {persons_total} en total.")
+        lines.append(f"👥 Personas observadas: aproximadamente {persons_total} en total.")
+
+    platos = counts_total.get("platos", 0)
+    bebidas = counts_total.get("bebidas", 0)
+    fundas = counts_total.get("fundas", 0)
+    clientes = counts_total.get("clientes_estimado", 0)
+
+    if platos > 0:
+        lines.append(f"🍽️ Platos visibles en total: ~{platos}.")
+    if bebidas > 0:
+        lines.append(f"🥤 Bebidas visibles: ~{bebidas}.")
+    if fundas > 0:
+        lines.append(f"🛍️ Fundas utilizadas: ~{fundas}.")
+    if clientes > 0:
+        lines.append(f"🧑‍🤝‍🧑 Clientes observados: ~{clientes}.")
 
     lines.append(f"📊 Objetos detectados en último análisis: {last_yolo.get('count', 0)}.")
     classes = last_yolo.get("classes", [])
@@ -1371,15 +1419,12 @@ async def _handle_context(session, session_id, user_id, message, first):
                 session["system_prompt"] = sp
                 ud = _load_user_data(user_id)
                 ud["schedule"] = sched
-                if session.get("concern"): ud["main_concerns"] = [session["concern"]]
+                if session.get("concern"): ud["main_concerns"] = [session.get("concern")]
                 ud["vigilance_context"] = {
                     "zone": session.get("zone",""),
                     "concern": session.get("concern",""),
-                    "forbidden_events": session.get("forbidden_events",""),
-                    "normal_state": session.get("normal_state",""),
-                    "authorized_people": session.get("authorized_people",""),
-                    "important_objects": session.get("important_objects",""),
-                    "severity_rules": session.get("severity_rules",""),
+                    "attention_phrases": session.get("attention_phrases", []),
+                    "owner_notes": session.get("owner_notes", []),
                 }
                 _save_user_data(user_id, ud)
                 session["phase"] = SetupPhase.CONFIRM.value
@@ -1421,12 +1466,13 @@ async def _handle_context(session, session_id, user_id, message, first):
             _save_session_to_disk(session)
             return _mk_resp(session, f"Dímelo concreto, {first}.\n\n{_context_question(session, step, first)}")
         default = _context_default(step, zone)
-        answer = _clean_context_answer(msg, default)
+        if step == "attention_phrases":
+            answer = _parse_attention_phrases(msg)
+            if not answer:
+                answer = default
+        else:
+            answer = _clean_context_answer(msg, default)
         session[step] = answer
-        session["business_answers"] = [
-            session.get("normal_state", answer if step == "normal_state" else ""),
-            session.get("forbidden_events", answer if step == "forbidden_events" else ""),
-        ]
         next_step = _next_context_step(session)
         session["context_step"] = next_step
         _sessions[session_id] = session
@@ -1435,7 +1481,7 @@ async def _handle_context(session, session_id, user_id, message, first):
             session["phase"] = SetupPhase.PROMPT_BUILD.value
             _sessions[session_id] = session
             _save_session_to_disk(session)
-            return _mk_resp(session, f"Gracias {first}. Ya tengo todo el contexto. Voy a crear el sistema de protección para tu {zone}...")
+            return _mk_resp(session, f"Gracias {first}. Ya tengo todo el contexto. Voy a crear el sistema de observación para tu {zone}...")
         return _mk_resp(session, _context_question(session, next_step, first))
 
     session["phase"] = SetupPhase.PROMPT_BUILD.value
@@ -1456,11 +1502,8 @@ async def _handle_prompt_build(session, session_id, user_id, message, first):
     ud["vigilance_context"] = {
         "zone": session.get("zone",""),
         "concern": session.get("concern",""),
-        "forbidden_events": session.get("forbidden_events",""),
-        "normal_state": session.get("normal_state",""),
-        "authorized_people": session.get("authorized_people",""),
-        "important_objects": session.get("important_objects",""),
-        "severity_rules": session.get("severity_rules",""),
+        "attention_phrases": session.get("attention_phrases", []),
+        "owner_notes": session.get("owner_notes", []),
     }
     _save_user_data(user_id, ud)
     sp = await _build_system_prompt(session)
@@ -1498,13 +1541,9 @@ async def _handle_confirm(session, session_id, user_id, message, first, storage_
             "business_name": session.get("business_name",""),
             "conversation_context": {
                 "concern": session.get("concern",""),
-                "forbidden_events": session.get("forbidden_events",""),
-                "normal_state": session.get("normal_state",""),
-                "authorized_people": session.get("authorized_people",""),
-                "important_objects": session.get("important_objects",""),
-                "severity_rules": session.get("severity_rules",""),
             },
-            "system_prompt": session.get("system_prompt",""),
+            "attention_phrases": session.get("attention_phrases", []),
+            "owner_notes": session.get("owner_notes", []),
             "schedule": session.get("schedule",{"open":"08:00","close":"22:00"}),
             "yolo_triggers": ["person"],
             "grid_size": 12, "cooldown_min": 5, "active": True, "configured_at": int(time.time()),
@@ -1538,11 +1577,12 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         from eva.tools import tool_get_activity_summary
         result = await tool_get_activity_summary(user_id, "today")
         total = result.get("total_events", 0)
-        violations = result.get("violations", 0)
+        attention_events = result.get("attention_events", 0)
         persons_total = result.get("persons_total", 0)
         last_summary = result.get("last_summary", "")
         details = result.get("details", {})
         last_yolo = result.get("last_yolo", {})
+        counts_total = result.get("counts_total", {})
         notable_events = result.get("notable_events", [])
         if total == 0:
             text = "Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta."
@@ -1550,12 +1590,19 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
             lines = []
             lines.append(f"Resumen del día: Hoy se realizaron {total} análisis de seguridad.")
             lines.append("")
-            if violations > 0:
-                lines.append(f"⚠️ Se detectaron {violations} alerta(s) de actividad sospechosa.")
+            if attention_events > 0:
+                lines.append(f"🔍 {attention_events} evento(s) coincidieron con lo que me pediste vigilar.")
             else:
-                lines.append("✅ No se detectaron alertas de actividad sospechosa.")
+                lines.append("✅ No se detectaron coincidencias con lo que me pediste vigilar.")
             if persons_total > 0:
-                lines.append(f"👥 Personas detectadas: {persons_total} en total.")
+                lines.append(f"👥 Personas observadas: aproximadamente {persons_total} en total.")
+            if counts_total:
+                platos = counts_total.get("platos", 0)
+                fundas = counts_total.get("fundas", 0)
+                if platos > 0:
+                    lines.append(f"🍽️ Platos visibles: ~{platos}.")
+                if fundas > 0:
+                    lines.append(f"🛍️ Fundas: ~{fundas}.")
             lines.append(f"📊 Objetos detectados en último análisis: {last_yolo.get('count', 0)}.")
             classes = last_yolo.get("classes", [])
             if classes:
@@ -1729,13 +1776,16 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         normal = v.get("normal_mode", {}) if isinstance(v.get("normal_mode"), dict) else {}
         sentinel = v.get("sentinel_mode", {}) if isinstance(v.get("sentinel_mode"), dict) else {}
         text = (
-            f"{first}, protección de {data.get('camera_id') or 'la cámara'}:\n"
+            f"{first}, configuración de observación de {data.get('camera_id') or 'la cámara'}:\n"
             f"Modo: {'centinela' if data.get('mode') == 'sentinel' else 'estándar'}.\n"
-            f"Sensibilidad: {normal.get('sensitivity', '—')}.\n"
-            f"Alertar si: {', '.join(normal.get('alert_behaviors', [])[:5]) or '—'}.\n"
-            f"No alertar por: {', '.join(normal.get('ignore_behaviors', [])[:5]) or '—'}.\n"
-            f"Centinela: {'activo' if sentinel.get('enabled', False) else 'inactivo'}."
+            f"Frases de atención ({len(data.get('attention_phrases', []))}):\n"
         )
+        for p in data.get("attention_phrases", [])[:5]:
+            text += f"  • {p}\n"
+        if data.get("owner_notes"):
+            text += f"Notas del dueño:\n"
+            for n in data.get("owner_notes", [])[:3]:
+                text += f"  • {n}\n"
         return {"text": text, "events": []}
 
     if tool_name == "update_vigilance_config":
@@ -1755,10 +1805,10 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
                 vigilance = {"normal_mode": {"enabled": True}, "enabled": True}
         if "sensitivity" in params:
             vigilance.setdefault("normal_mode", {})["sensitivity"] = params["sensitivity"]
-        if "alert_behaviors" in params:
-            vigilance.setdefault("normal_mode", {})["alert_behaviors"] = params["alert_behaviors"]
-        if "ignore_behaviors" in params:
-            vigilance.setdefault("normal_mode", {})["ignore_behaviors"] = params["ignore_behaviors"]
+        if "attention_phrases" in params:
+            vigilance["attention_phrases"] = params["attention_phrases"]
+        if "owner_notes" in params:
+            vigilance["owner_notes"] = params["owner_notes"]
         data = await _tool_call("update_vigilance_config", user_id, {
             "camera_id": params.get("camera_id", ""),
             "vigilance": vigilance or None,

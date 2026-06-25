@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual env
+venv/
+.venv/
+
+# Logs
+*.log
+nohup.out
+
+# Caches
+.cache/
+/tmp/
+
+# Models / heavy files
+models/
+*.gguf *.safetensors *.pt *.bin *.ckpt *.onnx
+
+# Credentials
+.cloudflared/
+.env .env.*
+credentials*.json
+service-account*.json
+firebase-adminsdk*.json
+.keystore
+
+# IDEs / OS
+.vscode/ .idea/
+*.swp *~ .DS_Store
+
+# Backup files
+*.backup *.bak
+voxtral/
+logs/

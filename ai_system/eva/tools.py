@@ -505,6 +505,9 @@ def _event_yolo(evt: dict) -> dict:
 
 
 def _event_is_alert(evt: dict) -> bool:
+    """True si el evento tiene attention_hits (nuevo sistema) o es legacy violation."""
+    if evt.get("attention_hits"):
+        return True
     qjson = _event_qwen(evt)
     importancia = str(qjson.get("importancia", "")).lower()
     anomalias = qjson.get("anomalias", []) if isinstance(qjson.get("anomalias"), list) else []
@@ -601,7 +604,10 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
 
 
 async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: str = None) -> dict:
-    """Resume la actividad de un día desde el diario."""
+    """Resume la actividad de un día desde el diario (enfoque descriptivo).
+
+    NUEVO: No cuenta "violaciones" — cuenta observaciones, personas, transacciones.
+    """
     events = []
     for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
         events.append(evt)
@@ -611,26 +617,46 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
 
     total = len(events)
     last = events[0]
-    violations = [e for e in events if _event_is_alert(e)]
-    alta = [e for e in events if _event_qwen(e).get("importancia") in ("alta", "critica")]
+
     persons_values = [_event_persons(e) for e in events if _event_persons(e) is not None]
     latest_yolo = _event_yolo(last)
     latest_qjson = _event_qwen(last)
 
-    summary_parts = [f"Total: {total} análisis realizados."]
-    if violations:
-        summary_parts.append(f"{len(violations)} con actividad sospechosa.")
-    if alta:
-        summary_parts.append(f"{len(alta)} de alta importancia.")
+    attention_events = [e for e in events if e.get("attention_hits")]
+    normal_events = [e for e in events if not e.get("attention_hits")]
+
+    total_platos = 0
+    total_bebidas = 0
+    total_fundas = 0
+    total_clientes_estimado = 0
+    for e in events:
+        qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
+        counts = qwen.get("counts", {}) if isinstance(qwen.get("counts"), dict) else {}
+        total_platos += counts.get("platos_visibles", 0) or 0
+        total_bebidas += counts.get("bebidas_visibles", 0) or 0
+        total_fundas += counts.get("fundas_visibles", 0) or 0
+        total_clientes_estimado += counts.get("clientes", 0) or 0
+
+    summary_parts = [f"📊 Hoy se realizaron {total} análisis de seguridad."]
     if persons_values:
-        summary_parts.append(f"Personas registradas: {sum(persons_values)} en {len(persons_values)} análisis.")
-    summary_parts.append(f"Detección del último análisis: {latest_yolo.get('count', 0)} objeto(s).")
+        summary_parts.append(f"👥 Se observaron aproximadamente {sum(persons_values)} persona(s) en total.")
+    if total_clientes_estimado > 0:
+        summary_parts.append(f"🧑‍🤝‍🧑 Clientes observados: ~{total_clientes_estimado} (estimado).")
+    if total_platos > 0:
+        summary_parts.append(f"🍽️ Platos visibles en total: ~{total_platos}.")
+    if total_bebidas > 0:
+        summary_parts.append(f"🥤 Bebidas visibles: ~{total_bebidas}.")
+    if total_fundas > 0:
+        summary_parts.append(f"🛍️ Fundas utilizadas: ~{total_fundas}.")
+    if attention_events:
+        summary_parts.append(f"🔍 {len(attention_events)} evento(s) coincidieron con lo que me pediste vigilar.")
 
     last_summary = latest_qjson.get("summary") or last.get("summary", "Sin datos")
-    summary_parts.append(f"Último análisis: {last_summary[:120]}")
+    summary_parts.append(f"📝 Último análisis: {last_summary[:150]}")
 
     notable_events = []
-    for e in violations[:5]:
+    for e in attention_events[:5]:
+        qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
         notable_events.append({
             "event_id": e.get("event_id", ""),
             "datetime": e.get("datetime", ""),
@@ -640,9 +666,9 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
             "description": e.get("description", "") or e.get("summary", ""),
             "summary": e.get("summary", "") or e.get("description", ""),
             "event_type": e.get("event_type", ""),
+            "attention_hits": e.get("attention_hits", []),
             "qwen_analysis": e.get("qwen_analysis", {}),
-            "qwen": e.get("qwen", {}),
-            "anomaly": True,
+            "qwen": qwen,
             "thumb_url": e.get("thumb_url", ""),
             "frame_url": e.get("frame_url", ""),
             "video_file": e.get("video_file", ""),
@@ -650,6 +676,7 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
         })
     if not notable_events:
         for e in events[:3]:
+            qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
             notable_events.append({
                 "event_id": e.get("event_id", ""),
                 "datetime": e.get("datetime", ""),
@@ -659,9 +686,9 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
                 "description": e.get("description", "") or e.get("summary", ""),
                 "summary": e.get("summary", "") or e.get("description", ""),
                 "event_type": e.get("event_type", ""),
+                "attention_hits": e.get("attention_hits", []),
                 "qwen_analysis": e.get("qwen_analysis", {}),
-                "qwen": e.get("qwen", {}),
-                "anomaly": False,
+                "qwen": qwen,
                 "thumb_url": e.get("thumb_url", ""),
                 "frame_url": e.get("frame_url", ""),
                 "video_file": e.get("video_file", ""),
@@ -671,34 +698,41 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
     return {
         "period": date or "today",
         "total_events": total,
-        "violations": len(violations),
-        "alta_importancia": len(alta),
+        "attention_events": len(attention_events),
         "persons_total": sum(persons_values),
         "persons_analyses": len(persons_values),
+        "counts_total": {
+            "platos": total_platos,
+            "bebidas": total_bebidas,
+            "fundas": total_fundas,
+            "clientes_estimado": total_clientes_estimado,
+        },
         "last_yolo": latest_yolo,
         "last_summary": last_summary,
         "details": latest_qjson.get("details", {}),
         "notable_events": notable_events,
-        "summary": " ".join(summary_parts),
+        "summary": "\n".join(summary_parts),
     }
 
 
 async def tool_find_anomalies(user_id: str, min_severity: str = "media",
                                date: str = None, camera_id: str = None, limit: int = 10) -> dict:
-    """Encuentra actividad sospechosa por severidad mínima."""
-    severity_order = {"baja": 0, "media": 1, "alta": 2, "critica": 3}
+    """Encuentra eventos con attention_hits (nuevo术语: observaciones relevantes)."""
+    severity_order = {"baja": 0, "media": 1, "alta": 2, "critica": 3, "observacion": 0}
     min_level = severity_order.get(min_severity, 1)
     results = []
     for evt, cam_name in _iter_events(user_id, camera_id, date):
-        if _event_is_alert(evt):
+        attention_hits = evt.get("attention_hits", []) if isinstance(evt, dict) else []
+        if attention_hits or _event_is_alert(evt):
             evt = _attach_event_package(evt, user_id, cam_name)
             results.append({
                 "event_id": evt["event_id"],
                 "datetime": evt.get("datetime", ""),
                 "camera_name": cam_name,
-                "tipo": "alerta",
+                "tipo": "observacion",
                 "descripcion": _event_description(evt),
-                "severidad": "alta",
+                "attention_hits": attention_hits,
+                "severidad": "observacion" if attention_hits else "alta",
                 "anomaly": True,
                 "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
                 "video_file": evt.get("video_file", ""),

@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+"""Orquestador simple para Qwen Vision"""
+import asyncio
+import httpx
+import json
+import os
+import time
+import logging
+import datetime
+from typing import Optional, List, Dict, Any
+from gateway_resize import resize_image, image_to_base64, create_grid_image
+import threading
+
+
+STORAGE_ROOT = "/home/sam/storage"
+DISKS_CONFIG_FILE = f"{STORAGE_ROOT}/disks_config.json"
+
+
+def get_disk_config() -> dict:
+    """Lee la configuración de discos desde disco."""
+    try:
+        with open(DISKS_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        if "disks" in cfg:
+            return cfg
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return {"disks": [{"mount": STORAGE_ROOT, "user_folder": "users"}], "plans": {}}
+
+
+def get_user_storage_path(user_id: str, plan: str = "founder") -> str:
+    """
+    Resuelve la ruta de almacenamiento del usuario consultando la config de discos.
+    Usa el disco con más espacio libre por defecto.
+    """
+    cfg = get_disk_config()
+    disks = cfg.get("disks", [])
+    plans = cfg.get("plans", {})
+
+    target_plan = plans.get(plan, plans.get("founder", {}))
+    priority_disk = target_plan.get("priority_disk", "")
+
+    selected = None
+    if priority_disk:
+        for d in disks:
+            if d.get("mount") == priority_disk:
+                selected = d
+                break
+
+    if not selected:
+        max_free = -1
+        for d in disks:
+            free = d.get("free_gb", 0) or 0
+            if free > max_free:
+                max_free = free
+                selected = d
+
+    if not selected and disks:
+        selected = disks[0]
+
+    if not selected:
+        selected = {"mount": STORAGE_ROOT, "user_folder": "users"}
+
+    return f"{selected['mount']}/{selected['user_folder'].strip('/')}/{user_id}"
+
+def get_camera_config(user_id: str, camera_id: str) -> dict:
+    """Lee la configuración de una cámara desde camera.json"""
+    camera_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
+    if os.path.exists(camera_file):
+        try:
+            with open(camera_file) as f:
+                return json.load(f)
+        except:
+            pass
+    return {"vigilance_prompt": "", "rules": [], "zone": "principal"}
+
+def save_event_to_disk(user_id: str, camera_id: str, event_type: str,
+                        frame_bytes: bytes, description: str, metadata: dict = None):
+    """Guarda evento en disco en la carpeta de la cámara correspondiente"""
+    ts = int(time.time())
+
+    # Resolver ruta según config de discos
+    try:
+        user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+        plan = "free"
+        if os.path.exists(user_file):
+            with open(user_file) as f:
+                ud = json.load(f)
+            plan = ud.get("plan", "free")
+        storage_path = get_user_storage_path(user_id, plan)
+    except Exception:
+        storage_path = f"{STORAGE_ROOT}/users/{user_id}"
+
+    # Crear ruta con subcarpeta de cámara
+    event_dir = f"{storage_path}/cameras/{camera_id}/events"
+    os.makedirs(event_dir, exist_ok=True)
+
+    event = {
+        "event_id": f"evt_{ts}_{camera_id}",
+        "user_id": user_id,
+        "camera_id": camera_id,
+        "event_type": event_type,
+        "description": description,
+        "timestamp": ts,
+        "metadata": metadata or {}
+    }
+
+    # Guardar metadata JSON
+    with open(f"{event_dir}/{event['event_id']}.json", "w") as f:
+        json.dump(event, f, indent=2)
+
+    # Guardar frame como imagen
+    with open(f"{event_dir}/{event['event_id']}.jpg", "wb") as f:
+        f.write(frame_bytes)
+
+    return event["event_id"]
+
+
+def update_camera_metrics(user_id: str, camera_id: str, event_type: str = "normal"):
+    """Actualizar métricas de cámara después de cada evento."""
+    try:
+        cam_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
+        if not os.path.exists(cam_file):
+            return
+        with open(cam_file) as f:
+            cam = json.load(f)
+        if "metrics" not in cam:
+            cam["metrics"] = {"total_events": 0, "total_alerts": 0, "total_false_positives": 0, "rules": {}, "needs_review": False}
+        cam["metrics"]["total_events"] = cam["metrics"].get("total_events", 0) + 1
+        if event_type == "alert":
+            cam["metrics"]["total_alerts"] = cam["metrics"].get("total_alerts", 0) + 1
+        with open(cam_file, "w") as f:
+            json.dump(cam, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Error actualizando métricas: {e}")
+
+
+def register_false_alarm(user_id: str, camera_id: str):
+    """Registrar falsa alarma — incrementar contador y marcar si necesita revisión."""
+    try:
+        cam_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
+        if not os.path.exists(cam_file):
+            return
+        with open(cam_file) as f:
+            cam = json.load(f)
+        if "metrics" not in cam:
+            cam["metrics"] = {"total_events": 0, "total_alerts": 0, "total_false_positives": 0, "rules": {}, "needs_review": False}
+        cam["metrics"]["total_false_positives"] = cam["metrics"].get("total_false_positives", 0) + 1
+        # Si tiene 3+ falsas alarmas, marcar para revisión
+        if cam["metrics"]["total_false_positives"] >= 3:
+            cam["metrics"]["needs_review"] = True
+        # También incrementar contador por regla (la última regla que disparó)
+        rules = cam.get("rules", [])
+        if rules:
+            rule_idx = len(rules) - 1  # Asumir que la última regla disparó
+            rules_metrics = cam["metrics"].get("rules", {})
+            key = f"rule_{rule_idx}"
+            if key not in rules_metrics:
+                rules_metrics[key] = {"false_positives": 0}
+            rules_metrics[key]["false_positives"] = rules_metrics[key].get("false_positives", 0) + 1
+            cam["metrics"]["rules"] = rules_metrics
+        with open(cam_file, "w") as f:
+            json.dump(cam, f, indent=2, ensure_ascii=False)
+        logging.info(f"⚠️ Falsa alarma registrada para {camera_id}. Total: {cam['metrics']['total_false_positives']}")
+    except Exception as e:
+        logging.error(f"Error registrando falsa alarma: {e}")
+
+
+
+def _send_night_fcm(cam_cfg, user_id, camera_id, frame_bytes, event_id, persons):
+    try:
+        import requests as _req
+        from google.oauth2 import service_account
+        import google.auth.transport.requests as _greq
+        uf = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+        tokens = []
+        if os.path.exists(uf):
+            with open(uf) as f:
+                tokens = json.load(f).get("fcm_tokens", [])
+        if not tokens:
+            return
+        creds = service_account.Credentials.from_service_account_file(
+            "/home/sam/ai_system/firebase-key.json",
+            scopes=["https://www.googleapis.com/auth/firebase.messaging"],
+        )
+        creds.refresh(_greq.Request())
+        now_str = time.strftime("%H:%M", time.localtime())
+        zone = cam_cfg.get("zone", camera_id)
+        title = f"\ud83d\udea9 ALERTA NOCTURNA — {zone}"
+        body = f"{now_str}: {persons} persona(s) detectada(s)"
+        business_name = ""
+        try:
+            with open(uf) as _uf:
+                business_name = json.load(_uf).get("business_name", "")
+        except Exception:
+            pass
+        link = f"https://ojoia.com.do/#events?event={event_id}" if event_id else "https://ojoia.com.do/#events"
+        b64 = image_to_base64(frame_bytes) if frame_bytes else None
+        for tok in tokens:
+            payload = {
+                "message": {
+                    "token": tok,
+                    "notification": {"title": title, "body": body},
+                    "android": {
+                        "priority": "high",
+                        "notification": {
+                            "channel_id": "security_critical",
+                            "notification_priority": "PRIORITY_MAX",
+                            "sound": "critical_alert",
+                            "visibility": "public",
+                        },
+                    },
+                    "apns": {
+                        "headers": {"apns-priority": "10"},
+                        "payload": {"aps": {"sound": "critical_alert.caf", "badge": 1, "category": "SECURITY_ALERT"}},
+                    },
+                    "data": {
+                        "event_id": event_id or "",
+                        "camera_id": camera_id,
+                        "priority": "critical",
+                        "type": "night_alert",
+                        "business_name": business_name,
+                    },
+                }
+            }
+            if b64:
+                payload["message"]["data"]["image"] = b64
+            _resp = _req.post(
+                "https://fcm.googleapis.com/v1/projects/ojoia-67216/messages:send",
+                headers={"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=10,
+            )
+            if _resp.status_code != 200:
+                logging.warning(f"Night FCM error {_resp.status_code}: {_resp.text[:200]}")
+    except Exception as e:
+        logging.error(f"_send_night_fcm error: {e}")
+
+
+async def send_fcm_notification(title: str, body: str, token: str = None,
+                                    user_id: str = None, image_b64: str = None, link: str = "https://ojoia.com.do/#events"):
+    """Enviar notificación push via Firebase Cloud Messaging (API HTTP v1 con OAuth2)."""
+    import logging as _log
+    try:
+        from google.oauth2 import service_account
+        import google.auth.transport.requests
+        import requests as _req
+        import json as _json
+        
+        # Buscar tokens FCM del usuario en user.json
+        tokens = []
+        if token:
+            tokens.append(token)
+        elif user_id:
+            _uf = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+            if os.path.exists(_uf):
+                with open(_uf) as _f:
+                    _ud = _json.load(_f)
+                tokens = _ud.get("fcm_tokens", [])
+        
+        if not tokens:
+            _log.info(f"FCM: Sin tokens para user={user_id}")
+            return False
+        
+        # Obtener access token OAuth2 con scope de FCM
+        _creds = service_account.Credentials.from_service_account_file(
+            "/home/sam/ai_system/firebase-key.json",
+            scopes=["https://www.googleapis.com/auth/firebase.messaging"]
+        )
+        _creds.refresh(google.auth.transport.requests.Request())
+        _access_token = _creds.token
+        
+        _headers = {
+            "Authorization": f"Bearer {_access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        sent = 0
+        for tok in tokens:
+            try:
+                _payload = {
+                    "message": {
+                        "token": tok,
+                        "notification": {"title": title, "body": body},
+                        "data": {
+                            "type": "violation",
+                            "url": link,
+                            "title": title,
+                            "body": body,
+                            "tag": "violation"
+                        },
+                        "webpush": {
+                            "notification": {
+                                "title": title,
+                                "body": body,
+                                "icon": "/img/icon-192.png",
+                                "badge": "/img/icon-192.png",
+                                "require_interaction": True,
+                                "tag": "violation"
+                            },
+                            "fcm_options": {"link": link}
+                        }
+                    }
+                }
+                _log.info(f"FCM payload: title='{title}' body='{body[:80]}' link={link}")
+                _resp = _req.post(
+                    "https://fcm.googleapis.com/v1/projects/ojoia-67216/messages:send",
+                    json=_payload, headers=_headers, timeout=10
+                )
+                if _resp.status_code == 200:
+                    _log.info(f"FCM enviado: {_resp.json().get('name', 'ok')}")
+                    sent += 1
+                else:
+                    _log.warning(f"FCM error {_resp.status_code}: {_resp.text[:200]}")
+            except Exception as _e:
+                _log.warning(f"FCM token error: {_e}")
+        
+        _log.info(f"FCM: {sent}/{len(tokens)} enviadas")
+        return sent > 0
+
+    except Exception as e:
+        _log.error(f"FCM error: {e}")
+        return False
+
+
+
+async def _process_night_grid(self, frames, cam_cfg, user_id, camera_id):
+    roi = _get_night_roi(cam_cfg)
+    tracker = NightTracker(persist_frames=int(cam_cfg.get("persist_frames", 2)))
+    frame0 = next((f for f in frames if f.get("image_bytes")), {}) or {}
+    img = frame0.get("image_bytes", b"")
+    detections = _detect_persons_night(img, roi)
+    confirmed = tracker.update(detections) if detections else []
+    if not confirmed:
+        return {
+            "frames_processed": len(frames),
+            "violation": False,
+            "night_mode": True,
+            "persons_detected": 0,
+            "schedule": cam_cfg.get("schedule", {}),
+        }
+    evt_id = _save_night_event(user_id, camera_id, img, confirmed, cam_cfg)
+    update_camera_metrics(user_id, camera_id, event_type="alert")
+    return {
+        "frames_processed": len(frames),
+        "violation": True,
+        "event_id": evt_id,
+        "night_mode": True,
+        "persons_detected": len(confirmed),
+        "schedule": cam_cfg.get("schedule", {}),
+    }
+
+
+def _detect_persons_night(img_bytes, roi):
+    persons = []
+    try:
+        import cv2
+        import numpy as np
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            return []
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        diff = cv2.absdiff(gray, gray)
+        _, motion = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        if cv2.countNonZero(motion) < 200:
+            return []
+        try:
+            from ultralytics import YOLO
+            yolo = YOLO("/home/sam/ai_system/models/yolo/yolov8n.pt")
+            for r in yolo.predict(source=frame, conf=0.25, iou=0.4, classes=[0], verbose=False):
+                for b in r.boxes:
+                    x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                    area = max(0, x2 - x1) * max(0, y2 - y1)
+                    if area < 500:
+                        continue
+                    bbox = [x1, y1, x2, y2]
+                    if not _person_in_roi(bbox, roi):
+                        continue
+                    persons.append({"bbox": bbox, "area": area, "conf": float(b.conf[0])})
+                if persons:
+                    break
+        except Exception as e:
+            logging.error(f"Night YOLO: {e}")
+    except Exception as e:
+        logging.error(f"Night detect: {e}")
+    return persons
+
+
+def _save_night_event(user_id, camera_id, img, confirmed, cam_cfg):
+    ts = int(time.time())
+    evt_dir = f"/home/sam/storage/users/{user_id}/cameras/{camera_id}/events"
+    os.makedirs(evt_dir, exist_ok=True)
+    evt_id = f"evt_night_{ts}_{camera_id}"
+    zone = cam_cfg.get("zone", camera_id)
+    desc = f"Persona detectada en modo nocturno (zona {zone}, {len(confirmed)} confirmado(s))"
+    evt = {
+        "event_id": evt_id,
+        "user_id": user_id,
+        "camera_id": camera_id,
+        "event_type": "night_alert",
+        "description": desc,
+        "timestamp": ts,
+        "metadata": {
+            "mode": "night",
+            "persons": len(confirmed),
+            "roi": cam_cfg.get("night_roi", []),
+            "schedule": cam_cfg.get("schedule", {}),
+        },
+    }
+    with open(f"{evt_dir}/{evt_id}.json", "w") as f:
+        json.dump(evt, f, indent=2)
+    with open(f"{evt_dir}/{evt_id}.jpg", "wb") as f:
+        f.write(img or b"")
+    return evt_id
+
+class FrameGrid:
+    """16-frame grid for Qwen analysis"""
+    
+    def __init__(self, max_frames: int = 16):
+        self.max_frames = max_frames
+        self.frames: List[Dict[str, Any]] = []
+        self.last_frame_bytes: bytes = b''
+        self.last_camera_id: str = ""
+        self.last_yolo_count: int = 0
+        self.lock = threading.Lock()
+        self.last_analysis_ts = 0
+        self.analysis_callback = None
+    
+    def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0) -> bool:
+        """Add frame to grid. Returns True when grid is full and ready for analysis.
+        
+        Args:
+            image_bytes: Raw image data
+            camera_id: Camera identifier
+            user_id: User identifier
+            yolo_count: Number of objects detected by YOLO (if 0, frame is skipped)
+        
+        Returns:
+            True if grid is now full, False otherwise
+        """
+        # Solo agregar al grid si YOLO detectó objetos
+        if yolo_count <= 0:
+            with self.lock:
+                self.last_frame_bytes = image_bytes
+                self.last_camera_id = camera_id
+            return False
+            
+        with self.lock:
+            self.frames.append({
+                "image_bytes": image_bytes,
+                "camera_id": camera_id,
+                "user_id": user_id,
+                "yolo_count": yolo_count,
+                "timestamp": time.time()
+            })
+        self.last_frame_bytes = image_bytes
+        self.last_camera_id = camera_id
+        self.last_yolo_count = yolo_count
+        is_full = len(self.frames) >= self.max_frames
+        return is_full
+
+    def get_and_reset(self) -> List[Dict[str, Any]]:
+        """Get current frames and reset grid."""
+        with self.lock:
+            frames = self.frames.copy()
+            self.frames = []
+            return frames
+    
+    def get_frame_count(self) -> int:
+        with self.lock:
+            return len(self.frames)
+    
+    def get_last_frame_bytes(self) -> bytes:
+        """Get the most recently received frame"""
+        with self.lock:
+            return self.last_frame_bytes
+    
+    def get_last_camera_id(self) -> str:
+        """Get the camera_id of the most recently received frame"""
+        with self.lock:
+            return self.last_camera_id
+    
+    def get_last_yolo_count(self) -> int:
+        """Get the yolo_count of the most recently received frame"""
+        with self.lock:
+            return self.last_yolo_count
+    
+    def get_grid_image(self) -> bytes:
+        """Get a 4x4 grid image of all frames"""
+        with self.lock:
+            image_bytes = [f["image_bytes"] for f in self.frames]
+            return create_grid_image(image_bytes)
+    
+    def get_grid_info(self) -> Dict[str, Any]:
+        """Get current grid state without modifying it"""
+        with self.lock:
+            return {
+                "frame_count": len(self.frames),
+                "camera_ids": list(set(f["camera_id"] for f in self.frames))
+            }
+
+
+
+# ─── Night Mode Configuration ───
+NIGHT_YOLO_CONF = 0.25
+NIGHT_YOLO_IOU = 0.4
+NIGHT_YOLO_CLASSES = [0]  # Only person class (COCO class 0)
+NIGHT_MIN_PERSON_AREA = 500  # Minimum bbox area in pixels
+NIGHT_PERSIST_FRAMES = 2  # Require detection in N consecutive frames
+NIGHT_MOTION_THRESH = 25  # Motion detection threshold
+
+# Default night ROI (normalized coordinates 0-1) - center area, exclude edges
+DEFAULT_NIGHT_ROI = [
+    [0.15, 0.15], [0.85, 0.15], [0.85, 0.85], [0.15, 0.85]
+]
+
+
+def _is_night_mode(cam_cfg: dict) -> bool:
+    """Check if camera is in night mode based on schedule."""
+    try:
+        schedule = cam_cfg.get("schedule", {})
+        open_time = schedule.get("open", "07:00")
+        close_time = schedule.get("close", "19:00")
+        now = datetime.datetime.now()
+        now_min = now.hour * 60 + now.minute
+        open_h, open_m = map(int, open_time.split(":"))
+        close_h, close_m = map(int, close_time.split(":"))
+        open_min = open_h * 60 + open_m
+        close_min = close_h * 60 + close_m
+        now_val = now.hour * 60 + now.minute
+        if open_min < close_min:
+            return now_val < open_min or now_val > close_min
+        else:
+            return now_val >= open_min or now_val < close_min
+    except Exception:
+        return False
+
+
+def _get_night_roi(cam_cfg: dict) -> list:
+    """Get night ROI from camera config or use default."""
+    return cam_cfg.get("night_roi", DEFAULT_NIGHT_ROI)
+
+
+def _bbox_in_roi(bbox: list, roi: list) -> bool:
+    """Check if bbox center is inside ROI polygon."""
+    if not bbox or len(bbox) != 4:
+        return False
+    cx = (bbox[0] + bbox[2]) / 2
+    cy = (bbox[1] + bbox[3]) / 2
+    # Point-in-polygon test (ray casting)
+    x, y = cx, cy
+    inside = False
+    n = len(roi)
+    for i in range(n):
+        j = (i + 1) % n
+        xi, yi = roi[i]
+        xj, yj = roi[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (cy - yi) / (yj - yi) + xi):
+            inside = not inside
+    return inside
+
+
+def _person_in_roi(person_bbox: list, roi: list) -> bool:
+    """Check if person bbox center is in ROI."""
+    return _bbox_in_roi(person_bbox, roi)
+
+
+class NightTracker:
+    """Track person detections across frames for persistence."""
+    
+    def __init__(self, persist_frames: int = 2):
+        self.persist_frames = persist_frames
+        self.tracks: Dict[int, dict] = {}  # track_id -> {bbox, frames_seen, last_seen}
+        self.next_id = 0
+        self.last_frame_time = 0
+    
+    def update(self, persons: list, frame_time: float) -> list:
+        """Update tracks with new detections. Return confirmed persons."""
+        confirmed = []
+        matched_ids = set()
+        
+        for person in persons:
+            bbox = person.get("bbox", [])
+            if not bbox:
+                continue
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            
+            # Find matching track
+            best_id = None
+            best_dist = float('inf')
+            for tid, track in self.tracks.items():
+                tx, ty = track["center"]
+                dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
+                if dist < 100 and dist < best_dist:  # 100px max movement
+                    best_dist = dist
+                    best_id = tid
+            
+            if best_id is not None:
+                # Update existing track
+                track = self.tracks[best_id]
+                track["bbox"] = person.get("bbox", [])
+                track["center"] = (cx, cy)
+                track["frames_seen"] += 1
+                track["last_seen"] = time.time()
+                track["conf"] = person.get("confidence", 0)
+                matched_ids.add(best_id)
+                if track["frames_seen"] >= 2:  # Confirmed after 2 frames
+                    confirmed.append({**person, "track_id": best_id, "frames_seen": track["frames_seen"]})
+            else:
+                # New track
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {
+                    "bbox": person.get("bbox", []),
+                    "center": (cx, cy),
+                    "frames_seen": 1,
+                    "last_seen": time.time(),
+                    "conf": person.get("confidence", 0)
+                }
+                matched_ids.add(tid)
+        
+        # Remove old tracks
+        current_time = time.time()
+        to_remove = [tid for tid, t in self.tracks.items() if current_time - t["last_seen"] > 5]
+        for tid in to_remove:
+            del self.tracks[tid]
+        
+        return confirmed
+
+
+class QwenOrchestrator:
+    """Orquestador simple para Qwen Vision"""
+    
+    def __init__(self, max_concurrent: int = 4, timeout: float = 15.0):
+        self.max_concurrent = max_concurrent
+        self.timeout = timeout
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        # ── Grid independiente por cámara ──
+        # Clave: "{user_id}_{camera_id}" → FrameGrid
+        self.grids: Dict[str, FrameGrid] = {}
+        self._grid_lock = threading.Lock()
+        # Cooldown tracking por cámara: último timestamp de notificación
+        self._last_notification_ts: Dict[str, float] = {}
+        # Configuración de cooldown (en segundos)
+        self._notification_cooldown = 300  # 5 minutos entre notificaciones por cámara
+    
+    def _get_grid(self, user_id: str, camera_id: str) -> FrameGrid:
+        """Obtener o crear grid para una cámara específica."""
+        cam_key = f"{user_id}_{camera_id}"
+        with self._grid_lock:
+            if cam_key not in self.grids:
+                self.grids[cam_key] = FrameGrid(max_frames=16)
+            return self.grids[cam_key]
+    
+    def _cleanup_grid(self, user_id: str, camera_id: str):
+        """Eliminar grid de una cámara (cuando se desactiva)."""
+        cam_key = f"{user_id}_{camera_id}"
+        with self._grid_lock:
+            self.grids.pop(cam_key, None)
+    
+    def _get_all_grid_info(self) -> Dict[str, Any]:
+        """Información de todos los grids activos (para admin)."""
+        with self._grid_lock:
+            return {
+                cam_key: {
+                    "frame_count": grid.get_frame_count(),
+                    "camera_id": grid.get_last_camera_id(),
+                }
+                for cam_key, grid in self.grids.items()
+            }
+    
+    # ── Acceso al grid de una cámara específica ──
+    
+    @property
+    def grid(self):
+        """Compatibilidad: retorna el primer grid activo (o uno vacío)."""
+        with self._grid_lock:
+            if self.grids:
+                return next(iter(self.grids.values()))
+        return FrameGrid(max_frames=16)  # Fallback vacío
+    
+    async def submit(
+        self, 
+        image_bytes: bytes, 
+        prompt: str, 
+        priority: int = 10
+    ) -> Optional[str]:
+        """Envía imagen a Qwen con limitación de concurrencia"""
+        async with self._semaphore:
+            return await self._call_qwen(image_bytes, prompt)
+    
+    async def process_grid(self, prompt: str = None, vigilance_prompt: str = None, vigilance_rules: str = None, use_grid_image: bool = True, user_id: str = "default", camera_id: str = "unknown") -> Dict[str, Any]:
+        """Process full grid of 16 frames with Qwen"""
+        grid = self._get_grid(user_id, camera_id)
+        frames = grid.get_and_reset()
+
+        cam_cfg = {}
+        if not frames:
+            return {"error": "No frames in grid"}
+
+        # ── Night mode gate ──
+        if not cam_cfg:
+            cam_cfg = get_camera_config(user_id, camera_id)
+        _night = False
+        _sched = cam_cfg.get("schedule", {}) or {}
+        _open = _sched.get("open", "08:00")
+        _close = _sched.get("close", "22:00")
+        if _open != _close:
+            try:
+                _now_val = datetime.datetime.now().hour * 60 + datetime.datetime.now().minute
+                _open_val = sum(int(x) * 60 for x in _open.split(":"))
+                _close_val = sum(int(x) * 60 for x in _close.split(":"))
+                _night = _now_val < _open_val or _now_val > _close_val
+            except Exception:
+                _night = False
+        if not _night:
+            _night = bool(cam_cfg.get("night_mode")) and _get_night_roi(cam_cfg)
+        if _night:
+            return await _process_night_grid(self, frames, cam_cfg, user_id, camera_id) or {
+                "frames_processed": len(frames), "violation": False, "night_mode": True
+            }
+        # ── End night gate ──
+
+        violation_detected = False
+        # Leer config de cámara
+        scanner_question = ""
+        if not cam_cfg:
+            cam_cfg = {}
+        if not vigilance_prompt:
+            cam_cfg = get_camera_config(user_id, camera_id)
+            vigilance_prompt = cam_cfg.get("vigilance_prompt", "")
+            scanner_question = cam_cfg.get("scanner_question", "")
+            if not vigilance_rules:
+                vigilance_rules = "\n".join(cam_cfg.get("rules", []))
+        # Fallback: leer de user.json
+        if not vigilance_prompt and not vigilance_rules:
+            try:
+                user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+                if os.path.exists(user_file):
+                    with open(user_file) as _uf:
+                        _ud = json.load(_uf)
+                    if not vigilance_prompt:
+                        vigilance_prompt = _ud.get("vigilance_prompt", "")
+                    if not scanner_question:
+                        scanner_question = _ud.get("scanner_question", "")
+                    if not vigilance_rules:
+                        _ur = _ud.get("vigilance_rules", [])
+                        if isinstance(_ur, list):
+                            vigilance_rules = "\n".join(_ur)
+                        elif isinstance(_ur, str):
+                            vigilance_rules = _ur
+            except Exception:
+                pass
+
+        # Calcular si estamos fuera de horario
+        _sched = cam_cfg.get("schedule", {})
+        _schedule_open = _sched.get("open", "08:00")
+        _schedule_close = _sched.get("close", "22:00")
+        _now_dt = datetime.datetime.now()
+        _now_val = _now_dt.hour * 60 + _now_dt.minute
+        try:
+            _open_h, _open_m = map(int, _schedule_open.split(":"))
+            _close_h, _close_m = map(int, _schedule_close.split(":"))
+            is_after_hours = _now_val < (_open_h * 60 + _open_m) or _now_val > (_close_h * 60 + _close_m)
+        except Exception:
+            is_after_hours = False
+
+        # Calcular estadísticas de objetos detectados en el grid
+        total_yolo_objects = sum(f.get("yolo_count", 0) for f in frames)
+        avg_yolo_objects = round(total_yolo_objects / len(frames), 1) if frames else 0
+
+        # Obtener config de cámara para el prompt (ANTES de construirlo)
+        if not cam_cfg:
+            cam_cfg = get_camera_config(user_id, camera_id)
+        zone = cam_cfg.get("zone", camera_id)
+        _sched = cam_cfg.get("schedule", {})
+        schedule_open = _sched.get("open", "08:00")
+        schedule_close = _sched.get("close", "22:00")
+
+        # Construir prompt de vigilancia estructurado
+        if vigilance_rules or scanner_question:
+            rules_list = [r.strip() for r in vigilance_rules.split("\n") if r.strip()] if vigilance_rules else []
+            rules_items = "\n".join(f"  {i+1}. {r}" for i, r in enumerate(rules_list)) if rules_list else "  Monitor for suspicious activity"
+            context_line = f"\nContext: {vigilance_prompt}" if vigilance_prompt else ""
+            sq = scanner_question if scanner_question else "Is there any suspicious activity?"
+            after_note = "\nAfter hours: ANY person in ANY frame = immediate VIOLATION." if is_after_hours else ""
+            rules_formatted = chr(10).join(f'{i+1}. {r}' for i, r in enumerate(rules_list)) if rules_list else f'1. {sq}'
+            analysis_prompt = (
+                f"Análisis de seguridad para {zone}.\n"
+                f"REGLAS (solo alertar si la violación es CLARA y evidente en la imagen):\n"
+                f"{rules_formatted}\n"
+                f"Horario: {schedule_open}-{schedule_close}\n"
+                f"{'ATENCIÓN: Ahora mismo es FUERA DE HORARIO.' if is_after_hours else ''}\n\n"
+                f"Instrucciones:\n"
+                f"- Solo responde 'Alerta:' si estás >80%% seguro de que la violación es real y claramente visible.\n"
+                f"- Si la imagen es ambigua, borrosa, o no puedes confirmar con alta confianza, responde 'Todo en orden'.\n"
+                f"- NO alertes por sospechas, posibilidades o suposiciones.\n"
+                f"- Responde SOLO una línea corta en español.\n"
+                f"- Si cumple todo: 'Todo en orden'\n"
+                f"- Si hay violación clara: 'Alerta: <regla incumplida> — detalle breve'\n"
+                f"- No enumeres reglas ni repitas el prompt."
+            )
+        else:
+            analysis_prompt = prompt or "Analiza estas imágenes y detecta si hay personas o actividades sospechosas."
+        
+        violation_detected = False
+
+        # Frases fuertes de NO violación (alta prioridad - anulan todo)
+        strong_no_violation = [
+            "no se detectó ninguna actividad sospechosa",
+            "no se detectó ninguna violación",
+            "no se detecta ninguna violación",
+            "no se observa ninguna violación",
+            "no se ha detectado violación",
+            "ninguna regla es violada",
+            "ninguna regla se viola",
+            "no se violó ninguna regla",
+            "no hubo violación",
+            "no hay violación",
+            "sin violación",
+            "todo parece normal",
+            "todo está normal",
+            "no se encontró evidencia",
+            "no violation detected",
+            "no suspicious activity",
+            "all checks no",
+            "everything appears normal",
+            "nothing unusual",
+            "todo en orden",
+        ]
+        
+        # Lógica de detección simplificada para respuesta de una línea
+        def _extract_qwen_one_liner(text: str) -> str:
+            """Extrae la última línea sustancial de Qwen."""
+            if not text:
+                return ""
+            lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+            if not lines:
+                return ""
+            # Buscar línea que empiece con "Alerta:" o "Todo en orden"
+            for line in reversed(lines):
+                lower = line.lower()
+                if lower.startswith("alerta") or lower.startswith("todo en orden") or lower.startswith("violación"):
+                    return line
+            # Fallback: última línea
+            return lines[-1]
+
+        qwen_one_liner = ""
+        
+        # Procesar con Qwen
+        grid_result = None
+        grid_img = None
+        if use_grid_image and len(frames) > 1:
+            grid_img = create_grid_image([f["image_bytes"] for f in frames])
+            try:
+                grid_result = await self._call_qwen(grid_img, analysis_prompt)
+                result_lower = grid_result.lower()
+                
+                # Extraer línea principal
+                qwen_one_liner = _extract_qwen_one_liner(grid_result)
+                
+                # Detectar violación: busca "Alerta:" o "Violación:" en la respuesta
+                if qwen_one_liner:
+                    qwen_lower = qwen_one_liner.lower()
+                    if qwen_lower.startswith("alerta") or qwen_lower.startswith("violación"):
+                        violation_detected = True
+                    elif any(kw in qwen_lower for kw in ["intruso", "prohibido", "fuera de horario"]):
+                        violation_detected = True
+            except Exception as e:
+                grid_result = f"Error analizando grid: {str(e)}"
+        
+        # Guardar evento del grid (SIEMPRE se guarda el análisis)
+        user_id = frames[0]["user_id"] if frames else user_id
+        camera_id = frames[0]["camera_id"] if frames else "unknown"
+        
+        # Obtener config completa para notificaciones y metadatos
+        cam_cfg2 = get_camera_config(user_id, camera_id)
+        zone = cam_cfg2.get("zone", camera_id)
+        cam_rules = cam_cfg2.get("rules", [])
+        cam_rules_es = cam_cfg2.get("rules_es", [])
+        
+        business_name = ""
+        try:
+            uf2 = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+            if os.path.exists(uf2):
+                with open(uf2) as _uf2:
+                    _ud2 = json.load(_uf2)
+                business_name = _ud2.get("business_name", "")
+        except:
+            pass
+        
+        # Inicializar variables de regla (antes del cooldown)
+        rule_violated = ""
+        rule_violated_es = ""
+        
+        # Cooldown: no notificar más de una vez cada N minutos por cámara
+        cam_key = f"{user_id}_{camera_id}"
+        last_notif = self._last_notification_ts.get(cam_key, 0)
+        cooldown_ok = (time.time() - last_notif) >= self._notification_cooldown
+        
+        # Cooldown adicional por regla violada (local)
+        rule_cooldown_ok = True
+        rule_cooldown_seconds = self._notification_cooldown
+        if violation_detected:
+            try:
+                uf_cooldown = f"{STORAGE_ROOT}/users/{user_id}/eva_config.json"
+                if os.path.exists(uf_cooldown):
+                    with open(uf_cooldown) as _uc:
+                        _cfg_cooldown = json.load(_uc)
+                    rule_cooldown_seconds = max(300, int(_cfg_cooldown.get("violation_cooldown_min", self._notification_cooldown // 60) * 60))
+            except Exception:
+                pass
+            rule_key = f"rule_{hash((user_id, camera_id, (rule_violated_es or rule_violated or '').strip())) & 0xffffffff}"
+            last_rule_ts = self._last_notification_ts.get(rule_key, 0)
+            rule_cooldown_ok = (time.time() - last_rule_ts) >= rule_cooldown_seconds
+        
+        # Violation path - guardar evento y notificar
+        if violation_detected:
+            violation_frame = frames[0]["image_bytes"] if frames else b''
+            
+            # Identificar qué regla se violó (priorizar reglas en español)
+            violation_reason = ""
+            matched_rules = []
+            if cam_rules:
+                grid_lower = grid_result.lower() if grid_result else ""
+                for idx, rule in enumerate(cam_rules):
+                    rule_lower = rule.lower()
+                    rule_words = [w for w in rule_lower.split() if len(w) > 4]
+                    matches = sum(1 for w in rule_words if w in grid_lower)
+                    if matches >= 2:
+                        matched_rules.append(idx)
+                        break
+                if not matched_rules and cam_rules:
+                    matched_rules = [0]
+                if matched_rules:
+                    rule_violated = cam_rules[matched_rules[0]][:100]
+                    if cam_rules_es and matched_rules[0] < len(cam_rules_es):
+                        rule_violated_es = cam_rules_es[matched_rules[0]][:100]
+                if violation_detected:
+                    if rule_violated_es:
+                        violation_reason = rule_violated_es.strip()
+                    elif rule_violated:
+                        violation_reason = rule_violated.strip()
+                    else:
+                        violation_reason = 'Alerta detectada'
+
+            # Construir notificación enriquecida
+            now_str = time.strftime("%H:%M", time.localtime())
+            
+            # Contexto de horario
+            if is_after_hours:
+                after_hours_tag = "⚠️ FUERA DE HORARIO"
+            else:
+                after_hours_tag = "🕐 Dentro de horario"
+            
+            # Título más descriptivo
+            if rule_violated_es:
+                title = f"🚨 {after_hours_tag} — {rule_violated_es}"
+            elif rule_violated:
+                title = f"🚨 {after_hours_tag} — {rule_violated}"
+            else:
+                title = f"🚨 {business_name or zone} — {after_hours_tag}"
+            
+            # Body detallado en español
+            qwen_lines = [l.strip() for l in grid_result.strip().split("\n") if l.strip() if not l.strip().startswith("- If") and not l.strip().startswith("Be precise")]
+            qwen_summary = " ".join(qwen_lines[:3])[:180]
+            
+            yolo_info = f"👁 {total_yolo_objects} objetos en {len(frames)} frames"
+            schedule_info = f"⏰ Horario: {_schedule_open}-{_schedule_close}"
+            
+            body = (
+                f"📍 {business_name or zone}\n"
+                f"🕐 {now_str} | {schedule_info}\n"
+                f"{yolo_info}\n"
+                f"🔍 {qwen_summary}"
+            )
+
+            event_id = save_event_to_disk(
+                user_id=user_id,
+                camera_id=camera_id,
+                event_type="violation",
+                frame_bytes=violation_frame,
+                description=violation_reason,
+                metadata={
+                    "qwen_analysis": grid_result,
+                    "frames_count": len(frames),
+                    "total_yolo_objects": total_yolo_objects,
+                    "avg_yolo_objects": avg_yolo_objects,
+                    "rule_violated": rule_violated_es or rule_violated,
+                    "business_name": business_name,
+                    "schedule": f"{_schedule_open}-{_schedule_close}",
+                    "after_hours": is_after_hours,
+                     "grid_b64": image_to_base64(grid_img) if grid_img else ""
+                }
+            )
+
+            # Actualizar métricas de la cámara
+            update_camera_metrics(user_id, camera_id, event_type="alert" if violation_detected else "normal")
+
+            # SOLO enviar notificación push si pasó el cooldown
+            if cooldown_ok and rule_cooldown_ok:
+                try:
+                    event_link = f"https://ojoia.com.do/#events?event={event_id}"
+                    _fcm_task = asyncio.create_task(send_fcm_notification(
+                        title=title,
+                        body=body,
+                        user_id=user_id,
+                        image_b64=image_to_base64(violation_frame) if violation_frame else None,
+                        link=event_link
+                    ))
+                    _fcm_task.add_done_callback(lambda t: logging.info(f"FCM alert sent: {title[:40]}") if not t.exception() else logging.error(f"FCM error: {t.exception()}"))
+                    self._last_notification_ts[cam_key] = time.time()
+                    if violation_detected:
+                        self._last_notification_ts[rule_key] = time.time()
+                    logging.info(f"Notification sent for {cam_key}, cooldown reset")
+                except Exception as _fcm_err:
+                    logging.error(f"FCM create_task error: {_fcm_err}")
+            else:
+                reason = []
+                if not cooldown_ok:
+                    reason.append("cooldown")
+                if not rule_cooldown_ok:
+                    reason.append("rule cooldown")
+                remaining = max(self._notification_cooldown, rule_cooldown_seconds) - (time.time() - last_notif)
+                logging.info(f"Notification suppressed for {cam_key} ({', '.join(reason)}, remaining {remaining:.0f}s)")
+
+            return {
+                "frames_processed": len(frames),
+                "grid_result": grid_result,
+                "individual_results": [],
+                "violation": True,
+                "violation_frame": "[Frame data excluded from response]",
+                "event_id": event_id,
+                "action_taken": "event_saved_and_notification_sent" if cooldown_ok else "event_saved_notification_cooldown"
+            }
+        
+        # Sin violación - guardar evento normal
+        # Extraer resumen de Qwen para la descripción
+        qwen_clean = grid_result.strip()
+        # Filtrar líneas del prompt que Qwen pueda haber repetido
+        for prefix in ['REGLAS', 'Instrucciones', 'Analiza', 'Revisa', 'Contexto:', 'Horario']:
+            if prefix.lower() in qwen_clean.lower():
+                lines = qwen_clean.split('\n')
+                qwen_clean = '\n'.join(l for l in lines if not l.strip().startswith(prefix))
+                break
+        
+        desc_normal = qwen_clean.strip()[:120] if qwen_clean.strip() else "Sin actividad sospechosa"
+        # Si la descripción quedó vacía o muy corta, usar fallback
+        if len(desc_normal) < 10:
+            desc_normal = "Sin actividad sospechosa"
+        
+        print(f"PROCESS_GRID: SAVING NORMAL EVENT desc={desc_normal[:60]}", flush=True)
+        event_id = save_event_to_disk(
+            user_id=user_id,
+            camera_id=camera_id,
+            event_type="normal",
+            frame_bytes=frames[0]["image_bytes"] if frames else b'',
+            description=desc_normal,
+            metadata={
+                "qwen_analysis": grid_result,
+                "frames_count": len(frames),
+                "total_yolo_objects": total_yolo_objects,
+                "business_name": business_name,
+                "grid_b64": image_to_base64(grid_img) if grid_img else ""
+            }
+        )
+
+        # Actualizar métricas de la cámara
+        update_camera_metrics(user_id, camera_id, event_type="normal")
+
+        # NO enviar notificación push para eventos normales (evita ruido)
+        # Solo se guarda el evento en la base de datos para historial
+
+        return {
+            "frames_processed": len(frames),
+            "grid_result": grid_result,
+            "individual_results": [],
+            "violation": False,
+            "event_id": event_id
+        }
+
+    async def _call_qwen(self, image_bytes: bytes, prompt: str) -> str:
+        """Llama a Qwen con timeout"""
+        resized = resize_image(image_bytes, max_size=512)
+        img_b64 = image_to_base64(resized)
+        
+        payload = {
+            "model": "qwen",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text", "text": prompt}
+                ]
+            }],
+            "max_tokens": 150
+        }
+        
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+    
+    def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
+                  vigilance_prompt: str = None, vigilance_rules: str = None, burst_mode: bool = False) -> Dict[str, Any]:
+        """Add frame to the specific grid for this camera. When grid is full, triggers analysis."""
+        grid = self._get_grid(user_id, camera_id)
+        is_full = grid.add_frame(image_bytes, camera_id, user_id, yolo_count=yolo_count)
+        result = {
+            "frame_count": grid.get_frame_count(),
+            "grid_full": is_full,
+            "ready_for_analysis": is_full,
+            "camera_id": camera_id,
+            "user_id": user_id,
+        }
+        if burst_mode and not is_full:
+            result["burst_active"] = True
+        if is_full:
+            # process_grid is called directly from api_eva.py when grid_full=True
+            pass
+        return result
+
+
+# Instancia global
+orchestrator = QwenOrchestrator(max_concurrent=4, timeout=15.0)

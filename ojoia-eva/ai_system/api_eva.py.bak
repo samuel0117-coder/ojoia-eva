@@ -1,0 +1,2141 @@
+#!/usr/bin/env python3
+"""API REST simple para que Eva consuma Qwen + Gateway + Orquestador"""
+import logging
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from gateway_resize import resize_image, image_to_base64
+from orchestrator import orchestrator
+import uvicorn
+import httpx
+import firebase_admin
+from firebase_admin import auth, credentials
+import time
+import base64
+import re
+
+try:
+    firebase_admin.get_app()
+except:
+    firebase_admin.initialize_app(credentials.Certificate("/home/sam/Downloads/firebase-key.json"))
+import json
+import os
+from datetime import datetime
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/home/sam/ai_system/api_eva.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+STORAGE_ROOT = "/home/sam/storage"
+DISKS_CONFIG_FILE = f"{STORAGE_ROOT}/disks_config.json"
+EVA_CONFIG_FILE = f"{STORAGE_ROOT}/eva_config.json"
+
+# ── Session state for Eva conversations ──
+eva_sessions: dict = {}
+
+def _resolve_user_id(camera_id: str, provided_user_id: str, client_ip: str = "unknown") -> str:
+    """Resolve user_id from camera_id, IP, or fallback if provided_user_id is default."""
+    if provided_user_id and provided_user_id != "default":
+        return provided_user_id
+    
+    # Search for camera in all user.json files, prioritizing founder plan with FCM tokens
+    try:
+        users_dir = f"{STORAGE_ROOT}/users"
+        if os.path.isdir(users_dir):
+            founder_match = None
+            any_match = None
+            for user_folder in os.listdir(users_dir):
+                user_file = f"{users_dir}/{user_folder}/user.json"
+                if os.path.isfile(user_file):
+                    try:
+                        with open(user_file) as f:
+                            ud = json.load(f)
+                        for cam in ud.get("cameras", []):
+                            if cam.get("camera_id") == camera_id:
+                                uid = ud.get("user_id", user_folder)
+                                plan = ud.get("plan", "")
+                                has_fcm = bool(ud.get("fcm_tokens"))
+                                if plan == "founder" and has_fcm:
+                                    founder_match = uid
+                                else:
+                                    any_match = uid
+                    except:
+                        pass
+            if founder_match:
+                return founder_match
+            if any_match:
+                return any_match
+    except:
+        pass
+    
+    return provided_user_id
+
+DEFAULT_DISK_CONFIG = {
+    "disks": [
+        {"mount": STORAGE_ROOT, "label": "Storage", "total_gb": 1000, "used_gb": 0,
+         "free_gb": 1000, "user_folder": "users"}
+    ],
+    "plans": {
+        "founder": {"max_storage_gb": 500, "max_cameras": 5, "priority_disk": ""},
+        "pro":     {"max_storage_gb": 250, "max_cameras": 3, "priority_disk": ""},
+        "free":    {"max_storage_gb": 10,  "max_cameras": 1, "priority_disk": ""}
+    },
+    "disk_fill_threshold_pct": 90,
+    "default_cleanup_hour": 23,
+    "default_frames_ttl_hours": 24,
+    "default_sessions_ttl_days": 7
+}
+
+app = FastAPI(title="Eva Vision API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Agregar middleware para CORS y evitar cache
+@app.middleware("http")
+async def add_cors_and_no_cache(request: Request, call_next):
+    if request.method == "OPTIONS":
+        from fastapi.responses import Response
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            }
+        )
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
+def get_disk_config() -> dict:
+    """Lee la configuración de discos desde disco; si no existe, crea la por defecto."""
+    if os.path.exists(DISKS_CONFIG_FILE):
+        with open(DISKS_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        if "disks" in cfg:
+            return cfg
+    # Si no existe el archivo o está corrupto, retorna defaults y lo crea de inmediato
+    save_disk_config(DEFAULT_DISK_CONFIG)
+    return dict(DEFAULT_DISK_CONFIG)
+
+
+def save_disk_config(cfg: dict) -> None:
+    """Guarda la configuración de discos a disco de forma atómica."""
+    os.makedirs(os.path.dirname(DISKS_CONFIG_FILE), exist_ok=True)
+    tmp = DISKS_CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, DISKS_CONFIG_FILE)
+
+
+def get_user_storage_path(user_id: str, plan: str = "founder") -> str:
+    """
+    Resuelve la ruta de almacenamiento del usuario consultando la config de discos.
+    Jerarquía:
+      1. Lee disks_config.json → OBTIENE disco con plan asignado
+      2. Si el plan tiene priority_disk definido, usa ese disco
+      3. Si no, elige el disco con más espacio libre
+      4. Forma ruta: {disk.mount}/{disk.user_folder}/{user_id}/
+    Por defecto cae en: /home/sam/storage/users/{user_id}/
+    """
+    cfg = get_disk_config()
+    disks = cfg.get("disks", [])
+    plans = cfg.get("plans", {})
+
+    target_plan = plans.get(plan, plans.get("founder", {}))
+    priority_disk = target_plan.get("priority_disk", "")
+
+    # Seleccionar disco
+    selected = None
+    if priority_disk:
+        for d in disks:
+            if d.get("mount") == priority_disk:
+                selected = d
+                break
+
+    if not selected:
+        # Escoger disco con más espacio libre
+        max_free = -1
+        for d in disks:
+            free = d.get("free_gb", 0) or 0
+            if free > max_free:
+                max_free = free
+                selected = d
+
+    if not selected and disks:
+        selected = disks[0]
+
+    if not selected:
+        selected = {"mount": STORAGE_ROOT, "user_folder": "users"}
+
+    return f"{selected['mount']}/{selected['user_folder'].strip('/')}/{user_id}"
+
+
+def _find_user_json(user_id: str) -> str | None:
+    """Busca user.json de un usuario en todos los discos configurados. Devuelve la ruta o None."""
+    # 1) Buscar en la ruta resuelta
+    for plan in ("founder", "free", "pro"):
+        path = get_user_storage_path(user_id, plan)
+        candidate = f"{path}/user.json"
+        if os.path.exists(candidate):
+            return candidate
+    # 2) Fallback: STORAGE_ROOT/users (compat)
+    compat = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if os.path.exists(compat):
+        return compat
+    return None
+
+
+def _resolve_user_events_dirs(user_id: str):
+    """
+    Devuelve todas las carpetas de eventos de un usuario.
+    Explora todas las subcarpetas de cámara bajo la ruta de almacenamiento del usuario.
+    También incluye la carpeta events/ antigua (compatibilidad).
+    """
+    base = get_user_storage_path(user_id, "founder")
+    # Fallback para detectar el plan real
+    try:
+        user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+        if os.path.exists(user_file):
+            with open(user_file) as f:
+                ud = json.load(f)
+            base = get_user_storage_path(user_id, ud.get("plan", "founder"))
+    except Exception:
+        pass
+
+    dirs = []
+    # nueva estructura: cameras/{cam_id}/events/
+    cameras_dir = f"{base}/cameras"
+    if os.path.exists(cameras_dir):
+        for cam_id in os.listdir(cameras_dir):
+            cam_events = f"{cameras_dir}/{cam_id}/events"
+            if os.path.isdir(cam_events):
+                dirs.append((cam_id, cam_events))
+    # compatibilidad: events/ directamente
+    legacy_dir = f"{base}/events"
+    if os.path.isdir(legacy_dir):
+        dirs.append(("_global", legacy_dir))
+    return dirs
+
+
+class AnalysisRequest(BaseModel):
+    prompt: str = "Describe this image briefly."
+    priority: int = 10
+    max_tokens: int = 100
+
+@app.post("/analyze")
+async def analyze_image(
+    image: UploadFile = File(...),
+    request: AnalysisRequest = None
+):
+    if request is None:
+        request = AnalysisRequest()
+    try:
+        img_bytes = await image.read()
+        resized = resize_image(img_bytes, max_size=512)
+        result = await orchestrator.submit(
+            resized, 
+            request.prompt, 
+            priority=request.priority
+        )
+        return {
+            "success": True,
+            "answer": result,
+            "image_size": len(resized),
+            "priority": request.priority
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get("http://localhost:8004/health")
+            status = "ok" if resp.status_code == 200 else "error"
+    except:
+        status = "error"
+    return {"status": status, "qwen": "healthy"}
+
+
+@app.get("/frames/latest")
+async def get_latest_frame():
+    """Último frame individual recibido por las cámaras"""
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    camera_id = orchestrator.grid.get_last_camera_id()
+    yolo_count = orchestrator.grid.get_last_yolo_count()
+    image_b64 = base64.b64encode(frame_bytes).decode("utf-8") if frame_bytes else ""
+    return {
+        "success": True,
+        "image_b64": image_b64,
+        "camera_id": camera_id,
+        "yolo": {"count": yolo_count},
+        "qwen": {"violation": False},
+        "metadata": {"camera_id": camera_id},
+        "has_frame": bool(frame_bytes)
+    }
+
+
+@app.get("/grid/latest")
+async def get_latest_grid(partial: int = 1):
+    """Último grid 4×4 de frames acumulados"""
+    grid_info = orchestrator.grid.get_grid_info()
+    grid_b64 = ""
+    if grid_info["frame_count"] > 0:
+        grid_img = orchestrator.grid.get_grid_image()
+        grid_b64 = base64.b64encode(grid_img).decode("utf-8")
+    return {
+        "frames_used": grid_info["frame_count"],
+        "grid_b64": grid_b64,
+        "camera_ids": grid_info["camera_ids"],
+        "partial": bool(partial)
+    }
+
+
+@app.post("/auth/firebase/verify")
+async def verify_firebase(request: dict):
+    id_token = request.get("id_token", "") or request.get("idToken", "")
+    if not id_token:
+        raise HTTPException(status_code=400, detail="Missing idToken")
+    try:
+        decoded = auth.verify_id_token(id_token)
+        uid = decoded["uid"]
+        email = decoded.get("email", "")
+        name = request.get("name", "")
+        business_name = request.get("business_name", "")
+        business_type = request.get("business_type", "")
+        plan = request.get("plan", "founder") or "founder"
+
+        # Resolver ruta de almacenamiento consultando config de discos
+        storage_path = get_user_storage_path(uid, plan)
+        
+        # Extraer disk_mount desde la ruta resuelta
+        disk_mount = os.path.dirname(storage_path) if storage_path else STORAGE_ROOT
+        
+        # Leer datos existentes si los hay
+        compat_dir = f"{STORAGE_ROOT}/users/{uid}"
+        existing_data = {}
+        existing_file = f"{storage_path}/user.json" if os.path.exists(f"{storage_path}/user.json") else f"{compat_dir}/user.json"
+        if os.path.exists(existing_file):
+            try:
+                with open(existing_file) as f:
+                    existing_data = json.load(f)
+            except:
+                pass
+        
+        user_data = {
+            "user_id": uid,
+            "name": name or decoded.get("name", "") or existing_data.get("name", ""),
+            "email": email or existing_data.get("email", ""),
+            "business_name": business_name or existing_data.get("business_name", ""),
+            "business_type": business_type or existing_data.get("business_type", ""),
+            "plan": plan,
+            "status": "active",
+            "created_at": existing_data.get("created_at", str(int(time.time()))),
+            "cameras": existing_data.get("cameras", []),
+            "disk_mount": disk_mount,
+            "storage_path": storage_path,
+            "fcm_tokens": existing_data.get("fcm_tokens", []),
+            "vigilance_prompt": existing_data.get("vigilance_prompt", ""),
+            "vigilance_rules": existing_data.get("vigilance_rules", [])
+        }
+        
+        # Crear carpeta del usuario en el disco asignado
+        os.makedirs(storage_path, exist_ok=True)
+        with open(f"{storage_path}/user.json", "w") as f:
+            json.dump(user_data, f, indent=2)
+        
+        # Crear también symlink o referencia en STORAGE_ROOT/users/ para compatibilidad
+        os.makedirs(compat_dir, exist_ok=True)
+        if not os.path.exists(f"{compat_dir}/user.json") or os.path.getsize(f"{compat_dir}/user.json") < 100:
+            with open(f"{compat_dir}/user.json", "w") as f:
+                json.dump(user_data, f, indent=2)
+
+        return {
+            "success": True,
+            "user_id": uid,
+            "email": email,
+            "name": user_data["name"],
+            "business_name": business_name,
+            "plan": plan,
+            "storage_path": storage_path
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/user/profile")
+async def get_user_profile(user_id: str):
+    user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if os.path.exists(user_file):
+        with open(user_file) as f:
+            user_data = json.load(f)
+        return {
+            "user_id": user_id, 
+            "plan": user_data.get("plan", "founder"), 
+            "status": user_data.get("status", "active"),
+            "business_name": user_data.get("business_name", ""),
+            "email": user_data.get("email", ""),
+            "vigilance_prompt": user_data.get("vigilance_prompt", ""),
+            "vigilance_rules": user_data.get("vigilance_rules", [])
+        }
+    return {"user_id": user_id, "plan": "founder", "status": "active", "business_name": "", "email": "", "vigilance_prompt": "", "vigilance_rules": []}
+
+
+@app.post("/api/user/profile")
+async def update_user_profile(request: Request):
+    """Actualizar perfil del usuario incluyendo prompt y reglas de vigilancia"""
+    data = await request.json()
+    user_id = data.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    
+    user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    os.makedirs(os.path.dirname(user_file), exist_ok=True)
+    
+    user_data = {}
+    if os.path.exists(user_file):
+        with open(user_file) as f:
+            user_data = json.load(f)
+    
+    # Actualizar campos
+    if "vigilance_prompt" in data:
+        user_data["vigilance_prompt"] = data["vigilance_prompt"]
+    if "vigilance_rules" in data:
+        user_data["vigilance_rules"] = data["vigilance_rules"]
+    
+    with open(user_file, "w") as f:
+        json.dump(user_data, f, indent=2)
+    
+    return {"success": True}
+
+@app.get("/api/user/events")
+async def get_user_events(user_id: str, date: str = None, filter: str = None, limit: int = 0):
+    """Obtener eventos de usuario. Puede filtrar por ?date=hoy o ?filter=today|alerts|all&limit=N"""
+    events = []
+    now = int(time.time())
+    start_of_today = now - (now % 86400)
+
+    # Cargar nombres de cámaras
+    cam_names = {}
+    user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if os.path.exists(user_file):
+        with open(user_file) as f:
+            ud = json.load(f)
+        for cam in ud.get("cameras", []):
+            cam_names[cam.get("camera_id", "")] = cam.get("name", "")
+
+    for cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        if not os.path.exists(events_dir):
+            continue
+        for fname in sorted(os.listdir(events_dir), reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            event_file = f"{events_dir}/{fname}"
+            with open(event_file) as f:
+                ev = json.load(f)
+            if date == 'hoy' or filter == 'today':
+                if ev.get("timestamp", 0) < start_of_today:
+                    continue
+            if filter == 'alerts':
+                if not ev.get("event_type") == "violation":
+                    continue
+            cid = ev.get("camera_id", "")
+            ev["camera_name"] = cam_names.get(cid, cam_id if cam_id != "_global" else cid)
+            # Strip huge grid_b64 from metadata to reduce payload
+            if "metadata" in ev and "grid_b64" in ev["metadata"]:
+                del ev["metadata"]["grid_b64"]
+            # Normalizar estructura para frontend: qwen.violation, qwen.description, yolo.count
+            qa = ev.get("metadata", {}).get("qwen_analysis", "")[:200]  # Limitar tamaño
+            ev["qwen"] = {
+                "violation": ev.get("event_type") == "violation",
+                "description": qa
+            }
+            ev["yolo"] = {"count": 1}  # Default, since YOLO count was per-frame
+            # No incluir grid_b64 ni frame_b64 en lista (muy pesado) - usar stats endpoint separado
+            events.append(ev)
+            if limit and len(events) >= limit:
+                return {"events": events}
+
+    return {"events": events}
+
+@app.get("/api/cameras")
+async def get_cameras(user_id: str):
+    """Lista las cámaras registradas del usuario"""
+    user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if os.path.exists(user_file):
+        with open(user_file) as f:
+            ud = json.load(f)
+        return {"cameras": ud.get("cameras", [])}
+    return {"cameras": []}
+
+
+@app.post("/frames/ingest")
+async def ingest_frame_form(
+    request: Request,
+    camera_id: str = Form(...),
+    user_id: str = Form("default"),
+    image: UploadFile = File(...)
+):
+    return await _process_ingest(request, camera_id, user_id, image)
+
+
+@app.post("/ingest/frame")
+async def ingest_frame_raw(request: Request):
+    """Compat: ESP32 envía bytes puros (image/jpeg, image/bmp, etc.)"""
+    try:
+        body = await request.body()
+        ct = request.headers.get("content-type", "")
+        qp = request.query_params
+        cid = qp.get("camera_id", "")
+        if not cid:
+            m = re.search(r'camera_id=(\w+)', str(request.url))
+            cid = m.group(1) if m else "unknown"
+        uid = qp.get("user_id", "default")
+        m = re.search(r'user_id=(\w+)', str(request.url))
+        uid = m.group(1) if m else uid
+        if not body:
+            return {"success": False, "error": "empty body"}
+        from io import BytesIO
+        fake_file = UploadFile(filename=f"{cid}.jpg", file=BytesIO(body))
+        return await _process_ingest(request, cid, uid, fake_file)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/ingest/photo")
+@app.post("/ingest/snapshot")
+async def ingest_photo_stack(
+    request: Request,
+    filename: str = Form(None),
+    camera_id: str = Form(None),
+    user_id: str = Form(None),
+    image: UploadFile = File(None)
+):
+    """Compatibilidad con ESP32 que envía sin campo 'camera_id' form"""
+    cid = camera_id or filename or "unknown"
+    uid = user_id or "default"
+    if image is None:
+        body = await request.body()
+        import mimetypes
+        ct = request.headers.get("content-type", "")
+        if "image" in ct and body:
+            from io import BytesIO
+            image = UploadFile(
+                filename=f"{cid}.jpg",
+                file=BytesIO(body),
+                content_type=ct
+            )
+        else:
+            raise HTTPException(status_code=400, detail="No image provided")
+    return await _process_ingest(request, cid, uid, image)
+
+
+async def _process_ingest(request: Request, camera_id: str, user_id: str, image: UploadFile):
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        # Resolve user_id from camera if needed
+        user_id = _resolve_user_id(camera_id, user_id, client_ip)
+        
+        img_bytes = await image.read()
+        frame_size = len(img_bytes)
+
+        logger.info(f"📸 Frame recibido - IP: {client_ip} | Camera: {camera_id} | User: {user_id} | Size: {frame_size} bytes")
+
+        # 1. Llamar YOLO para detección de objetos
+        yolo_count = 0
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                yolo_resp = await client.post(
+                    "http://localhost:8002/detect",
+                    files={"image": ("frame.jpg", img_bytes, "image/jpeg")},
+                )
+                if yolo_resp.status_code == 200:
+                    yolo_data = yolo_resp.json()
+                    yolo_count = yolo_data.get("count", 0)
+        except Exception as yolo_err:
+            logger.warning(f"YOLO no disponible: {yolo_err}")
+            yolo_count = 0
+
+        logger.info(f"👁 YOLO detectó: {yolo_count} objetos")
+
+        # 2. Solo agregar al grid si YOLO detectó objetos
+        grid_result = {"frame_count": 0, "grid_full": False, "ready_for_analysis": False}
+        if yolo_count > 0:
+            # Cargar vigilancia del usuario para pasar al grid
+            v_prompt, v_rules = "", ""
+            if user_id and user_id != "default":
+                uf = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+                if os.path.exists(uf):
+                    try:
+                        with open(uf) as f:
+                            ud = json.load(f)
+                        v_prompt = ud.get("vigilance_prompt", "")
+                        v_rules_raw = ud.get("vigilance_rules", "")
+                        # Handle both string and array format
+                        v_rules = v_rules_raw if isinstance(v_rules_raw, str) else "\n".join(v_rules_raw) if v_rules_raw else ""
+                    except: pass
+            grid_result = orchestrator.add_frame(
+                img_bytes, camera_id, user_id, yolo_count=yolo_count,
+                vigilance_prompt=v_prompt, vigilance_rules=v_rules
+            )
+            logger.info(f"✅ Frame procesado - Camera: {camera_id} | Grid: {grid_result['frame_count']}/16 | YOLO: {yolo_count}")
+        else:
+            logger.info(f"❌ Frame omitido - sin objetos YOLO | Camera: {camera_id}")
+
+        # 3. Registrar cámara en user.json si es nueva
+        if user_id and user_id != "default":
+            user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+            if os.path.exists(user_file):
+                with open(user_file) as f:
+                    ud = json.load(f)
+                existing_ids = [c.get("camera_id") for c in ud.get("cameras", [])]
+                if camera_id not in existing_ids:
+                    ud.setdefault("cameras", []).append({
+                        "camera_id": camera_id,
+                        "name": camera_id,
+                        "zone": "",
+                        "active": True,
+                        "first_seen": int(time.time()),
+                        "last_frame": int(time.time())
+                    })
+                    with open(user_file, "w") as f:
+                        json.dump(ud, f, indent=2)
+
+        return {
+            "success": True,
+            "camera_id": camera_id,
+            "user_id": user_id,
+            "client_ip": client_ip,
+            "frame_size": frame_size,
+            "timestamp": datetime.now().isoformat(),
+            "yolo": {"count": yolo_count},
+            **grid_result
+        }
+    except Exception as e:
+        logger.error(f"❌ Error procesando frame: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/grid/analyze")
+async def analyze_grid(request: dict):
+    user_id = request.get("user_id", "default")
+    prompt = request.get("prompt")
+    vigilance_prompt = request.get("vigilance_prompt", "")
+    vigilance_rules = request.get("vigilance_rules", "")
+    
+    # Si no se proveen, cargar del perfil del usuario
+    if not vigilance_prompt or not vigilance_rules:
+        user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+        if os.path.exists(user_file):
+            with open(user_file) as f:
+                user_data = json.load(f)
+            vigilance_prompt = vigilance_prompt or user_data.get("vigilance_prompt", "")
+            v_rules_raw = vigilance_rules or user_data.get("vigilance_rules", [])
+            vigilance_rules = v_rules_raw if isinstance(v_rules_raw, str) else "\n".join(v_rules_raw) if v_rules_raw else ""
+    
+    result = await orchestrator.process_grid(prompt, vigilance_prompt, vigilance_rules)
+    # Asegurar que no haya bytes en la respuesta
+    if "violation_frame" in result and result["violation_frame"]:
+        result["violation_frame"] = "[Frame data excluded from response]"
+    return result
+
+@app.post("/config/reset")
+async def config_reset(request: dict):
+    """Reset Eva conversation session."""
+    user_id = request.get("user_id", "")
+    eva_sessions.pop(user_id, None)
+    return {"success": True, "message": "Sesión reiniciada"}
+
+
+@app.get("/config/session")
+async def config_session(user_id: str):
+    """Get current Eva session state."""
+    s = eva_sessions.get(user_id, {})
+    return {
+        "active": bool(s),
+        "camera_id": s.get("camera_id", ""),
+        "camera_image_b64": s.get("camera_image_b64", ""),
+        "zone": s.get("zone", ""),
+        "rules": s.get("rules", []),
+        "msgs_count": len(s.get("msgs", []))
+    }
+
+
+@app.post("/fcm/test")
+async def api_fcm_test(request: dict):
+    """Enviar notificación de prueba."""
+    user_id = request.get("user_id", "default")
+    title = request.get("title", "🚨 Prueba - OjoIA")
+    body = request.get("body", "Notificación de prueba")
+    from orchestrator import send_fcm_notification
+    result = await send_fcm_notification(title=title, body=body, user_id=user_id)
+    return {"success": result, "message": "Notificación enviada" if result else "No hay tokens válidos"}
+
+
+@app.get("/api/user/events/stats")
+async def get_user_events_stats(user_id: str, date: str = None):
+    """Conteo rápido de eventos del usuario."""
+    now = int(time.time())
+    start_of_today = now - (now % 86400)
+    total = 0
+    today_count = 0
+    alerts_count = 0
+    for cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        if not os.path.exists(events_dir):
+            continue
+        for fname in sorted(os.listdir(events_dir), reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            try:
+                with open(f"{events_dir}/{fname}") as f:
+                    ev = json.load(f)
+            except:
+                continue
+            total += 1
+            ts = ev.get("timestamp", 0)
+            if ts >= start_of_today:
+                today_count += 1
+            if ev.get("event_type") == "violation":
+                alerts_count += 1
+    return {"total": total, "today": today_count, "alerts": alerts_count}
+
+
+@app.get("/api/user/latest_analysis")
+async def get_latest_analysis(user_id: str):
+    """Último análisis Qwen."""
+    latest = None
+    for cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        if not os.path.exists(events_dir):
+            continue
+        for fname in sorted(os.listdir(events_dir), reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            try:
+                with open(f"{events_dir}/{fname}") as f:
+                    ev = json.load(f)
+            except:
+                continue
+            ts = ev.get("timestamp", 0)
+            if latest is None or ts > latest["timestamp"]:
+                latest = {
+                    "event_id": ev.get("event_id", ""),
+                    "event_type": ev.get("event_type", ""),
+                    "timestamp": ts,
+                    "qwen_violation": ev.get("event_type") == "violation",
+                    "qwen_description": ev.get("metadata", {}).get("qwen_analysis", ""),
+                    "camera_id": ev.get("camera_id", ""),
+                }
+    if latest is None:
+        return {"found": False, "violation": False, "description": "", "timestamp": 0}
+    latest["found"] = True
+    return latest
+
+
+@app.get("/api/cameras/{camera_id}/grid")
+async def api_get_camera_grid(camera_id: str):
+    """Último frame individual de una cámara específica."""
+    last_cam_id = orchestrator.grid.get_last_camera_id()
+    frame_bytes = orchestrator.grid.get_last_frame_bytes() if last_cam_id == camera_id else b''
+    image_b64 = base64.b64encode(frame_bytes).decode("utf-8") if frame_bytes else ""
+    return {
+        "success": True, "camera_id": camera_id, "image_b64": image_b64,
+        "yolo": {"count": 0}, "qwen": {"violation": False}
+    }
+
+
+@app.post("/device/announce")
+async def device_announce(request: dict):
+    """Endpoint que recibe cuando una cámara nueva se conecta."""
+    camera_id = request.get("camera_id", "")
+    user_id = request.get("user_id", "")
+    if not camera_id:
+        raise HTTPException(status_code=400, detail="camera_id requerido")
+    image_b64 = ""
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    last_cam_id = orchestrator.grid.get_last_camera_id()
+    if frame_bytes and (last_cam_id == camera_id or not user_id):
+        import base64 as _b64
+        from gateway_resize import resize_image
+        try:
+            resized = resize_image(frame_bytes, max_size=256)
+            image_b64 = _b64.b64encode(resized).decode("utf-8")
+        except:
+            image_b64 = _b64.b64encode(frame_bytes).decode("utf-8")
+    if user_id and user_id in eva_sessions:
+        s = eva_sessions[user_id]
+        s["camera_id"] = camera_id
+        s["camera_image_b64"] = image_b64
+        s["camera_connected"] = True
+        eva_sessions[user_id] = s
+    return {
+        "success": True, "message": f"Camera {camera_id} connected",
+        "camera_id": camera_id, "image_b64": image_b64,
+        "frame_available": bool(frame_bytes)
+    }
+
+
+@app.get("/config/camera_status")
+async def config_camera_status(user_id: str):
+    """Consulta si hay cámara conectada e imagen disponible para la sesión de Eva."""
+    s = eva_sessions.get(user_id, {})
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    image_b64 = ""
+    if frame_bytes:
+        from gateway_resize import resize_image
+        try:
+            resized = resize_image(frame_bytes, max_size=512)
+            image_b64 = base64.b64encode(resized).decode("utf-8")
+        except:
+            image_b64 = base64.b64encode(frame_bytes).decode("utf-8")
+    return {
+        "camera_connected": s.get("camera_connected", False),
+        "camera_id": s.get("camera_id", ""),
+        "has_frame": bool(frame_bytes),
+        "image_b64": image_b64,
+        "zone": s.get("zone", ""),
+        "rules_count": len(s.get("rules", [])),
+        "configured": s.get("configured", False)
+    }
+
+
+@app.get("/admin/cameras")
+async def admin_cameras():
+    """Lista todas las cámaras del sistema."""
+    cfg = get_disk_config()
+    now = time.time()
+    cameras = []
+    active_ids = set(orchestrator.grid.get_grid_info()["camera_ids"])
+    last_seen = {}
+    for f in orchestrator.grid.frames:
+        lid = f.get("camera_id", "")
+        ts = f.get("timestamp", 0)
+        if lid and (lid not in last_seen or ts > last_seen[lid]):
+            last_seen[lid] = ts
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if not os.path.isdir(users_base):
+            continue
+        for uid in os.listdir(users_base):
+            user_file = os.path.join(users_base, uid, "user.json")
+            if not os.path.isfile(user_file):
+                continue
+            try:
+                with open(user_file) as fh:
+                    udata = json.load(fh)
+            except:
+                continue
+            for cam in udata.get("cameras", []):
+                cid = cam.get("camera_id", "")
+                ts = last_seen.get(cid, 0)
+                online = (now - ts) < 300
+                cameras.append({
+                    "camera_id": cid, "name": cam.get("name", cid),
+                    "zone": cam.get("zone", ""), "user_id": uid,
+                    "business_name": udata.get("business_name", ""),
+                    "status": "online" if online else "offline",
+                    "active": cam.get("active", True),
+                    "last_seen_seconds_ago": int(now - ts) if ts else None,
+                    "last_seen": datetime.fromtimestamp(ts).isoformat() if ts else None,
+                })
+    return {"cameras": cameras}
+
+
+@app.get("/admin/events")
+async def admin_events(limit: int = 50, user_id: str = None, event_type: str = None):
+    """Lista eventos recientes con filtros."""
+    cfg = get_disk_config()
+    events = []
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if not os.path.isdir(users_base):
+            continue
+        for uid in os.listdir(users_base):
+            if user_id and uid != user_id:
+                continue
+            for _cam_id, events_dir in _resolve_user_events_dirs(uid):
+                if not os.path.exists(events_dir):
+                    continue
+                for fname in sorted(os.listdir(events_dir), reverse=True):
+                    if not fname.endswith(".json"):
+                        continue
+                    ef = f"{events_dir}/{fname}"
+                    try:
+                        with open(ef) as fh:
+                            ev = json.load(fh)
+                    except:
+                        continue
+                    if event_type and ev.get("event_type") != event_type:
+                        continue
+                    ev["_user_id"] = uid
+                    events.append(ev)
+                    if len(events) >= limit:
+                        break
+    events.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+    return {"events": events[:limit], "total": len(events)}
+
+
+@app.get("/admin/events/stats")
+async def admin_events_stats(days: int = 7):
+    """Estadísticas de eventos."""
+    from collections import Counter, defaultdict
+    cfg = get_disk_config()
+    now = time.time()
+    cutoff = now - days * 86400
+    per_day = defaultdict(int)
+    per_type = Counter()
+    top_rules = Counter()
+    total = 0
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if not os.path.isdir(users_base):
+            continue
+        for uid in os.listdir(users_base):
+            for _cam_id, events_dir in _resolve_user_events_dirs(uid):
+                if not os.path.exists(events_dir):
+                    continue
+                for fname in os.listdir(events_dir):
+                    if not fname.endswith(".json"):
+                        continue
+                    ef = f"{events_dir}/{fname}"
+                    try:
+                        with open(ef) as fh:
+                            ev = json.load(fh)
+                    except:
+                        continue
+                    ts = ev.get("timestamp", 0)
+                    if ts < cutoff:
+                        continue
+                    day = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+                    per_day[day] += 1
+                    etype = ev.get("event_type", "unknown")
+                    per_type[etype] += 1
+                    if etype == "violation":
+                        rules = ev.get("metadata", {}).get("violated_rules", [])
+                        for r in rules:
+                            top_rules[r] += 1
+                    total += 1
+    daily = [{"date": d, "count": c} for d, c in sorted(per_day.items())]
+    return {"days": days, "total_events": total, "by_day": daily, "by_type": dict(per_type), "top_rules": top_rules.most_common(10)}
+
+
+@app.post("/admin/firebase/update-server-status")
+async def update_server_status(request: dict):
+    """Update Firestore server_status."""
+    try:
+        db = firebase_admin.firestore.client()
+        url = request.get("backend", "https://api.ojoia.com.do")
+        db.collection('system').doc('server_status').set({
+            "backend": url, "ngrok_url": url, "updated_at": int(time.time())
+        }, merge=True)
+        return {"success": True, "backend": url}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/config/chat")
+async def config_chat(request: dict):
+    user_id = request.get("user_id", "")
+    message = request.get("message", "hola")
+
+    if message == "__greet__":
+        eva_sessions.pop(user_id, None)
+
+    s = eva_sessions.get(user_id, {
+        "msgs": [], "zone": "", "rules": [], "camera_id": "",
+        "camera_connected": False, "camera_image_b64": "",
+        "image_shown": False, "phase": "saludo",
+        "concerns": [], "schedule": {"open": "08:00", "close": "22:00"}
+    })
+
+    user_file = _find_user_json(user_id)
+    owner = "amigo"
+    biz = "tu negocio"
+    biz_type = "negocio"
+    schedule = {"open": "08:00", "close": "22:00"}
+    existing_cams = []
+    if user_file:
+        try:
+            with open(user_file) as f:
+                u = json.load(f)
+            owner = u.get("owner_name") or u.get("name", "amigo")
+            biz = u.get("business_name") or u.get("business_type", "tu negocio")
+            biz_type = u.get("business_type", "negocio")
+            schedule = u.get("schedule", schedule)
+            existing_cams = u.get("cameras", [])
+        except:
+            pass
+
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    has_frame = bool(frame_bytes)
+    frame_b64 = ""
+    if has_frame:
+        try:
+            resized = resize_image(frame_bytes, max_size=512)
+            frame_b64 = base64.b64encode(resized).decode("utf-8")
+        except:
+            frame_b64 = base64.b64encode(frame_bytes).decode("utf-8")
+
+    if has_frame and not s.get("camera_image_b64"):
+        s["camera_image_b64"] = frame_b64
+        s["camera_connected"] = True
+
+    first_name = owner.split()[0]
+    current_phase = s.get("phase", "saludo")
+    rules_so_far = s.get("rules", [])
+    concerns_so_far = s.get("concerns", [])
+    rules_count = len(rules_so_far)
+    zone = s.get("zone", "")
+    image_description = s.get("image_description", "")
+    business_info = " ".join(s.get("business_info", []))
+
+    def _build_system(phase_instruction: str, extra: str = "") -> str:
+        return f"""Eres Eva, asistente de seguridad de OjoIA.
+
+CONTEXTO DEL NEGOCIO:
+- Dueño: {owner}
+- Negocio: {biz} ({biz_type})
+- Horario: {schedule.get('open', '08:00')} a {schedule.get('close', '22:00')}
+- Zona de la cámara: {zone if zone else 'no definida'}
+
+ESTADO DE LA CONFIGURACIÓN:
+- Fase actual: {current_phase}
+- Preocupaciones del usuario: {concerns_so_far if concerns_so_far else 'aún no mencionadas'}
+- Reglas confirmadas: {rules_count}/3 — {rules_so_far if rules_so_far else 'ninguna'}
+- Info del negocio: {business_info if business_info else 'aún no proporcionada'}
+- Descripción de imagen: {image_description if image_description else 'sin imagen aún'}
+
+INSTRUCCIÓN ACTUAL:
+{phase_instruction}
+{extra}
+
+REGLAS PARA EVA:
+- Tono dominicano, cercano, directo. Máximo 3-4 líneas por respuesta.
+- NO uses términos técnicos (YOLO, grid, scanner, tokens, API).
+- Responde de forma natural según el contexto y el mensaje del usuario.
+- Cuando propongas una regla, di exactamente: 'Te propongo esta regla: [regla específica]. ¿Te parece bien o quieres que la ajuste?'
+- NO guardes ninguna regla hasta que el usuario acepte explícitamente.
+- Solo cuando acepte, di: '✅ Regla X guardada: [descripción breve]'
+- Máximo 3 reglas.
+- El usuario NUNCA debe ver bloques técnicos como [CAMERA_CONFIG]."""
+
+    def _build_messages(sys_prompt: str) -> list:
+        msgs = [{"role": "system", "content": sys_prompt}]
+        for m in s.get("msgs", [])[-10:]:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if role == "assistant" and "[CAMERA_CONFIG]" in content:
+                continue
+            if isinstance(content, list):
+                has_img = any(isinstance(c, dict) and c.get("type") == "image_url" for c in content)
+                if has_img:
+                    text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                    content = " ".join(text_parts)
+                    if not content.strip():
+                        continue
+            msgs.append({"role": role, "content": content})
+        return msgs
+
+    async def _qwen(messages: list, max_tok: int = 300) -> str:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "http://localhost:8004/v1/chat/completions",
+                    json={"model": "qwen", "messages": messages, "max_tokens": max_tok}
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        except Exception as e:
+            logger.error(f"config_chat _qwen error: {e}")
+        return "Disculpa, tuve un problema. ¿Puedes repetir?"
+
+    async def _describe_image(img_b64: str) -> str:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    "http://localhost:8004/v1/chat/completions",
+                    json={
+                        "model": "qwen",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                                {"type": "text", "text": "Describe brevemente esta imagen (máximo 30 palabras). ¿Qué zona es? ¿Hay mostrador, caja, estantes, personas, columna? ¿Ves algún problema como reflejos o ángulo malo?"}
+                            ]
+                        }],
+                        "max_tokens": 100
+                    }
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        except:
+            pass
+        return "Veo la zona donde instalaste la cámara."
+
+    def _poor_quality(desc: str) -> bool:
+        return any(kw in desc.lower() for kw in ["reflejo", "reflejos", "ángulo", "angle", "malo", "bajo", "cortado", "oscuro", "borroso", "no se ve", "difícil", "problem"])
+
+    # ── FASE: SALUDO ──
+    if current_phase == "saludo" and not s.get("msgs"):
+        s["msgs"] = []
+        sys_p = _build_system(
+            f"Es el primer contacto con el usuario. Saluda de forma cálida y natural usando su nombre ({owner}). "
+            f"Menciona que tienes registrado su {biz_type} ({biz}) y que van a configurar una cámara nueva. "
+            f"Pregunta dónde quiere poner la cámara. Sé breve y amigable."
+        )
+        s["msgs"].append({"role": "user", "content": "Hola"})
+        msgs = _build_messages(sys_p)
+        answer = await _qwen(msgs)
+        s["phase"] = "zona"
+        s["msgs"].append({"role": "assistant", "content": answer})
+        eva_sessions[user_id] = s
+        return {"success": True, "response": answer, "ready_to_confirm": False, "camera_image_b64": "", "zone": "", "rules": []}
+
+    # ── FASE: ZONA (usuario dice dónde poner la cámara) ──
+    if current_phase == "zona":
+        s["zone"] = message.strip()
+        zone = s["zone"]
+        s["phase"] = "hardware"
+        s["msgs"].append({"role": "user", "content": message})
+        sys_p = _build_system(
+            f"PASO ACTUAL: El usuario dijo que quiere la cámara en '{zone}'.\n"
+            f"ACCIÓN: Confirma la zona. Luego INSTRUYE al usuario para que ÉL encienda físicamente la cámara.\n"
+            f"IMPORTANTE: Tú NO puedes encender la cámara. EL USUARIO debe hacerlo.\n"
+            f"Di algo como: 'Perfecto. Ahora ENCIENDE la cámara (tú físico). La luz va a parpadear azul. Avímanos cuando lo veas.'\n"
+            f"NO digas '¿Quieres que encienda?' ni 'Voy a encender'. El usuario es quien enciende."
+        )
+        msgs = _build_messages(sys_p)
+        answer = await _qwen(msgs)
+        s["msgs"].append({"role": "assistant", "content": answer})
+        eva_sessions[user_id] = s
+        return {"success": True, "response": answer, "ready_to_confirm": False, "camera_image_b64": "", "zone": zone, "rules": []}
+
+    # ── FASE: HARDWARE (enciende la cámara) ──
+    if current_phase == "hardware":
+        lower = message.lower()
+        hw_keywords = ["ya", "listo", "enciend", "prendí", "prendida", "azul", "parpade", "la veo", "ya la veo", "luz azul", "parpadeando", "luz", "led", "ya está", "esta", "lo veo"]
+        if any(w in lower for w in hw_keywords):
+            s["phase"] = "wifi"
+            s["msgs"].append({"role": "user", "content": message})
+            answer = await _qwen(_build_messages(_build_system(
+                f"El usuario dice: '{message}' (confirmó que ve la cámara encendida).\n"
+                f"Responde confirmando y dándole instrucciones para conectarse al WiFi.\n"
+                f"Menciona la red 'OjoIA-XXXX' y pídele que te avise cuando esté conectado.\n"
+                f"Ejemplo: '¡Excelente! Ahora ve al WiFi de tu celular...'"
+            )))
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_image_b64": "", "zone": zone, "rules": []}
+        else:
+            s["msgs"].append({"role": "user", "content": message})
+            answer = await _qwen(_build_messages(_build_system(
+                f"El usuario dice: '{message}'.\n"
+                f"Pídele que ENCIENDA la cámara físicamente (ÉL debe hacerlo).\n"
+                f"Dile que la luz va a parpadear azul y que te avise cuando lo vea.\n"
+                f"NO digas '¿Quieres que encienda?' El usuario es quien enciende."
+            )))
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_image_b64": "", "zone": zone, "rules": []}
+
+    # ── FASE: WiFi (conectar al WiFi) ──
+    if current_phase == "wifi":
+        lower = message.lower()
+        if any(w in lower for w in ["ya", "listo", "conect", "ok", "bien", "hecho"]):
+            s["phase"] = "esperando_imagen"
+            s["camera_connected"] = True
+            s["msgs"].append({"role": "user", "content": message})
+            answer = await _qwen(_build_messages(_build_system(
+                f"El usuario dice: '{message}' (confirmó conexión al WiFi).\n"
+                f"Dile que esperes un momento mientras recibes la imagen de la cámara.\n"
+                f"Pídele paciencia. Si después de unos segundos no llega, pídele que diga 'revisa'.\n"
+                f"NO le hagas preguntas. Solo espera la imagen."
+            )))
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_image_b64": "", "zone": zone, "rules": []}
+        else:
+            s["msgs"].append({"role": "user", "content": message})
+            answer = await _qwen(_build_messages(_build_system(
+                f"El usuario dice: '{message}'.\n"
+                f"Pídele que se conecte al WiFi 'OjoIA-XXXX' y luego elija su WiFi del negocio.\n"
+                f"Dile que te avise cuando esté conectado."
+            )))
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_image_b64": "", "zone": zone, "rules": []}
+
+    # ── FASE: ESPERANDO IMAGEN (usuario dice 'revisa' o similar) ──
+    if current_phase == "esperando_imagen":
+        if has_frame:
+            s["camera_image_b64"] = frame_b64
+            s["image_shown"] = True
+            s["camera_connected"] = True
+            image_description = await _describe_image(frame_b64)
+            s["image_description"] = image_description
+            img_b64 = frame_b64
+            is_poor = _poor_quality(image_description)
+            if is_poor:
+                s["phase"] = "ajustando_camara"
+                sys_p = _build_system(
+                    f"El usuario pidió revisar la imagen y HAY frame. Tu análisis: {image_description}. "
+                    f"La imagen tiene problemas de calidad (reflejos, ángulo malo, zona cortada). "
+                    f"Describe al usuario ({first_name}) lo que ves: qué problemas tiene la imagen. "
+                    f"Da instrucciones ESPECÍFICAS de ajuste: dónde mover la cámara, qué ángulo usar, qué evitar. "
+                    f"Pide que ajuste y avise cuando esté listo."
+                )
+            else:
+                s["phase"] = "mostrando_imagen"
+                sys_p = _build_system(
+                    f"El usuario pidió revisar la imagen y HAY frame. Tu análisis: {image_description}. "
+                    f"La imagen se ve bien. Describe al usuario ({first_name}) lo que ves en detalle. "
+                    f"PREGUNTA: 'Según lo que veo, parece que la cámara está apuntando a [zona detectada]. "
+                    f"¿Este es el lugar correcto que quieres vigilar?' "
+                    f"Deja que el usuario confirme o corrija el lugar. Ustedes dos deben ponerse de acuerdo."
+                )
+            # Include image in messages so Qwen can see it
+            msgs = _build_messages(sys_p)
+            if img_b64 and s.get("camera_image_b64"):
+                if msgs and len(msgs) > 1:
+                    last_msg = msgs[-1]
+                    if last_msg.get("role") == "user":
+                        last_msg["content"] = [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                            {"type": "text", "text": last_msg.get("content", "")}
+                        ]
+            answer = await _qwen(msgs)
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": img_b64, "zone": zone, "rules": rules_so_far}
+        else:
+            sys_p = _build_system(
+                f"El usuario dice '{message}' pero aún NO hay imagen de la cámara. "
+                f"Dile a {first_name} que la imagen aún no llega. "
+                f"Pídele que verifique: cámara encendida, conectada al WiFi, apuntando a la zona. "
+                f"Dile que diga 'revisa' de nuevo cuando quiera intentar otra vez. "
+                f"NO inventes ajustes ni reglas. Solo espera la imagen."
+            )
+            msgs = _build_messages(sys_p)
+            answer = await _qwen(msgs)
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+
+    # ── FASE: ZONA CONFIRMADA (usuario explica cómo funciona) ──
+    if current_phase == "zona_confirmada":
+        s["phase"] = "proponiendo_regla"
+        if "business_info" not in s:
+            s["business_info"] = []
+        s["business_info"].append(message)
+        business_info = " ".join(s["business_info"])
+        sys_p = _build_system(
+            f"El usuario te explicó cómo funciona su negocio: '{message}'. "
+            f"Toda la info del negocio hasta ahora: {business_info}. "
+            f"ANALIZA lo que te dijo y la imagen de la cámara ({image_description}). "
+            f"Piensa cuál es el mayor riesgo. Luego propón UNA sola regla específica. "
+            f"Di: 'Te propongo esta regla: [regla específica]. ¿Te parece bien o quieres que la ajuste?'"
+        )
+        # Include image in messages so Qwen can see it
+        msgs = _build_messages(sys_p)
+        # Add image to the last user message if available
+        if img_b64 and s.get("camera_image_b64"):
+            if msgs and len(msgs) > 1:
+                last_msg = msgs[-1]
+                if last_msg.get("role") == "user":
+                    last_msg["content"] = [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                        {"type": "text", "text": last_msg.get("content", "")}
+                    ]
+        answer = await _qwen(msgs)
+        s["msgs"].append({"role": "assistant", "content": answer})
+        eva_sessions[user_id] = s
+        return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+
+    # ── FASE: PROPONIENDO REGLA ──
+    if current_phase == "proponiendo_regla":
+        lower = message.lower()
+        concern_keywords = ["me preocupa", "quiero que", "también", "además", "otra cosa", "y que", "que se", "que no", "que los", "que la", "que el"]
+        strong_accept = ["perfecto", "exacto", "correcto", "dale", "vamos", "apruebo", "confirmo", "acepto", "suena bien", "me gusta"]
+        is_concern = any(w in lower for w in concern_keywords)
+        is_accept = any(w in lower for w in strong_accept)
+        is_reject = any(w in lower for w in ["no", "cambia", "modifica", "diferente", "mejor", "prefiero"])
+
+        if is_concern and not is_accept:
+            if "concerns" not in s:
+                s["concerns"] = []
+            s["concerns"].append(message)
+            concerns_so_far = s["concerns"]
+            s["phase"] = "proponiendo_regla"
+            sys_p = _build_system(
+                f"El usuario expresó una nueva preocupación: '{message}'. "
+                f"Preocupaciones acumuladas: {concerns_so_far}. "
+                f"Propón UNA regla específica basada en esta preocupación. "
+                f"Di: 'Te propongo esta regla: [regla]. ¿Te parece bien o quieres que la ajuste?'"
+            )
+            msgs = _build_messages(sys_p)
+            answer = await _qwen(msgs)
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+
+        elif is_accept and not is_reject:
+            if "rules" not in s:
+                s["rules"] = []
+            rule_num = len(s["rules"]) + 1
+            s["rules"].append(f"regla_{rule_num}")
+            rules_so_far = s["rules"]
+            rules_count = len(rules_so_far)
+            if rules_count >= 3:
+                s["phase"] = "confirmando"
+                sys_p = _build_system(
+                    f"✅ Regla {rule_num} guardada. Ya tienen {rules_count}/3 reglas. "
+                    f"Ahora pregunta sobre el horario del negocio. "
+                    f"Dile que fuera de ese horario vas a estar alerta a cualquier persona. "
+                    f"Pregunta: ¿Cuál es el horario de tu {biz_type}?"
+                )
+                msgs = _build_messages(sys_p)
+                answer = await _qwen(msgs)
+                s["msgs"].append({"role": "assistant", "content": answer})
+                eva_sessions[user_id] = s
+                return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+            else:
+                s["phase"] = "proponiendo_regla"
+                sys_p = _build_system(
+                    f"✅ Regla {rule_num} guardada. Les faltan {3 - rules_count} reglas (máximo 3). "
+                    f"Pregunta si quiere agregar otra regla. Pídile que te cuente qué más le preocupa."
+                )
+                msgs = _build_messages(sys_p)
+                answer = await _qwen(msgs)
+                s["msgs"].append({"role": "assistant", "content": answer})
+                eva_sessions[user_id] = s
+                return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+
+        elif is_reject:
+            s["phase"] = "proponiendo_regla"
+            sys_p = _build_system(
+                f"El usuario rechazó o quiere modificar la regla (mensaje: '{message}'). "
+                f"Pídele que te diga cómo quiere que sea la regla y ajusta según su respuesta. "
+                f"Sé flexible y colaborativo."
+            )
+            msgs = _build_messages(sys_p)
+            answer = await _qwen(msgs)
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+
+        else:
+            s["phase"] = "proponiendo_regla"
+            sys_p = _build_system(
+                f"El usuario respondió algo ambiguo (mensaje: '{message}'). "
+                f"Pregúntale directamente: ¿Te parece bien la regla que te propuse o quieres que la ajuste?"
+            )
+            msgs = _build_messages(sys_p)
+            answer = await _qwen(msgs)
+            s["msgs"].append({"role": "assistant", "content": answer})
+            eva_sessions[user_id] = s
+            return {"success": True, "response": answer, "ready_to_confirm": False, "camera_saved": False, "camera_image_b64": "", "zone": zone, "rules": rules_so_far}
+
+    # ── FASE: CONFIRMANDO ──
+    if current_phase == "confirmando":
+        lower = message.lower()
+        final_confirm = ["si", "sí", "acepto", "apruebo", "confirmo", "listo", "dale", "vamos", "esta bien", "está bien", "de acuerdo", "perfecto"]
+        if any(w in lower for w in final_confirm):
+            pass
+        sys_p = _build_system(
+            f"El usuario respondió: '{message}'. "
+            f"Muestra un RESUMEN completo de la configuración: "
+            f"zona={zone}, reglas={rules_so_far}, horario={schedule.get('open','08:00')}-{schedule.get('close','22:00')}. "
+            f"Pide confirmación final. Si confirma, genera [CAMERA_CONFIG] con los datos reales. "
+            f"Formato: [CAMERA_CONFIG]{{...}}[/CAMERA_CONFIG]"
+        )
+        msgs = _build_messages(sys_p)
+        answer = await _qwen(msgs, max_tok=500)
+        s["msgs"].append({"role": "assistant", "content": answer})
+
+    # ── FASE: Default (cualquier otra fase, dejar a Qwen responder) ──
+    if current_phase not in ("confirmando",):
+        sys_p = _build_system(
+            f"El usuario dijo: '{message}'. "
+            f"Continúa la configuración de forma natural según el contexto. "
+            f"Si ya tienes suficiente información, muestra un resumen y pide confirmación final "
+            f"generando [CAMERA_CONFIG] con los datos reales."
+        )
+        msgs = _build_messages(sys_p)
+        answer = await _qwen(msgs)
+        s["msgs"].append({"role": "assistant", "content": answer})
+
+    # ── Parsear CAMERA_CONFIG ──
+    camera_image_b64 = ""
+    camera_saved = False
+
+    if "[CAMERA_CONFIG]" in answer:
+        match = re.search(r'\[CAMERA_CONFIG\](.*?)\[/CAMERA_CONFIG\]', answer, re.DOTALL)
+        if match:
+            try:
+                camera_config = json.loads(match.group(1).strip())
+                camera_id = camera_config.get("camera_id", "unknown")
+                if camera_id == "AUTO":
+                    camera_id = s.get("camera_id", f"cam_{int(time.time())}")
+                    camera_config["camera_id"] = camera_id
+
+                storage_path = get_user_storage_path(user_id, "founder")
+                camera_dir = f"{storage_path}/cameras/{camera_id}"
+                os.makedirs(camera_dir, exist_ok=True)
+                with open(f"{camera_dir}/camera.json", "w") as f:
+                    json.dump(camera_config, f, indent=2)
+
+                uf = _find_user_json(user_id)
+                if uf:
+                    with open(uf) as f:
+                        user_data = json.load(f)
+                else:
+                    user_data = {"user_id": user_id, "cameras": []}
+                user_data.setdefault("cameras", [])
+                existing = [c for c in user_data["cameras"] if c.get("camera_id") != camera_id]
+                existing.append({
+                    "camera_id": camera_id,
+                    "name": camera_config.get("name", camera_id),
+                    "zone": camera_config.get("zone", "")
+                })
+                user_data["cameras"] = existing
+                compat_dir = f"{STORAGE_ROOT}/users/{user_id}"
+                os.makedirs(compat_dir, exist_ok=True)
+                with open(f"{compat_dir}/user.json", "w") as f:
+                    json.dump(user_data, f, indent=2)
+
+                camera_saved = True
+                s["configured"] = True
+                s["camera_id"] = camera_id
+                s["phase"] = "completado"
+                logger.info(f"Camera saved: {camera_id} for user {user_id}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse CAMERA_CONFIG JSON: {e}")
+            except Exception as e:
+                logger.error(f"Failed to save camera: {e}")
+
+        answer = re.sub(r'\[CAMERA_CONFIG\].*?\[/CAMERA_CONFIG\]', '', answer, flags=re.DOTALL).strip()
+        if not answer or len(answer) < 20:
+            answer = "✅ ¡Listo! Tu cámara está configurada y vigilando."
+
+    eva_sessions[user_id] = s
+
+    return {
+        "success": True,
+        "response": answer,
+        "ready_to_confirm": camera_saved,
+        "camera_saved": camera_saved,
+        "camera_image_b64": "",
+        "zone": zone,
+        "rules": rules_so_far
+    }
+
+@app.post("/config/confirm")
+async def config_confirm(request: dict):
+    return {"success": True}
+
+@app.post("/config/camera")
+async def config_camera(request: dict):
+    """Configura una cámara - recibe business_id, camera_id, config"""
+    user_id = request.get("user_id", "")
+    camera_id = request.get("camera_id", "")
+    camera_config = request.get("config", {})
+    
+    if not user_id or not camera_id:
+        raise HTTPException(status_code=400, detail="user_id y camera_id requeridos")
+    
+    # Get storage path
+    user_file = _find_user_json(user_id)
+    if not user_file:
+        # Create user path
+        plan = camera_config.get("plan", "free")
+        storage_path = get_user_storage_path(user_id, plan)
+    else:
+        storage_path = os.path.dirname(user_file)
+    
+    # Create camera directory
+    camera_dir = f"{storage_path}/cameras/{camera_id}"
+    os.makedirs(camera_dir, exist_ok=True)
+    
+    # Save camera.json
+    camera_file = f"{camera_dir}/camera.json"
+    camera_data = {
+        "camera_id": camera_id,
+        "user_id": user_id,
+        "created_at": int(time.time()),
+        "name": camera_config.get("name", camera_id),
+        "zone": camera_config.get("zone", "principal"),
+        "vigilance_prompt": camera_config.get("vigilance_prompt", ""),
+        "rules": camera_config.get("rules", [])
+    }
+    with open(camera_file, "w") as f:
+        json.dump(camera_data, f, indent=2)
+    
+    # Update user.json
+    if user_file:
+        with open(user_file) as f:
+            user_data = json.load(f)
+    else:
+        user_data = {"user_id": user_id, "cameras": []}
+    
+    user_data.setdefault("cameras", [])
+    existing = [c for c in user_data["cameras"] if c.get("camera_id") != camera_id]
+    existing.append({
+        "camera_id": camera_id,
+        "name": camera_data["name"],
+        "zone": camera_data["zone"]
+    })
+    user_data["cameras"] = existing
+    
+    # Preserve business context if exists
+    if "business_name" in camera_config:
+        user_data["business_name"] = camera_config["business_name"]
+    if "business_type" in camera_config:
+        user_data["business_type"] = camera_config["business_type"]
+    if "business_hours" in camera_config:
+        user_data["business_hours"] = camera_config["business_hours"]
+    
+    with open(user_file if user_file else f"{storage_path}/user.json", "w") as f:
+        json.dump(user_data, f, indent=2)
+    
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "storage_path": storage_path
+    }
+
+# ========== ADMIN ENDPOINTS ==========
+@app.get("/admin/server/status")
+async def admin_server_status():
+    return {
+        "status": "ok",
+        "ngrok_url": "https://api.ojoia.com.do",
+        "hostname": "ojoia-server",
+        "local_ip": "10.0.0.44",
+        "backend_port": 8005,
+        "uptime_seconds": 0
+    }
+
+@app.get("/admin/stats")
+async def admin_stats():
+    cfg = get_disk_config()
+    events_count = 0
+    violations_count = 0
+
+    # Contar eventos desde todos los discos configurados
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if not os.path.isdir(users_base):
+            continue
+        for uid in os.listdir(users_base):
+            for _cam_id, events_dir in _resolve_user_events_dirs(uid):
+                if os.path.exists(events_dir):
+                    for f in os.listdir(events_dir):
+                        if f.endswith('.json'):
+                            events_count += 1
+                            with open(f"{events_dir}/{f}") as fh:
+                                ev = json.load(fh)
+                                if ev.get("event_type") == "violation":
+                                    violations_count += 1
+
+    # Calcular total de cámaras
+    total_cameras = 0
+    cfg = get_disk_config()
+    user_cameras = set()
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if not os.path.isdir(users_base):
+            continue
+        for uid in os.listdir(users_base):
+            user_file = os.path.join(users_base, uid, "user.json")
+            if os.path.isfile(user_file):
+                try:
+                    with open(user_file) as f:
+                        udata = json.load(f)
+                    for cam in udata.get("cameras", []):
+                        user_cameras.add(cam.get("camera_id", ""))
+                except Exception:
+                    pass
+    total_cameras = len(user_cameras)
+
+    # Leer used_gb de la config de discos
+    storage_used_gb = 0
+    for disk in cfg.get("disks", []):
+        total_gb = disk.get("total_gb", 0) or 0
+        used_gb  = disk.get("used_gb",  0) or 0
+        storage_used_gb += used_gb
+
+    total_users = 0
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if os.path.isdir(users_base):
+            total_users += len(os.listdir(users_base))
+
+    return {
+        "total_users": total_users,
+        "total_cameras": total_cameras,
+        "active_cameras": len(orchestrator.grid.get_grid_info()["camera_ids"]),
+        "storage_used_gb": round(storage_used_gb, 2),
+        "total_events": events_count,
+        "total_violations": violations_count,
+        "memory_used_percent": 0,
+        "uptime_hours": 0
+    }
+
+@app.get("/admin/disks")
+async def admin_disks():
+    """Devuelve la configuración de discos desde disco (persistente)"""
+    return get_disk_config()
+
+@app.get("/admin/users")
+async def admin_users():
+    users = []
+    cfg = get_disk_config()
+    seen = set()
+    # Escanear todos los discos configurados
+    for disk in cfg.get("disks", []):
+        users_base = os.path.join(disk.get("mount", ""), disk.get("user_folder", "users"))
+        if not os.path.isdir(users_base):
+            continue
+        for uid in os.listdir(users_base):
+            if uid in seen:
+                continue
+            user_file = os.path.join(users_base, uid, "user.json")
+            if os.path.isfile(user_file):
+                try:
+                    with open(user_file) as f:
+                        users.append(json.load(f))
+                    seen.add(uid)
+                except Exception:
+                    pass
+    return {"users": users}
+
+
+@app.get("/admin/queue")
+async def admin_queue():
+    frame_count = orchestrator.grid.get_frame_count()
+    return {
+        "queue_length": frame_count,
+        "processing": 0,
+        "done": 0,
+        "error": 0,
+        "queue_size_mb": 0,
+        "oldest_item": None,
+        "last_processed": None,
+        "worker_running": True,
+        "pending_frames": [],
+        "grid_frames": frame_count,
+        "grid_ready": frame_count >= 16
+    }
+
+@app.post("/admin/calc-tokens")
+async def admin_calc_tokens(request: dict):
+    prompt = request.get("prompt", "")
+    tokens = max(1, len(prompt) // 3)
+    return {"tokens": tokens}
+
+def get_eva_config() -> dict:
+    try:
+        with open(EVA_CONFIG_FILE) as f:
+            return json.load(f)
+    except:
+        return {"prompt": "# Instructions for Eva\nEres un asistente de seguridad inteligente."}
+
+def save_eva_config(cfg: dict):
+    with open(EVA_CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+@app.get("/admin/eva-config")
+async def admin_eva_config():
+    cfg = get_eva_config()
+    return {"prompt": cfg.get("prompt", ""), "docs": cfg.get("docs", [])}
+
+@app.post("/admin/system/prompts")
+async def admin_save_prompt(request: dict):
+    cfg = get_eva_config()
+    cfg["prompt"] = request.get("prompt", cfg.get("prompt", ""))
+    save_eva_config(cfg)
+    return {"success": True}
+
+@app.get("/admin/eva-docs")
+async def admin_eva_docs():
+    cfg = get_eva_config()
+    return {"documents": cfg.get("docs", [])}
+
+@app.get("/admin/eva-docs/{name}")
+async def admin_get_eva_doc(name: str):
+    cfg = get_eva_config()
+    docs = cfg.get("docs_content", {})
+    return {"name": name, "content": docs.get(name, "# " + name)}
+
+@app.post("/admin/eva-docs/save")
+async def admin_save_eva_doc(request: dict):
+    cfg = get_eva_config()
+    docs_content = cfg.get("docs_content", {})
+    docs_content[request.get("name", "")] = request.get("content", "")
+    cfg["docs_content"] = docs_content
+    if request.get("name") and request.get("name") not in cfg.get("docs", []):
+        cfg.setdefault("docs", []).append(request.get("name"))
+    save_eva_config(cfg)
+    return {"success": True}
+
+@app.post("/admin/server/cloudflared/save")
+async def admin_cloudflared_save(request: dict):
+    return {"success": True}
+
+@app.post("/admin/server/sync-firestore")
+async def admin_sync_firestore():
+    return {"success": True}
+
+@app.get("/admin/users/{user_id}")
+async def admin_get_user(user_id: str):
+    user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if os.path.exists(user_file):
+        with open(user_file) as f:
+            user_data = json.load(f)
+        return {
+            "user_id": user_id,
+            "name": user_data.get("name", "-"),
+            "email": user_data.get("email", "-"),
+            "business_name": user_data.get("business_name", ""),
+            "business_type": user_data.get("business_type", ""),
+            "plan": user_data.get("plan", "founder"),
+            "status": user_data.get("status", "active"),
+            "created_at": user_data.get("created_at", "-"),
+            "last_login": "2025-05-19",
+            "cameras": user_data.get("cameras", [])
+        }
+    return {
+        "user_id": user_id,
+        "name": "Test User",
+        "email": "test@example.com",
+        "business_name": "Test Business",
+        "plan": "founder",
+        "status": "active",
+        "created_at": "2025-01-01",
+        "last_login": "2025-05-19",
+        "cameras": []
+    }
+
+@app.get("/admin/disks/autodetect")
+async def admin_disks_autodetect():
+    """Detecta montajes activos en el sistema"""
+    detected = []
+    common_mounts = ["/mnt", "/media", "/home"]  # ampliar según necesidad
+    for base in common_mounts:
+        if os.path.exists(base):
+            try:
+                candidates = os.listdir(base)
+            except PermissionError:
+                continue
+            for c in candidates:
+                mp = os.path.join(base, c)
+                if os.path.ismount(mp):
+                    detected.append({"mount": mp, "label": os.path.basename(mp)})
+    return {"detected": detected}
+
+
+@app.post("/admin/disks/scan")
+async def admin_disks_scan():
+    """Escanea discos y actualiza used/free GB en la config"""
+    cfg = get_disk_config()
+    for disk in cfg.get("disks", []):
+        mount = disk.get("mount", "")
+        if mount and os.path.exists(mount):
+            try:
+                st = os.statvfs(mount)
+                total = st.f_blocks * st.f_frsize
+                free  = st.f_bavail * st.f_frsize
+                disk["total_gb"] = round(total / (1024**3), 1)
+                disk["free_gb"]  = round(free  / (1024**3), 1)
+                disk["used_gb"]  = round((total - free) / (1024**3), 1)
+            except OSError:
+                pass
+    save_disk_config(cfg)
+    return {"success": True, "disks": cfg.get("disks", [])}
+
+
+@app.post("/admin/disks/save")
+async def admin_disks_save(request: dict):
+    """Guarda la configuración completa de discos y planes"""
+    required = ["disks", "plans"]
+    if not all(k in request for k in required):
+        raise HTTPException(status_code=400, detail="Missing fields")
+    save_disk_config(request)
+    return {"success": True}
+
+
+@app.post("/admin/disks/add")
+async def admin_disks_add(request: dict):
+    """Agrega un nuevo disco a la configuración"""
+    cfg = get_disk_config()
+    mount = request.get("mount", "")
+    if not mount or mount in [d.get("mount") for d in cfg["disks"]]:
+        raise HTTPException(status_code=400, detail="Mount path empty or already exists")
+    cfg["disks"].append({
+        "mount": mount,
+        "label": request.get("label", mount),
+        "total_gb": 0, "used_gb": 0, "free_gb": 0,
+        "user_folder": request.get("user_folder", "users")
+    })
+    save_disk_config(cfg)
+    return {"success": True}
+
+
+@app.post("/admin/disks/remove")
+async def admin_disks_remove(request: dict):
+    """Elimina un disco de la configuración"""
+    cfg = get_disk_config()
+    mount = request.get("mount", "")
+    cfg["disks"] = [d for d in cfg["disks"] if d.get("mount") != mount]
+    save_disk_config(cfg)
+    return {"success": True}
+
+@app.get("/admin/storage/{user_id}")
+async def admin_get_user_storage(user_id: str):
+    """Devuelve info de almacenamiento del usuario, resolviendo la ruta desde la config de discos"""
+    cfg = get_disk_config()
+    plan = "free"
+    disk_mount = STORAGE_ROOT
+    user_file_compat = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+
+    # Leer plano desde compat o desde disk config
+    if os.path.exists(user_file_compat):
+        with open(user_file_compat) as f:
+            ud = json.load(f)
+        plan = ud.get("plan", "free")
+
+    # Resolver ruta real desde config de discos
+    storage_path = get_user_storage_path(user_id, plan)
+    disk_mount = os.path.dirname(storage_path)
+
+    # Calcular uso desde la ruta real
+    used_mb = 0
+    user_dir = storage_path
+    if os.path.isdir(user_dir):
+        for root, dirs, files in os.walk(user_dir):
+            for fi in files:
+                fp = os.path.join(root, fi)
+                if os.path.isfile(fp):
+                    used_mb += os.path.getsize(fp)
+    used_mb = round(used_mb / (1024**2), 1)
+
+    plan_data = cfg.get("plans", {}).get(plan, {})
+    return {
+        "user_id": user_id,
+        "disk_mount": disk_mount,
+        "quota_gb": plan_data.get("max_storage_gb", 500),
+        "used_mb": used_mb,
+        "usage_percent": round(used_mb / (plan_data.get("max_storage_gb", 500) * 1024) * 100, 1) if plan_data.get("max_storage_gb") else 0,
+        "plan": plan
+    }
+
+@app.post("/admin/storage/{user_id}/update")
+async def admin_update_user_storage(user_id: str, request: dict):
+    """Actualiza plan / quota de un usuario"""
+    user_file = _find_user_json(user_id)
+    if not user_file:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with open(user_file) as f:
+        user_data = json.load(f)
+    if "plan" in request:
+        user_data["plan"] = request["plan"]
+    if "quota_gb" in request:
+        user_data["quota_gb"] = request["quota_gb"]
+    with open(user_file, "w") as f:
+        json.dump(user_data, f, indent=2)
+    return {"success": True}
+
+@app.post("/admin/storage/{user_id}/migrate")
+async def admin_migrate_user(user_id: str, request: dict):
+    """Migra un usuario a un nuevo disco creando user.json en la nueva ruta y reemplazando el disk_mount"""
+    new_disk_mount = request.get("disk_mount", STORAGE_ROOT)
+    cfg = get_disk_config()
+
+    # Encontrar disco destino en config
+    target_disk = None
+    for d in cfg.get("disks", []):
+        if d.get("mount") == new_disk_mount:
+            target_disk = d
+            break
+    if not target_disk:
+        target_disk = {"mount": new_disk_mount, "user_folder": "users"}
+    user_folder = target_disk.get("user_folder", "users")
+    new_user_dir = f"{new_disk_mount}/{user_folder.strip('/')}/{user_id}"
+    new_user_file = f"{new_user_dir}/user.json"
+
+    # Leer datos existentes del usuario desde cualquier disco
+    existing = {}
+    old_file = _find_user_json(user_id)
+    if old_file:
+        with open(old_file) as f:
+            existing = json.load(f)
+
+    existing["disk_mount"] = new_disk_mount
+    os.makedirs(new_user_dir, exist_ok=True)
+    with open(new_user_file, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    # Actualizar compat en STORAGE_ROOT si difiere
+    compat_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if compat_file != new_user_file:
+        os.makedirs(os.path.dirname(compat_file), exist_ok=True)
+        with open(compat_file, "w") as f:
+            json.dump(existing, f, indent=2)
+
+    return {"success": True, "new_path": new_user_dir}
+
+@app.post("/admin/queue/clear")
+async def admin_clear_queue():
+    return {"success": True}
+
+@app.post("/api/fcm/register")
+async def api_fcm_register(request: dict):
+    return {"success": True}
+
+
+@app.get("/debug/frames")
+async def debug_frames():
+    """Endpoint de debug para ver frames recibidos"""
+    grid_info = orchestrator.grid.get_grid_info()
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "grid_status": grid_info,
+        "camera_ids_active": grid_info["camera_ids"]
+    }
+
+
+@app.get("/debug/logs")
+async def debug_logs(limit: int = 100):
+    """Ver últimas líneas del log del API"""
+    log_file = "/home/sam/ai_system/api_eva.log"
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            lines = f.readlines()[-limit:]
+        return {"logs": lines}
+    return {"logs": []}
+
+
+@app.get("/api/events")
+async def api_get_events(user_id: str, limit: int = 50):
+    """Obtener eventos de usuario"""
+    events = []
+    cam_names = {}
+    user_file = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+    if os.path.exists(user_file):
+        with open(user_file) as f:
+            ud = json.load(f)
+        for cam in ud.get("cameras", []):
+            cam_names[cam.get("camera_id", "")] = cam.get("name", "")
+
+    seen = set()
+    for cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        if not os.path.exists(events_dir):
+            continue
+        for fname in sorted(os.listdir(events_dir), reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            if len(events) >= limit:
+                break
+            with open(f"{events_dir}/{fname}") as f:
+                ev = json.load(f)
+            eid = ev.get("event_id", fname)
+            if eid in seen:
+                continue
+            seen.add(eid)
+            ev["camera_name"] = cam_names.get(ev.get("camera_id", ""), cam_id if cam_id != "_global" else "Cámara")
+            events.append(ev)
+    return {"events": events}
+
+
+@app.get("/api/events/{event_id}")
+async def api_get_event(event_id: str, user_id: str):
+    """Obtener evento específico con imagen - busca en todas las carpetas de cámara"""
+    event_file = None
+    img_file = None
+
+    for _cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        ef = f"{events_dir}/{event_id}.json"
+        if os.path.exists(ef):
+            event_file = ef
+            img_file = f"{events_dir}/{event_id}.jpg"
+            break
+
+    if not event_file or not os.path.exists(event_file):
+        raise HTTPException(status_code=404, detail="Evento no encontrado")
+
+    with open(event_file) as f:
+        event = json.load(f)
+
+    # Agregar imagen en base64 si existe
+    if img_file and os.path.exists(img_file):
+        with open(img_file, "rb") as f:
+            import base64
+            event["frame_b64"] = base64.b64encode(f.read()).decode('utf-8')
+
+    # Normalizar estructura para frontend
+    event["qwen"] = {
+        "violation": event.get("event_type") == "violation",
+        "description": event.get("metadata", {}).get("qwen_analysis", "")
+    }
+    event["yolo"] = {"count": 1}
+    event["grid_b64"] = event.get("metadata", {}).get("grid_b64", "")
+
+    return event
+
+
+@app.get("/api/grid/latest")
+async def api_get_latest_grid(user_id: str = "default"):
+    """Obtener último grid de frames"""
+    grid_info = orchestrator.grid.get_grid_info()
+    grid_b64 = ""
+    
+    if grid_info["frame_count"] > 0:
+        grid_img = orchestrator.grid.get_grid_image()
+        import base64
+        grid_b64 = base64.b64encode(grid_img).decode('utf-8')
+    
+    return {
+        "frames_used": grid_info["frame_count"],
+        "grid_b64": grid_b64,
+        "camera_ids": grid_info["camera_ids"]
+    }
+
+
+@app.get("/api/cameras/{camera_id}/grid")
+async def api_get_camera_grid(camera_id: str):
+    """Último frame individual de una cámara específica"""
+    last_cam_id = orchestrator.grid.get_last_camera_id()
+    frame_bytes = orchestrator.grid.get_last_frame_bytes() if last_cam_id == camera_id else b''
+    image_b64 = base64.b64encode(frame_bytes).decode("utf-8") if frame_bytes else ""
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "image_b64": image_b64,
+        "yolo": {"count": 0},
+        "qwen": {"violation": False}
+    }
+
+
+@app.get("/api/violations")
+async def api_get_violations(user_id: str, limit: int = 20):
+    """Obtener violaciones/alertas de usuario"""
+    violations = []
+    for _cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        if not os.path.exists(events_dir):
+            continue
+        for fname in sorted(os.listdir(events_dir), reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            if len(violations) >= limit:
+                break
+            with open(f"{events_dir}/{fname}") as f:
+                event = json.load(f)
+                if event.get("event_type") == "violation":
+                    violations.append(event)
+    return {"violations": violations}
+
+
+# Agregar al final - manejar /devices/announce (probablemente ESP32 CAM o similar)
+@app.post("/devices/announce")
+async def devices_announce(request: dict = None):
+    """Endpoint para manejar anuncios de dispositivos (ESP32 CAM)"""
+    device_id = request.get("device_id", "unknown") if request else "unknown"
+    logger.info(f"📱 Dispositivo detectado: {device_id}")
+    return {
+        "status": "registered",
+        "device_id": device_id,
+        "message": "Device registered successfully"
+    }
+
+
+# ========== ENDPOINTS FALTANTES ==========
+
+@app.post("/api/event/{event_id}/dismiss")
+async def dismiss_event(event_id: str, request: dict = None):
+    """Marcar evento como revisado / falsa alarma"""
+    user_id = (request or {}).get("user_id", "")
+    event_file = None
+    for _cam_id, events_dir in _resolve_user_events_dirs(user_id):
+        ef = f"{events_dir}/{event_id}.json"
+        if os.path.exists(ef):
+            event_file = ef
+            break
+
+    if not event_file or not os.path.exists(event_file):
+        raise HTTPException(status_code=404, detail="Evento no encontrado")
+
+    with open(event_file) as f:
+        ev = json.load(f)
+    ev["dismissed"] = True
+    ev["dismissed_at"] = int(time.time())
+    with open(event_file, "w") as f:
+        json.dump(ev, f, indent=2)
+    logger.info(f"Evento {event_id} marcado como revisado por {user_id}")
+    return {"success": True}
+
+
+@app.post("/api/payment/upload")
+async def upload_payment_receipt(
+    request: Request,
+    user_id: str = Form(...),
+    receipt: UploadFile = File(...)
+):
+    """Recibir comprobante de pago de usuario"""
+    upload_dir = f"{STORAGE_ROOT}/receipts"
+    os.makedirs(upload_dir, exist_ok=True)
+    ts = int(time.time())
+    filename = f"{user_id}_{ts}_{receipt.filename}"
+    filepath = f"{upload_dir}/{filename}"
+    try:
+        content = await receipt.read()
+        with open(filepath, "wb") as f:
+            f.write(content)
+        logger.info(f"Comprobante de pago recibido: {filename} ({len(content)} bytes)")
+        return {"success": True, "filename": filename, "size": len(content)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/vigilance/config")
+async def save_vigilance_config(request: dict):
+    """Guardar configuración de vigilancia (usada por Eva wizard)"""
+    user_id = request.get("user_id", "default")
+    prompt = request.get("prompt", "")
+    rules = request.get("rules", [])
+    config_dir = f"{STORAGE_ROOT}/config"
+    os.makedirs(config_dir, exist_ok=True)
+    config_file = f"{config_dir}/{user_id}.json"
+    with open(config_file, "w") as f:
+        json.dump({"prompt": prompt, "rules": rules, "updated_at": int(time.time())}, f, indent=2)
+    return {"success": True}
+
+
+@app.get("/api/vigilance/events")
+async def get_vigilance_events(user_id: str, date: str = None, filter: str = None):
+    """Alias de /api/user/events con soporte de filtros"""
+    return await get_user_events(user_id, date=date, filter=filter)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8005)

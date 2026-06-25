@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Test - Whisper · SDXL · AudioLDM2 · Voxtral · ComfyUI</title>
+<script>window.APP_VERSION='20260531_1945';</script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, monospace; background: #0f0f0f; color: #e0e0e0; padding: 20px; }
+  .container { max-width: 800px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+  h1 { text-align: center; color: #0ff; font-size: 1.4em; border-bottom: 1px solid #333; padding-bottom: 12px; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 20px; }
+  .recording { border-color: #f44 !important; }
+  .rec-cont { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  .rec-btn { padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; font-size: 0.85em; flex: 1; }
+  .rec-btn.rec { background: #f44; color: #fff; animation: pulse 1s infinite; }
+  .rec-btn.stop { background: #333; color: #ddd; }
+  .rec-btn.use { background: #0f0; color: #000; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  audio { width: 100%; margin-top: 8px; }
+  .card h2 { font-size: 1em; color: #0ff; margin-bottom: 12px; }
+  label { display: block; font-size: 0.85em; color: #aaa; margin-bottom: 4px; }
+  input, textarea, select { width: 100%; background: #111; border: 1px solid #333; color: #e0e0e0; padding: 10px; border-radius: 4px; font-family: inherit; font-size: 0.9em; }
+  textarea { resize: vertical; min-height: 60px; }
+  input[type="file"] { padding: 8px; font-size: 0.85em; }
+  button { background: #0ff; color: #000; border: none; padding: 10px 24px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.9em; }
+  button:hover { background: #3ff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  .row * { flex: 1; }
+  .result { background: #111; border: 1px solid #333; border-radius: 4px; padding: 12px; font-size: 0.85em; white-space: pre-wrap; word-break: break-all; min-height: 40px; max-height: 300px; overflow: auto; margin-top: 8px; }
+  .result img { max-width: 100%; border-radius: 4px; display: block; margin: 8px 0; }
+  .error { color: #f44; }
+  .ok { color: #0f0; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.75em; margin-left: 8px; }
+  .badge.online { background: #0f0; color: #000; }
+  .badge.offline { background: #f44; color: #fff; }
+  .gpu-info { font-size: 0.75em; color: #666; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🧪 Test: Whisper · SDXL · AudioLDM2 · Voxtral · ComfyUI</h1>
+
+  <div class="card">
+    <h2>🔍 Health Check</h2>
+    <div class="row">
+       <button onclick="health('whisper')">Whisper :8008</button>
+       <button onclick="health('sdxl')">SDXL :8006</button>
+       <button onclick="health('audioldm2')">AudioLDM2 :8009</button>
+       <button onclick="health('voxtral')">Voxtral :8010</button>
+    </div>
+    <div id="health-result" class="result">Presiona un botón para verificar...</div>
+  </div>
+
+  <div class="card">
+    <h2>🎤 Whisper - Transcripción <span class="gpu-info">GPU 1</span></h2>
+    <label>Archivo de audio (mp3, wav, etc.)</label>
+    <input type="file" id="audio-file" accept="audio/*">
+    <div style="margin-top:8px">
+      <button onclick="transcribe()">▶ Transcribir</button>
+    </div>
+    <div id="whisper-result" class="result">Esperando audio...</div>
+  </div>
+
+  <div class="card">
+    <h2>🖼️ SDXL - Generación <span class="gpu-info">GPU 1</span></h2>
+    <label>Modelo</label>
+    <select id="sdxl-model">
+      <option value="turbo">⚡ SDXL Turbo (2 steps, 512×512)</option>
+      <option value="juggernaut">🎬 JuggernautXL v10 (30 steps, 1344×768)</option>
+    </select>
+    <label style="margin-top:8px">Prompt</label>
+    <textarea id="prompt" placeholder="Ej: a cyberpunk cat riding a neon motorcycle in tokyo"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button onclick="generate()">🎨 Generar</button>
+    </div>
+    <div id="sdxl-result" class="result">Esperando prompt...</div>
+    <div id="sdxl-image"></div>
+  </div>
+
+  <div class="card">
+    <h2>🌊 Flux - Generación <span class="gpu-info">GPU 1 · GGUF Q5</span></h2>
+    <label>Prompt</label>
+    <textarea id="flux-prompt" placeholder="Ej: a cinematic photo of a dragon flying over a mountain, 8k"></textarea>
+    <label style="margin-top:8px">Tamaño</label>
+    <select id="flux-size">
+      <option value="1024x1024">1024×1024</option>
+      <option value="1344x768">1344×768 (widescreen)</option>
+      <option value="768x1344">768×1344 (portrait)</option>
+    </select>
+    <div class="row" style="margin-top:8px">
+      <button onclick="fluxGenerate()">🌊 Generar con Flux</button>
+    </div>
+    <div id="flux-result" class="result">Esperando prompt...</div>
+    <div id="flux-image"></div>
+  </div>
+
+  <div class="card">
+    <h2>🎵 AudioLDM2 - Texto/Audio a Audio <span class="gpu-info">GPU 2</span></h2>
+    <label>Prompt</label>
+    <textarea id="audioldm2-prompt" placeholder="Ej: techno music with a strong beat">techno music with a strong beat</textarea>
+    <div class="row" style="margin-top:8px">
+      <button onclick="audioldm2Generate()">🎵 Generar Audio (10s)</button>
+    </div>
+    <div id="audioldm2-result" class="result">Escribe un prompt para generar audio...</div>
+    <div id="audioldm2-audio"></div>
+  </div>
+
+  <div class="card">
+    <h2>🔊 Voxtral TTS - Texto a Voz <span class="gpu-info">GPU 2 · INT4 · 57fps</span></h2>
+    <label>Texto</label>
+    <textarea id="tts-text" placeholder="Ej: Hello, this is a test">Hello, this is a test of Voxtral text to speech</textarea>
+    <label style="margin-top:8px">Voz</label>
+    <select id="tts-voice">
+      <option value="tara">tara (neutral female)</option>
+      <option value="neutral_female">neutral_female</option>
+      <option value="neutral_male">neutral_male</option>
+      <option value="es_female">es_female (Spanish)</option>
+      <option value="es_male">es_male (Spanish)</option>
+    </select>
+    <div style="margin-top:8px">
+      <button onclick="speak()">🔊 Generar Audio</button>
+    </div>
+    <div id="voxtral-result" class="result">Esperando texto...</div>
+    <div id="voxtral-audio"></div>
+  </div>
+
+  <div class="card">
+    <h2>🎭 Voxtral - Clonación de Voz <span class="gpu-info">GPU 2 · Zero-shot · 3s+ ref</span></h2>
+    <label>Audio de referencia (3-30 segundos de voz clara)</label>
+    <input type="file" id="clone-audio" accept="audio/*">
+    <div class="rec-cont" style="margin-top:8px">
+      <button class="rec-btn rec" id="rec-start" onclick="startRecording()">🎤 Grabar</button>
+      <button class="rec-btn stop" id="rec-stop" onclick="stopRecording()" disabled>⏹ Detener</button>
+      <button class="rec-btn use" id="rec-use" onclick="useRecording()" disabled style="display:none">✅ Usar grabación</button>
+    </div>
+    <audio id="rec-preview" controls style="display:none"></audio>
+    <label style="margin-top:8px">Texto a generar con la voz clonada</label>
+    <textarea id="clone-text" placeholder="Ej: Hola, esta es mi voz clonada">Hola, esta es mi voz clonada funcionando perfectamente</textarea>
+    <div style="margin-top:8px">
+      <button onclick="cloneVoice()">🎭 Clonar Voz y Generar</button>
+    </div>
+    <div id="clone-result" class="result">Sube un audio de referencia o graba por micrófono...</div>
+    <div id="clone-audio-player"></div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <!-- COMFYUI WAN 2.1 I2V -->
+  <!-- ═══════════════════════════════════════════════════════════════════ -->
+  <div class="card">
+    <h2>🎬 ComfyUI - Wan 2.1 I2V <span class="gpu-info">GPU 2 · 720P · FP8</span></h2>
+
+    <div style="margin-bottom:12px">
+      <button onclick="checkComfyModels()">🔍 Verificar Modelos</button>
+      <div id="comfy-models-status" class="result" style="margin-top:4px">Presiona para verificar...</div>
+    </div>
+
+    <div style="margin-bottom:12px">
+      <button onclick="downloadWanModels()" id="btn-download-wan" style="background:#ff8c00;color:#000">⬇️ Instalar Modelos (~38G)</button>
+      <div id="wan-download-status" class="result" style="margin-top:4px"></div>
+    </div>
+
+    <label>Imagen de referencia</label>
+    <input type="file" id="i2v-image" accept="image/*">
+    <img id="i2v-preview" style="display:none;max-width:200px;max-height:150px;border-radius:4px;margin-top:8px;object-fit:contain">
+
+    <label style="margin-top:8px">Prompt</label>
+    <textarea id="i2v-prompt" placeholder="Ej: A cinematic shot, slowly zooming in, dramatic lighting, smooth camera movement"></textarea>
+
+    <div class="row" style="margin-top:8px">
+      <label style="flex:none;width:80px">Tamaño</label>
+      <select id="i2v-size" style="flex:1">
+        <option value="1280x720" selected>1280×720</option>
+        <option value="832x480">832×480</option>
+      </select>
+      <label style="flex:none;width:80px;margin-left:8px">Segundos</label>
+      <select id="i2v-seconds" style="flex:1">
+        <option value="3" selected>3s</option>
+        <option value="5">5s</option>
+      </select>
+    </div>
+
+    <div style="margin-top:8px">
+      <button onclick="generateI2V()" id="btn-generate-i2v">🎬 Generar Video</button>
+    </div>
+
+    <div id="i2v-result" class="result">Sube imagen + prompt para generar video...</div>
+    <div id="i2v-progress" style="display:none;margin-top:8px">
+      <div style="background:#333;border-radius:4px;height:20px;overflow:hidden">
+        <div id="i2v-progress-bar" style="background:#0ff;height:100%;width:0%;transition:width 0.5s"></div>
+      </div>
+      <div id="i2v-progress-text" style="font-size:0.8em;color:#888;margin-top:4px"></div>
+    </div>
+    <video id="i2v-video" controls style="display:none;width:100%;border-radius:4px;margin-top:8px;max-height:500px;background:#000"></video>
+  </div>
+</div>
+
+<script>
+const WHISPER = "/api/whisper";
+const SDXL = "/api/sdxl";
+const FLUX = "/api/flux";
+const VOXTRAL = "/api/voxtral";
+const AUDIOldm2 = "/api/audioldm2";
+
+// ── Health ──────────────────────────────────────────────────────────────
+async function health(svc) {
+  const el = document.getElementById("health-result");
+  el.textContent = "Verificando...";
+  try {
+    let lines = [];
+    if (svc === "whisper") {
+      try { const r = await fetch(WHISPER + "/health"); const d = await r.json(); lines.push("Whisper :8008 → ✅ " + d.model + " (" + d.status + ")"); } catch(e) { lines.push("Whisper :8008 → ❌ " + e.message); }
+    }
+    if (svc === "sdxl") {
+      try { const r = await fetch(SDXL + "/health"); const d = await r.json(); lines.push("SDXL    :8006 → ✅ " + d.model + " (" + d.status + ")"); } catch(e) { lines.push("SDXL    :8006 → ❌ " + e.message); }
+    }
+    if (svc === "audioldm2") {
+      try { const r = await fetch(AUDIOldm2 + "/health"); const d = await r.json(); lines.push("AudioLDM2:8009 → ✅ " + d.model + " (" + d.status + ")"); } catch(e) { lines.push("AudioLDM2:8009 → ❌ " + e.message); }
+    }
+    if (svc === "voxtral") {
+      try { const r = await fetch(VOXTRAL + "/health"); const d = await r.json(); lines.push("Voxtral :8010 → ✅ " + d.model + " (" + d.status + ")"); } catch(e) { lines.push("Voxtral :8010 → ❌ " + e.message); }
+    }
+    el.innerHTML = lines.join("\n");
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + "</span>"; }
+}
+
+// ── Whisper ─────────────────────────────────────────────────────────────
+async function transcribe() {
+  const file = document.getElementById("audio-file").files[0];
+  const el = document.getElementById("whisper-result");
+  if (!file) { el.innerHTML = '<span class="error">Selecciona un archivo de audio</span>'; return; }
+  el.textContent = "Transcribiendo...";
+  const form = new FormData();
+  form.append("audio", file, file.name);
+  try {
+    const r = await fetch(WHISPER + "/transcribe", { method: "POST", body: form });
+    const data = await r.json();
+    el.innerHTML = "📝 " + data.text + "\n\n🌐 Idioma: " + data.language + " | ⏱ Duración: " + (data.duration?.toFixed(1)||"?") + "s";
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── SDXL ────────────────────────────────────────────────────────────────
+async function generate() {
+  const prompt = document.getElementById("prompt").value;
+  const model = document.getElementById("sdxl-model").value;
+  const el = document.getElementById("sdxl-result");
+  const imgEl = document.getElementById("sdxl-image");
+  if (!prompt.trim()) { el.innerHTML = '<span class="error">Escribe un prompt</span>'; return; }
+  el.textContent = "Generando (" + model + ")...";
+  imgEl.innerHTML = "";
+  try {
+    const r = await fetch(SDXL + "/generate", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ prompt, model }) });
+    const data = await r.json();
+    if (data.prompt_id) {
+      el.textContent = "Procesando...";
+      const imgUrl = await pollComfyImage(data.prompt_id);
+      if (imgUrl) {
+        imgEl.innerHTML = '<img src="' + imgUrl + '" alt="Generated">';
+        el.innerHTML = "✅ Generado | Modelo: " + model;
+      } else {
+        el.innerHTML = '<span class="error">Timeout</span>';
+      }
+    } else {
+      el.innerHTML = '<span class="error">Error: ' + (data.error || JSON.stringify(data)) + '</span>';
+    }
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── Flux ────────────────────────────────────────────────────────────────
+async function fluxGenerate() {
+  const prompt = document.getElementById("flux-prompt").value;
+  const size = document.getElementById("flux-size").value;
+  const el = document.getElementById("flux-result");
+  const imgEl = document.getElementById("flux-image");
+  if (!prompt.trim()) { el.innerHTML = '<span class="error">Escribe un prompt</span>'; return; }
+  const [width, height] = size.split("x").map(Number);
+  el.textContent = "Generando Flux (" + width + "×" + height + ")...";
+  imgEl.innerHTML = "";
+  try {
+    const r = await fetch(FLUX + "/generate", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ prompt, width, height, num_inference_steps: 20, guidance_scale: 3.5 }) });
+    const data = await r.json();
+    if (data.prompt_id) {
+      el.textContent = "Procesando...";
+      const imgUrl = await pollComfyImage(data.prompt_id);
+      if (imgUrl) {
+        imgEl.innerHTML = '<img src="' + imgUrl + '" alt="Flux">';
+        el.innerHTML = "✅ Flux | " + width + "×" + height;
+      } else {
+        el.innerHTML = '<span class="error">Timeout</span>';
+      }
+    } else {
+      el.innerHTML = '<span class="error">Error: ' + (data.error || JSON.stringify(data)) + '</span>';
+    }
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── Voxtral TTS ─────────────────────────────────────────────────────────
+async function speak() {
+  const text = document.getElementById("tts-text").value;
+  const voice = document.getElementById("tts-voice").value;
+  const el = document.getElementById("voxtral-result");
+  const audioEl = document.getElementById("voxtral-audio");
+  if (!text.trim()) { el.innerHTML = '<span class="error">Escribe texto</span>'; return; }
+  el.textContent = "Generando audio...";
+  audioEl.innerHTML = "";
+  try {
+    const r = await fetch(VOXTRAL + "/v1/audio/speech", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ input: text, voice: voice, response_format: "wav" }) });
+    if (!r.ok) { el.innerHTML = '<span class="error">Error HTTP: ' + r.status + '</span>'; return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    audioEl.innerHTML = '<audio controls src="' + url + '"></audio>';
+    el.innerHTML = "✅ Audio: " + (blob.size/1024).toFixed(0) + " KB | Voz: " + voice;
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── AudioLDM2 ───────────────────────────────────────────────────────────
+async function audioldm2Generate() {
+  const prompt = document.getElementById("audioldm2-prompt").value;
+  const el = document.getElementById("audioldm2-result");
+  const audioEl = document.getElementById("audioldm2-audio");
+  if (!prompt.trim()) { el.innerHTML = '<span class="error">Escribe un prompt</span>'; return; }
+  el.textContent = "Generando audio...";
+  audioEl.innerHTML = "";
+  try {
+    const r = await fetch(AUDIOldm2 + "/generate", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ prompt, num_inference_steps: 10, audio_length_in_s: 10 }) });
+    if (!r.ok) { el.innerHTML = '<span class="error">Error ' + r.status + '</span>'; return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    audioEl.innerHTML = '<audio controls src="' + url + '"></audio>';
+    el.innerHTML = "✅ Audio generado (" + (blob.size/1024).toFixed(0) + " KB)";
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── Recording ───────────────────────────────────────────────────────────
+let _mediaRecorder = null;
+let _recordedBlob = null;
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    _mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+    const chunks = [];
+    _mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    _mediaRecorder.onstop = () => {
+      _recordedBlob = new Blob(chunks, { type: "audio/webm" });
+      const url = URL.createObjectURL(_recordedBlob);
+      const preview = document.getElementById("rec-preview");
+      preview.src = url; preview.style.display = "block";
+      document.getElementById("rec-use").style.display = "inline-flex";
+      document.getElementById("rec-use").disabled = false;
+      stream.getTracks().forEach(t => t.stop());
+    };
+    _mediaRecorder.start();
+    document.getElementById("rec-start").disabled = true;
+    document.getElementById("rec-stop").disabled = false;
+    document.getElementById("rec-use").style.display = "none";
+    document.getElementById("rec-use").disabled = true;
+  } catch(e) {
+    document.getElementById("clone-result").innerHTML = '<span class="error">Micrófono no disponible: ' + e.message + '</span>';
+  }
+}
+
+function stopRecording() {
+  if (_mediaRecorder && _mediaRecorder.state !== "inactive") _mediaRecorder.stop();
+  document.getElementById("rec-start").disabled = false;
+  document.getElementById("rec-stop").disabled = true;
+}
+
+function useRecording() {
+  if (!_recordedBlob) return;
+  const file = new File([_recordedBlob], "recording.webm", { type: "audio/webm" });
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  document.getElementById("clone-audio").files = dt.files;
+  document.getElementById("clone-result").textContent = "✅ Grabación lista (" + (_recordedBlob.size/1024).toFixed(0) + " KB)";
+}
+
+// ── Clone Voice ─────────────────────────────────────────────────────────
+async function cloneVoice() {
+  const inputFile = document.getElementById("clone-audio").files[0];
+  const text = document.getElementById("clone-text").value;
+  const el = document.getElementById("clone-result");
+  const audioEl = document.getElementById("clone-audio-player");
+  const file = inputFile || (_recordedBlob ? new File([_recordedBlob], "recording.webm", { type: "audio/webm" }) : null);
+  if (!file) { el.innerHTML = '<span class="error">Sube un audio o graba</span>'; return; }
+  if (!text.trim()) { el.innerHTML = '<span class="error">Escribe texto</span>'; return; }
+  el.textContent = "Clonando voz y generando audio...";
+  audioEl.innerHTML = "";
+  const form = new FormData();
+  form.append("audio", file, file.name);
+  form.append("text", text);
+  form.append("voice_name", "cloned_" + Date.now());
+  try {
+    const r = await fetch(VOXTRAL + "/v1/audio/clone", { method: "POST", body: form });
+    if (!r.ok) { const errText = await r.text().catch(() => ""); el.innerHTML = '<span class="error">Error ' + r.status + '</span>'; return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    audioEl.innerHTML = '<audio controls src="' + url + '"></audio>';
+    el.innerHTML = "✅ Voz clonada: " + (blob.size/1024).toFixed(0) + " KB";
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── Poll ComfyUI for image result ───────────────────────────────────────
+async function pollComfyImage(promptId, timeout) {
+  timeout = timeout || 120;
+  for (let i = 0; i < timeout; i++) {
+    const h = await fetch("/api/comfyui/history/" + promptId);
+    const hist = await h.json();
+    if (hist[promptId] && hist[promptId].outputs) {
+      for (const nodeId in hist[promptId].outputs) {
+        const out = hist[promptId].outputs[nodeId];
+        if (out.images && out.images.length > 0) {
+          return "/api/comfyui/view?filename=" + out.images[0].filename + "&subfolder=" + (out.images[0].subfolder || "") + "&type=output";
+        }
+      }
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// COMFYUI WAN 2.1 I2V
+// ═══════════════════════════════════════════════════════════════════════
+
+// Preview imagen subida
+document.getElementById("i2v-image").addEventListener("change", function() {
+  const file = this.files[0];
+  if (file) {
+    const url = URL.createObjectURL(file);
+    const img = document.getElementById("i2v-preview");
+    img.src = url;
+    img.style.display = "block";
+  }
+});
+
+async function checkComfyModels() {
+  const el = document.getElementById("comfy-models-status");
+  el.textContent = "Verificando...";
+  try {
+    const r = await fetch("/api/comfyui/models/status");
+    const d = await r.json();
+    let lines = [];
+    for (const [name, info] of Object.entries(d)) {
+      const icon = info.ok ? "✅" : (info.installed ? "⚠️" : "❌");
+      lines.push(icon + " " + name + " (" + info.size_gb + "G / " + info.expected_gb + "G)");
+    }
+    el.innerHTML = lines.join("\n");
+  } catch(e) {
+    el.innerHTML = '<span class="error">Error: ' + e.message + '</span>';
+  }
+}
+
+async function downloadWanModels() {
+  const btn = document.getElementById("btn-download-wan");
+  const el = document.getElementById("wan-download-status");
+  btn.disabled = true;
+  el.textContent = "Iniciando descarga en background...";
+  try {
+    const r = await fetch("/api/comfyui/download-all", { method: "POST" });
+    const d = await r.json();
+    if (d.status === "already_running") {
+      el.textContent = "⚠️ Ya hay descarga en progreso: " + d.current;
+    } else {
+      el.textContent = "⬇️ Descarga iniciada. Revisando progreso...";
+      setTimeout(pollDownloadProgress, 3000);
+    }
+  } catch(e) {
+    el.innerHTML = '<span class="error">Error: ' + e.message + '</span>';
+    btn.disabled = false;
+  }
+}
+
+async function pollDownloadProgress() {
+  const el = document.getElementById("wan-download-status");
+  const btn = document.getElementById("btn-download-wan");
+  try {
+    const r = await fetch("/api/comfyui/download-status");
+    const d = await r.json();
+    let lines = [];
+    for (const [name, info] of Object.entries(d.progress)) {
+      const icon = info.status === "downloaded" ? "✅" : (info.status === "already_exists" ? "⏭️" : "❌");
+      lines.push(icon + " " + name + ": " + info.status + (info.size_gb ? " (" + info.size_gb + "G)" : ""));
+    }
+    if (d.running && d.current) {
+      lines.push("\n⬇️ Ahora: " + d.current);
+    }
+    el.innerHTML = lines.join("\n");
+    if (d.running) {
+      setTimeout(pollDownloadProgress, 15000);
+    } else {
+      btn.disabled = false;
+      setTimeout(checkComfyModels, 2000);
+    }
+  } catch(e) {
+    el.textContent = "Error: " + e.message;
+    btn.disabled = false;
+  }
+}
+
+async function generateI2V() {
+  const file = document.getElementById("i2v-image").files[0];
+  const prompt = document.getElementById("i2v-prompt").value.trim();
+  const size = document.getElementById("i2v-size").value;
+  const seconds = parseInt(document.getElementById("i2v-seconds").value);
+  const resultEl = document.getElementById("i2v-result");
+  const progressEl = document.getElementById("i2v-progress");
+  const progressBar = document.getElementById("i2v-progress-bar");
+  const progressText = document.getElementById("i2v-progress-text");
+  const videoEl = document.getElementById("i2v-video");
+  const btn = document.getElementById("btn-generate-i2v");
+
+  if (!file) { resultEl.innerHTML = '<span class="error">Sube una imagen</span>'; return; }
+  if (!prompt) { resultEl.innerHTML = '<span class="error">Escribe un prompt</span>'; return; }
+
+  const [width, height] = size.split("x").map(Number);
+  const length = seconds * 16 + 1;
+
+  btn.disabled = true;
+  resultEl.textContent = "Preparando...";
+  progressEl.style.display = "block";
+  videoEl.style.display = "none";
+  progressBar.style.width = "5%";
+
+  let imgName = null;
+
+  try {
+    // 1. Upload image to ComfyUI
+    progressText.textContent = "Subiendo imagen...";
+    const imgForm = new FormData();
+    imgForm.append("image", file, file.name);
+    const uploadResp = await fetch("/api/comfyui/upload/image", { method: "POST", body: imgForm });
+    if (!uploadResp.ok) {
+      throw new Error("Error subiendo imagen: " + uploadResp.status);
+    }
+    const uploadText = await uploadResp.text();
+    if (!uploadText || uploadText.trim() === "") {
+      throw new Error("Respuesta vacía al subir imagen");
+    }
+    const uploadData = JSON.parse(uploadText);
+    imgName = uploadData.name;
+    if (!imgName) {
+      throw new Error("No se obtuvo nombre de imagen");
+    }
+
+    progressBar.style.width = "15%";
+    progressText.textContent = "Enviando workflow a GPU...";
+
+    // 2. Workflow usando WanVideoWrapper nodes (los que detectó ComfyUI)
+    const workflow = {
+      "1": { "class_type": "WanVideoModelLoader", "inputs": { "model": "wan2.1-i2v-14b-480p-Q3_K_S.gguf", "base_precision": "bf16", "quantization": "disabled", "load_device": "offload_device", "attention_mode": "sdpa" } },
+      "2": { "class_type": "LoadWanVideoT5TextEncoder", "inputs": { "model_name": "umt5_xxl_fp16.safetensors", "precision": "fp16", "load_device": "offload_device" } },
+      "3": { "class_type": "WanVideoTextEncode", "inputs": { "positive_prompt": prompt, "negative_prompt": "blur, low quality, static", "t5": ["2", 0], "force_offload": true } },
+      "4": { "class_type": "WanVideoVAELoader", "inputs": { "model_name": "wan_2.1_vae.safetensors", "precision": "fp16" } },
+      "5": { "class_type": "LoadImage", "inputs": { "image": imgName } },
+      "6": { "class_type": "WanVideoImageToVideoEncode", "inputs": { "vae": ["4", 0], "start_image": ["5", 0], "width": Math.min(width, 320), "height": Math.min(height, 320), "num_frames": Math.min(length, 5), "force_offload": true, "noise_aug_strength": 0.02, "start_latent_strength": 1.0, "end_latent_strength": 1.0 } },
+      "7": { "class_type": "WanVideoSampler", "inputs": { "model": ["1", 0], "image_embeds": ["6", 0], "text_embeds": ["3", 0], "steps": 2, "cfg": 5.0, "shift": 3.0, "seed": 42, "scheduler": "unipc", "riflex_freq_index": 0, "force_offload": true } },
+      "8": { "class_type": "WanVideoDecode", "inputs": { "vae": ["4", 0], "samples": ["7", 0], "enable_vae_tiling": true, "tile_x": 64, "tile_y": 64, "tile_stride_x": 32, "tile_stride_y": 32 } },
+      "9": { "class_type": "VHS_VideoCombine", "inputs": { "images": ["8", 0], "frame_rate": 4, "loop_count": 0, "filename_prefix": "Wan2.1_I2V", "format": "video/h264-mp4", "pixel_format": "yuv420p", "crf": 20, "save_metadata": false, "pingpong": false, "save_output": true } }
+    };
+
+    const promptResp = await fetch("/api/comfyui/prompt", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ prompt: workflow }),
+    });
+
+    if (!promptResp.ok) {
+      const errText = await promptResp.text();
+      throw new Error("Error enviando workflow: " + promptResp.status + " " + errText.slice(0,200));
+    }
+
+    const promptText = await promptResp.text();
+    if (!promptText || promptText.trim() === "") {
+      throw new Error("Respuesta vacía del servidor");
+    }
+    const promptData = JSON.parse(promptText);
+    const promptId = promptData.prompt_id;
+
+    if (!promptId) {
+      throw new Error("No se obtuvo prompt_id: " + JSON.stringify(promptData).slice(0,200));
+    }
+
+    progressBar.style.width = "30%";
+    progressText.textContent = "Generando video en GPU... (puede tardar varios minutos)";
+
+    // 3. Poll for result
+    const maxWait = 600;
+    let videoBlob = null;
+    let pollErrors = 0;
+    for (let i = 0; i < maxWait; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const h = await fetch("/api/comfyui/history/" + promptId);
+        const histText = await h.text();
+        if (!histText || histText.trim() === "") { pollErrors++; continue; }
+        const hist = JSON.parse(histText);
+        if (hist[promptId]) {
+          pollErrors = 0; // Reset on successful response
+          const entry = hist[promptId];
+          // Check for execution error in messages
+          const messages = entry.status?.messages || [];
+          for (const msg of messages) {
+            if (msg[0] === "execution_error") {
+              const errMsg = msg[1]?.exception_message || "Error desconocido";
+              throw new Error("Error en generación: " + errMsg.substring(0, 200));
+            }
+          }
+          if (entry.outputs) {
+            for (const nodeId in entry.outputs) {
+              const output = entry.outputs[nodeId];
+              if (output.videos && output.videos.length > 0) {
+                const vidInfo = output.videos[0];
+                const videoUrl = "/api/comfyui/view?filename=" + vidInfo.filename + "&subfolder=" + (vidInfo.subfolder || "") + "&type=output&format=video";
+                const resp = await fetch(videoUrl);
+                videoBlob = await resp.blob();
+                break;
+              }
+            }
+          }
+          if (videoBlob) break;
+        }
+      } catch(e) {
+        pollErrors++;
+        if (pollErrors <= 3) {
+          console.warn("Poll error (" + pollErrors + "):", e.message);
+        }
+      }
+      progressBar.style.width = Math.min(30 + (i / maxWait) * 65, 95);
+      progressText.textContent = "Generando... (" + (i*3) + "s)";
+    }
+
+    if (videoBlob) {
+      const url = URL.createObjectURL(videoBlob);
+      videoEl.src = url;
+      videoEl.style.display = "block";
+      resultEl.innerHTML = "✅ Video generado (" + (videoBlob.size/1024/1024).toFixed(1) + "MB) | " + width + "×" + height + " | " + seconds + "s";
+    } else {
+      resultEl.innerHTML = '<span class="error">Timeout esperando video (10 min)</span>';
+    }
+
+  } catch(e) {
+    resultEl.innerHTML = '<span class="error">Error: ' + e.message + '</span>';
+    console.error("I2V error:", e);
+  }
+
+  progressEl.style.display = "none";
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>
