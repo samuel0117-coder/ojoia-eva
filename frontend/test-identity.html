@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prueba Identity Wan — ESP32-CAM</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff;min-height:100dvh}
+.header{background:#1c1c1e;padding:16px;text-align:center;border-bottom:1px solid #333}
+.header h1{font-size:1.2rem;color:#0a84ff}
+.header .sub{font-size:.75rem;color:#888;margin-top:4px}
+.container{padding:16px;max-width:800px;margin:0 auto}
+.row{margin-bottom:12px}
+label{display:block;font-size:.8rem;color:#888;margin-bottom:6px}
+input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #333;background:#1c1c1e;color:#fff;font-size:.9rem}
+video,img{width:100%;border-radius:12px;background:#111;display:block}
+.btn{padding:12px;border-radius:8px;border:none;cursor:pointer;font-size:.9rem;font-weight:600;width:100%;margin-bottom:8px}
+.btn-primary{background:#0a84ff;color:#fff}
+.btn-success{background:#30d158;color:#000}
+.btn-danger{background:#ff453a;color:#fff}
+.btn-ghost{background:transparent;color:#0a84ff;border:1px solid #0a84ff}
+.badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:.7rem;font-weight:700}
+.badge-ok{background:rgba(48,209,88,.15);color:#30d158}
+.badge-warn{background:rgba(255,214,10,.15);color:#ffd60a}
+.badge-err{background:rgba(255,69,58,.15);color:#ff453a}
+.log{background:#111;border-radius:8px;padding:12px;font-family:monospace;font-size:.75rem;max-height:300px;overflow-y:auto;white-space:pre-wrap;color:#aaa;border:1px solid #222}
+.log .info{color:#0a84ff}
+.log .ok{color:#30d158}
+.log .err{color:#ff453a}
+.log .warn{color:#ffd60a}
+.card{background:#1c1c1e;border:1px solid #333;border-radius:12px;padding:14px;margin-bottom:12px}
+.card h3{font-size:.85rem;color:#888;text-transform:uppercase;margin-bottom:8px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.status-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+#previewWrap{position:relative}
+#previewWrap .overlay{position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,.7);padding:4px 8px;border-radius:6px;font-size:.7rem}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🧪 Prueba Identity Wan</h1>
+  <div class="sub">ESP32-CAM + Reconocimiento Facial</div>
+</div>
+
+<div class="container">
+
+  <div class="status-bar" id="statusBar">
+    <span class="badge badge-warn" id="badge-CAM">● CAM</span>
+    <span class="badge badge-warn" id="badge-IDW">● IDW</span>
+    <span class="badge badge-warn" id="badge-FACE">● FACE</span>
+  </div>
+
+  <div class="card">
+    <h3>📷 Cámara</h3>
+    <div class="row">
+      <label>Cámara</label>
+      <select id="camSelect"><option value="">Cargando...</option></select>
+    </div>
+    <div class="row">
+      <button class="btn btn-primary" onclick="captureFrame()">📸 Capturar Frame</button>
+    </div>
+    <div id="previewWrap">
+      <img id="preview" src="" alt="Preview" style="display:none">
+      <div class="overlay" id="previewInfo" style="display:none"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>👤 Registrar Cara</h3>
+    <div class="row">
+      <label>Persona / Project ID</label>
+      <input id="projectId" placeholder="ej: juan_perez" value="test_project">
+    </div>
+    <div class="grid2">
+      <button class="btn btn-success" onclick="encodeFace()">🔐 Codificar Cara</button>
+      <button class="btn btn-ghost" onclick="checkHealth()">💓 Health Check</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>🎬 Generar Video (Wan I2V)</h3>
+    <div class="row">
+      <label>Prompt</label>
+      <input id="wanPrompt" value="subtle cinematic movement, keep identity consistent">
+    </div>
+    <div class="grid2">
+      <div>
+        <label>Frames</label>
+        <input id="wanFrames" type="number" value="16" min="1" max="121">
+      </div>
+      <div>
+        <label>Steps</label>
+        <input id="wanSteps" type="number" value="8" min="1" max="50">
+      </div>
+    </div>
+    <div class="row">
+      <label>Face Image Path (opcional)</label>
+      <input id="faceImagePath" placeholder="/ruta/a/cara.jpg">
+    </div>
+    <div class="grid2">
+      <button class="btn btn-primary" onclick="submitFaceIdJob()">🎥 Wan + FaceID</button>
+      <button class="btn btn-primary" onclick="submitIPAdapterJob()" style="background:#555">🖼️ Wan + IP-Adapter</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📋 Log</h3>
+    <div class="log" id="log" style="min-height:150px">Listo...</div>
+    <button class="btn btn-ghost" onclick="clearLog()" style="margin-top:8px">Limpiar</div>
+  </div>
+
+</div>
+
+<script>
+const API = 'http://localhost:8005';
+const IDW = 'http://localhost:8025';
+
+const logEl = document.getElementById('log');
+
+function log(msg, type='') {
+  const t = new Date().toLocaleTimeString('es-DO');
+  const cls = type ? ` class="${type}"` : '';
+  logEl.innerHTML += `<div${cls}>[${t}] ${msg}</div>`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function clearLog() { logEl.innerHTML = ''; log('Log limpiado', 'info'); }
+
+function setBadge(id, state) {
+  const el = document.getElementById('badge-' + id);
+  if (!el) return;
+  el.className = 'badge badge-' + (state === 'ok' ? 'ok' : state === 'err' ? 'err' : 'warn');
+  el.textContent = (state === 'ok' ? '✓' : state === 'err' ? '✗' : '○') + ' ' + id;
+}
+
+// ── load cameras ────────────────────────────────────────────
+
+async function loadCameras() {
+  try {
+    const r = await fetch(`${API}/api/cameras?user_id=z6q9KStIs1boz31q2fiHJREPBMH2`);
+    const d = await r.json();
+    const sel = document.getElementById('camSelect');
+    sel.innerHTML = '';
+    (d.cameras || []).forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.camera_id;
+      opt.textContent = `${c.name} (${c.camera_id})`;
+      sel.appendChild(opt);
+    });
+    log(`Cargadas ${(d.cameras||[]).length} cámaras`, 'ok');
+    setBadge('CAM','ok');
+  } catch(e) {
+    log(`Error cargando cámaras: ${e.message}`, 'err');
+    setBadge('CAM','err');
+  }
+}
+
+// ── capture frame ───────────────────────────────────────────
+
+async function captureFrame() {
+  const camId = document.getElementById('camSelect').value;
+  if (!camId) { log('Selecciona una cámara', 'warn'); return; }
+  log(`Capturando frame de ${camId}...`, 'info');
+  try {
+    const r = await fetch(`${API}/frames/latest?camera_id=${camId}&user_id=z6q9KStIs1boz31q2fiHJREPBMH2&_=${Date.now()}`);
+    const d = await r.json();
+    if (d.success && d.image_b64) {
+      document.getElementById('preview').src = `data:image/jpeg;base64,${d.image_b64}`;
+      document.getElementById('preview').style.display = 'block';
+      document.getElementById('previewInfo').style.display = 'block';
+      document.getElementById('previewInfo').textContent = `${camId} · ${new Date().toLocaleTimeString()}`;
+      log(`Frame capturado OK (${Math.round(d.image_b64.length/1024)}KB)`, 'ok');
+    } else {
+      log(`Sin imagen: ${JSON.stringify(d)}`, 'warn');
+    }
+  } catch(e) {
+    log(`Error: ${e.message}`, 'err');
+  }
+}
+
+// ── health check ────────────────────────────────────────────
+
+async function checkHealth() {
+  log('Verificando servicios...', 'info');
+  try {
+    const r = await fetch(`${IDW}/health`);
+    const d = await r.json();
+    log(`IDW health: ${JSON.stringify(d)}`, 'ok');
+    setBadge('IDW','ok');
+  } catch(e) {
+    log(`IDW no responde: ${e.message}`, 'err');
+    setBadge('IDW','err');
+  }
+}
+
+// ── encode face ─────────────────────────────────────────────
+
+async function encodeFace() {
+  const projectId = document.getElementById('projectId').value || 'test';
+  const img = document.getElementById('preview');
+  if (!img.src || img.style.display === 'none') {
+    log('Primero captura un frame', 'warn');
+    return;
+  }
+  log(`Codificando cara proyecto=${projectId}...`, 'info');
+  try {
+    const r = await fetch(`${IDW}/api/identity/lynx/encode-face`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        project_id: projectId,
+        face_image_path: `/tmp/face_${projectId}.jpg`,
+      }),
+    });
+    const d = await r.json();
+    log(`Encode face: ${JSON.stringify(d)}`, d.status === 'ok' ? 'ok' : 'warn');
+    setBadge('FACE', d.status === 'ok' ? 'ok' : 'warn');
+  } catch(e) {
+    log(`Error encode face: ${e.message}`, 'err');
+    setBadge('FACE','err');
+  }
+}
+
+// ── submit wan jobs ─────────────────────────────────────────
+
+async function submitJob(endpoint) {
+  const camId = document.getElementById('camSelect').value;
+  if (!camId) { log('Selecciona una cámara', 'warn'); return; }
+  const projectId = document.getElementById('projectId').value || 'test';
+  const prompt = document.getElementById('wanPrompt').value;
+  const frames = parseInt(document.getElementById('wanFrames').value) || 16;
+  const steps = parseInt(document.getElementById('wanSteps').value) || 8;
+  const facePath = document.getElementById('faceImagePath').value;
+
+  log(`Enviando job ${endpoint}...`, 'info');
+  try {
+    const body = {
+      project_id: projectId,
+      shot_id: '01_01',
+      image_path: `/tmp/wan_${camId}_${Date.now()}.png`,
+      prompt,
+      frames,
+      steps,
+      identity_mode: endpoint.includes('faceid') ? 'faceid' : 'ipadapter',
+    };
+    if (facePath) body.face_image_path = facePath;
+
+    const r = await fetch(`${IDW}${endpoint}`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.job_id) {
+      log(`Job enviado: ${d.job_id}`, 'ok');
+      pollJob(d.job_id, endpoint.includes('faceid') ? 'faceid' : 'ipadapter');
+    } else {
+      log(`Error: ${JSON.stringify(d)}`, 'err');
+    }
+  } catch(e) {
+    log(`Error submit: ${e.message}`, 'err');
+  }
+}
+
+function submitFaceIdJob() { submitJob('/api/wan/i2v-faceid/submit'); }
+function submitIPAdapterJob() { submitJob('/api/wan/i2v-ipadapter/submit'); }
+
+async function pollJob(jobId, mode) {
+  const st = setInterval(async () => {
+    try {
+      const r = await fetch(`${IDW}/api/wan/i2v-${mode}/status/${jobId}`);
+      const d = await r.json();
+      log(`Job ${d.status} (${d.progress || 0}%)`, d.status === 'done' ? 'ok' : d.status === 'error' ? 'err' : 'info');
+      if (d.status === 'done' || d.status === 'error') {
+        clearInterval(st);
+        if (d.status === 'done') log(`Output: ${d.output_path}`, 'ok');
+      }
+    } catch(e) {
+      clearInterval(st);
+      log(`Error poll: ${e.message}`, 'err');
+    }
+  }, 2000);
+}
+
+// ── init ────────────────────────────────────────────────────
+
+loadCameras();
+checkHealth();
+log('App de prueba lista', 'ok');
+</script>
+</body>
+</html>
