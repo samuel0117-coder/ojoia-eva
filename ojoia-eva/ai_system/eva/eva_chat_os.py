@@ -478,14 +478,17 @@ REGLAS:
                             all_events.append({
                                 "event_id": evt["event_id"], "datetime": evt["datetime"],
                                 "camera_name": evt["camera_name"], "description": evt["description"],
-                                "persons": evt["persons"], "frame_url": evt["frame_url"],
+                                "summary": evt.get("description", ""),
+                                "persons": evt["persons"], "frame_url": evt.get("frame_url", ""),
+                                "thumb_url": evt.get("thumb_url", ""),
                                 "anomaly": evt.get("anomaly", False)
                             })
                     elif tool_name == "find_person":
                         for m in tool_result.get("event_matches", []):
                             all_events.append({
                                 "datetime": m["datetime"], "camera_name": m["camera_name"],
-                                "description": m["person_description"], "frame_url": m["frame_url"],
+                                "description": m["person_description"], "frame_url": m.get("frame_url", ""),
+                                "thumb_url": m.get("thumb_url", ""),
                                 "event_type": m.get("event_type", "normal")
                             })
 

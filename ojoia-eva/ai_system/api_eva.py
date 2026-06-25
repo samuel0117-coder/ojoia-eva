@@ -358,6 +358,12 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
             if latest_vig.exists():
                 frame_bytes = latest_vig.read_bytes()
                 last_cam = camera_id
+            else:
+                frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                latest_raw = frames_dir / "latest_raw.jpg"
+                if latest_raw.exists():
+                    frame_bytes = latest_raw.read_bytes()
+                    last_cam = camera_id
         except:
             pass
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
@@ -382,11 +388,31 @@ async def get_latest_frame_jpg(camera_id: Optional[str] = None, user_id: Optiona
             latest_vig = events_dir / "latest_vigilance.jpg"
             if latest_vig.exists():
                 frame_bytes = latest_vig.read_bytes()
+            else:
+                frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                latest_raw = frames_dir / "latest_raw.jpg"
+                if latest_raw.exists():
+                    frame_bytes = latest_raw.read_bytes()
         except:
             pass
     if not frame_bytes:
         return Response(status_code=204)
     return Response(content=frame_bytes, media_type="image/jpeg", headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+@app.get("/frames/latest-raw.jpg")
+async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[str] = None):
+    """Frame en vivo más reciente (siempre se guarda, sin importar YOLO)."""
+    if not camera_id or not user_id:
+        return Response(status_code=204)
+    try:
+        frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+        latest_raw = frames_dir / "latest_raw.jpg"
+        if latest_raw.exists():
+            frame_bytes = latest_raw.read_bytes()
+            return Response(content=frame_bytes, media_type="image/jpeg", headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+    except:
+        pass
+    return Response(status_code=204)
 
 @app.get("/grid/latest")
 async def get_latest_grid(partial: int = 1, camera_id: Optional[str] = None, user_id: Optional[str] = None):
@@ -720,7 +746,7 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
                     ev["frame_b64"] = base64.b64encode(resized).decode()
                 except Exception as e:
                     pass
-            ev["thumb_url"] = f"https://api.ojoia.com.do/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
+            ev["thumb_url"] = f"/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
             events.append(ev)
     return {"events": events}
 
@@ -732,7 +758,11 @@ async def get_event_thumb(event_id: str, user_id: str = None):
     from PIL import Image as PILImage
     import io
     base = Path(STORAGE_ROOT) / "users"
-    search_dirs = [base / user_id / "cameras"] if user_id else [d / "cameras" for d in base.iterdir() if d.is_dir()]
+    search_dirs = []
+    if user_id and user_id != "default":
+        search_dirs.append(base / user_id / "cameras")
+    if not search_dirs:
+        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
     for cam_base in search_dirs:
         if not cam_base.exists():
             continue
@@ -1042,6 +1072,15 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         # 3. Ajustar brillo para YOLO (siempre, para que detecte mejor)
         yolo_bytes = _adjust_brightness(img_bytes)
+
+        # 3b. Guardar frame más reciente para el viewer (SIEMPRE, sin importar modo)
+        try:
+            frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            with open(frames_dir / "latest_raw.jpg", "wb") as f:
+                f.write(img_bytes)
+        except Exception:
+            pass
 
         # 4. YOLO detection - detectar CUALQUIER objeto con conf >= 0.25
         yolo_count = 0
@@ -1396,7 +1435,7 @@ def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count:
 
 def _update_camera_last_frame(user_id: str, camera_id: str):
     """Actualizar last_frame de una cámara en user.json."""
-    if not user_id or user_id == "default":
+    if not user_id:
         return
     try:
         uf = find_user_json(user_id)

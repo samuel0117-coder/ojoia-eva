@@ -1,26 +1,822 @@
 """
 eva/tools.py — Herramientas que Eva puede invocar durante el chat.
 
-Cada función es una "tool" que el LLM puede llamar cuando el usuario
-hace una pregunta o pide una acción. Eva decide qué tool usar basándose
-en el mensaje del usuario y el contexto del negocio.
+Tools para configuración (SETUP mode):
+- save_business_data: Guarda un dato del negocio extraído de la conversación
+- save_camera_config: Guarda la configuración de una cámara
+- get_latest_frame: Obtiene imagen reciente de una cámara
+- analyze_frame: Analiza la imagen actual con Eva
 
-Todas las tools leen/escriben en:
-  - /storage/users/{uid}/business.json  (RAG principal)
-  - /storage/users/{uid}/cameras/{cid}/events/{eid}.json  (eventos)
+Tools para consulta (OS mode):
+- search_events: Busca eventos por query/fecha/cámara en el diario JSON rico
+- get_activity_summary: Resume la actividad de un día
+- find_anomalias: Encuentra actividad sospechosa por severidad
 """
-
 import json
-import os
-import time
 import logging
-from datetime import datetime, timedelta
+import re
+import time
+from datetime import date as _date, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Dict, List, Any
+from eva.camera_builder import normalize_camera_vigilance_config, build_vigilance_prompt
 
 logger = logging.getLogger(__name__)
-
 STORAGE_ROOT = Path("/home/sam/storage")
+
+
+# ═══════════════════════════════════════════════════════════════
+# TOOLS PARA SETUP
+# ═══════════════════════════════════════════════════════════════
+
+async def tool_save_business_data(user_id: str, field: str, value: str) -> dict:
+    """Guarda un dato del negocio."""
+    try:
+        uf = STORAGE_ROOT / "users" / user_id / "user.json"
+        user_data = json.loads(uf.read_text()) if uf.exists() else {
+            "user_id": user_id, "owner": {}, "business_name": "",
+            "business_type": "", "schedule": {"open": "07:00", "close": "19:00"},
+            "main_concerns": [], "cameras": {},
+        }
+        if field == "business_name":
+            user_data["business_name"] = value
+        elif field == "business_type":
+            user_data["business_type"] = value
+        elif field == "owner_name":
+            user_data.setdefault("owner", {})["name"] = value
+        elif field == "concern":
+            user_data.setdefault("main_concerns", []).append(value)
+        elif field == "schedule_open":
+            user_data.setdefault("schedule", {})["open"] = value
+        elif field == "schedule_close":
+            user_data.setdefault("schedule", {})["close"] = value
+        else:
+            user_data[field] = value
+        tmp = uf.with_suffix(".tmp")
+        tmp.write_text(json.dumps(user_data, indent=2, ensure_ascii=False))
+        tmp.replace(uf)
+        return {"success": True, "field": field, "value": value}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def tool_save_camera_config(user_id: str, camera_id: str, **kwargs) -> dict:
+    """Guarda la configuración de una cámara."""
+    try:
+        cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        cam_dir.mkdir(parents=True, exist_ok=True)
+        cam_file = cam_dir / "camera.json"
+        config = json.loads(cam_file.read_text()) if cam_file.exists() else {}
+        config.update(kwargs)
+        cam_file.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+        return {"success": True, "camera_id": camera_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _load_camera_config(user_id: str, camera_id: str) -> dict:
+    cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+    if cam_file.exists():
+        return json.loads(cam_file.read_text())
+    return {"camera_id": camera_id, "zone": "zona principal", "schedule": {"open": "08:00", "close": "22:00"}}
+
+
+def _save_camera_config(user_id: str, camera_id: str, config: dict):
+    cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+    cam_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cam_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    tmp.replace(cam_file)
+
+
+def _merge_config(base: dict, incoming: dict) -> dict:
+    result = dict(base or {})
+    for key, value in (incoming or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _parse_config_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    return value
+
+
+async def tool_get_vigilance_config(user_id: str, camera_id: str = "") -> dict:
+    """Obtiene configuración de protección de una cámara."""
+    try:
+        if not camera_id:
+            cams = sorted((STORAGE_ROOT / "users" / user_id / "cameras").iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            camera_id = cams[0].name if cams else ""
+        config = normalize_camera_vigilance_config(_load_camera_config(user_id, camera_id))
+        mode = "sentinel" if _is_vigilance_mode(config.get("schedule", {}), config.get("vigilance", {})) else "normal"
+        return {
+            "success": True,
+            "camera_id": camera_id,
+            "mode": mode,
+            "system_prompt": config.get("system_prompt", ""),
+            "vigilance": config.get("vigilance", {}),
+            "schedule": config.get("schedule", {}),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def tool_update_vigilance_config(user_id: str, camera_id: str, vigilance: dict = None,
+                                       schedule: dict = None, mode: str = None,
+                                       system_prompt: str = None) -> dict:
+    """Actualiza configuración de protección y regenera el prompt."""
+    try:
+        if not camera_id:
+            cams = sorted((STORAGE_ROOT / "users" / user_id / "cameras").iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            camera_id = cams[0].name if cams else ""
+        if not camera_id:
+            return {"success": False, "error": "No hay cámaras configuradas"}
+        config = normalize_camera_vigilance_config(_load_camera_config(user_id, camera_id))
+        if schedule:
+            config["schedule"] = _merge_config(config.get("schedule", {}), schedule)
+        if vigilance:
+            config["vigilance"] = _merge_config(config.get("vigilance", {}), vigilance)
+        current_mode = mode or ("sentinel" if _is_vigilance_mode(config.get("schedule", {}), config.get("vigilance", {})) else "normal")
+        config["system_prompt"] = system_prompt if system_prompt else build_vigilance_prompt(config, current_mode)
+        _save_camera_config(user_id, camera_id, config)
+        return {
+            "success": True,
+            "camera_id": camera_id,
+            "mode": current_mode,
+            "system_prompt": config.get("system_prompt", ""),
+            "vigilance": config.get("vigilance", {}),
+            "schedule": config.get("schedule", {}),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _is_vigilance_mode(schedule: dict, vigilance: dict) -> bool:
+    try:
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        open_h, open_m = map(int, (schedule or {}).get("open", "08:00").split(":"))
+        close_h, close_m = map(int, (schedule or {}).get("close", "22:00").split(":"))
+        grace = int((vigilance or {}).get("grace_minutes", 15))
+        close_dt = datetime(now.year, now.month, now.day, close_h, close_m) + timedelta(minutes=grace)
+        open_dt = datetime(now.year, now.month, now.day, open_h, open_m)
+        return now < open_dt or now >= close_dt
+    except Exception:
+        return False
+
+
+async def tool_get_latest_frame(user_id: str, camera_id: str = "") -> dict:
+    """Obtiene la imagen más reciente de una cámara."""
+    base = STORAGE_ROOT / "users" / user_id / "cameras"
+    if not base.exists():
+        return {"has_frame": False}
+    dirs = [base / camera_id] if camera_id else sorted(base.iterdir(), key=lambda d: d.stat().st_mtime if d.is_dir() else 0, reverse=True)
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        latest = d / "latest_vigilance.jpg" if (d / "latest_vigilance.jpg").exists() else None
+        if not latest:
+            jpgs = sorted(d.glob("**/*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+            latest = jpgs[0] if jpgs else None
+        if latest:
+            return {"has_frame": True, "frame_path": str(latest), "camera_id": d.name}
+    return {"has_frame": False}
+
+
+async def tool_analyze_frame(user_id: str, camera_id: str = "", prompt: str = "") -> dict:
+    """Analiza una imagen con Eva."""
+    try:
+        import httpx, base64
+        frame_info = await tool_get_latest_frame(user_id, camera_id)
+        if not frame_info.get("has_frame"):
+            return {"success": False, "error": "No hay imagen disponible"}
+        with open(frame_info["frame_path"], "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        if not prompt:
+            prompt = "Describe detalladamente lo que ves en esta imagen de seguridad."
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "http://localhost:8004/v1/chat/completions",
+                json={"model": "qwen", "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text", "text": prompt}
+                ]}], "max_tokens": 300},
+            )
+            resp.raise_for_status()
+            analysis = resp.json()["choices"][0]["message"]["content"]
+        return {"success": True, "analysis": analysis, "camera_id": frame_info.get("camera_id", camera_id)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# TOOLS PARA FACE ID
+# ═══════════════════════════════════════════════════════════════
+
+async def tool_identify_face(user_id: str, camera_id: str = "") -> dict:
+    """Identifica quién aparece en el frame actual de una cámara."""
+    try:
+        import httpx, base64
+        frame_info = await tool_get_latest_frame(user_id, camera_id)
+        if not frame_info.get("has_frame"):
+            return {"success": False, "error": "No hay imagen disponible"}
+        with open(frame_info["frame_path"], "rb") as f:
+            frame_b64 = base64.b64encode(f.read()).decode()
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "http://localhost:8005/api/identity/identify-frame",
+                json={"user_id": user_id, "frame_b64": frame_b64, "threshold": 0.45},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        identified = data.get("identified", [])
+        if identified:
+            person = identified[0]
+            return {
+                "success": True,
+                "identified": True,
+                "person_name": person.get("person_name", "desconocido"),
+                "person_id": person.get("person_id", ""),
+                "confidence": person.get("confidence", 0),
+                "message": f"Vi a {person.get('person_name', 'alguien')} (confianza: {person.get('confidence', 0):.0%})",
+            }
+        return {
+            "success": True,
+            "identified": False,
+            "message": "Vi a una persona pero no está registrada como empleado.",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def tool_list_employees(user_id: str) -> dict:
+    """Lista los empleados registrados con faceid."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"http://localhost:8005/api/identity/employees?user_id={user_id}",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        employees = data.get("employees", [])
+        if employees:
+            names = ", ".join(e.get("person_name", "?") for e in employees)
+            return {
+                "success": True,
+                "count": len(employees),
+                "employees": employees,
+                "message": f"Hay {len(employees)} empleado(s) registrado(s): {names}.",
+            }
+        return {
+            "success": True,
+            "count": 0,
+            "employees": [],
+            "message": "No hay empleados registrados con faceid.",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def _iter_events(user_id: str, camera_id: str = None, date_filter: str = None):
+    """Iterador sobre eventos del diario con filtros."""
+    base = STORAGE_ROOT / "users" / user_id / "cameras"
+    if not base.exists():
+        return
+    cam_dirs = [base / camera_id] if camera_id and (base / camera_id).exists() else base.iterdir()
+    for cam_dir in cam_dirs:
+        if not cam_dir.is_dir():
+            continue
+        events_dir = cam_dir / "events"
+        if not events_dir.exists():
+            continue
+        for evt_file in sorted(events_dir.glob("*.json"), key=lambda p: (json.loads(p.read_text()).get("timestamp", 0) if p.name.endswith(".json") else 0), reverse=True):
+            try:
+                evt = json.loads(evt_file.read_text())
+                if date_filter:
+                    evt_date = evt.get("datetime", "")[:10]
+                    evt_ts = int(evt.get("timestamp", 0) or 0)
+                    if date_filter == "today" and evt_date != _date.today().isoformat():
+                        continue
+                    if date_filter == "yesterday" and evt_date != (_date.today() - timedelta(days=1)).isoformat():
+                        continue
+                    if date_filter == "recent" and evt_ts < int(time.time()) - 24 * 60 * 60:
+                        continue
+                    if date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
+                        continue
+                yield evt, cam_dir.name
+            except Exception:
+                pass
+
+
+def _parse_json_text(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    text = value.strip()
+    if not text:
+        return {}
+    text = re.sub(r"\{[\s]*\.\.\.[\s]*\}", "{}", text)
+    text = re.sub(r"\[[\s]*\.\.\.[\s]*\]", "[]", text)
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+    for key in ("summary", "description"):
+        key_match = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        if key_match:
+            try:
+                return {key: json.loads('"' + key_match.group(1) + '"')}
+            except Exception:
+                return {key: key_match.group(1)}
+    return {}
+
+
+def _event_qwen(evt: dict) -> dict:
+    q = evt.get("qwen", {}) if isinstance(evt.get("qwen"), dict) else {}
+    qj = evt.get("qwen_json", {}) if isinstance(evt.get("qwen_json"), dict) else {}
+    parsed = _parse_json_text(evt.get("summary"))
+    parsed_desc = _parse_json_text(evt.get("description"))
+    merged = {}
+    for source in (parsed_desc, parsed, q, qj):
+        if isinstance(source, dict):
+            merged.update(source)
+    if not merged and evt.get("event_type") in ("vigilance_alert", "night_alert"):
+        classes = evt.get("yolo_classes") or []
+        if isinstance(classes, str):
+            classes = [c.strip() for c in classes.split(",") if c.strip()]
+        count = evt.get("yolo_count") or len(classes) or 0
+        summary = evt.get("description") or f"Modo centinela: {count} objeto(s) detectado(s): {', '.join(classes)}"
+        merged.update({
+            "summary": summary,
+            "description": summary,
+            "violation": True,
+            "importance": "alta",
+            "importancia": "alta",
+            "mode": "centinela",
+            "details": {"persons": count},
+            "anomalias": [{"tipo": "objeto en centinela", "descripcion": summary, "severidad": "alta"}],
+        })
+    for key in ("summary", "description"):
+        if isinstance(merged.get(key), str):
+            nested = _parse_json_text(merged[key])
+            if nested.get("summary"):
+                merged[key] = nested["summary"]
+            elif nested.get("description"):
+                merged[key] = nested["description"]
+    if "importance" in merged and "importancia" not in merged:
+        merged["importancia"] = merged["importance"]
+    return merged
+
+
+def _enrich_description_from_metadata(evt: dict, desc: str, qj: dict) -> str:
+    metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+    yolo_classes = metadata.get("yolo_classes") or evt.get("yolo_classes") or []
+    if isinstance(yolo_classes, str):
+        yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
+    total_yolo = int(metadata.get("total_yolo_objects") or evt.get("total_yolo_objects") or 0 or 0)
+    person_count = sum(1 for c in yolo_classes if str(c).lower() == "person") if isinstance(yolo_classes, list) else 0
+    if not person_count and total_yolo > 0:
+        person_count = max(1, total_yolo)
+    qj_details = qj.get("details") if isinstance(qj.get("details"), dict) else {}
+    fallback_details = metadata.get("qwen_details") if isinstance(metadata.get("qwen_details"), dict) else {}
+    if not qj_details and isinstance(fallback_details, dict):
+        qj_details = fallback_details
+    generic_markers = ["escena tranquila", "escena repetitiva", "sin personas", "ninguna persona",
+                       "personas adicionales", "sin actividad sospechosa", "con ninguna actividad"]
+    is_generic = any(m in desc.lower() for m in generic_markers)
+    parts = []
+    if person_count > 0 and not qj_details.get("persons_description"):
+        parts.append(f"YOLO detectó {person_count} persona(s) en el grid; Qwen no distinguió más detalles visibles.")
+    if qj_details.get("persons_description"):
+        parts.append(str(qj_details["persons_description"]))
+    if qj_details.get("scene_context"):
+        parts.append(str(qj_details["scene_context"]))
+    for key in ("actions_visible", "objects_visible", "clothing_visible"):
+        v = qj_details.get(key)
+        if isinstance(v, list) and v:
+            parts.append(", ".join(str(x) for x in v))
+        elif v:
+            parts.append(str(v))
+    tags = qj.get("search_tags") or metadata.get("qwen_search_tags") or []
+    if tags:
+        parts.append(", ".join(str(t) for t in tags))
+    detail_text = " ".join(parts).strip()
+    if is_generic and detail_text:
+        return f"{detail_text} {desc}".strip()
+    return " ".join([x for x in [desc, detail_text] if x]).strip() or "Sin descripción"
+
+
+def _event_description_simple(evt: dict) -> str:
+    qj = _event_qwen(evt)
+    desc = qj.get("summary") or qj.get("description") or evt.get("description") or evt.get("summary") or ""
+    if isinstance(desc, dict):
+        desc = json.dumps(desc, ensure_ascii=False)
+    desc = str(desc).strip()
+    return _enrich_description_from_metadata(evt, desc, qj)
+
+
+def _event_description(evt: dict) -> str:
+    qj = _event_qwen(evt)
+    desc = qj.get("summary") or qj.get("description") or evt.get("description") or evt.get("summary") or ""
+    if isinstance(desc, dict):
+        desc = json.dumps(desc, ensure_ascii=False)
+    desc = str(desc).strip()
+    try:
+        from orchestrator import _description_detail_parts, _is_generic_qwen_summary
+    except Exception:
+        return _enrich_description_from_metadata(evt, desc, qj)
+    desc = qj.get("summary") or qj.get("description") or evt.get("description") or evt.get("summary") or ""
+    detail_parts = _description_detail_parts(qj, evt)
+    metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+    yolo_classes = metadata.get("yolo_classes") or evt.get("yolo_classes") or []
+    if isinstance(yolo_classes, str):
+        yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
+    total_yolo = int(metadata.get("total_yolo_objects") or evt.get("total_yolo_objects") or evt.get("yolo_count") or 0 or 0)
+    person_count = sum(1 for c in yolo_classes if str(c).lower() == "person") if isinstance(yolo_classes, list) else 0
+    if not person_count and total_yolo > 0:
+        person_count = max(1, min(total_yolo, 16))
+    vision = qj.get("vision", {}) if isinstance(qj.get("vision"), dict) else {}
+    v_persons = vision.get("persons", []) if isinstance(vision.get("persons"), list) else []
+    v_scene = vision.get("scene", "")
+    v_objects = vision.get("objects", []) if isinstance(vision.get("objects"), list) else []
+    if person_count > 0 and not any("persona" in p.lower() for p in detail_parts):
+        if v_persons:
+            person_descs = []
+            for p in v_persons:
+                location = p.get("location", "")
+                clothing = p.get("clothing", [])
+                actions_list = p.get("acciones", [])
+                parts = []
+                if clothing:
+                    parts.append(" con ".join(str(c) for c in clothing))
+                if location:
+                    parts.append(location)
+                if actions_list:
+                    parts.append(" y ".join(str(a) for a in actions_list))
+                if parts:
+                    person_descs.append("Persona" + " ".join(parts))
+            if person_descs:
+                detail_parts.insert(0, ". ".join(person_descs))
+            elif v_scene:
+                detail_parts.insert(0, v_scene)
+        elif v_scene and not detail_parts:
+            detail_parts.insert(0, v_scene)
+    if isinstance(desc, dict):
+        desc = json.dumps(desc, ensure_ascii=False)
+    desc = str(desc).strip()
+    detail_text = " ".join(detail_parts).strip()
+    if _is_generic_qwen_summary(desc) and detail_text:
+        enriched = f"{detail_text} {desc}".strip()
+    else:
+        enriched = " ".join([x for x in [desc, detail_text] if x]).strip()
+    return enriched or "Sin descripción"
+
+
+def _event_yolo(evt: dict) -> dict:
+    meta = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+    y = evt.get("yolo", {}) if isinstance(evt.get("yolo"), dict) else {}
+    classes = meta.get("yolo_classes") or evt.get("yolo_classes") or y.get("classes") or []
+    if isinstance(classes, str):
+        classes = [c.strip() for c in classes.split(",") if c.strip()]
+    return {"count": evt.get("total_yolo_objects") or evt.get("yolo_count") or y.get("count") or 0, "classes": classes}
+
+
+def _event_is_alert(evt: dict) -> bool:
+    """True si el evento tiene attention_hits (nuevo sistema) o es legacy violation."""
+    if evt.get("attention_hits"):
+        return True
+    qjson = _event_qwen(evt)
+    importancia = str(qjson.get("importancia", "")).lower()
+    anomalias = qjson.get("anomalias", []) if isinstance(qjson.get("anomalias"), list) else []
+    high_severity = any(str(a.get("severidad") if isinstance(a, dict) else a).lower() in ("alta", "critica", "crítica") for a in anomalias)
+    return evt.get("event_type") in ("violation", "vigilance_alert", "night_alert") or bool(qjson.get("violation")) or importancia in ("alta", "critica") or high_severity
+
+
+def _attach_event_package(evt: dict, user_id: str, camera_id: str):
+    folder = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / evt.get("event_id", "")
+    mp4 = folder / f"{evt.get('event_id', '')}.mp4"
+    if mp4.exists() and not evt.get("video_file"):
+        evt["video_file"] = mp4.name
+    frames_dir = folder / "frames"
+    if frames_dir.exists() and not evt.get("frames"):
+        frames = []
+        for fp in sorted(frames_dir.glob("frame_*.jpg")):
+            try:
+                frames.append({"timestamp": evt.get("timestamp", 0), "datetime": evt.get("datetime", ""), "file": fp.name, "size": fp.stat().st_size, "index": len(frames)})
+            except Exception:
+                pass
+        if frames:
+            evt["frames"] = frames
+            evt["frames_count"] = len(frames)
+            evt["clip_type"] = "event_package"
+    return evt
+
+
+def _event_persons(evt: dict) -> int:
+    qj = _event_qwen(evt)
+    details = qj.get("details", {}) if isinstance(qj.get("details"), dict) else {}
+    for key in ("persons", "person_count", "persons_visible", "personas", "personas_contadas", "people_count"):
+        try:
+            value = details.get(key)
+            if value is None:
+                value = qj.get(key)
+            if value is not None and int(value) > 0:
+                return int(value)
+        except Exception:
+            pass
+    metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+    yolo_classes = metadata.get("yolo_classes") or evt.get("yolo_classes") or []
+    if isinstance(yolo_classes, str):
+        yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
+    if isinstance(yolo_classes, list):
+        person_count = sum(1 for c in yolo_classes if str(c).lower() == "person")
+        total_yolo = int(metadata.get("total_yolo_objects") or evt.get("total_yolo_objects") or evt.get("yolo_count") or 0 or 0)
+        return max(person_count, 1) if person_count == 0 and total_yolo > 0 else person_count
+    return _event_yolo(evt).get("classes", []).count("person")
+
+
+async def tool_search_events(user_id: str, query: str = "", date: str = None,
+                              camera_id: str = None, limit: int = 10) -> dict:
+    """Busca eventos en el diario. Busca en summary, description y qwen_json."""
+    results = []
+    query_lower = query.lower()
+    query_words = [w for w in query_lower.split() if len(w) >= 4]
+    for evt, cam_name in _iter_events(user_id, camera_id, date):
+        if query_lower:
+            qjson = evt.get("qwen_json", {}) if isinstance(evt.get("qwen_json"), dict) else {}
+            searchable_parts = [
+                evt.get("summary", ""),
+                evt.get("description", ""),
+                str(qjson.get("summary", "")),
+                str(qjson.get("anomalias", "")),
+            ]
+            for key in ("details", "evidence"):
+                val = qjson.get(key, {})
+                if isinstance(val, dict):
+                    searchable_parts.append(" ".join(str(v) for v in val.values() if v))
+                elif val:
+                    searchable_parts.append(str(val))
+            searchable = " ".join(searchable_parts).lower()
+            if not any(w in searchable for w in query_words):
+                continue
+        evt = _attach_event_package(evt, user_id, cam_name)
+        qjson = _event_qwen(evt)
+        results.append({
+            "event_id": evt["event_id"],
+            "datetime": evt.get("datetime", ""),
+            "camera_name": cam_name,
+            "event_type": evt.get("event_type", ""),
+            "description": _event_description(evt),
+            "summary": qjson.get("summary", _event_description(evt)),
+            "qwen_json": qjson,
+            "importancia": qjson.get("importancia", "baja"),
+            "anomalias": qjson.get("anomalias", []),
+            "persons": _event_persons(evt),
+            "yolo": _event_yolo(evt),
+            "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
+            "thumb_url": f"/api/event-thumb/{evt['event_id']}?user_id={user_id}",
+        })
+        if len(results) >= limit:
+            break
+    return {"found": len(results), "events": results}
+
+
+async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: str = None) -> dict:
+    """Resume la actividad de un día desde el diario (enfoque descriptivo).
+
+    NUEVO: No cuenta "violaciones" — cuenta observaciones, personas, transacciones.
+    """
+    events = []
+    for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
+        events.append(evt)
+
+    if not events:
+        return {"period": date or "today", "total_events": 0, "summary": "Sin eventos registrados."}
+
+    total = len(events)
+    last = events[0]
+
+    persons_values = [_event_persons(e) for e in events if _event_persons(e) is not None]
+    latest_yolo = _event_yolo(last)
+    latest_qjson = _event_qwen(last)
+
+    attention_events = [e for e in events if e.get("attention_hits")]
+    normal_events = [e for e in events if not e.get("attention_hits")]
+
+    total_platos = 0
+    total_bebidas = 0
+    total_fundas = 0
+    total_clientes_estimado = 0
+    for e in events:
+        qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
+        counts = qwen.get("counts", {}) if isinstance(qwen.get("counts"), dict) else {}
+        total_platos += counts.get("platos_visibles", 0) or 0
+        total_bebidas += counts.get("bebidas_visibles", 0) or 0
+        total_fundas += counts.get("fundas_visibles", 0) or 0
+        total_clientes_estimado += counts.get("clientes", 0) or 0
+
+    summary_parts = [f"📊 Hoy se realizaron {total} análisis de seguridad."]
+    if persons_values:
+        summary_parts.append(f"👥 Se observaron aproximadamente {sum(persons_values)} persona(s) en total.")
+    if total_clientes_estimado > 0:
+        summary_parts.append(f"🧑‍🤝‍🧑 Clientes observados: ~{total_clientes_estimado} (estimado).")
+    if total_platos > 0:
+        summary_parts.append(f"🍽️ Platos visibles en total: ~{total_platos}.")
+    if total_bebidas > 0:
+        summary_parts.append(f"🥤 Bebidas visibles: ~{total_bebidas}.")
+    if total_fundas > 0:
+        summary_parts.append(f"🛍️ Fundas utilizadas: ~{total_fundas}.")
+    if attention_events:
+        summary_parts.append(f"🔍 {len(attention_events)} evento(s) coincidieron con lo que me pediste vigilar.")
+
+    last_summary = latest_qjson.get("summary") or last.get("summary", "Sin datos")
+    summary_parts.append(f"📝 Último análisis: {last_summary[:150]}")
+
+    notable_events = []
+    for e in attention_events[:5]:
+        qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
+        notable_events.append({
+            "event_id": e.get("event_id", ""),
+            "datetime": e.get("datetime", ""),
+            "timestamp": e.get("timestamp", 0),
+            "camera_id": e.get("camera_id", ""),
+            "camera_name": e.get("camera_name", ""),
+            "description": e.get("description", "") or e.get("summary", ""),
+            "summary": e.get("summary", "") or e.get("description", ""),
+            "event_type": e.get("event_type", ""),
+            "attention_hits": e.get("attention_hits", []),
+            "qwen_analysis": e.get("qwen_analysis", {}),
+            "qwen": qwen,
+            "thumb_url": e.get("thumb_url", ""),
+            "frame_url": e.get("frame_url", ""),
+            "video_file": e.get("video_file", ""),
+            "persons": e.get("persons", 0),
+        })
+    if not notable_events:
+        for e in events[:3]:
+            qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
+            notable_events.append({
+                "event_id": e.get("event_id", ""),
+                "datetime": e.get("datetime", ""),
+                "timestamp": e.get("timestamp", 0),
+                "camera_id": e.get("camera_id", ""),
+                "camera_name": e.get("camera_name", ""),
+                "description": e.get("description", "") or e.get("summary", ""),
+                "summary": e.get("summary", "") or e.get("description", ""),
+                "event_type": e.get("event_type", ""),
+                "attention_hits": e.get("attention_hits", []),
+                "qwen_analysis": e.get("qwen_analysis", {}),
+                "qwen": qwen,
+                "thumb_url": e.get("thumb_url", ""),
+                "frame_url": e.get("frame_url", ""),
+                "video_file": e.get("video_file", ""),
+                "persons": e.get("persons", 0),
+            })
+
+    return {
+        "period": date or "today",
+        "total_events": total,
+        "attention_events": len(attention_events),
+        "persons_total": sum(persons_values),
+        "persons_analyses": len(persons_values),
+        "counts_total": {
+            "platos": total_platos,
+            "bebidas": total_bebidas,
+            "fundas": total_fundas,
+            "clientes_estimado": total_clientes_estimado,
+        },
+        "last_yolo": latest_yolo,
+        "last_summary": last_summary,
+        "details": latest_qjson.get("details", {}),
+        "notable_events": notable_events,
+        "summary": "\n".join(summary_parts),
+    }
+
+
+async def tool_find_anomalies(user_id: str, min_severity: str = "media",
+                               date: str = None, camera_id: str = None, limit: int = 10) -> dict:
+    """Encuentra eventos con attention_hits (nuevo术语: observaciones relevantes)."""
+    severity_order = {"baja": 0, "media": 1, "alta": 2, "critica": 3, "observacion": 0}
+    min_level = severity_order.get(min_severity, 1)
+    results = []
+    for evt, cam_name in _iter_events(user_id, camera_id, date):
+        attention_hits = evt.get("attention_hits", []) if isinstance(evt, dict) else []
+        if attention_hits or _event_is_alert(evt):
+            evt = _attach_event_package(evt, user_id, cam_name)
+            results.append({
+                "event_id": evt["event_id"],
+                "datetime": evt.get("datetime", ""),
+                "camera_name": cam_name,
+                "tipo": "observacion",
+                "descripcion": _event_description(evt),
+                "attention_hits": attention_hits,
+                "severidad": "observacion" if attention_hits else "alta",
+                "anomaly": True,
+                "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
+                "video_file": evt.get("video_file", ""),
+                "frames": evt.get("frames", []),
+            })
+            if len(results) >= limit:
+                break
+            continue
+        qjson = _event_qwen(evt)
+        for anom in (qjson.get("anomalias", []) if isinstance(qjson.get("anomalias"), list) else []):
+            if isinstance(anom, dict):
+                sev = anom.get("severidad", "baja")
+                if severity_order.get(sev, 0) >= min_level:
+                    evt = _attach_event_package(evt, user_id, cam_name)
+                    results.append({
+                        "event_id": evt["event_id"],
+                        "datetime": evt.get("datetime", ""),
+                        "camera_name": cam_name,
+                        "tipo": anom.get("tipo", ""),
+                        "descripcion": anom.get("descripcion", ""),
+                        "severidad": sev,
+                        "anomaly": True,
+                        "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
+                        "video_file": evt.get("video_file", ""),
+                        "frames": evt.get("frames", []),
+                    })
+        if len(results) >= limit:
+            break
+    return {"found": len(results), "anomalies": results}
+
+
+async def tool_latest_events(user_id: str, limit: int = 5,
+                             date: str = None, camera_id: str = None) -> dict:
+    """Lista los últimos análisis del diario."""
+    events = []
+    for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
+        evt = _attach_event_package(evt, user_id, cam_name)
+        qjson = _event_qwen(evt)
+        events.append({
+            "event_id": evt["event_id"],
+            "datetime": evt.get("datetime", ""),
+            "camera_name": cam_name,
+            "event_type": evt.get("event_type", ""),
+            "description": _event_description(evt),
+            "summary": qjson.get("summary", _event_description(evt)),
+            "importancia": qjson.get("importancia", "baja"),
+            "anomaly": _event_is_alert(evt),
+            "persons": _event_persons(evt),
+            "yolo": _event_yolo(evt),
+            "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
+        })
+        if len(events) >= limit:
+            break
+    return {"found": len(events), "events": events}
+
+
+async def tool_find_risks(user_id: str, date: str = None,
+                          camera_id: str = None, limit: int = 10) -> dict:
+    """Busca riesgos de incendio, humo o actividad sospechosa crítica."""
+    risk_words = ("fuego", "humo", "incendio", "riesgo", "crítico", "critica", "alarma")
+    results = []
+    for evt, cam_name in _iter_events(user_id, camera_id, date):
+        qjson = _event_qwen(evt)
+        text = " ".join([
+            _event_description(evt),
+            str(qjson.get("details", "")),
+            str(qjson.get("anomalias", "")),
+            str(qjson.get("importancia", "")),
+        ]).lower()
+        if any(w in text for w in risk_words) or qjson.get("importancia") in ("alta", "critica") or _event_is_alert(evt):
+            evt = _attach_event_package(evt, user_id, cam_name)
+            results.append({
+                "event_id": evt["event_id"],
+                "datetime": evt.get("datetime", ""),
+                "camera_name": cam_name,
+                "description": _event_description(evt),
+                "importancia": qjson.get("importancia", "baja"),
+                "anomaly": True,
+                "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
+            })
+        if len(results) >= limit:
+            break
+    return {"found": len(results), "risks": results}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -28,906 +824,375 @@ STORAGE_ROOT = Path("/home/sam/storage")
 # ═══════════════════════════════════════════════════════════════
 
 def load_business_json(user_id: str) -> dict:
-    """Cargar business.json del usuario. Si no existe, crearlo desde user.json."""
-    bp = STORAGE_ROOT / "users" / user_id / "business.json"
+    bp = STORAGE_ROOT / "users" / user_id / "user.json"
     if bp.exists():
-        with open(bp) as f:
-            return json.load(f)
-    # Migrar desde user.json
-    up = STORAGE_ROOT / "users" / user_id / "user.json"
-    if up.exists():
-        with open(up) as f:
-            ud = json.load(f)
-        return migrate_user_to_business(ud)
-    return {}
+        return json.loads(bp.read_text())
+    return {
+        "user_id": user_id, "owner": {}, "business_name": "",
+        "business_type": "", "schedule": {"open": "07:00", "close": "19:00"},
+        "main_concerns": [], "cameras": {},
+    }
 
 
 def save_business_json(user_id: str, data: dict):
-    """Guardar business.json atómicamente."""
-    bp = STORAGE_ROOT / "users" / user_id / "business.json"
+    bp = STORAGE_ROOT / "users" / user_id / "user.json"
     bp.parent.mkdir(parents=True, exist_ok=True)
     tmp = bp.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     tmp.replace(bp)
 
 
-def migrate_user_to_business(user_data: dict) -> dict:
-    """Migrar user.json existente al nuevo formato business.json."""
-    uid = user_data.get("user_id", "")
-    cameras = {}
-    for cam in user_data.get("cameras", []):
-        cid = cam.get("camera_id", "")
-        if not cid:
-            continue
-        cameras[cid] = {
-            "name": cam.get("name", cid),
-            "zone": cam.get("zone", ""),
-            "active": cam.get("active", False),
-            "rules": cam.get("rules", []),
-            "rules_es": cam.get("rules_es", []),
-            "system_prompt": cam.get("system_prompt", ""),
-            "last_frame_ts": cam.get("last_frame", 0),
-            "today_summary": {
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "total_events": 0,
-                "total_persons": 0,
-                "alerts": 0,
-                "peak_hour": None,
-                "peak_persons": 0,
-                "qwen_descriptions": []
-            }
+async def tool_save_event(user_id: str, camera_id: str = "", summary: str = "",
+                          importance: str = "baja") -> dict:
+    """Guarda un evento de seguridad en el diario."""
+    try:
+        import uuid
+        base = STORAGE_ROOT / "users" / user_id / "cameras"
+        if not base.exists():
+            return {"success": False, "error": "No hay cámaras configuradas"}
+        if not camera_id:
+            cams = sorted([d for d in base.iterdir() if d.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+            if not cams:
+                return {"success": False, "error": "No hay cámaras configuradas"}
+            camera_id = cams[0].name
+        cam_dir = base / camera_id
+        events_dir = cam_dir / "events"
+        events_dir.mkdir(parents=True, exist_ok=True)
+        event_id = f"manual_{uuid.uuid4().hex[:12]}"
+        from datetime import datetime
+        now = datetime.now()
+        evt = {
+            "event_id": event_id,
+            "timestamp": int(now.timestamp()),
+            "datetime": now.strftime("%Y-%m-%d %H:%M"),
+            "event_type": "manual_event",
+            "summary": summary,
+            "description": summary,
+            "importance": importance,
+            "camera_id": camera_id,
+            "metadata": {}
         }
+        evt_file = events_dir / f"{event_id}.json"
+        evt_file.write_text(json.dumps(evt, indent=2, ensure_ascii=False))
+        return {"success": True, "event_id": event_id, "message": f"Evento guardado: {summary}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-    return {
-        "user_id": uid,
-        "business_name": user_data.get("business_name", ""),
-        "business_type": user_data.get("business_type", ""),
-        "owner": {
-            "name": user_data.get("name", ""),
-            "phone": user_data.get("phone", ""),
-            "email": user_data.get("email", "")
-        },
-        "schedule": user_data.get("schedule", {"open": "07:00", "close": "19:00"}),
-        "main_concerns": user_data.get("main_concerns", []),
-        "cameras": cameras,
-        "people": {"known": [], "suspicious": []},
-        "conversation_context": {
-            "weaknesses": [],
-            "agreed_rules": user_data.get("rules_es", []),
-            "last_chat_summary": ""
-        },
-        "daily_summaries": {}
-    }
 
+async def tool_respond_directly(user_id: str, message: str = "") -> dict:
+    """Respuesta directa sin consultar herramientas."""
+    return {"success": True, "message": message, "tool": "respond_directly"}
 
-def resolve_user_events_dirs(user_id: str) -> List[tuple]:
-    """Devolver carpetas de eventos del usuario."""
-    base = STORAGE_ROOT / "users" / user_id
-    dirs = []
-    cameras_dir = base / "cameras"
-    if cameras_dir.exists():
-        for cam_id in cameras_dir.iterdir():
-            events = cam_id / "events"
-            if events.is_dir():
-                dirs.append((cam_id.name, events))
-    legacy = base / "events"
-    if legacy.is_dir():
-        dirs.append(("_global", legacy))
-    return dirs
-
-
-def parse_date_range(date_str: str) -> tuple:
-    """Convierte 'today', 'yesterday', 'this_week' a (start_ts, end_ts)."""
-    now = datetime.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
-
-    if date_str == "today":
-        return (int(today_start.timestamp()), int(today_end.timestamp()))
-    elif date_str == "yesterday":
-        yest = today_start - timedelta(days=1)
-        yest_end = today_start - timedelta(seconds=1)
-        return (int(yest.timestamp()), int(yest_end.timestamp()))
-    elif date_str == "this_week":
-        week_start = today_start - timedelta(days=now.weekday())
-        return (int(week_start.timestamp()), int(today_end.timestamp()))
-    elif date_str == "last_week":
-        week_start = today_start - timedelta(days=now.weekday() + 7)
-        week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
-        return (int(week_start.timestamp()), int(week_end.timestamp()))
-    else:
-        try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            end = dt.replace(hour=23, minute=59, second=59)
-            return (int(dt.timestamp()), int(end.timestamp()))
-        except ValueError:
-            return (0, int(time.time()))
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 1: search_events — Buscar eventos por descripción/hora/cámara
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_search_events(
-    user_id: str,
-    query: str = "",
-    camera_id: str = None,
-    date: str = None,
-    event_type: str = None,
-    limit: int = 10
-) -> dict:
-    """
-    Busca eventos por descripción, persona, hora o cámara.
-    
-    Args:
-        query: Búsqueda libre — "persona con gorra negra", "Pedro", "alertas"
-        camera_id: ID de cámara o None para todas
-        date: "today", "yesterday", "this_week", "2026-06-05"
-        event_type: "violation", "normal", "night_alert", None=todos
-        limit: Máximo de resultados
-    
-    Returns:
-        {found: int, events: [{event_id, datetime, camera, description, persons, frame_url}]}
-    """
-    business = load_business_json(user_id)
-    date_range = parse_date_range(date) if date else (0, int(time.time()))
-    results = []
-    query_lower = query.lower() if query else ""
-    query_terms = [t for t in query_lower.split() if len(t) > 2] if query_lower else []
-
-    cameras_to_search = [camera_id] if camera_id else list(business.get("cameras", {}).keys())
-
-    for cam_id in cameras_to_search:
-        if cam_id == "_global":
-            continue
-        events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / cam_id / "events"
-        if not events_dir.exists():
-            continue
-
-        cam_name = business.get("cameras", {}).get(cam_id, {}).get("name", cam_id)
-
-        for fname in sorted(os.listdir(events_dir), reverse=True):
-            if not fname.endswith(".json"):
-                continue
-            if len(results) >= limit * 3:  # Leemos más para filtrar
-                break
-
-            try:
-                with open(events_dir / fname) as f:
-                    event = json.load(f)
-            except Exception:
-                continue
-
-            # Filtrar por fecha
-            ts = event.get("timestamp", 0)
-            if ts < date_range[0] or ts > date_range[1]:
-                continue
-
-            # Filtrar por tipo
-            if event_type and event.get("event_type") != event_type:
-                continue
-
-            # Buscar coincidencia en descripción (compatible con formato viejo y nuevo)
-            qwen = event.get("qwen_analysis", {})
-            searchable_parts = [
-                qwen.get("description", ""),
-                " ".join([p.get("clothing", "") + " " + p.get("action", "")
-                         for p in qwen.get("persons_details", [])]),
-                event.get("description", ""),
-                " ".join(event.get("yolo_classes", [])),
-            ]
-            # También buscar en el event_id para vigilance_
-            eid = event.get("event_id", "")
-            if eid.startswith("vigilance_"):
-                searchable_parts.append("vigilance alerta centinela persona")
-            searchable = " ".join(searchable_parts).lower()
-
-            if query_terms:
-                matches = sum(1 for t in query_terms if t in searchable)
-            else:
-                matches = 1  # Sin query = incluir todos
-            if matches > 0:
-                dt = datetime.fromtimestamp(ts)
-                results.append({
-                    "event_id": event.get("event_id", ""),
-                    "datetime": event.get("datetime", dt.strftime("%Y-%m-%d %H:%M")),
-                    "hour": event.get("hour", dt.strftime("%H:%M")),
-                    "date": event.get("date", dt.strftime("%Y-%m-%d")),
-                    "camera_id": cam_id,
-                    "camera_name": cam_name,
-                    "description": qwen.get("description", event.get("description", "")),
-                    "persons": qwen.get("persons", event.get("yolo", {}).get("count", event.get("yolo_count", 0))),
-                    "persons_details": qwen.get("persons_details", []),
-                    "activity_level": qwen.get("activity_level", ""),
-                    "anomaly": qwen.get("anomaly", False),
-                    "event_type": event.get("event_type", "normal"),
-                    "frame_url": f"/api/event-frame/{event.get('event_id', '')}?user_id={user_id}",
-                    "relevance": matches / len(query_terms) if query_terms else 0
-                })
-
-    # Ordenar por relevancia
-    results.sort(key=lambda x: x["relevance"], reverse=True)
-    results = results[:limit]
-
-    return {
-        "found": len(results),
-        "query": query,
-        "events": results
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 2: find_person — Buscar persona por descripción visual
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_find_person(
-    user_id: str,
-    description: str,
-    date: str = None,
-    camera_id: str = None,
-    limit: int = 10
-) -> dict:
-    """
-    Busca una persona por descripción visual en los eventos.
-    
-    Args:
-        description: "camisa blanca, gorra negra, delantal azul"
-        date: "today", "yesterday", "this_week"
-        camera_id: Cámara específica o None
-    
-    Returns:
-        {found: int, person_matches: [{datetime, camera, description, frame_url}]}
-    """
-    # Reutilizar search_events pero enfocado en persons_details
-    result = await tool_search_events(
-        user_id=user_id,
-        query=description,
-        camera_id=camera_id,
-        date=date,
-        limit=limit
-    )
-
-    # Filtrar solo eventos donde se detectaron personas con esa descripción
-    person_matches = []
-    for evt in result.get("events", []):
-        persons_details = evt.get("persons_details", [])
-        desc_lower = description.lower()
-        for person in persons_details:
-            person_text = f"{person.get('clothing', '')} {person.get('action', '')} {person.get('role', '')}".lower()
-            if any(term in person_text for term in desc_lower.split()):
-                person_matches.append({
-                    "datetime": evt["datetime"],
-                    "hour": evt["hour"],
-                    "camera_name": evt["camera_name"],
-                    "person_description": f"{person.get('role', 'persona')} — {person.get('action', '')} — {person.get('clothing', '')}",
-                    "all_persons": evt["persons"],
-                    "frame_url": evt["frame_url"],
-                    "event_type": evt["event_type"]
-                })
-                break
-
-    # También buscar en people del business.json
-    business = load_business_json(user_id)
-    known_matches = []
-    for person in business.get("people", {}).get("known", []):
-        person_text = " ".join(person.get("visual_tags", []) + [person.get("name", "")] + [person.get("role", "")]).lower()
-        if any(term in person_text for term in description.lower().split()):
-            known_matches.append({
-                "name": person.get("name", ""),
-                "role": person.get("role", ""),
-                "visual_tags": person.get("visual_tags", []),
-                "patterns": person.get("patterns", {})
-            })
-
-    for person in business.get("people", {}).get("suspicious", []):
-        person_text = " ".join(person.get("visual_tags", [])).lower()
-        if any(term in person_text for term in description.lower().split()):
-            known_matches.append({
-                "name": person.get("id", "Desconocido"),
-                "role": "sospechoso",
-                "visual_tags": person.get("visual_tags", []),
-                "incidents": person.get("incidents", 0),
-                "notes": person.get("notes", "")
-            })
-
-    return {
-        "found": len(person_matches),
-        "description_searched": description,
-        "event_matches": person_matches[:limit],
-        "known_people_matches": known_matches
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 3: get_daily_summary — Resumen de un día
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_get_daily_summary(
-    user_id: str,
-    date: str = "today"
-) -> dict:
-    """
-    Obtiene el resumen de un día específico.
-    
-    Args:
-        date: "today", "yesterday", "2026-06-05"
-    
-    Returns:
-        {date, total_events, total_persons, alerts, peak_hour, highlights}
-    """
-    business = load_business_json(user_id)
-
-    # Determinar la fecha
-    if date == "today":
-        date_key = datetime.now().strftime("%Y-%m-%d")
-    elif date == "yesterday":
-        date_key = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        date_key = date
-
-    # Buscar en daily_summaries guardados
-    daily = business.get("daily_summaries", {}).get(date_key, {})
-
-    # Si no hay resumen guardado, generarlo desde los eventos
-    if not daily:
-        date_range = parse_date_range(date_key)
-        total_events = 0
-        total_persons = 0
-        alerts = 0
-        peak_hour = None
-        peak_persons = 0
-        highlights = []
-        cameras_data = {}
-
-        for cam_id, cam_dir in resolve_user_events_dirs(user_id):
-            if cam_id == "_global":
-                continue
-            cam_name = business.get("cameras", {}).get(cam_id, {}).get("name", cam_id)
-            cam_events = []
-
-            for fname in os.listdir(cam_dir):
-                if not fname.endswith(".json"):
-                    continue
-                try:
-                    with open(cam_dir / fname) as f:
-                        event = json.load(f)
-                except Exception:
-                    continue
-
-                ts = event.get("timestamp", 0)
-                if ts < date_range[0] or ts > date_range[1]:
-                    continue
-
-                total_events += 1
-                qwen = event.get("qwen_analysis", {})
-                persons = qwen.get("persons", event.get("yolo", {}).get("count", 0))
-                total_persons += persons
-
-                if event.get("event_type") in ("violation", "night_alert"):
-                    alerts += 1
-
-                hour = datetime.fromtimestamp(ts).strftime("%H:%M")
-                if persons > peak_persons:
-                    peak_persons = persons
-                    peak_hour = hour
-
-                desc = qwen.get("description", event.get("description", ""))
-            # Mejorar descripción de eventos de vigilancia
-            if desc.startswith("Modo centinela:") and event.get("yolo_classes"):
-                persons = sum(1 for c in event["yolo_classes"] if c == "person")
-                objects = [c for c in event["yolo_classes"] if c != "person"]
-                if persons > 0:
-                    obj_str = f" + {', '.join(objects)}" if objects else ""
-                    desc = f"Persona detectada{obj_str}"
-                elif objects:
-                    desc = f"Objetos: {', '.join(objects)}"
-                if desc:
-                    cam_events.append(f"{hour} — {desc}")
-
-            if cam_events:
-                cameras_data[cam_name] = cam_events
-
-        daily = {
-            "date": date_key,
-            "total_events": total_events,
-            "total_persons": total_persons,
-            "alerts": alerts,
-            "peak_hour": peak_hour,
-            "peak_persons": peak_persons,
-            "cameras_data": cameras_data,
-            "generated_at": datetime.now().isoformat()
-        }
-
-    return daily
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 4: get_traffic_analysis — Análisis de tráfico de personas
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_get_traffic_analysis(
-    user_id: str,
-    days: int = 7,
-    camera_id: str = None,
-    group_by: str = "hour"
-) -> dict:
-    """
-    Analiza patrones de tráfico de personas.
-    
-    Args:
-        days: Últimos N días
-        camera_id: Cámara específica o None para todas
-        group_by: "hour", "day", "weekday"
-    
-    Returns:
-        {peak_hour, peak_persons, daily_avg, trend, hourly_breakdown}
-    """
-    business = load_business_json(user_id)
-    date_range = (int((datetime.now() - timedelta(days=days)).timestamp()), int(time.time()))
-
-    hourly_counts = {}
-    daily_counts = {}
-    total_persons = 0
-    total_events = 0
-
-    cameras_to_search = [camera_id] if camera_id else list(business.get("cameras", {}).keys())
-
-    for cam_id in cameras_to_search:
-        if cam_id == "_global":
-            continue
-        events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / cam_id / "events"
-        if not events_dir.exists():
-            continue
-
-        for fname in os.listdir(events_dir):
-            if not fname.endswith(".json"):
-                continue
-            try:
-                with open(events_dir / fname) as f:
-                    event = json.load(f)
-            except Exception:
-                continue
-
-            ts = event.get("timestamp", 0)
-            if ts < date_range[0] or ts > date_range[1]:
-                continue
-
-            total_events += 1
-            qwen = event.get("qwen_analysis", {})
-            persons = qwen.get("persons", event.get("yolo", {}).get("count", event.get("yolo_count", 0)))
-            # Para eventos de vigilancia, contar personas de yolo_classes
-            if persons == 0 and event.get("event_type") == "vigilance_alert":
-                yolo_classes = event.get("yolo_classes", [])
-                persons = sum(1 for c in yolo_classes if c == "person")
-            total_persons += persons
-
-            dt = datetime.fromtimestamp(ts)
-            hour_key = dt.strftime("%H:00")
-            day_key = dt.strftime("%Y-%m-%d")
-            weekday_key = dt.strftime("%A")
-
-            hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + persons
-            daily_counts[day_key] = daily_counts.get(day_key, 0) + persons
-
-    # Encontrar pico
-    peak_hour = max(hourly_counts, key=hourly_counts.get) if hourly_counts else None
-    peak_persons = hourly_counts.get(peak_hour, 0) if peak_hour else 0
-
-    # Promedio diario
-    daily_avg = round(total_persons / max(len(daily_counts), 1))
-
-    # Tendencia (comparar primera mitad vs segunda mitad)
-    sorted_days = sorted(daily_counts.keys())
-    if len(sorted_days) >= 2:
-        mid = len(sorted_days) // 2
-        first_half = sum(daily_counts[d] for d in sorted_days[:mid]) / max(mid, 1)
-        second_half = sum(daily_counts[d] for d in sorted_days[mid:]) / max(len(sorted_days) - mid, 1)
-        if second_half > first_half * 1.1:
-            trend = "subiendo"
-        elif second_half < first_half * 0.9:
-            trend = "bajando"
-        else:
-            trend = "estable"
-    else:
-        trend = "sin datos suficientes"
-
-    return {
-        "period_days": days,
-        "total_persons": total_persons,
-        "total_events": total_events,
-        "daily_avg": daily_avg,
-        "peak_hour": peak_hour,
-        "peak_persons": peak_persons,
-        "trend": trend,
-        "hourly_breakdown": dict(sorted(hourly_counts.items())),
-        "daily_breakdown": dict(sorted(daily_counts.items()))
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 5: get_business_summary — Resumen ejecutivo del negocio
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_get_business_summary(
-    user_id: str,
-    period: str = "today"
-) -> dict:
-    """
-    Genera un resumen ejecutivo del negocio.
-    
-    Args:
-        period: "today", "yesterday", "week"
-    
-    Returns:
-        {period, cameras_status, events_summary, alerts, suggestions}
-    """
-    business = load_business_json(user_id)
-    now = time.time()
-
-    # Estado de cámaras
-    cameras_status = []
-    for cam_id, cam in business.get("cameras", {}).items():
-        last_frame = cam.get("last_frame_ts", 0)
-        is_online = (now - last_frame) < 120 if last_frame else False
-        cameras_status.append({
-            "id": cam_id,
-            "name": cam.get("name", cam_id),
-            "online": is_online,
-            "last_frame_ago": int(now - last_frame) if last_frame else None
-        })
-
-    # Resumen de eventos del período
-    if period == "week":
-        date_range = (int((datetime.now() - timedelta(days=7)).timestamp()), now)
-    elif period == "yesterday":
-        yest = datetime.now() - timedelta(days=1)
-        start = int(yest.replace(hour=0, minute=0, second=0).timestamp())
-        end = int(yest.replace(hour=23, minute=59, second=59).timestamp())
-        date_range = (start, end)
-    else:
-        start = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
-        date_range = (start, now)
-
-    total_events = 0
-    total_persons = 0
-    alerts = 0
-    false_alarms = 0
-
-    for cam_id, cam_dir in resolve_user_events_dirs(user_id):
-        if cam_id == "_global":
-            continue
-        for fname in os.listdir(cam_dir):
-            if not fname.endswith(".json"):
-                continue
-            try:
-                with open(cam_dir / fname) as f:
-                    event = json.load(f)
-            except Exception:
-                continue
-            ts = event.get("timestamp", 0)
-            if ts < date_range[0] or ts > date_range[1]:
-                continue
-            total_events += 1
-            qwen = event.get("qwen_analysis", {})
-            total_persons += qwen.get("persons", 0)
-            if event.get("event_type") in ("violation", "night_alert"):
-                alerts += 1
-
-    online_cams = sum(1 for c in cameras_status if c["online"])
-
-    return {
-        "period": period,
-        "business_name": business.get("business_name", ""),
-        "cameras": {
-            "total": len(cameras_status),
-            "online": online_cams,
-            "offline": len(cameras_status) - online_cams,
-            "details": cameras_status
-        },
-        "events": {
-            "total": total_events,
-            "total_persons": total_persons,
-            "alerts": alerts,
-            "false_alarms": false_alarms
-        },
-        "main_concerns": business.get("main_concerns", []),
-        "generated_at": datetime.now().isoformat()
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 6: get_camera_frames — Frames recientes de una cámara
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_get_camera_frames(
-    user_id: str,
-    camera_id: str,
-    count: int = 5,
-    time_range: str = "last_hour"
-) -> dict:
-    """
-    Obtiene frames recientes de una cámara con análisis de Qwen.
-    
-    Args:
-        camera_id: ID de la cámara
-        count: Cantidad de frames (default: 5)
-        time_range: "last_hour", "today", "yesterday"
-    
-    Returns:
-        {camera_name, frames: [{event_id, datetime, description, persons, frame_url}]}
-    """
-    business = load_business_json(user_id)
-    cam = business.get("cameras", {}).get(camera_id, {})
-    cam_name = cam.get("name", camera_id)
-
-    if time_range == "today":
-        date_range = parse_date_range("today")
-    elif time_range == "yesterday":
-        date_range = parse_date_range("yesterday")
-    else:
-        date_range = (int(time.time()) - 3600, int(time.time()))
-
-    events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
-    if not events_dir.exists():
-        return {"camera_name": cam_name, "frames": [], "error": "Cámara sin eventos"}
-
-    frames = []
-    for fname in sorted(os.listdir(events_dir), reverse=True):
-        if not fname.endswith(".json"):
-            continue
-        if len(frames) >= count:
-            break
-        try:
-            with open(events_dir / fname) as f:
-                event = json.load(f)
-        except Exception:
-            continue
-
-        ts = event.get("timestamp", 0)
-        if ts < date_range[0] or ts > date_range[1]:
-            continue
-
-        qwen = event.get("qwen_analysis", {})
-        dt = datetime.fromtimestamp(ts)
-        frames.append({
-            "event_id": event.get("event_id", ""),
-            "datetime": dt.strftime("%Y-%m-%d %H:%M"),
-            "hour": dt.strftime("%H:%M"),
-            "description": qwen.get("description", event.get("description", "")),
-            "persons": qwen.get("persons", event.get("yolo", {}).get("count", 0)),
-            "activity_level": qwen.get("activity_level", ""),
-            "anomaly": qwen.get("anomaly", False),
-            "frame_url": f"/api/event-frame/{event.get('event_id', '')}?user_id={user_id}"
-        })
-
-    return {
-        "camera_name": cam_name,
-        "camera_id": camera_id,
-        "frames": frames,
-        "count": len(frames)
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 7: update_business_context — Actualizar datos del negocio
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_update_business_context(
-    user_id: str,
-    field: str,
-    value: str
-) -> dict:
-    """
-    Actualiza el contexto del negocio con nueva información.
-    
-    Args:
-        field: "schedule_open", "schedule_close", "concerns", "employee_count", "note"
-        value: Nuevo valor
-    
-    Returns:
-        {success, field, new_value}
-    """
-    business = load_business_json(user_id)
-
-    if field == "schedule_open":
-        business.setdefault("schedule", {})["open"] = value
-    elif field == "schedule_close":
-        business.setdefault("schedule", {})["close"] = value
-    elif field == "concerns":
-        concerns = [c.strip() for c in value.split(",") if c.strip()]
-        business["main_concerns"] = concerns
-    elif field == "employee_count":
-        business["employee_count"] = value
-    elif field == "note":
-        ctx = business.setdefault("conversation_context", {})
-        notes = ctx.get("notes", [])
-        notes.append({
-            "text": value,
-            "timestamp": datetime.now().isoformat()
-        })
-        ctx["notes"] = notes
-    elif field == "add_person":
-        people = business.setdefault("people", {}).setdefault("known", [])
-        people.append({"name": value, "visual_tags": [], "role": "empleado"})
-    elif field == "add_suspicious":
-        people = business.setdefault("people", {}).setdefault("suspicious", [])
-        people.append({"id": f"susp_{len(people)+1:03d}", "visual_tags": [value], "incidents": 0})
-    else:
-        return {"success": False, "error": f"Campo desconocido: {field}"}
-
-    save_business_json(user_id, business)
-    return {"success": True, "field": field, "value": value}
-
-
-# ═══════════════════════════════════════════════════════════════
-# TOOL 8: learn_from_feedback — Aprender del feedback del usuario
-# ═══════════════════════════════════════════════════════════════
-
-async def tool_learn_from_feedback(
-    user_id: str,
-    event_id: str,
-    is_real: bool,
-    notes: str = None
-) -> dict:
-    """
-    Procesa feedback del usuario sobre alertas.
-    
-    Args:
-        event_id: ID del evento
-        is_real: True = alerta real, False = falsa alarma
-        notes: Notas adicionales del usuario
-    
-    Returns:
-        {success, action_taken}
-    """
-    # Buscar el evento
-    for cam_id, events_dir in resolve_user_events_dirs(user_id):
-        if cam_id == "_global":
-            continue
-        ef = events_dir / f"{event_id}.json"
-        if ef.exists():
-            with open(ef) as f:
-                event = json.load(f)
-
-            if not is_real:
-                # Marcar como falsa alarma
-                event["feedback"] = {
-                    "is_false_alarm": True,
-                    "notes": notes,
-                    "timestamp": int(time.time())
-                }
-                with open(ef, "w") as f:
-                    json.dump(event, f, indent=2)
-
-                # Actualizar métricas de la cámara
-                cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / cam_id / "camera.json"
-                if cam_file.exists():
-                    with open(cam_file) as f:
-                        cam = json.load(f)
-                    metrics = cam.setdefault("metrics", {})
-                    metrics["total_false_positives"] = metrics.get("total_false_positives", 0) + 1
-                    with open(cam_file, "w") as f:
-                        json.dump(cam, f, indent=2, ensure_ascii=False)
-
-                return {"success": True, "action": "false_alarm_registered", "camera_id": cam_id}
-            else:
-                event["feedback"] = {
-                    "is_confirmed": True,
-                    "notes": notes,
-                    "timestamp": int(time.time())
-                }
-                with open(ef, "w") as f:
-                    json.dump(event, f, indent=2)
-                return {"success": True, "action": "alert_confirmed", "camera_id": cam_id}
-
-    return {"success": False, "error": "Evento no encontrado"}
-
-
-# ═══════════════════════════════════════════════════════════════
-# REGISTRY — Todas las tools disponibles para el LLM
-# ═══════════════════════════════════════════════════════════════
 
 TOOLS_REGISTRY = {
+    "save_business_data": {
+        "function": tool_save_business_data,
+        "description": "Guarda un dato del negocio. Campos: business_name, business_type, owner_name, concern, schedule_open, schedule_close",
+        "parameters": {"type": "object", "properties": {
+            "field": {"type": "string"}, "value": {"type": "string"}
+        }, "required": ["field", "value"]},
+    },
+    "save_camera_config": {
+        "function": tool_save_camera_config,
+        "description": "Guarda configuración de cámara",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"}, "zone": {"type": "string"},
+        }, "required": ["camera_id"]},
+    },
+    "get_vigilance_config": {
+        "function": tool_get_vigilance_config,
+        "description": "Obtiene configuración de protección de una cámara: prompt, modo, horario, comportamientos y sensibilidad",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"},
+        }},
+    },
+    "update_vigilance_config": {
+        "function": tool_update_vigilance_config,
+        "description": "Actualiza configuración de protección y regenera el prompt. Usa protección estructurada, no reglas sueltas.",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"},
+            "vigilance": {"type": "object"},
+            "schedule": {"type": "object"},
+            "mode": {"type": "string", "description": "normal o sentinel"},
+            "system_prompt": {"type": "string"},
+        }},
+    },
+    "get_latest_frame": {
+        "function": tool_get_latest_frame,
+        "description": "Obtiene imagen más reciente de una cámara",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"},
+        }},
+    },
+    "analyze_frame": {
+        "function": tool_analyze_frame,
+        "description": "Analiza una imagen con Eva",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"}, "prompt": {"type": "string"},
+        }},
+    },
     "search_events": {
         "function": tool_search_events,
-        "description": "Busca eventos por descripción, persona, hora o cámara. "
-                       "Útil para: 'Busca persona con gorra negra', '¿Qué pasó ayer?', 'Alertas de la semana'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Búsqueda: 'persona con gorra negra', 'Pedro', 'alertas'"},
-                "camera_id": {"type": "string", "description": "ID de cámara o null para todas"},
-                "date": {"type": "string", "description": "today, yesterday, this_week, 2026-06-05"},
-                "event_type": {"type": "string", "description": "violation, normal, night_alert, null=todos"},
-                "limit": {"type": "integer", "description": "Máximo resultados (default: 10)"}
-            },
-            "required": []
-        }
+        "description": "Busca eventos en el diario por texto, fecha o cámara. Usa query='' para listar todos.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Texto a buscar (vacío = todos)"},
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+            "camera_id": {"type": "string"},
+            "limit": {"type": "integer"},
+        }},
     },
-    "find_person": {
-        "function": tool_find_person,
-        "description": "Busca persona por descripción visual. "
-                       "Útil para: 'Busca camisa blanca y gorra negra', '¿Viste a Pedro?'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "description": {"type": "string", "description": "Descripción visual: 'camisa blanca, gorra negra'"},
-                "date": {"type": "string", "description": "today, yesterday, this_week"},
-                "camera_id": {"type": "string", "description": "Cámara específica o null"}
-            },
-            "required": ["description"]
-        }
+    "get_activity_summary": {
+        "function": tool_get_activity_summary,
+        "description": "Resume la actividad de un día. '¿Cómo estuvo el día?' / '¿Cuántos eventos hubieron?'",
+        "parameters": {"type": "object", "properties": {
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+            "camera_id": {"type": "string"},
+        }},
     },
-    "get_daily_summary": {
-        "function": tool_get_daily_summary,
-        "description": "Resumen de un día. Útil para: '¿Cómo estuvo ayer?', 'Resumen de hoy'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "today, yesterday, 2026-06-05"}
-            },
-            "required": ["date"]
-        }
+    "find_anomalies": {
+        "function": tool_find_anomalies,
+        "description": "Busca actividad sospechosa por severidad. '¿Hubo alertas?' / '¿Viste algo raro?'",
+        "parameters": {"type": "object", "properties": {
+            "min_severity": {"type": "string", "description": "baja, media, alta, critica"},
+            "date": {"type": "string"},
+            "camera_id": {"type": "string"},
+            "limit": {"type": "integer"},
+        }},
     },
-    "get_traffic_analysis": {
-        "function": tool_get_traffic_analysis,
-        "description": "Análisis de tráfico de personas. Útil para: '¿A qué hora hay más clientes?', 'Picos de tráfico'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "days": {"type": "integer", "description": "Últimos N días (default: 7)"},
-                "camera_id": {"type": "string", "description": "Cámara específica o null"},
-                "group_by": {"type": "string", "description": "hour, day, weekday"}
+    "latest_events": {
+        "function": tool_latest_events,
+        "description": "Lista los últimos análisis guardados en el diario de eventos.",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer"},
+            "date": {"type": "string"},
+            "camera_id": {"type": "string"},
+        }},
+    },
+    "find_risks": {
+        "function": tool_find_risks,
+        "description": "Busca riesgos de incendio, humo o alertas críticas en el diario.",
+        "parameters": {"type": "object", "properties": {
+            "date": {"type": "string"},
+            "camera_id": {"type": "string"},
+            "limit": {"type": "integer"},
+        }},
+    },
+    "identify_face": {
+        "function": tool_identify_face,
+        "description": "Identifica quién aparece en el frame actual usando face recognition. '¿Quién está en cámara?' / '¿Es el cajero?'",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"},
+        }},
+    },
+    "list_employees": {
+        "function": tool_list_employees,
+        "description": "Lista los empleados registrados con faceid. '¿Cuántos empleados hay?' / '¿Quién está registrado?'",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    "save_event": {
+        "function": tool_save_event,
+        "description": "Guarda un evento de seguridad en el diario.",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string"},
+            "summary": {"type": "string"},
+            "importance": {"type": "string"}
+        }},
+    },
+    "respond_directly": {
+        "function": tool_respond_directly,
+        "description": "Responde directamente sin consultar herramientas.",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string"}
+        }, "required": ["message"]},
+    },
+}
+
+OPENAI_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_events",
+            "description": "Busca eventos en el diario de seguridad. Busca por texto, fecha o cámara. Usa query vacío para listar todos los eventos del día.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Texto a buscar en eventos (vacío = todos)"},
+                    "date": {"type": "string", "description": "today, yesterday, reciente, o YYYY-MM-DD"},
+                    "camera_id": {"type": "string", "description": "ID de cámara específica (vacío = todas)"},
+                    "limit": {"type": "integer", "description": "Máximo de resultados (1-10)"}
+                }
             }
         }
     },
-    "get_business_summary": {
-        "function": tool_get_business_summary,
-        "description": "Resumen ejecutivo del negocio. Útil para: '¿Cómo va el negocio?', 'Resumen de la semana'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "period": {"type": "string", "description": "today, yesterday, week"}
+    {
+        "type": "function",
+        "function": {
+            "name": "get_activity_summary",
+            "description": "Resume la actividad de un día: total de eventos, alertas, personas detectadas y último análisis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "today, yesterday, reciente, o YYYY-MM-DD"},
+                    "camera_id": {"type": "string", "description": "ID de cámara específica (vacío = todas)"}
+                }
             }
         }
     },
-    "get_camera_frames": {
-        "function": tool_get_camera_frames,
-        "description": "Frames recientes de una cámara. Útil para: '¿Qué ves ahora?', 'Muéstrame la caja'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "camera_id": {"type": "string", "description": "ID de la cámara"},
-                "count": {"type": "integer", "description": "Cantidad de frames (default: 5)"},
-                "time_range": {"type": "string", "description": "last_hour, today, yesterday"}
-            },
-            "required": ["camera_id"]
+    {
+        "type": "function",
+        "function": {
+            "name": "find_anomalies",
+            "description": "Busca actividad sospechosa, alertas o violaciones de seguridad por severidad mínima.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_severity": {"type": "string", "description": "baja, media, alta, critica"},
+                    "date": {"type": "string", "description": "today, yesterday, reciente, o YYYY-MM-DD"},
+                    "camera_id": {"type": "string", "description": "ID de cámara específica (vacío = todas)"},
+                    "limit": {"type": "integer", "description": "Máximo de resultados (1-10)"}
+                }
+            }
         }
     },
-    "update_business_context": {
-        "function": tool_update_business_context,
-        "description": "Actualiza datos del negocio. Útil para: 'Ahora abro los domingos', 'Tengo 3 empleados'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "field": {"type": "string", "description": "schedule_open, schedule_close, concerns, employee_count, note, add_person"},
-                "value": {"type": "string", "description": "Nuevo valor"}
-            },
-            "required": ["field", "value"]
+    {
+        "type": "function",
+        "function": {
+            "name": "latest_events",
+            "description": "Lista los últimos análisis guardados en el diario, ordenados por fecha descendente.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Cantidad de eventos (1-10)"},
+                    "date": {"type": "string", "description": "today, yesterday, reciente, o YYYY-MM-DD"},
+                    "camera_id": {"type": "string", "description": "ID de cámara específica (vacío = todas)"}
+                }
+            }
         }
     },
-    "learn_from_feedback": {
-        "function": tool_learn_from_feedback,
-        "description": "Procesa feedback sobre alertas. Útil para: 'Eso fue falsa alarma', 'Sí, era real'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "event_id": {"type": "string", "description": "ID del evento"},
-                "is_real": {"type": "boolean", "description": "True=alerta real, False=falsa alarma"},
-                "notes": {"type": "string", "description": "Notas adicionales"}
-            },
-            "required": ["event_id", "is_real"]
+    {
+        "type": "function",
+        "function": {
+            "name": "find_risks",
+            "description": "Busca riesgos de incendio, humo, fuego o alertas críticas en el diario.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "today, yesterday, reciente, o YYYY-MM-DD"},
+                    "camera_id": {"type": "string", "description": "ID de cámara específica (vacío = todas)"},
+                    "limit": {"type": "integer", "description": "Máximo de resultados (1-10)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_vigilance_config",
+            "description": "Lee la configuración actual de protección de una cámara: modo, sensibilidad, horarios, comportamientos.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de cámara"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_vigilance_config",
+            "description": "Actualiza la configuración de protección: activar/desactivar centinela, sensibilidad, horario, alertar si, no alertar por.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de cámara"},
+                    "mode": {"type": "string", "description": "normal o sentinel"},
+                    "schedule": {"type": "object", "description": "Horario: {open: 'HH:MM', close: 'HH:MM'}"},
+                    "sensitivity": {"type": "string", "description": "sensibilidad: baja, media, alta, critica"},
+                    "alert_behaviors": {"type": "array", "items": {"type": "string"}, "description": "Comportamientos que deben generar alerta"},
+                    "ignore_behaviors": {"type": "array", "items": {"type": "string"}, "description": "Comportamientos que NO deben generar alerta"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_latest_frame",
+            "description": "Obtiene la imagen más reciente de una cámara. Útil para ver qué está pasando ahora.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de cámara"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_frame",
+            "description": "Analiza el último frame con una pregunta específica sobre la escena.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de cámara"},
+                    "prompt": {"type": "string", "description": "Pregunta sobre la imagen"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "identify_face",
+            "description": "Identifica quién aparece en el frame actual usando reconocimiento facial.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de cámara"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_employees",
+            "description": "Lista los empleados registrados con faceid.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_event",
+            "description": "Guarda un evento de seguridad en el diario. Usa esta función cuando detectes algo importante que el usuario debe saber.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de cámara"},
+                    "summary": {"type": "string", "description": "Descripción corta del evento"},
+                    "importance": {"type": "string", "description": "baja, media, alta, critica"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "respond_directly",
+            "description": "Responde directamente al usuario sin consultar herramientas. Usa esto para saludos, conversación general, o cuando no necesitas consultar el diario.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Tu respuesta directa al usuario"}
+                },
+                "required": ["message"]
+            }
         }
     }
-}
+]

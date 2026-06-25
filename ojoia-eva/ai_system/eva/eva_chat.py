@@ -1484,21 +1484,29 @@ async def handle_eva_chat(
         _sessions[session_id] = session
         return _resp(session, text)
 
-    # ── DONE ───────────────────────────────────────────────────────────────────
+    # ── DONE: Modo operativo (chat con Eva) ─────────────────────────────────────
     if session["phase"] == EvaPhase.DONE.value:
-        text = (
-            f"Tu cámara ya está activa y vigilando, {first}. "
-            f"Si necesitas agregar otra cámara o cambiar algo, avísame."
-        )
-        session["msgs"].append({"role":"user","content":message})
-        session["msgs"].append({"role":"assistant","content":text})
-        _sessions[session_id] = session
-        return _resp(session, text)
+        try:
+            from eva.eva_chat_os import handle_eva_chat_os
+            return await handle_eva_chat_os(
+                user_id=user_id,
+                message=message,
+                session_id=session_id,
+                setup_phase="CHAT_OS",
+                setup_session=session,
+            )
+        except Exception as e:
+            logger.error(f"Error en modo OS: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            text = f"Tu cámara está activa y vigilando, {first}. ¿En qué te puedo ayudar?"
+            session["msgs"].append({"role":"assistant","content":text})
+            _sessions[session_id] = session
+            return _resp(session, text)
 
     # ── Fallback — fase desconocida ─────────────────────────────────────────
     logger.warning(f"Fase desconocida: {session['phase']}")
     text = "Hola, ¿en qué te puedo ayudar?"
-    session["msgs"].append({"role":"user","content":message})
     session["msgs"].append({"role":"assistant","content":text})
     _sessions[session_id] = session
     return _resp(session, text)
@@ -1538,35 +1546,53 @@ def _save_session_to_disk(session: Dict, storage_root: Path):
 
 
 def _load_session_from_disk(session_id: str, storage_root: Path) -> Optional[Dict]:
-    """Cargar sesión Eva desde disco si existe."""
+    """Cargar sesión Eva desde disco si existe. Busca la sesión más reciente del usuario."""
     try:
+        # Extraer user_id del session_id (formato: eva_USERID_single o chat_USERID_timestamp)
+        user_id = None
+        if "_" in session_id:
+            parts = session_id.split("_", 2)
+            if len(parts) >= 2:
+                user_id = parts[1]
+        
         # Buscar en todas las carpetas de usuario/cámara
-        for user_dir in storage_root.glob("users/*"):
+        found = []
+        search_users = [storage_root / "users" / user_id] if user_id else storage_root.glob("users/*")
+        for user_dir in search_users:
+            if not user_dir.exists():
+                continue
             for cam_dir in user_dir.glob("cameras/*"):
-                session_file = cam_dir / "eva_session.json"
-                if session_file.exists():
-                    data = json.loads(session_file.read_text())
-                    if data.get("session_id") == session_id:
-                        # Cargar datos del usuario para completar campos faltantes
-                        ud = _load_user_data(user_dir.name, storage_root)
-                        # Asegurar campos mínimos
-                        data.setdefault("owner_name", ud.get("name", "amigo"))
-                        data.setdefault("business_name", ud.get("business_name", "tu negocio"))
-                        data.setdefault("business_type", ud.get("business_type", "negocio"))
-                        data.setdefault("schedule", ud.get("schedule", {"open":"08:00","close":"22:00"}))
-                        data.setdefault("msgs", [])
-                        data.setdefault("camera_connected", True)
-                        data.setdefault("position_confirmed", True)
-                        data.setdefault("image_b64", "")
-                        data.setdefault("image_desc", "")
-                        data.setdefault("scene_analysis", "")
-                        data.setdefault("business_answers", [])
-                        data.setdefault("hardware_step", 0)
-                        data.setdefault("metrics", {"total_events":0,"total_alerts":0,"total_false_positives":0,"rules":{},"needs_review":False})
-                        # Asegurar que confirmed_rules sea lista
-                        if not isinstance(data.get("confirmed_rules"), list):
-                            data["confirmed_rules"] = []
-                        return data
+                # Buscar ambos nombres de archivo
+                for fname in ["eva_session.json", "eva_session_v2.json"]:
+                    session_file = cam_dir / fname
+                    if session_file.exists():
+                        try:
+                            data = json.loads(session_file.read_text())
+                            # Verificar que pertenece al usuario correcto
+                            if user_id and user_id in str(data.get("user_id", "")):
+                                found.append(data)
+                            elif not user_id:
+                                found.append(data)
+                        except:
+                            pass
+        
+        if found:
+            # Retornar la más reciente
+            best = max(found, key=lambda x: x.get("last_activity", 0))
+            # Cargar datos del usuario para completar campos faltantes
+            uid = user_id or best.get("user_id", "default")
+            ud = _load_user_data(uid, storage_root)
+            best.setdefault("owner_name", ud.get("owner",{}).get("name", "amigo"))
+            best.setdefault("business_name", ud.get("business_name", "tu negocio"))
+            best.setdefault("business_type", ud.get("business_type", "negocio"))
+            best.setdefault("schedule", ud.get("schedule", {"open":"08:00","close":"22:00"}))
+            best.setdefault("msgs", [])
+            best.setdefault("camera_connected", True)
+            best.setdefault("position_confirmed", True)
+            return best
+        return None
+    except Exception as e:
+        logger.error(f"Error loading session: {e}")
         return None
     except Exception:
         return None
