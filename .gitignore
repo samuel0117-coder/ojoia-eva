@@ -25,3 +25,6 @@ storage/
 *.mp4
 !frontend/img/
 venv*/
+venv*/
+*/venv*/
+**/venv*/
