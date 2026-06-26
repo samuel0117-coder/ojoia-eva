@@ -24,3 +24,4 @@ storage/
 *.jpeg
 *.mp4
 !frontend/img/
+venv*/
