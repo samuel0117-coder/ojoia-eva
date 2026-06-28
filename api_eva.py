@@ -1121,6 +1121,12 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         img_bytes = await image.read()
         frame_size = len(img_bytes)
+        now_dt = datetime.now()
+
+        # ── WATERMARK: Agregar marca de agua al frame original ──
+        ts_str = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        img_bytes = add_frame_watermark(img_bytes, camera_id, ts_str, business_name="")
+
         logger.info(f"Frame: IP={client_ip} Cam={camera_id} User={user_id} Size={frame_size}B")
 
         # 1. Leer config de la cámara
@@ -1139,7 +1145,6 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                 pass
 
         # 2. Determinar modo: normal o centinela
-        now_dt = datetime.now()
         current_time = now_dt.strftime("%H:%M")
         is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False))
         logger.info(f"Mode: {'VIGILANTE' if is_vigilante else 'NORMAL'} | Time: {current_time}")

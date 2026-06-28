@@ -13,6 +13,10 @@ Tools para consulta (OS mode):
 - find_anomalias: Encuentra actividad sospechosa por severidad
 """
 import json
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 import logging
 import re
 import time
@@ -886,6 +890,12 @@ async def tool_respond_directly(user_id: str, message: str = "") -> dict:
 
 
 async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = None, user_id: str = None) -> dict:
+    """Procesa feedback del usuario sobre un evento.
+
+    - Si es falsa alarma: registra el false_alarm y guarda notas como contexto
+    - Si es amenaza real: fortalece la atención en esa zona
+    - Las notas del usuario se convierten en owner_notes para futuros análisis
+    """
     try:
         import os, json
         event_file = None
@@ -901,20 +911,59 @@ async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = No
             return {"success": False, "error": "Evento no encontrado", "action": "none"}
         with open(event_file) as f:
             event_data = json.load(f)
+
+        # Guardar feedback
         if "feedback" not in event_data:
             event_data["feedback"] = {}
         event_data["feedback"]["is_real"] = is_real
         event_data["feedback"]["user_id"] = user_id
+        event_data["feedback"]["timestamp"] = int(time.time())
         if notes:
             event_data["feedback"]["notes"] = notes
+
+        camera_id = event_data.get("camera_id", "")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # FEEDBACK LOOP: Convertir notas del dueño en owner_notes
+        # ═══════════════════════════════════════════════════════════════════
+        if notes and camera_id:
+            try:
+                cam_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
+                if os.path.exists(cam_file):
+                    with open(cam_file) as f:
+                        cam_cfg = json.load(f)
+                    vigilance = cam_cfg.get("vigilance", {})
+                    if not isinstance(vigilance, dict):
+                        vigilance = {}
+
+                    # Inicializar owner_notes si no existe
+                    if "owner_notes" not in vigilance:
+                        vigilance["owner_notes"] = []
+
+                    # Agregar la nota del usuario (sin duplicar)
+                    note_clean = notes.strip()
+                    if note_clean and note_clean not in vigilance["owner_notes"]:
+                        vigilance["owner_notes"].append(note_clean)
+                        # Limitar a 20 notas para no inflar el prompt
+                        vigilance["owner_notes"] = vigilance["owner_notes"][-20:]
+
+                    cam_cfg["vigilance"] = vigilance
+                    with open(cam_file, "w") as f:
+                        json.dump(cam_cfg, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Owner note added for {camera_id}: {note_clean[:50]}")
+            except Exception as e:
+                logger.warning(f"Could not save owner_note: {e}")
+
         with open(event_file, "w") as f:
             json.dump(event_data, f, indent=2, ensure_ascii=False)
+
+        # Registrar falsa alarma si aplica
         from orchestrator import register_false_alarm
-        camera_id = event_data.get("camera_id", "")
         if not is_real and camera_id:
             register_false_alarm(user_id, camera_id)
+
         action = "false_alarm_registered" if not is_real else "feedback_recorded"
-        return {"success": True, "action": action, "event_id": event_id}
+        return {"success": True, "action": action, "event_id": event_id, "note_saved": bool(notes)}
     except Exception as e:
         return {"success": False, "error": str(e), "action": "none"}
 

@@ -10,8 +10,9 @@ import logging
 import datetime
 import re
 from typing import Optional, List, Dict, Any
-from gateway_resize import resize_image, image_to_base64, create_grid_image
+from gateway_resize import resize_image, image_to_base64, create_grid_image, create_panels_2x2
 from eva.camera_builder import normalize_camera_vigilance_config, build_witness_prompt
+from eva.vigilance_prompts import format_vision_prompt
 from face_pipeline import identify_from_frame, extract_face_from_frame
 import threading
 
@@ -1706,96 +1707,84 @@ class QwenOrchestrator:
          cam_cfg: dict, frames: list = None, concern: str = "",
          attention_phrases: list = None, owner_notes: list = None
      ) -> dict:
-        """Etapa 1: Qwen solo describe lo que ve. NUNCA decide violación.
+        """Etapa 1: Qwen analiza 4 panels 2x2 con prompt maestro por rol.
 
-        Qwen es TESTIGO, no juzga. Solo narra hechos observables.
-        attention_phrases: frases de atención del dueño (observacionales, no juicios).
-        owner_notes: notas previas del dueño para contexto (ej: "tocarse bolsillo por teléfono es normal").
+        Qwen es TESTIGO, no juzga. Recibe:
+        - 4 panels (grids 2x2 de 4 frames cada uno = 16 frames totales)
+        - Prompt maestro con rol específico según negocio+zona
+        - Frases de atención del dueño como preguntas directas
+        - Timestamps en cada frame para temporal grounding
         """
-        after_note = "FUERA DE HORARIO laboral." if is_after_hours else "Dentro de horario laboral."
-
-        attention_section = ""
-        if attention_phrases:
-            phrases_text = "\n".join(f"- {p}" for p in attention_phrases)
-            attention_section = (
-                f"\n\n=== LO QUE EL DEÑO QUIERE QUE OBSERVES ===\n"
-                f"Si en algún momento de esta secuencia ves algo que se parezca a\n"
-                f"lo siguiente, menciónalo explícitamente en 'attention_hits' con\n"
-                f"el momento exacto en que ocurre:\n{phrases_text}\n"
-                f"Si NO ves nada de esto, no lo menciones — sigue describiendo normalmente.\n"
-                f"Esto es observación, no juicio. Solo dime si físicamente pasó.\n"
-            )
-
-        notes_section = ""
-        if owner_notes:
-            notes_text = "\n".join(f"- {n}" for n in owner_notes)
-            notes_section = (
-                f"\n\n=== NOTAS DEL DUEÑO (CONTEXTO) ===\n"
-                f"{notes_text}\n"
-                f"Ten en cuenta estas aclaraciones al describir la escena.\n"
-            )
-
-        # Construir prompt específico por rol usando templates
-        witness_base = build_witness_prompt({
-            "zone": zone,
-            "business_name": business_name,
-            "business_type": business_type,
-            "schedule": {"open": schedule_open, "close": schedule_close},
-            "attention_phrases": attention_phrases or [],
-            "owner_notes": owner_notes or [],
-        })
-
-        attention_questions = ""
-        if attention_phrases:
-            questions = "\n".join(f"- ¿{phrase.strip().capitalize().rstrip('.')}?" for phrase in attention_phrases)
-            attention_questions = (
-                f"\n\n=== LO QUE EL DEÑO SABE QUE DEBES PREGUNTAR ===\n"
-                f"Por cada una de estas preguntas, responde en 'attention_hits' si físicamente pasó:\n{questions}\n"
-                f"Si NO viste ninguna de estas cosas, no las menciones — sigue describiendo normalmente.\n"
-                f"Esto es observación, NUNCA juicio. Solo dime si físicamente pasó.\n"
-            )
-
-        vision_prompt = (
-            f"{witness_base}\n"
-            f"Estado actual: {'FUERA DE HORARIO laboral.' if is_after_hours else 'Dentro de horario laboral.'}\n"
-            f"{attention_questions}\n"
-            f"{notes_section}\n"
-            f"FORMATO de respuesta (JSON válido):\n"
-            f"{{\n"
-            f'  "personas": [{{"ubicacion": "centro/izquierda/derecha/fondo", "ropa": "camiseta negra", "accion": "esperando", "rol": "cliente/empleado/otro"}}],\n'
-            f'  "counts": {{"clientes": 0, "empleados": 0, "platos_visibles": 0, "bebidas_visibles": 0, "fundas_visibles": 0}},\n'
-            f'  "attention_hits": [{{"frase": "frase que coincidió", "momento": "frame X o descripción breve"}}],\n'
-            f'  "resumen": "Relato de 3-5 frases narrando la secuencia. Solo hechos, sin juicios."\n'
-            f"}}"
+        # ═══════════════════════════════════════════════════════════════════
+        # 1. CONSTRUIR PROMPT MAESTRO DESDE BIBLIOTECA
+        # ═══════════════════════════════════════════════════════════════════
+        vision_prompt = format_vision_prompt(
+            business_type=business_type,
+            zone=zone,
+            business_name=business_name,
+            is_after_hours=is_after_hours,
+            owner_notes=owner_notes,
         )
 
-        # LOGGING CRUDO - Capa 1: prompt exacto enviado a Qwen
-        logger.info(f"[QWEN_PROMPT] {vision_prompt[:500]}")
+        # ═══════════════════════════════════════════════════════════════════
+        # 2. FORMATO DE RESPUESTA JSON
+        # ═══════════════════════════════════════════════════════════════════
+        response_format = """
+INSTRUCCIONES DE SALIDA:
+Responde SOLO con JSON válido, sin markdown ni texto adicional:
 
-        # Construir content con frames individuales + grid
+{
+  "paneles": [
+    {"rango": "0-2s", "evento": "descripción de lo que pasó", "personas": 0},
+    {"rango": "2-4s", "evento": "descripción de lo que pasó", "personas": 0},
+    {"rango": "4-6s", "evento": "descripción de lo que pasó", "personas": 0},
+    {"rango": "6-8s", "evento": "descripción de lo que pasó", "personas": 0}
+  ],
+  "escena_completa": "Relato continuo de qué pasó en los 8 segundos. Máximo 6 oraciones.",
+  "counts": {
+    "clientes": 0,
+    "empleados": 0,
+    "platos_visibles": 0,
+    "bebidas_visibles": 0,
+    "fundas_visibles": 0
+  },
+  "atencion_detectada": [
+    {"frase": "la frase que coincidió", "momento": "panel 2, frame 3", "accion_observada": "qué pasó exactamente"}
+  ],
+  "resumen_temporal": "Cómo cambió la escena desde el inicio hasta el final"
+}"""
+
+        full_prompt = vision_prompt + "\n\n" + response_format
+
+        logger.info(f"[QWEN_PROMPT] {full_prompt[:800]}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 3. CONSTRUIR 4 PANELS 2×2 DESDE LOS FRAMES CON WATERMARK
+        # ═══════════════════════════════════════════════════════════════════
         content = []
 
-        # Agregar frames individuales (hasta 4 recientes)
-        if frames:
-            recent_frames = frames[-4:] if len(frames) >= 4 else frames
-            for i, f in enumerate(recent_frames):
-                if "image_bytes" in f and f["image_bytes"]:
-                    try:
-                        frame_b64 = image_to_base64(f["image_bytes"])
-                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}})
-                    except Exception:
-                        pass
+        if frames and len(frames) >= 4:
+            panels = create_panels_2x2(frames)
+            for panel_bytes in panels:
+                panel_b64 = image_to_base64(panel_bytes)
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{panel_b64}"}
+                })
+        else:
+            # Fallback: enviar grid si no hay frames individuales
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{grid_img_b64}"}
+            })
 
-        # Agregar grid
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{grid_img_b64}"}})
-
-        # Agregar prompt de texto
-        content.append({"type": "text", "text": vision_prompt})
+        # Agregar prompt de texto al final
+        content.append({"type": "text", "text": full_prompt})
 
         payload = {
             "model": "qwen",
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 500
+            "max_tokens": 600
         }
 
         try:
@@ -1803,15 +1792,14 @@ class QwenOrchestrator:
                 resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
                 resp.raise_for_status()
                 raw_content = resp.json()["choices"][0]["message"]["content"]
-                # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
-                logger.info(f"[QWEN_RAW] {raw_content[:500]}")
+                logger.info(f"[QWEN_RAW] {raw_content[:600]}")
                 parsed = _parse_qwen_json(raw_content)
-                # LOGGING CRUDO - Capa 3: JSON parseado
-                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:500]}")
+                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:600]}")
                 return parsed
         except Exception as e:
             logger.error(f"Vision Analyst error: {e}")
             return {}
+
 
     async def submit(
         self, 
