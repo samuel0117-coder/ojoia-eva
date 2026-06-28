@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+firebase-key.json
+*.log
+storage/
+!storage/.gitkeep
