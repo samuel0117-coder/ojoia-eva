@@ -1413,6 +1413,89 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
 # SETUP MODE
 # =============================================================================
 
+async def _extract_business_data(user_id: str, message: str, session: dict) -> dict:
+    """Extrae owner_name, business_name y business_type del mensaje del usuario."""
+    import re
+    result = {"owner_name": None, "business_name": None, "business_type": None}
+    msg = message.strip()
+
+    # Heurística 1: "Mi nombre es X" / "Me llamo X" / "Soy X"
+    name_patterns = [
+        r"(?:mi nombre es|me llamo|soy|yo soy)\s+([A-Z\xc1\xc9\xcd\xd3\xda\xd1][a-z\xe1\xe9\xed\xf3\xfa\xf1]+(?:\s+[A-Z\xc1\xc9\xcd\xd3\xda\xd1][a-z\xe1\xe9\xed\xf3\xfa\xf1]+)?)",
+    ]
+    for pat in name_patterns:
+        m = re.search(pat, msg, re.IGNORECASE)
+        if m:
+            result["owner_name"] = m.group(1).strip().title()
+            break
+
+    # Heurística 2: "Mi negocio es X" / "Tengo un X"
+    biz_patterns = [
+        r"(?:mi negocio es|mi empresa es|se llama)\s+[\x27\x22]?([^\x27\x22\n,]+)[\x27\x22]?",
+        r"tengo\s+(?:un|una)\s+([a-z\xe1\xe9\xed\xf3\xfa\xf1]+(?:\s+[a-z\xe1\xe9\xed\xf3\xfa\xf1]+){0,3})",
+    ]
+    for pat in biz_patterns:
+        m = re.search(pat, msg, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            skip_words = {"que", "para", "por", "con", "sin", "muy", "bien", "mal"}
+            if candidate.lower() not in skip_words and len(candidate) > 2:
+                result["business_name"] = candidate.title()
+                break
+
+    # Heurística 3: Detectar tipo de negocio desde el nombre
+    if result["business_name"]:
+        biz_lower = result["business_name"].lower()
+        type_keywords = {
+            "restaurante": ["restaurante", "restaurant", "comida", "cocina"],
+            "bar": ["bar", "cantina", "pub", "cerveza"],
+            "tienda": ["tienda", "store", "shop", "venta", "comercio"],
+            "farmacia": ["farmacia", "pharmacy", "medicina"],
+            "supermercado": ["supermercado", "super", "mercado", "grocery"],
+            "oficina": ["oficina", "office", "despacho"],
+            "almacen": ["almacen", "bodega", "warehouse"],
+            "panaderia": ["panaderia", "bakery", "pan"],
+            "cafeteria": ["cafeteria", "cafe"],
+            "peluqueria": ["peluqueria", "barberia", "salon"],
+        }
+        for biz_type, keywords in type_keywords.items():
+            if any(kw in biz_lower for kw in keywords):
+                result["business_type"] = biz_type
+                break
+
+    # Si no se encontró nada con heurísticas y el mensaje es largo, usar LLM
+    if not result["owner_name"] and not result["business_name"] and len(msg) > 10:
+        try:
+            from eva.eva_v2 import _call_qwen
+            extraction_prompt = (
+                "Del siguiente mensaje, extrae SOLO estos datos si existen:\n"
+                "- owner_name: nombre de la persona\n"
+                "- business_name: nombre del negocio\n"
+                "- business_type: tipo de negocio\n\n"
+                f"Mensaje: {msg!r}\n\n"
+                "Responde SOLO en JSON: {\"owner_name\": \"...\", \"business_name\": \"...\", \"business_type\": \"...\"}"
+            )
+            llm_result = await _call_qwen(
+                [{"role": "system", "content": "Extrae datos del mensaje. Responde solo JSON."},
+                 {"role": "user", "content": extraction_prompt}],
+                max_tokens=150
+            )
+            if llm_result.get("success"):
+                content = llm_result.get("content", "{}")
+                json_match = re.search(r"\{[^}]+\}", content)
+                if json_match:
+                    extracted = json.loads(json_match.group())
+                    result["owner_name"] = extracted.get("owner_name")
+                    result["business_name"] = extracted.get("business_name")
+                    result["business_type"] = extracted.get("business_type")
+        except Exception:
+            pass
+
+    return result
+
+
+
+
 async def _handle_setup(session, user_id, message, session_id, cam_id, storage_root, include_frame=False):
     phase = session["phase"]
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"

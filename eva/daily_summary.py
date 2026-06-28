@@ -81,7 +81,63 @@ def _load_camera_config(user_id, camera_id):
     return {}
 
 
-def generate_daily_summary(user_id, target_date=None):
+
+async def _generate_ai_narrative(summary: dict) -> str:
+    """Genera un párrafo narrativo con Qwen basado en los datos del resumen."""
+    try:
+        totals = summary.get("totals", {})
+        people = summary.get("people", {})
+        items = summary.get("items", {})
+        time_info = summary.get("time", {})
+        comp = summary.get("comparison", {})
+        date_str = summary.get("date", "ayer")
+
+        # Construir contexto para Qwen
+        facts = f"""Fecha: {date_str}
+Eventos totales: {totals.get('events', 0)}
+Alertas: {totals.get('alerts', 0)}
+Clientes estimados: {people.get('clientes_estimado', 0)}
+Empleados: {people.get('empleados', 0)}
+Platos visibles: {items.get('platos', 0)}
+Bebidas visibles: {items.get('bebidas', 0)}
+Hora pico: {time_info.get('peak_hour', 'N/A')}:00
+Cobertura: {time_info.get('coverage_hours', 0)} horas
+Cambio vs ayer: {comp.get('delta_events', 0)} eventos"""
+
+        prompt = f"""Basándote en estos datos de seguridad del negocio, escribe UN párrafo narrativo (4-6 oraciones) en español dominicano, tono cercano pero profesional.
+
+{facts}
+
+Reglas:
+- Empieza con "Ayer en tu negocio..."
+- Menciona lo más relevante (pico de actividad, personas, items)
+- Si hubo alertas, menciónalas naturalmente
+- Compara con ayer solo si hay cambio significativo (>20%)
+- Termina con una sugerencia práctica
+- NO uses palabras como "violación", "anomalía", "sospechoso"
+- Máximo 150 palabras"""
+
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "http://localhost:8004/v1/chat/completions",
+                json={
+                    "model": "qwen",
+                    "messages": [
+                        {"role": "system", "content": "Eres Eva, asistente de seguridad. Narras hechos del negocio en español dominicano, tono cercano."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 200
+                }
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"Error generando narrativa: {e}")
+    return ""
+
+
+async def generate_daily_summary(user_id, target_date=None):
     date_str = target_date or date.today().isoformat()
     yesterday_str = (date.fromisoformat(date_str) - timedelta(days=1)).isoformat()
 
@@ -133,9 +189,12 @@ def generate_daily_summary(user_id, target_date=None):
     for e in today_events:
         qj = _event_qwen(e)
         counts = qj.get("counts", {}) if isinstance(qj.get("counts"), dict) else {}
+        # Los counts también pueden estar en qwen_json.vision (formato del orchestrator)
+        vision = qj.get("vision", {}) if isinstance(qj.get("vision"), dict) else {}
+        vision_counts = vision.get("counts", {}) if isinstance(vision.get("counts"), dict) else {}
         meta = e.get("metadata", {}) if isinstance(e.get("metadata"), dict) else {}
         meta_counts = meta.get("counts", {}) if isinstance(meta.get("counts"), dict) else {}
-        all_counts = {**meta_counts, **counts}
+        all_counts = {**meta_counts, **counts, **vision_counts}
         total_clientes += (all_counts.get("clientes") or 0)
         total_empleados += (all_counts.get("empleados") or 0)
         total_platos += (all_counts.get("platos_visibles") or 0)
@@ -270,6 +329,12 @@ def generate_daily_summary(user_id, target_date=None):
         },
         "notable_events": notable,
     }
+
+    # Generar narrativa AI (no bloqueante - si falla, continúa)
+    try:
+        summary["ai_narrative"] = await _generate_ai_narrative(summary)
+    except Exception:
+        summary["ai_narrative"] = ""
 
     _persist_summary(user_id, date_str, summary)
     return summary

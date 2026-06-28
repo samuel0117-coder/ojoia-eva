@@ -954,6 +954,11 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
         qwen_json["attention_hits"] = []
     if not isinstance(qwen_json.get("counts"), dict):
         qwen_json["counts"] = {}
+    # Garantizar que los campos de counts siempre existan (aunque Qwen no los devuelva)
+    counts_defaults = {"clientes": 0, "empleados": 0, "platos_visibles": 0, "bebidas_visibles": 0, "fundas_visibles": 0}
+    for k, v in counts_defaults.items():
+        if k not in qwen_json["counts"]:
+            qwen_json["counts"][k] = v
     if not qwen_json.get("search_tags"):
         tags = []
         for value in details.values():
@@ -1910,6 +1915,12 @@ class QwenOrchestrator:
                          attention_phrases=attention_phrases, owner_notes=owner_notes
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
+                    # Garantizar counts siempre presentes en vision_json
+                    if not isinstance(vision_json.get("counts"), dict):
+                        vision_json["counts"] = {}
+                    for k in ("clientes", "empleados", "platos_visibles", "bebidas_visibles", "fundas_visibles"):
+                        if k not in vision_json["counts"]:
+                            vision_json["counts"][k] = 0
                 logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
             except Exception as e:
                 logger.error(f"[VISION] Error: {e}", exc_info=True)

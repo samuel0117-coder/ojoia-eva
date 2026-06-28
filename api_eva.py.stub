@@ -3169,6 +3169,10 @@ async def get_daily_summary(user_id: str, date_str: str = None):
         summary = await generate_daily_summary(user_id, target_date)
     return {"success": True, "summary": summary}
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8005)
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  SDXL Switch — Cambiar entre Turbo y JuggernautXL
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3414,11 +3418,3 @@ async def save_setup_session(user_id: str, data: dict):
     with open(session_file, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return {"success": True}
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Entry point — Solo se ejecuta cuando se corre directamente (no cuando se importa)
-# ═══════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8005)

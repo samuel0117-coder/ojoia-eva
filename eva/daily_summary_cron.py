@@ -20,7 +20,7 @@ async def send_fcm_notification(user_id: str, title: str, body: str):
     try:
         import httpx
         # Cargar Firebase credentials
-        cred_path = Path("/home/sam/ojoia/code/firebase-key.json")
+        cred_path = Path("/opt/ojoia/code/firebase-key.json")
         if not cred_path.exists():
             logger.warning("Firebase key not found, skipping push")
             return

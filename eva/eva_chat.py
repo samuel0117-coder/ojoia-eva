@@ -652,6 +652,15 @@ async def handle_eva_chat(
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
     phase = session["phase"]
 
+    # ── MORNING GREETING ──────────────────────────────────────────────────────
+    if message == "__morning_greeting__":
+        from eva.eva_v2 import handle_eva_v2
+        return await handle_eva_v2(
+            user_id=user_id,
+            message=message,
+            session_id=session_id
+        )
+
     # Si __greet__ llega pero la sesión ya está en fase posterior (edición),
     # y el mensaje es __greet__, no mostrar GREET — continuar a la fase actual
     if message == "__greet__" and phase != EvaPhase.GREET.value:
