@@ -10,6 +10,7 @@ import torch
 import logging
 import asyncio
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("yolo_server")
@@ -196,13 +197,12 @@ def _get_tracker(camera_id):
 async def load_model():
     global model
     model_name = os.getenv("YOLO_MODEL", "yolov8s-pose.pt")
-    log.info(f"Loading {model_name} model for CPU...")
-    torch.set_num_threads(int(os.getenv("YOLO_CPU_THREADS", "4")))
-    torch.set_num_interop_threads(1)
+    log.info(f"Loading {model_name} model for CUDA (GPU 1)...")
+    torch.set_num_threads(2)
     model = YOLO(model_name, verbose=False)
-    model.to("cpu")
+    model.to("cuda")
     model.eval()
-    log.info(f"Model loaded successfully on CPU with {torch.get_num_threads()} threads")
+    log.info(f"Model loaded successfully on CUDA (GPU 1)")
 
 
 @app.post("/detect")
@@ -265,7 +265,7 @@ async def health():
         "yolo": "healthy" if model else "loading",
         "model": os.getenv("YOLO_MODEL", "yolov8s-pose.pt"),
         "loaded": model is not None,
-        "device": "cpu",
+        "device": "cuda",
         "threads": torch.get_num_threads(),
         "imgsz": int(os.getenv("YOLO_IMGSZ", "416")),
         "default_confidence": 0.25,

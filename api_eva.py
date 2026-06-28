@@ -827,6 +827,15 @@ async def get_event_detail(event_id: str, user_id: str):
     }
     event["yolo"] = {"count": 1}
     event["grid_b64"] = event.get("metadata", {}).get("grid_b64", "")
+    # Contar frames disponibles para el carrusel
+    frames_dir = events_dir / event_id / "frames"
+    if frames_dir.exists():
+        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+        event["frames"] = [{"index": i, "file": f.name} for i, f in enumerate(frame_files)]
+        event["frameCount"] = len(frame_files)
+    else:
+        event["frames"] = []
+        event["frameCount"] = 0
     return event
 
 @app.get("/api/user/events/stats")
@@ -3302,6 +3311,28 @@ async def get_event_frame(event_id: str, user_id: str):
                 img.save(buf, format="JPEG", quality=75)
                 return Response(content=buf.getvalue(), media_type="image/jpeg",
                                 headers={"Cache-Control": "max-age=86400"})
+            except Exception:
+                pass
+    raise HTTPException(status_code=404, detail="Frame no encontrado")
+
+
+@app.get("/api/events/{event_id}/frame/{index}")
+async def get_event_frame_by_index(event_id: str, index: int, user_id: str):
+    """Sirve un frame específico del evento por índice (para carrusel/video)."""
+    for cam_id, events_dir in resolve_user_events_dirs(user_id):
+        if cam_id == "_global":
+            continue
+        frame_file = events_dir / event_id / "frames" / f"frame_{index:03d}.jpg"
+        if frame_file.exists():
+            try:
+                from PIL import Image as PILImage
+                import io
+                img = PILImage.open(frame_file)
+                img.thumbnail((640, 480))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=75)
+                return Response(content=buf.getvalue(), media_type="image/jpeg",
+                                headers={"Cache-Control": "max-age=3600"})
             except Exception:
                 pass
     raise HTTPException(status_code=404, detail="Frame no encontrado")
