@@ -1208,6 +1208,68 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
     return None
 
 
+
+async def _handle_morning_greeting(session, user_id, message, session_id):
+    """Saludo matutino con resumen del día anterior."""
+    from eva.daily_summary import load_summary, generate_daily_summary
+    from datetime import date, timedelta
+    first = session.get("owner_name", "amigo").split()[0] if session.get("owner_name") else "amigo"
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    summary = load_summary(user_id, yesterday)
+    if not summary or not summary.get("totals", {}).get("events"):
+        summary = await generate_daily_summary(user_id, yesterday)
+    
+    lines = []
+    lines.append(f"¡Buenos días, {first}! 👋")
+    lines.append("")
+    
+    if summary and summary.get("totals", {}).get("events", 0) > 0:
+        t = summary.get("totals", {})
+        p = summary.get("people", {})
+        items = summary.get("items", {})
+        time_info = summary.get("time", {})
+        comp = summary.get("comparison", {})
+        
+        lines.append(f"📊 Resumen de ayer ({yesterday}):")
+        lines.append(f"• {t.get('events', 0)} análisis de seguridad")
+        
+        if t.get("alerts", 0) > 0:
+            lines.append(f"• ⚠️ {t.get('alerts', 0)} alertas")
+        else:
+            lines.append("• Sin alertas ✅")
+        
+        if p.get("clientes_estimado", 0) > 0:
+            lines.append(f"• 🧑‍🤝‍🧑 ~{p.get('clientes_estimado', 0)} clientes")
+        if p.get("empleados", 0) > 0:
+            lines.append(f"• 👤 ~{p.get('empleados', 0)} empleados")
+        if items.get("platos", 0) > 0:
+            lines.append(f"• 🍽️ ~{items.get('platos', 0)} platos")
+        if items.get("bebidas", 0) > 0:
+            lines.append(f"• 🥤 ~{items.get('bebidas', 0)} bebidas")
+        
+        peak = time_info.get("peak_hour")
+        if peak is not None:
+            lines.append(f"• Hora pico: {peak}:00")
+        
+        if comp.get("delta_events") is not None:
+            delta = comp["delta_events"]
+            if delta > 0:
+                lines.append(f"• ↑ {delta} más que antier")
+            elif delta < 0:
+                lines.append(f"• ↓ {abs(delta)} menos que antier")
+        
+        lines.append("")
+        lines.append("¿Qué quieres revisar hoy?")
+    else:
+        lines.append("Ayer no hubo actividad registrada. Todo tranquilo. ✅")
+        lines.append("")
+        lines.append("¿En qué te ayudo hoy?")
+    
+    text = "\n".join(lines)
+    session["msgs"].append({"role": "assistant", "content": text})
+    _sessions[session_id] = session
+    return _mk_resp(session, text, suggestions=_get_business_suggestions_list(session.get("business_type", ""), session.get("cameras_count", 0), first))
+
 async def _handle_os_mode(session, user_id, message, session_id):
     return await _handle_os_mode_v2(session, user_id, message, session_id)
 
@@ -1220,6 +1282,9 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
 
     if message == "__daily_summary__":
         return await _handle_daily_summary(session, user_id, message, session_id)
+
+    if message == "__morning_greeting__":
+        return await _handle_morning_greeting(session, user_id, message, session_id)
 
     if "resumen del dia" in message.lower() or "resumen del día" in message.lower():
         return await _handle_daily_summary(session, user_id, message, session_id)
