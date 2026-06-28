@@ -34,7 +34,7 @@ import firebase_admin
 from firebase_admin import auth, credentials
 
 # Importar modulos locales
-from gateway_resize import resize_image, image_to_base64
+from gateway_resize import resize_image, image_to_base64, add_frame_watermark
 from orchestrator import orchestrator
 
 # Configuracion Global
@@ -1123,7 +1123,16 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         frame_size = len(img_bytes)
         now_dt = datetime.now()
 
-        # ── WATERMARK: Agregar marca de agua al frame original ──
+        # Guardar frame ORIGINAL (sin watermark) para el viewer
+        try:
+            frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            frames_dir_v.mkdir(parents=True, exist_ok=True)
+            with open(frames_dir_v / "latest_raw.jpg", "wb") as f:
+                f.write(img_bytes)
+        except Exception:
+            pass
+
+        # ── WATERMARK: Agregar marca de agua SOLO para análisis Qwen ──
         ts_str = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
         img_bytes = add_frame_watermark(img_bytes, camera_id, ts_str, business_name="")
 
@@ -1151,15 +1160,6 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         # 3. Ajustar brillo para YOLO (siempre, para que detecte mejor)
         yolo_bytes = _adjust_brightness(img_bytes)
-
-        # 3b. Guardar frame más reciente para el viewer (SIEMPRE, sin importar modo)
-        try:
-            frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
-            frames_dir.mkdir(parents=True, exist_ok=True)
-            with open(frames_dir / "latest_raw.jpg", "wb") as f:
-                f.write(img_bytes)
-        except Exception:
-            pass
 
         # 4. YOLO detection - detectar CUALQUIER objeto con conf >= 0.25
         yolo_count = 0
