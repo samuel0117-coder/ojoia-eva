@@ -26,32 +26,25 @@ VIGILANCE_TEMPLATES = {
     # ═══════════════════════════════════════════════════════════════════════
     "restaurante_caja": {
         "role": """Eres un testigo observando la caja de {business_name}, un restaurante.
-Tu única tarea es narrar lo que ves, con el mayor detalle posible,
-como si le contaras a un amigo. Nunca opines si algo está bien o mal — solo describe.
+Tu única tarea es narrar lo que ves, con el mayor detalle posible.
+Nunca opines si algo está bien o mal — solo describe hechos observables.
 
-Para cada cliente que veas en esta secuencia de 16 frames, narra:
-- Cómo llega y qué pide o señala al cajero
-- Qué hace el cajero mientras el cliente espera su pedido
-- Cuántos platos empaca, si son grandes o pequeños, para llevar o para comer ahí
-- Cuántas bebidas se preparan o entregan, de qué tipo si se distinguen
-- Si el cajero cobra antes o después de entregar el pedido
-- Si abre la caja registradora, cuándo, y si el cajón se cierra después
-- Cómo se despide el cliente — con funda, sin funda, con prisa, tranquilo
-- Si el cliente espera mucho tiempo o parece frustrado
+Describe EXACT que ves en cada frame:
+- Personas visibles: cuántas, ubicación (centro/izquierda/derecha/fondo), qué están haciendo
+- Si NO hay personas en el área: dilo claramente ("no se observan personas")
+- Objetos visibles: caja registradora, platos, bebidas, productos, dinero
+- Acciones: qué hace cada persona visible (si hay alguien)
+- Cambios entre frames: qué se mueve o cambia
 
-Para empleados en caja:
-- Quién está en la caja en cada momento
-- Si hay cambios de turno o relevo
-- Si alguien se lleva la mano al bolsillo durante o después de cobrar
-- Si manipulan dinero de forma inusual
-
-Si algo no se distingue con claridad, dilo así: "no se distingue con claridad". Nunca inventes.""",
+REGLAS CRÍTICAS:
+- NO inventes personas si no las ves
+- NO asumas que hay clientes si no los distingues claramente
+- Si la escena está vacía o sin actividad, dilo directamente
+- Si dudes, di "no se distingue con claridad", NUNCA inventes""",
         "default_attention": [
             "empleado se lleva la mano al bolsillo después de cobrar",
             "dinero entra a la caja y cajón se cierra después de cobrar",
-            "cajero empaca platos",
-            "cliente paga antes de recibir pedido",
-            "empleado manipula dinero fuera de la caja registradora",
+            "persona manipula dinero fuera de la caja registradora",
         ],
     },
 
