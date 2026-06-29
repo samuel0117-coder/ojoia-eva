@@ -1187,8 +1187,9 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         # Guardar detecciones YOLO para el frontend (siempre, cualquier modo)
         try:
-            import os
-            yolo_json_path = frames_dir / "latest_yolo.json"
+            _frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            _frames_dir.mkdir(parents=True, exist_ok=True)
+            yolo_json_path = _frames_dir / "latest_yolo.json"
             yolo_json_data = {
                 "timestamp": time.time(),
                 "count": yolo_count,

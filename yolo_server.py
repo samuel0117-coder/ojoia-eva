@@ -213,7 +213,7 @@ async def detect(image: UploadFile = File(...), confidence: float = 0.25, camera
     img_bytes = await image.read()
     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     imgsz = int(os.getenv("YOLO_IMGSZ", "416"))
-    effective_conf = max(float(confidence), float(os.getenv("YOLO_PERSON_CONF", "0.35")))
+    effective_conf = min(float(confidence), float(os.getenv("YOLO_PERSON_CONF", "0.35")))
 
     async with yolo_lock:
         results = model(img, imgsz=imgsz, conf=effective_conf, verbose=False)
