@@ -1438,14 +1438,33 @@ def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night
     close_t = schedule.get("close", "19:00")
     grace_min = vigilance.get("grace_minutes", 15)
     try:
-        from datetime import datetime as dt, timedelta
-        close_dt = dt.strptime(close_t, "%H:%M")
-        vigilante_start = (close_dt + timedelta(minutes=grace_min)).strftime("%H:%M")
+        def to_min(t: str) -> int:
+            parts = t.split(":")[:2]
+            return int(parts[0]) * 60 + int(parts[1])
+        cur = to_min(current_time)
+        opn = to_min(open_t)
+        cls_close = to_min(close_t)
+        # Minuto en que inicia el modo centinela (cierre + gracia)
+        centinela_start = cls_close + grace_min
+        # Caso 1: NO cruza medianoche (ej: cierre 20:00 + 15min = 20:15)
+        if centinela_start < 1440:
+            if cur < opn or cur > centinela_start:
+                return True
+            return False
+        # Caso 2: CRUZA medianoche (ej: cierre 23:59 + 15min = 1454 = 00:14 dia sig)
+        else:
+            real_centinel_start = centinela_start - 1440  # 14 = 00:14
+            # Normal: dentro del horario laboral
+            if cur >= opn and cur <= cls_close:
+                return False
+            # Gracia: después de medianoche pero Antes del inicio real de centinela
+            # Usa <= para incluir el último minuto de gracia
+            if cur <= real_centinel_start:
+                return False
+            # Centinela: antes de abrir o después de la gracia
+            return True
     except:
-        vigilante_start = close_t
-    if current_time < open_t or current_time >= vigilante_start:
-        return True
-    return False
+        return False
 
 
 _vigilance_cooldowns = {}  # {user_id_camera_id: last_alert_timestamp}
