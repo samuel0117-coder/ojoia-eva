@@ -974,12 +974,13 @@ def _build_summary_from_rich_qwen(qwen_json: dict, zone: str, attention_detected
     parts = []
 
     # ═══════════════════════════════════════════════════════════════════
-    # NUEVO FORMATO: paneles[], escena_completa, counts, atencion_detectada
+    # NUEVO FORMATO: vision.paneles[], vision.escena_completa, etc
     # ═══════════════════════════════════════════════════════════════════
-    paneles = qwen_json.get("paneles", [])
+    vision = qwen_json.get("vision", {}) if isinstance(qwen_json.get("vision"), dict) else {}
+    paneles = vision.get("paneles", [])
     if isinstance(paneles, list) and paneles:
         # Usar escena_completa si existe
-        escena = qwen_json.get("escena_completa", "")
+        escena = vision.get("escena_completa", "")
         if escena and len(escena) > 20:
             parts.append(escena)
         else:
@@ -993,7 +994,7 @@ def _build_summary_from_rich_qwen(qwen_json: dict, zone: str, attention_detected
                 parts.append(" ".join(eventos))
 
     # Counts (personas, objetos)
-    counts = qwen_json.get("counts", {})
+    counts = vision.get("counts", qwen_json.get("counts", {}))
     if isinstance(counts, dict):
         count_parts = []
         if counts.get("clientes", 0) > 0:
@@ -1008,7 +1009,7 @@ def _build_summary_from_rich_qwen(qwen_json: dict, zone: str, attention_detected
             parts.append("Conteo: " + ", ".join(count_parts))
 
     # Atención detectada (frases del dueño)
-    atencion = qwen_json.get("atencion_detectada", [])
+    atencion = vision.get("atencion_detectada", [])
     if isinstance(atencion, list) and atencion:
         for hit in atencion:
             frase = hit.get("frase", "")
@@ -1023,7 +1024,7 @@ def _build_summary_from_rich_qwen(qwen_json: dict, zone: str, attention_detected
                 parts.append(linea)
 
     # Resumen temporal
-    resumen_temp = qwen_json.get("resumen_temporal", "")
+    resumen_temp = vision.get("resumen_temporal", "")
     if resumen_temp and len(resumen_temp) > 10:
         parts.append(f"Cambio temporal: {resumen_temp}")
 
@@ -1311,7 +1312,7 @@ def _enrich_qwen_json_from_metadata(qwen_json: dict, metadata: dict, zone: str, 
                     qwen_json["summary"] = ". ".join(parts) + "."
                 else:
                     # Fallback: usar escena_completa o resumen de paneles
-                    escena = qwen_json.get("escena_completa", "")
+                    escena = vision.get("escena_completa", "")
                     if escena and len(escena) > 20:
                         qwen_json["summary"] = escena
                     else:
@@ -1965,6 +1966,10 @@ Responde SOLO con JSON válido, sin markdown ni texto adicional:
         # Extraer resumen del nuevo formato si existe
         if isinstance(qwen_json, dict):
             v_resumen = qwen_json.get("vision", {}).get("resumen", "")
+            if not v_resumen:
+                v_escena = qwen_json.get("vision", {}).get("escena_completa", "")
+                if v_escena:
+                    v_resumen = v_escena
             if v_resumen and len(v_resumen) > len(summary):
                 qwen_json["summary"] = v_resumen
                 summary = v_resumen
