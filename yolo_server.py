@@ -248,10 +248,11 @@ async def detect(image: UploadFile = File(...), confidence: float = 0.25, camera
         if d.get("track_stable") or conf >= 0.70 or (pose_score >= 0.65 and conf >= 0.55):
             stable_persons.append(d)
     return {
-        "detections": stable_persons,
+        "detections": person_detections,  # Todas las personas (no solo estables)
         "all_detections": tracked,
         "raw_detections": raw_detections,
-        "count": len(stable_persons),
+        "count": len(person_detections),  # Count real de personas detectadas
+        "stable_count": len(stable_persons),
         "model": os.getenv("YOLO_MODEL", "yolov8s-pose.pt"),
         "pose_model": True,
         "tracker": "simple_iou",
