@@ -970,96 +970,94 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
 
 
 def _build_summary_from_rich_qwen(qwen_json: dict, zone: str, attention_detected: bool) -> str:
-    details = qwen_json.get("details", {}) if isinstance(qwen_json.get("details"), dict) else {}
-    persons = details.get("persons_description") or ""
-    actions = details.get("actions_visible") or []
-    objects = details.get("objects_visible") or []
-    scene = details.get("scene_context") or ""
-    vision = qwen_json.get("vision", {}) if isinstance(qwen_json.get("vision"), dict) else {}
-    v_cliente = vision.get("cliente") or qwen_json.get("cliente")
-    v_empleado = vision.get("empleado") or qwen_json.get("empleado")
-    v_resumen = vision.get("summary", "") or qwen_json.get("summary", "")
-    v_persons = vision.get("persons", []) or qwen_json.get("persons", [])
-    if not isinstance(v_persons, list):
-        v_persons = []
-    v_scene = vision.get("scene", "") or qwen_json.get("scene", "")
-    v_objects = vision.get("objects", []) or qwen_json.get("objects", [])
-    if not isinstance(v_objects, list):
-        v_objects = []
+    """Construye resumen legible desde JSON de Qwen (nuevo formato paneles[])."""
     parts = []
-    if v_cliente and isinstance(v_cliente, dict) and v_cliente.get("presente"):
-        desc = "Cliente"
-        if v_cliente.get("descripcion"):
-            desc += f" — {v_cliente['descripcion']}"
-            if v_cliente.get("accion") and v_cliente["accion"] not in v_cliente.get("descripcion", ""):
-                desc += f", {v_cliente['accion']}"
-        elif v_cliente.get("accion"):
-            desc += f" — {v_cliente['accion']}"
-        if v_cliente.get("pago"):
-            desc += f" | Pago: {v_cliente['pago']}"
-            if v_cliente.get("cantidad_billetes"):
-                desc += f" ({v_cliente['cantidad_billetes']} billete(s))"
-            if v_cliente.get("denominacion"):
-                desc += f" de {v_cliente['denominacion']}"
-        if v_cliente.get("platos"):
-            desc += f" | Pedido: {v_cliente['platos']} plato(s)"
-        parts.append(desc)
-    if v_empleado and isinstance(v_empleado, dict) and v_empleado.get("presente"):
-        desc = "Empleado (cajero)"
-        if v_empleado.get("descripcion"):
-            desc += f" — {v_empleado['descripcion']}"
-            if v_empleado.get("accion") and v_empleado["accion"] not in v_empleado.get("descripcion", ""):
-                desc += f", {v_empleado['accion']}"
-        elif v_empleado.get("accion"):
-            desc += f" — {v_empleado['accion']}"
-        actions_list = []
-        if v_empleado.get("cajon_abierto"):
-            actions_list.append("abrió cajón")
-        if v_empleado.get("entrego_cambio"):
-            actions_list.append("entregó cambio")
-        if v_empleado.get("uso_datafono"):
-            actions_list.append("usó datáfono")
-        if v_empleado.get("entrego_platos"):
-            actions_list.append(f"entregó {v_empleado['entrego_platos']} plato(s)")
-        if actions_list:
-            desc += f" | {', '.join(actions_list)}"
-        parts.append(desc)
-    if v_persons and not v_cliente and not v_empleado:
-        for p in v_persons:
-            role = p.get("role", "persona")
-            clothing = p.get("clothing", "")
-            action = p.get("action", p.get("acciones", ""))
-            interaction = p.get("interaction", "")
-            desc = role.capitalize()
-            if clothing:
-                desc += f" ({clothing})" if isinstance(clothing, str) else f" ({', '.join(str(c) for c in clothing)})"
-            if action and isinstance(action, list):
-                desc += " — " + ", ".join(str(a) for a in action)
-            elif action and isinstance(action, str):
-                desc += f" — {action.strip()}"
-            if interaction and isinstance(interaction, str) and interaction.strip():
-                desc += f", {interaction.strip()}"
-            parts.append(desc)
-    elif persons:
-        parts.append(str(persons))
-    if v_scene and len(v_scene) > 30:
-        parts.append(v_scene)
-    elif v_resumen and v_resumen != v_scene:
-        parts.append(v_resumen)
-    v_objects_filtered = [str(o) for o in v_objects if str(o).lower() not in ("silla", "mesa", "pared", "techo", "lámpara", "cable")]
-    if v_objects_filtered:
-        parts.append("Objetos: " + ", ".join(v_objects_filtered))
-    elif isinstance(objects, list) and objects:
-        parts.append("objetos visibles: " + ", ".join(str(o) for o in objects[:5]))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # NUEVO FORMATO: paneles[], escena_completa, counts, atencion_detectada
+    # ═══════════════════════════════════════════════════════════════════
+    paneles = qwen_json.get("paneles", [])
+    if isinstance(paneles, list) and paneles:
+        # Usar escena_completa si existe
+        escena = qwen_json.get("escena_completa", "")
+        if escena and len(escena) > 20:
+            parts.append(escena)
+        else:
+            # Concatenar eventos de cada panel
+            eventos = []
+            for p in paneles:
+                ev = p.get("evento", "")
+                if ev and ev not in eventos:
+                    eventos.append(ev)
+            if eventos:
+                parts.append(" ".join(eventos))
+
+    # Counts (personas, objetos)
+    counts = qwen_json.get("counts", {})
+    if isinstance(counts, dict):
+        count_parts = []
+        if counts.get("clientes", 0) > 0:
+            count_parts.append(f"{counts['clientes']} cliente(s)")
+        if counts.get("empleados", 0) > 0:
+            count_parts.append(f"{counts['empleados']} empleado(s)")
+        if counts.get("platos_visibles", 0) > 0:
+            count_parts.append(f"{counts['platos_visibles']} plato(s)")
+        if counts.get("bebidas_visibles", 0) > 0:
+            count_parts.append(f"{counts['bebidas_visibles']} bebida(s)")
+        if count_parts:
+            parts.append("Conteo: " + ", ".join(count_parts))
+
+    # Atención detectada (frases del dueño)
+    atencion = qwen_json.get("atencion_detectada", [])
+    if isinstance(atencion, list) and atencion:
+        for hit in atencion:
+            frase = hit.get("frase", "")
+            momento = hit.get("momento", "")
+            accion = hit.get("accion_observada", "")
+            if frase:
+                linea = f"⚠️ {frase}"
+                if momento:
+                    linea += f" (en {momento})"
+                if accion:
+                    linea += f" — {accion}"
+                parts.append(linea)
+
+    # Resumen temporal
+    resumen_temp = qwen_json.get("resumen_temporal", "")
+    if resumen_temp and len(resumen_temp) > 10:
+        parts.append(f"Cambio temporal: {resumen_temp}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # FALLBACK: Formato antiguo (vision.summary, vision.scene, etc.)
+    # ═══════════════════════════════════════════════════════════════════
+    if not parts:
+        vision = qwen_json.get("vision", {}) if isinstance(qwen_json.get("vision"), dict) else {}
+        v_resumen = vision.get("summary", "") or qwen_json.get("summary", "")
+        v_scene = vision.get("scene", "") or qwen_json.get("scene", "")
+        v_persons = vision.get("persons", []) or qwen_json.get("persons", [])
+        if not isinstance(v_persons, list):
+            v_persons = []
+        if v_resumen and len(v_resumen) > 20:
+            parts.append(v_resumen)
+        elif v_scene and len(v_scene) > 20:
+            parts.append(v_scene)
+        elif v_persons:
+            for p in v_persons[:3]:
+                role = p.get("role", "persona")
+                action = p.get("action", p.get("acciones", ""))
+                desc = role.capitalize()
+                if action:
+                    desc += f" — {action}"
+                parts.append(desc)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # RESULTADO FINAL
+    # ═══════════════════════════════════════════════════════════════════
     if parts:
         prefix = "Observación relevante" if attention_detected else "Actividad normal"
         return f"{prefix} en {zone}: " + ". ".join(parts) + "."
-    if v_resumen:
-        return v_resumen
-    if v_scene:
-        return v_scene
-    if persons:
-        return str(persons)
+
+    # Último fallback
     return "Actividad normal" if not attention_detected else "Observación relevante"
 
 
@@ -1312,7 +1310,14 @@ def _enrich_qwen_json_from_metadata(qwen_json: dict, metadata: dict, zone: str, 
                 if parts:
                     qwen_json["summary"] = ". ".join(parts) + "."
                 else:
-                    qwen_json["summary"] = f"Actividad normal en {zone}."
+                    # Fallback: usar escena_completa o resumen de paneles
+                    escena = qwen_json.get("escena_completa", "")
+                    if escena and len(escena) > 20:
+                        qwen_json["summary"] = escena
+                    else:
+                        paneles = qwen_json.get("paneles", [])
+                        eventos = [p.get("evento", "") for p in paneles if p.get("evento")] if isinstance(paneles, list) else []
+                        qwen_json["summary"] = ". ".join(eventos) if eventos else f"Actividad normal en {zone}."
     if not details.get("scene_context"):
         horario = "fuera de horario" if after_hours else "dentro de horario"
         details["scene_context"] = f"Zona {zone}, {horario}."

@@ -385,8 +385,10 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
         if _yolo_json_path.exists():
             with open(_yolo_json_path) as _f:
                 _yolo_data = json.load(_f)
-            if _yolo_data.get("detections"):
-                yolo_detections = _yolo_data["detections"]
+            # Usar datos del JSON si el timestamp es reciente (< 60s)
+            _yolo_ts = _yolo_data.get("timestamp", 0)
+            if isinstance(_yolo_ts, (int, float)) and (time.time() - _yolo_ts) < 60:
+                yolo_detections = _yolo_data.get("detections", [])
                 yolo_count = _yolo_data.get("count", len(yolo_detections))
     except:
         pass
