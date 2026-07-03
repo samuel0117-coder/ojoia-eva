@@ -16,6 +16,8 @@ from face_pipeline import identify_from_frame, extract_face_from_frame
 import threading
 
 logger = logging.getLogger(__name__)
+ENABLE_ATTENTION_HITS = False
+USE_FALLBACK_SUMMARY = False
 
 STORAGE_ROOT = "/home/sam/storage"
 DISKS_CONFIG_FILE = f"{STORAGE_ROOT}/disks_config.json"
@@ -1720,11 +1722,7 @@ class QwenOrchestrator:
         # Agregar prompt de texto
         content.append({"type": "text", "text": vision_prompt})
 
-        payload = {
-            "model": "qwen",
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": 500
-        }
+        payload = {\n            "model": "qwen",\n            "messages": [{"role": "user", "content": content}],\n            "max_tokens": 800,\n            "temperature": 0.4\n        }
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -1960,17 +1958,7 @@ class QwenOrchestrator:
         resized = resize_image(image_bytes, max_size=512)
         img_b64 = image_to_base64(resized)
         
-        payload = {
-            "model": "qwen",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text", "text": prompt}
-                ]
-            }],
-            "max_tokens": 1200
-        }
+        payload = {\n            "model": "qwen",\n            "messages": [{"role": "user", "content": content}],\n            "max_tokens": 800,\n            "temperature": 0.4\n        }
         
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
