@@ -19,14 +19,15 @@ import re
 import time
 import base64
 import secrets
-from datetime import datetime
+import asyncio
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.status import HTTP_200_OK
 from pydantic import BaseModel
 import httpx
@@ -34,7 +35,7 @@ import firebase_admin
 from firebase_admin import auth, credentials
 
 # Importar modulos locales
-from gateway_resize import resize_image, image_to_base64
+from gateway_resize import resize_image, image_to_base64, add_frame_watermark
 from orchestrator import orchestrator
 
 # Configuracion Global
@@ -199,10 +200,13 @@ async def add_security_headers(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return response
     except Exception as e:
-        logger.error(f"Middleware error: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Middleware error: {type(e).__name__}: {e}")
+        logger.error(f"Traceback: {tb}")
         return Response(
             status_code=500,
-            content="Internal error",
+            content=f"Error: {type(e).__name__}: {e}",
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
@@ -376,6 +380,19 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
     yolo_count = grid.get_last_yolo_count()
     yolo_detections = grid.get_last_yolo_detections()
+    # Leer latest_yolo.json si existe (más actualizado, funciona en modo centinela también)
+    try:
+        _yolo_json_path = STORAGE_ROOT / "users" / (user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
+        if _yolo_json_path.exists():
+            with open(_yolo_json_path) as _f:
+                _yolo_data = json.load(_f)
+            # Usar datos del JSON si el timestamp es reciente (< 60s)
+            _yolo_ts = _yolo_data.get("timestamp", 0)
+            if isinstance(_yolo_ts, (int, float)) and (time.time() - _yolo_ts) < 60:
+                yolo_detections = _yolo_data.get("detections", [])
+                yolo_count = _yolo_data.get("count", len(yolo_detections))
+    except:
+        pass
     return {
         "success": bool(frame_bytes),
         "image_b64": image_b64,
@@ -437,6 +454,111 @@ async def get_latest_grid(partial: int = 1, camera_id: Optional[str] = None, use
         "camera_ids": info["camera_ids"],
         "partial": bool(partial)
     }
+
+
+# ── MJPEG Stream (viewer en tiempo real) ──────────────────────────────────
+# Cache en RAM del último frame por (user_id, camera_id) para evitar disco
+_frame_cache: Dict[str, bytes] = {}
+_frame_cache_ts: Dict[str, float] = {}
+_FRAME_CACHE_TTL = 5.0  # segundos
+
+def _get_cache_key(user_id: str, camera_id: str) -> str:
+    return f"{user_id}:{camera_id}"
+
+def _cache_frame(user_id: str, camera_id: str, frame_bytes: bytes):
+    key = _get_cache_key(user_id, camera_id)
+    _frame_cache[key] = frame_bytes
+    _frame_cache_ts[key] = time.time()
+
+def _get_cached_frame(user_id: str, camera_id: str) -> Optional[bytes]:
+    key = _get_cache_key(user_id, camera_id)
+    ts = _frame_cache_ts.get(key, 0)
+    if time.time() - ts > _FRAME_CACHE_TTL:
+        return None
+    return _frame_cache.get(key)
+
+def _read_latest_frame_bytes(user_id: str, camera_id: str) -> Optional[bytes]:
+    """Leer el frame más reciente: intenta cache en RAM primero, luego disco."""
+    cached = _get_cached_frame(user_id, camera_id)
+    if cached:
+        return cached
+    try:
+        frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+        latest_raw = frames_dir / "latest_raw.jpg"
+        if latest_raw.exists():
+            data = latest_raw.read_bytes()
+            if data:
+                _cache_frame(user_id, camera_id, data)
+                return data
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/cameras/{camera_id}/stream")
+async def camera_mjpeg_stream(camera_id: str, user_id: str = None, fps: int = 2):
+    """
+    MJPEG stream en tiempo real para el viewer.
+    - fps: frames por segundo (1-10, default 2)
+    - No requiere suscripción activa (solo visualización)
+    - Usa cache en RAM para minimizar I/O de disco
+    - Envia el ultimo frame conocido en cada tick (aunque se repita)
+      para mantener la conexion activa y el navegador fluido
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+
+    fps = max(1, min(fps, 10))
+    frame_interval = 1.0 / fps
+    boundary = b"--frame"
+
+    async def generate():
+        last_frame_bytes = None
+        first_frame_sent = False
+        repeats = 0
+
+        while True:
+            try:
+                frame_bytes = _read_latest_frame_bytes(user_id, camera_id)
+
+                if frame_bytes:
+                    if not first_frame_sent or frame_bytes != last_frame_bytes:
+                        first_frame_sent = True
+                        last_frame_bytes = frame_bytes
+                        repeats = 0
+                        yield b"Content-Type: image/jpeg\r\n"
+                        yield f"Content-Length: {len(frame_bytes)}\r\n".encode()
+                        yield b"Cache-Control: no-store\r\n"
+                        yield b"\r\n"
+                        yield frame_bytes
+                        yield b"\r\n"
+                        yield boundary + b"\r\n"
+                    else:
+                        repeats += 1
+                        if repeats >= 3:
+                            repeats = 0
+                            yield b"Content-Type: image/jpeg\r\n"
+                            yield f"Content-Length: {len(frame_bytes)}\r\n".encode()
+                            yield b"Cache-Control: no-store\r\n"
+                            yield b"\r\n"
+                            yield frame_bytes
+                            yield b"\r\n"
+                            yield boundary + b"\r\n"
+
+            except Exception as e:
+                logger.warning(f"MJPEG stream error for {camera_id}: {e}")
+
+            await asyncio.sleep(frame_interval)
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Connection": "close",
+            "Pragma": "no-cache",
+        }
+    )
 
 # Auth Firebase
 
@@ -813,6 +935,15 @@ async def get_event_detail(event_id: str, user_id: str):
     }
     event["yolo"] = {"count": 1}
     event["grid_b64"] = event.get("metadata", {}).get("grid_b64", "")
+    # Contar frames disponibles para el carrusel
+    frames_dir = events_dir / event_id / "frames"
+    if frames_dir.exists():
+        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+        event["frames"] = [{"index": i, "file": f.name} for i, f in enumerate(frame_files)]
+        event["frameCount"] = len(frame_files)
+    else:
+        event["frames"] = []
+        event["frameCount"] = 0
     return event
 
 @app.get("/api/user/events/stats")
@@ -863,9 +994,42 @@ async def get_cameras(user_id: str):
             if last_frame and (now - last_frame) < 120:
                 is_online = True
             cam_copy["active"] = is_online
-            # Age info for frontend
             cam_copy["announce_age"] = int(now - last_announce) if last_announce else None
             cam_copy["frame_age"] = int(now - last_frame) if last_frame else None
+            # Metrics para el frontend
+            try:
+                cam_id = cam.get("camera_id", "")
+                ev_dir = STORAGE_ROOT / "users" / user_id / "cameras" / cam_id / "events"
+                total_ev = 0
+                total_al = 0
+                today_ev = 0
+                today_al = 0
+                today_start = (int(now) // 86400) * 86400
+                if ev_dir.exists():
+                    for f in ev_dir.iterdir():
+                        if f.name.endswith(".json"):
+                            total_ev += 1
+                            try:
+                                with open(f) as fh:
+                                    _ev = json.load(fh)
+                                _ts = _ev.get("timestamp", 0)
+                                _type = _ev.get("event_type", "")
+                                if _type in ("vigilance_alert", "violation", "attention_alert"):
+                                    total_al += 1
+                                if _ts and _ts >= today_start:
+                                    today_ev += 1
+                                    if _type in ("vigilance_alert", "violation", "attention_alert"):
+                                        today_al += 1
+                            except:
+                                pass
+                cam_copy["metrics"] = {
+                    "total_events": total_ev,
+                    "total_alerts": total_al,
+                    "today_events": today_ev,
+                    "today_alerts": today_al,
+                }
+            except:
+                cam_copy["metrics"] = {"total_events": 0, "total_alerts": 0, "today_events": 0, "today_alerts": 0}
             result.append(cam_copy)
         return {"cameras": result}
     return {"cameras": []}
@@ -876,10 +1040,14 @@ from typing import Optional as _Optional
 
 @app.post("/cameras/{camera_id}/cmd", include_in_schema=False)
 async def cam_cmd(camera_id: str, request: dict = None):
-    """Proxy de comandos al ESP32 local."""
+    """Proxy de comandos al ESP32 local + guardar config para polling."""
     cors_headers = {"Access-Control-Allow-Origin": "*"}
     try:
         body = request or {}
+
+        # Guardar configuracion en user.json para polling del ESP32
+        _save_cam_config_to_user(camera_id, body)
+
         target_ip = None
         users_dir = STORAGE_ROOT / "users"
         if users_dir.is_dir():
@@ -913,9 +1081,53 @@ async def cam_cmd(camera_id: str, request: dict = None):
                 resp = await client.post(f"http://{target_ip}:81/config", json=body)
             return JSONResponse(content={"ok": True}, headers=cors_headers)
         except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError):
-            return JSONResponse(content={"ok": True}, headers=cors_headers)
+            # Si no se puede conectar directamente, el ESP32 aplicara via polling
+            return JSONResponse(content={"ok": True, "queued": True}, headers=cors_headers)
     except Exception as e:
         return JSONResponse(status_code=502, content={"ok": False, "error": str(e)}, headers=cors_headers)
+
+
+def _save_cam_config_to_user(camera_id: str, body: dict):
+    """Guardar configuracion de camara en user.json para polling del ESP32."""
+    try:
+        users_dir = STORAGE_ROOT / "users"
+        if not users_dir.is_dir():
+            return
+        for user_dir in users_dir.iterdir():
+            if not user_dir.is_dir():
+                continue
+            uf = user_dir / "user.json"
+            if not uf.exists():
+                continue
+            try:
+                with open(uf) as f:
+                    ud = json.load(f)
+                for c in ud.get("cameras", []):
+                    if c.get("camera_id") == camera_id:
+                        # Guardar campos que el ESP32 entiende
+                        if "quality" in body:
+                            c["quality"] = body["quality"]
+                        if "interval_ms" in body:
+                            c["interval_ms"] = body["interval_ms"]
+                        if "framesize" in body:
+                            c["framesize"] = body["framesize"]
+                        if "led_auto" in body:
+                            c["led_auto"] = body["led_auto"]
+                        if "led_bright" in body:
+                            c["led_bright"] = body["led_bright"]
+                        if "h_mirror" in body:
+                            c["h_mirror"] = body["h_mirror"]
+                        if "v_flip" in body:
+                            c["v_flip"] = body["v_flip"]
+                        if "led_on" in body:
+                            c["led_on"] = body["led_on"]
+                        with open(uf, "w") as f:
+                            json.dump(ud, f, indent=2)
+                        return
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"Error saving cam config: {e}")
 
 @app.get("/api/cameras/{camera_id}")
 async def get_camera(camera_id: str, user_id: str = None):
@@ -958,12 +1170,55 @@ async def get_camera_grid(camera_id: str, user_id: Optional[str] = None):
     frame_bytes = grid.get_last_frame_bytes() if last_cam == camera_id else b""
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
     return {
-        "success": True,
+"success": True,
         "camera_id": camera_id,
         "image_b64": image_b64,
         "yolo": {"count": grid.get_last_yolo_count()},
         "qwen": {"violation": False}
     }
+
+
+# ── Config para ESP32 (polling cada 30s) ─────────────────────────────────
+# El ESP32 hace GET /camera/config/{id} para obtener su configuracion
+# Este endpoint devuelve los valores que el ESP32 debe aplicar
+
+@app.get("/camera/config/{camera_id}")
+async def get_esp32_config(camera_id: str):
+    """
+    Endpoint de polling del ESP32.
+    Devuelve la configuracion que la app ha guardado para esta camara:
+    - quality, interval_ms, framesize, led_auto, led_bright, h_mirror, v_flip
+    El ESP32 compara con su config local y aplica cambios si difiere.
+    """
+    # Buscar el user_id de esta camara
+    user_id = _resolve_user_id_from_camera(camera_id)
+    if not user_id:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+
+    with open(uf) as f:
+        ud = json.load(f)
+
+    for c in ud.get("cameras", []):
+        if c.get("camera_id") == camera_id:
+            # Devolver solo los campos que el ESP32 entiende
+            return {
+                "camera_id": camera_id,
+                "quality": c.get("quality", 10),
+                "interval_ms": c.get("interval_ms", 500),
+                "framesize": c.get("framesize", 10),
+                "led_auto": c.get("led_auto", True),
+                "led_bright": c.get("led_bright", 128),
+                "h_mirror": c.get("h_mirror", False),
+                "v_flip": c.get("v_flip", False),
+                "stream_always": c.get("stream_always", True)
+            }
+
+    raise HTTPException(status_code=404, detail="Camera not found in user")
+
 
 # Ingesta de Frames (ESP32-CAM)
 @app.post("/ingest/frame")
@@ -1065,31 +1320,47 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         img_bytes = await image.read()
         frame_size = len(img_bytes)
+        now_dt = datetime.now()
+
+        # Guardar frame ORIGINAL (sin watermark) para el viewer
+        try:
+            frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            frames_dir_v.mkdir(parents=True, exist_ok=True)
+            with open(frames_dir_v / "latest_raw.jpg", "wb") as f:
+                f.write(img_bytes)
+            # Cache en RAM para MJPEG stream (sin I/O de disco)
+            _cache_frame(user_id, camera_id, img_bytes)
+        except Exception:
+            pass
+
+        # ── WATERMARK: Agregar marca de agua SOLO para análisis Qwen ──
+        ts_str = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        img_bytes = add_frame_watermark(img_bytes, camera_id, ts_str, business_name="")
+
         logger.info(f"Frame: IP={client_ip} Cam={camera_id} User={user_id} Size={frame_size}B")
 
         # 1. Leer config de la cámara
         cam_cfg = get_camera_config_static(user_id, camera_id)
         yolo_triggers = cam_cfg.get("yolo_triggers", ["person"])
         vigilance = cam_cfg.get("vigilance", {})
-        schedule = cam_cfg.get("schedule", {})
+        schedule = cam_cfg.get("schedule") or {}
+        if not schedule:
+            try:
+                _uf = find_user_json(user_id)
+                if _uf and _uf.exists():
+                    with open(_uf) as _f:
+                        _ud = json.load(_f)
+                    schedule = _ud.get("schedule", {})
+            except:
+                pass
 
         # 2. Determinar modo: normal o centinela
-        now_dt = datetime.now()
         current_time = now_dt.strftime("%H:%M")
         is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False))
         logger.info(f"Mode: {'VIGILANTE' if is_vigilante else 'NORMAL'} | Time: {current_time}")
 
         # 3. Ajustar brillo para YOLO (siempre, para que detecte mejor)
         yolo_bytes = _adjust_brightness(img_bytes)
-
-        # 3b. Guardar frame más reciente para el viewer (SIEMPRE, sin importar modo)
-        try:
-            frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
-            frames_dir.mkdir(parents=True, exist_ok=True)
-            with open(frames_dir / "latest_raw.jpg", "wb") as f:
-                f.write(img_bytes)
-        except Exception:
-            pass
 
         # 4. YOLO detection - detectar CUALQUIER objeto con conf >= 0.25
         yolo_count = 0
@@ -1108,10 +1379,30 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                         if d.get("confidence", 0) >= 0.25:
                             yolo_classes.append(d.get("class", ""))
                             yolo_detections.append(d)
-                    yolo_count = len(yolo_classes)
-                    logger.warning(f"YOLO_DEBUG: raw_count={yolo_data.get('count')} filtered_count={yolo_count} classes={yolo_classes} all_dets={[(d.get('class'),d.get('confidence')) for d in yolo_data.get('detections',[])]}")
+                    # Conteo inteligente: usar track_id para personas únicas
+                    unique_track_ids = set(d.get("track_id") for d in yolo_detections if d.get("track_id"))
+                    yolo_count = len(unique_track_ids) if unique_track_ids else len(yolo_detections)
+                    # Metadata de tracking en español
+                    tracking_info = _build_tracking_info(yolo_detections)
+                    logger.warning(f"YOLO_DEBUG: raw_count={yolo_data.get('count')} filtered_count={yolo_count} classes={yolo_classes} unique_tracks={len(unique_track_ids)} tracking={tracking_info}")
         except Exception as e:
             logger.warning(f"YOLO unavailable: {e}")
+
+        # Guardar detecciones YOLO para el frontend (siempre, cualquier modo)
+        try:
+            _frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            _frames_dir.mkdir(parents=True, exist_ok=True)
+            yolo_json_path = _frames_dir / "latest_yolo.json"
+            yolo_json_data = {
+                "timestamp": time.time(),
+                "count": yolo_count,
+                "detections": yolo_detections,
+                "mode": "vigilante" if is_vigilante else "normal"
+            }
+            with open(yolo_json_path, "w") as f:
+                json.dump(yolo_json_data, f)
+        except Exception:
+            pass
 
         # 4. YOLO GATE: si no hay objetos, NO pasar al grid
         grid_result = {"frame_count": 0, "grid_full": False, "ready_for_analysis": False}
@@ -1119,7 +1410,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         if yolo_count == 0:
             # YOLO no detectó nada - frame NO va al grid
             logger.info(f"YOLO gate: 0 objects → frame REJECTED (not added to grid)")
-            _update_camera_last_frame(user_id, camera_id)
+            _update_camera_last_frame(user_id, camera_id, client_ip)
             return {
                 "success": True, "camera_id": camera_id, "user_id": user_id,
                 "client_ip": client_ip, "frame_size": frame_size,
@@ -1141,7 +1432,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                 pass
             # Guardar evento de vigilancia y notificar FCM
             _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count, yolo_classes, client_ip)
-            _update_camera_last_frame(user_id, camera_id)
+            _update_camera_last_frame(user_id, camera_id, client_ip)
             return {
                 "success": True, "camera_id": camera_id, "user_id": user_id,
                 "client_ip": client_ip, "frame_size": frame_size,
@@ -1176,7 +1467,8 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         grid_result = orchestrator.add_frame(
             grid_bytes, camera_id, user_id,
-            yolo_count=yolo_count, vigilance_prompt=v_prompt,
+            yolo_count=yolo_count, yolo_detections=yolo_detections,
+            vigilance_prompt=v_prompt,
             vigilance_rules=v_rules, burst_mode=burst_mode
         )
         logger.info(f"Grid: {grid_result['frame_count']}/16 | YOLO:{yolo_count} | zone:{zone_priority}")
@@ -1209,7 +1501,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             logger.debug(f"eva frame buffer: {e}")
 
         # 10. Actualizar timestamp de la cámara
-        _update_camera_last_frame(user_id, camera_id)
+        _update_camera_last_frame(user_id, camera_id, client_ip)
 
         return {
             "success": True,
@@ -1237,6 +1529,103 @@ _background_objects: dict = {}
 
 # Cooldown tracking: {camera_id: last_alert_timestamp}
 _alert_cooldowns: dict = {}
+
+
+def _build_tracking_info(yolo_detections: list) -> dict:
+    """Construir metadata de tracking en español para las detecciones.
+    
+    Returns:
+        dict con información de tracking en español:
+        - total_personas: número total de detecciones
+        - personas_unicas: número de track_ids únicos
+        - personas_estables: count de track_stable=True
+        - alturas: lista de alturas estimadas
+        - actividades: lista de actividades inferidas
+    """
+    if not yolo_detections:
+        return {"total_personas": 0, "personas_unicas": 0}
+    
+    track_ids = set()
+    estables = 0
+    alturas = []
+    actividades = []
+    
+    for d in yolo_detections:
+        # Track ID
+        tid = d.get("track_id")
+        if tid:
+            track_ids.add(tid)
+        
+        # Estabilidad
+        if d.get("track_stable"):
+            estables += 1
+        
+        # Altura estimada desde pose
+        pose = d.get("pose", {})
+        altura = _estimate_height_from_pose(pose, d.get("bbox", []))
+        if altura:
+            alturas.append(altura)
+        
+        # Actividad inferida
+        actividad = _infer_activity_from_pose(pose)
+        if actividad:
+            actividades.append(actividad)
+    
+    return {
+        "total_personas": len(yolo_detections),
+        "personas_unicas": len(track_ids),
+        "personas_estables": estables,
+        "alturas_estimadas": alturas,
+        "actividades": list(set(actividades))
+    }
+
+
+def _estimate_height_from_pose(pose: dict, bbox: list) -> str:
+    """Estimar altura de persona desde keypoints de pose."""
+    if not pose or not bbox or len(bbox) != 4:
+        return "desconocida"
+    
+    keypoints = pose.get("keypoints", [])
+    if not keypoints or len(keypoints) < 17:
+        return "desconocida"
+    
+    try:
+        # Usar vertical_span como proxy de altura
+        vertical_span = pose.get("vertical_span", 0)
+        
+        if vertical_span > 0.6:
+            return "alta"
+        elif vertical_span > 0.4:
+            return "media"
+        else:
+            return "baja"
+    except Exception:
+        return "desconocida"
+
+
+def _infer_activity_from_pose(pose: dict) -> str:
+    """Inferir actividad desde métricas de pose."""
+    if not pose:
+        return "desconocida"
+    
+    try:
+        vertical_span = pose.get("vertical_span", 0)
+        visible = pose.get("visible", 0)
+        has_pose = pose.get("has_pose", False)
+        
+        if not has_pose:
+            return "desconocida"
+        
+        if vertical_span > 0.5 and visible > 6:
+            return "de_pie"
+        elif vertical_span < 0.3 and visible < 6:
+            return "sentado"
+        elif visible > 6:
+            return "moviendo_manos"
+        else:
+            return "quieto"
+    except Exception:
+        return "desconocida"
 
 
 def _get_background_objects(camera_id: str) -> dict:
@@ -1321,24 +1710,6 @@ def _get_zone_priority(cam_cfg: dict, yolo_detections: list) -> str:
                     elif priority == "medium":
                         return "medium"
     return "low"
-    """Determinar si la cámara está en modo centinela (fuera de horario laboral)."""
-    if not vigilance.get("enabled", False):
-        if not night_mode:
-            return False
-    open_t = schedule.get("open", "07:00")
-    close_t = schedule.get("close", "19:00")
-    grace_min = vigilance.get("grace_minutes", 15)
-    # Calcular horario centinela con gracia
-    try:
-        from datetime import datetime, timedelta
-        close_dt = datetime.strptime(close_t, "%H:%M")
-        vigilante_start = (close_dt + timedelta(minutes=grace_min)).strftime("%H:%M")
-    except:
-        vigilante_start = close_t
-    # Si current_time está fuera del horario + gracia → vigilante
-    if current_time < open_t or current_time >= vigilante_start:
-        return True
-    return False
 
 
 def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night_mode: bool = False) -> bool:
@@ -1350,14 +1721,33 @@ def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night
     close_t = schedule.get("close", "19:00")
     grace_min = vigilance.get("grace_minutes", 15)
     try:
-        from datetime import datetime as dt, timedelta
-        close_dt = dt.strptime(close_t, "%H:%M")
-        vigilante_start = (close_dt + timedelta(minutes=grace_min)).strftime("%H:%M")
+        def to_min(t: str) -> int:
+            parts = t.split(":")[:2]
+            return int(parts[0]) * 60 + int(parts[1])
+        cur = to_min(current_time)
+        opn = to_min(open_t)
+        cls_close = to_min(close_t)
+        # Minuto en que inicia el modo centinela (cierre + gracia)
+        centinela_start = cls_close + grace_min
+        # Caso 1: NO cruza medianoche (ej: cierre 20:00 + 15min = 20:15)
+        if centinela_start < 1440:
+            if cur < opn or cur > centinela_start:
+                return True
+            return False
+        # Caso 2: CRUZA medianoche (ej: cierre 23:59 + 15min = 1454 = 00:14 dia sig)
+        else:
+            real_centinel_start = centinela_start - 1440  # 14 = 00:14
+            # Normal: dentro del horario laboral
+            if cur >= opn and cur <= cls_close:
+                return False
+            # Gracia: después de medianoche pero Antes del inicio real de centinela
+            # Usa <= para incluir el último minuto de gracia
+            if cur <= real_centinel_start:
+                return False
+            # Centinela: antes de abrir o después de la gracia
+            return True
     except:
-        vigilante_start = close_t
-    if current_time < open_t or current_time >= vigilante_start:
-        return True
-    return False
+        return False
 
 
 _vigilance_cooldowns = {}  # {user_id_camera_id: last_alert_timestamp}
@@ -1442,7 +1832,7 @@ def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count:
         logger.error(f"Error sending vigilance FCM: {e}")
 
 
-def _update_camera_last_frame(user_id: str, camera_id: str):
+def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = None):
     """Actualizar last_frame de una cámara en user.json."""
     if not user_id:
         return
@@ -1454,24 +1844,58 @@ def _update_camera_last_frame(user_id: str, camera_id: str):
             for c in ud.get("cameras", []):
                 if c.get("camera_id") == camera_id:
                     c["last_frame"] = int(time.time())
+                    # Actualizar IP si es diferente del servidor (10.0.0.44) y no es localhost
+                    if client_ip and client_ip != "10.0.0.44" and client_ip != "127.0.0.1":
+                        c["last_announce_ip"] = client_ip
+                        c["last_announce"] = int(time.time())
                     break
             with open(uf, "w") as f:
                 json.dump(ud, f, indent=2)
     except Exception as e:
         logger.error(f"Error updating camera last_frame: {e}")
 
+
+def _resolve_user_id_from_camera(camera_id: str) -> str:
+    """Buscar el user_id al que pertenece una cámara escaneando todos los user.json."""
+    users_dir = STORAGE_ROOT / "users"
+    if not users_dir.is_dir():
+        return ""
+    for user_dir in users_dir.iterdir():
+        if not user_dir.is_dir():
+            continue
+        uf = user_dir / "user.json"
+        if not uf.exists():
+            continue
+        try:
+            with open(uf) as f:
+                ud = json.load(f)
+            for c in ud.get("cameras", []):
+                if c.get("camera_id") == camera_id:
+                    return user_dir.name
+        except:
+            continue
+    return ""
+
+
 # Anuncio de Dispositivo
 @app.post("/devices/announce")
 async def device_announce(request: dict = None):
+    cors_headers = {"Access-Control-Allow-Origin": "*"}
     if not request:
         request = {}
     camera_id = request.get("camera_id", "unknown")
     user_id = request.get("user_id", "")
-    client_ip = request.get("client_ip", "")
+    # IP real del ESP32: prioridad al campo "ip" del payload (el firmware lo envía)
+    # Porque el announce viene por Cloudflare Tunnel y client_ip es el del servidor
+    client_ip = request.get("ip", "") or request.get("client_ip", "") or ""
     if not camera_id:
         raise HTTPException(status_code=400, detail="camera_id required")
     logger.info(f"Device announce: Cam={camera_id} User={user_id} IP={client_ip}")
-    
+
+    # Si no viene user_id, resolver desde el camera_id (el firmware no lo envía)
+    if not user_id or user_id == "":
+        user_id = _resolve_user_id_from_camera(camera_id)
+
     # Update last_announce timestamp in user.json
     if user_id and user_id != "":
         uf = find_user_json(user_id)
@@ -1481,23 +1905,35 @@ async def device_announce(request: dict = None):
             camera_found = False
             for c in ud.get("cameras", []):
                 if c.get("camera_id") == camera_id:
-                    c["last_announce"] = int(time.time())
+                    now = int(time.time())
+                    c["last_announce"] = now
                     c["last_announce_ip"] = client_ip
+                    # Asegurar que first_seen exista (compatibilidad con cámaras antiguas)
+                    if "first_seen" not in c:
+                        c["first_seen"] = now
+                    # Guardar interval_ms y quality si vienen en el announce
+                    if request.get("interval_ms"):
+                        c["interval_ms"] = request.get("interval_ms")
+                    if request.get("quality"):
+                        c["quality"] = request.get("quality")
                     camera_found = True
-                    logger.info(f"Updated last_announce for {camera_id}")
+                    logger.info(f"Updated last_announce for {camera_id} IP={client_ip}")
                     break
             if not camera_found:
                 # Camera not in list, add it
                 logger.info(f"Adding new camera {camera_id} to user {user_id}")
+                now = int(time.time())
                 ud.setdefault("cameras", []).append({
                     "camera_id": camera_id,
                     "name": camera_id,
                     "zone": "",
                     "active": True,
-                    "first_seen": int(time.time()),
-                    "last_announce": int(time.time()),
+                    "first_seen": now,
+                    "last_announce": now,
                     "last_announce_ip": client_ip,
-                    "last_frame": 0
+                    "last_frame": 0,
+                    "interval_ms": request.get("interval_ms") or 0,
+                    "quality": request.get("quality") or 0
                 })
             uf.parent.mkdir(parents=True, exist_ok=True)
             with open(uf, "w") as f:
@@ -3089,10 +3525,14 @@ async def admin_queue_status():
         }
     }
 
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8005)
+@app.get("/api/daily-summary/{user_id}")
+async def get_daily_summary(user_id: str, date_str: str = None):
+    from eva.daily_summary import load_summary, generate_daily_summary
+    target_date = date_str or (date.today() - timedelta(days=1)).isoformat()
+    summary = load_summary(user_id, target_date)
+    if not summary or not summary.get("totals", {}).get("events"):
+        summary = await generate_daily_summary(user_id, target_date)
+    return {"success": True, "summary": summary}
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SDXL Switch — Cambiar entre Turbo y JuggernautXL
@@ -3232,6 +3672,28 @@ async def get_event_frame(event_id: str, user_id: str):
     raise HTTPException(status_code=404, detail="Frame no encontrado")
 
 
+@app.get("/api/events/{event_id}/frame/{index}")
+async def get_event_frame_by_index(event_id: str, index: int, user_id: str):
+    """Sirve un frame específico del evento por índice (para carrusel/video)."""
+    for cam_id, events_dir in resolve_user_events_dirs(user_id):
+        if cam_id == "_global":
+            continue
+        frame_file = events_dir / event_id / "frames" / f"frame_{index:03d}.jpg"
+        if frame_file.exists():
+            try:
+                from PIL import Image as PILImage
+                import io
+                img = PILImage.open(frame_file)
+                img.thumbnail((640, 480))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=75)
+                return Response(content=buf.getvalue(), media_type="image/jpeg",
+                                headers={"Cache-Control": "max-age=3600"})
+            except Exception:
+                pass
+    raise HTTPException(status_code=404, detail="Frame no encontrado")
+
+
 @app.get("/api/business/{user_id}")
 async def get_business_data(user_id: str):
     """Obtiene el business.json del usuario."""
@@ -3272,6 +3734,161 @@ def resolve_user_events_dirs(user_id: str):
     if legacy.is_dir():
         dirs.append(("_global", legacy))
     return dirs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VIDEO EXPORT — Guardar últimos N minutos como video MP4
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/cameras/{camera_id}/export-video")
+async def export_camera_video(camera_id: str, user_id: str = None, minutes: int = 45):
+    """
+    Exporta los últimos N minutos de frames como video MP4.
+    - minutes: 1-120 (default 45)
+    - Retorna JSON con URL del video generado
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    minutes = max(1, min(minutes, 120))
+
+    try:
+        frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+        if not frames_dir.exists():
+            raise HTTPException(status_code=404, detail="No hay frames para esta cámara")
+
+        # Buscar frames en el directorio de eventos (frames individuales por evento)
+        events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+        cutoff_ts = time.time() - (minutes * 60)
+
+        # Recolectar frames de todos los eventos recientes
+        frame_files = []
+        if events_dir.exists():
+            for event_dir in sorted(events_dir.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
+                if not event_dir.is_dir():
+                    continue
+                # Verificar si el evento es reciente
+                try:
+                    event_ts = event_dir.stat().st_mtime
+                    if event_ts < cutoff_ts:
+                        continue
+                except:
+                    continue
+                # Buscar frames dentro del evento
+                frames_subdir = event_dir / "frames"
+                if frames_subdir.exists():
+                    for ff in sorted(frames_subdir.iterdir()):
+                        if ff.suffix.lower() in ('.jpg', '.jpeg', '.png'):
+                            frame_files.append(ff)
+                # También buscar el frame principal del evento
+                for ext in ('.jpg', '.jpeg', '.png'):
+                    main_frame = event_dir / f"{event_dir.name}{ext}"
+                    if main_frame.exists():
+                        frame_files.append(main_frame)
+                        break
+
+        # Si no hay frames de eventos, usar latest_raw.jpg como fallback
+        if not frame_files:
+            latest_raw = frames_dir / "latest_raw.jpg"
+            if latest_raw.exists():
+                frame_files.append(latest_raw)
+
+        if not frame_files:
+            raise HTTPException(status_code=404, detail="No hay frames disponibles en el período solicitado")
+
+        # Limitar a 500 frames para evitar videos enormes
+        if len(frame_files) > 500:
+            step = len(frame_files) // 500
+            frame_files = frame_files[::step][:500]
+
+        # Crear video con ffmpeg
+        import subprocess
+        import tempfile
+
+        # Crear directorio de salida
+        export_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = export_dir / f"video_{camera_id}_{timestamp_str}.mp4"
+
+        # Crear archivo de lista para ffmpeg
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as fflist:
+            for ff in frame_files:
+                fflist.write(f"file '{ff.absolute()}'\n")
+                fflist.write(f"duration 0.5\n")  # 2 fps
+            list_file = fflist.name
+
+        # Ejecutar ffmpeg
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-vf', 'scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            '-r', '2',
+            '-movflags', '+faststart',
+            str(output_file)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        # Limpiar archivo temporal
+        try:
+            os.unlink(list_file)
+        except:
+            pass
+
+        if result.returncode != 0:
+            logger.error(f"ffmpeg error: {result.stderr[-500:]}")
+            raise HTTPException(status_code=500, detail=f"Error generando video: {result.stderr[-200:]}")
+
+        if not output_file.exists():
+            raise HTTPException(status_code=500, detail="No se pudo generar el video")
+
+        file_size = output_file.stat().st_size
+        logger.info(f"Video exportado: {output_file.name} ({file_size} bytes, {len(frame_files)} frames)")
+
+        return {
+            "success": True,
+            "video_url": f"/api/cameras/{camera_id}/download-video?user_id={user_id}&file={output_file.name}",
+            "frames_used": len(frame_files),
+            "duration_seconds": len(frame_files) * 0.5,
+            "file_size_bytes": file_size,
+            "minutes_covered": minutes
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Export video error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/cameras/{camera_id}/download-video")
+async def download_camera_video(camera_id: str, user_id: str = None, file: str = None):
+    """Descarga un video exportado previamente."""
+    if not user_id or not file:
+        raise HTTPException(status_code=400, detail="user_id y file requeridos")
+
+    # Sanitizar nombre de archivo
+    safe_file = Path(file).name
+    video_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "exports" / safe_file
+
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video no encontrado")
+
+    return Response(
+        content=video_path.read_bytes(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_file}"',
+            "Cache-Control": "no-store"
+        }
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # EVA SETUP FLOW — Endpoint de configuración inicial
@@ -3339,3 +3956,11 @@ async def save_setup_session(user_id: str, data: dict):
     with open(session_file, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point — Solo se ejecuta cuando se corre directamente (no cuando se importa)
+# ═══════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8005)
