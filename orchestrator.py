@@ -10,9 +10,8 @@ import logging
 import datetime
 import re
 from typing import Optional, List, Dict, Any
-from gateway_resize import resize_image, image_to_base64, create_grid_image, create_panels_2x2
+from gateway_resize import resize_image, image_to_base64, create_grid_image
 from eva.camera_builder import normalize_camera_vigilance_config, build_witness_prompt
-from eva.vigilance_prompts import format_vision_prompt
 from face_pipeline import identify_from_frame, extract_face_from_frame
 import threading
 
@@ -290,9 +289,8 @@ def _send_night_fcm(cam_cfg, user_id, camera_id, frame_bytes, event_id, persons)
         creds.refresh(_greq.Request())
         now_str = time.strftime("%H:%M", time.localtime())
         zone = cam_cfg.get("zone", camera_id)
-        title = f"🚨 Persona detectada fuera de horario — {zone}"
-        body = (f"⚠️ {persons} persona(s) detectada(s) a las {now_str} en {business_name or zone}.\n\n"
-                f"El negocio está cerrado. Toca para ver el momento.")
+        title = f"\ud83d\udea9 ALERTA NOCTURNA — {zone}"
+        body = f"{now_str}: {persons} persona(s) detectada(s)"
         business_name = ""
         try:
             with open(uf) as _uf:
@@ -536,89 +534,15 @@ class FrameGrid:
         self.lock = threading.Lock()
         self.last_analysis_ts = 0
         self.analysis_callback = None
-        # Sistema de descarte inteligente + ráfaga
-        self.last_keypoints: list = []
-        self.last_add_time: float = 0
-        self.burst_mode: bool = False
-        self.burst_until: float = 0
-        self._burst_trigger_kps: list = []
-    
-    def _extract_keypoints_flat(self, yolo_detections):
-        """Extraer todos los keypoints en una lista plana"""
-        kps = []
-        for d in yolo_detections:
-            for kp in d.get("keypoints", []):
-                if len(kp) >= 2 and (kp[0] > 0 or kp[1] > 0):
-                    kps.append([float(kp[0]), float(kp[1])])
-        return kps
-    
-    def _detect_burst_trigger(self, yolo_detections):
-        """Detectar si hay movimiento rápido que active modo ráfaga"""
-        curr_kps = self._extract_keypoints_flat(yolo_detections)
-        if not curr_kps or not self._burst_trigger_kps:
-            self._burst_trigger_kps = curr_kps
-            return False
-        
-        min_len = min(len(curr_kps), len(self._burst_trigger_kps))
-        if min_len == 0:
-            self._burst_trigger_kps = curr_kps
-            return False
-        
-        max_speed = 0
-        for i in range(min_len):
-            dx = curr_kps[i][0] - self._burst_trigger_kps[i][0]
-            dy = curr_kps[i][1] - self._burst_trigger_kps[i][1]
-            dist = (dx*dx + dy*dy) ** 0.5
-            max_speed = max(max_speed, dist)
-        
-        self._burst_trigger_kps = curr_kps
-        return max_speed > 20.0
-    
-    def _should_discard_frame(self, yolo_detections, now):
-        """Decidir si descartar frame por ser muy similar al anterior"""
-        if not self.last_keypoints or not yolo_detections:
-            return False
-        
-        if self.burst_mode and now < self.burst_until:
-            return False
-        
-        if now - self.last_add_time > 3.0:
-            return False
-        
-        curr_kps = self._extract_keypoints_flat(yolo_detections)
-        prev_kps = self.last_keypoints
-        
-        if not curr_kps or not prev_kps:
-            return False
-        
-        min_len = min(len(curr_kps), len(prev_kps))
-        if min_len == 0:
-            return False
-        
-        total_dist = 0
-        for i in range(min_len):
-            dx = curr_kps[i][0] - prev_kps[i][0]
-            dy = curr_kps[i][1] - prev_kps[i][1]
-            total_dist += (dx*dx + dy*dy) ** 0.5
-        
-        avg_dist = total_dist / min_len
-        return avg_dist < 15.0
     
     def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
-                  yolo_classes: list = None, yolo_detections: list = None, mode: str = "normal") -> bool:
+                  yolo_classes: list = None, yolo_detections: list = None, mode: str = "normal",
+                  vigilance_prompt: str = None, vigilance_rules: str = None) -> bool:
         """Add frame to grid. Returns True when grid is full and ready for analysis.
         
         Args:
-            image_bytes: Raw image data
-            camera_id: Camera identifier
-            user_id: User identifier
-            yolo_count: Number of relevant objects detected by YOLO (if 0, frame is skipped)
-            yolo_classes: Detected class names for person/object counts
-            yolo_detections: Full detection list with bbox/confidence for future pose/tracking
-            mode: Camera mode at ingest time
-        
-        Returns:
-            True if grid is now full, False otherwise
+            vigilance_prompt: Prompt for Qwen analysis (now stored per frame)
+            vigilance_rules: Rules for attention detection
         """
         yolo_classes = yolo_classes or []
         yolo_detections = yolo_detections or []
@@ -628,25 +552,6 @@ class FrameGrid:
                 self.last_camera_id = camera_id
             return False
 
-        now = time.time()
-
-        if self._detect_burst_trigger(yolo_detections):
-            self.burst_mode = True
-            self.burst_until = now + 5.0
-
-        if self._should_discard_frame(yolo_detections, now):
-            with self.lock:
-                self.last_frame_bytes = image_bytes
-                self.last_camera_id = camera_id
-                self.last_yolo_count = yolo_count
-                self.last_yolo_detections = yolo_detections
-            return False
-
-        self.last_keypoints = self._extract_keypoints_flat(yolo_detections)
-        self.last_add_time = now
-        if self.burst_mode and now >= self.burst_until:
-            self.burst_mode = False
-
         with self.lock:
             self.frames.append({
                 "image_bytes": image_bytes,
@@ -655,11 +560,12 @@ class FrameGrid:
                 "yolo_count": yolo_count,
                 "yolo_classes": yolo_classes,
                 "yolo_detections": yolo_detections,
-                "face_identified": None,
                 "mode": mode,
-                "timestamp": now
+                "timestamp": time.time(),
+                "vigilance_prompt": vigilance_prompt,
+                "vigilance_rules": vigilance_rules
             })
-            is_full = len(self.frames) == self.max_frames
+            is_full = len(self.frames) >= 16  # Changed from 8 to 16 for 4x4 grid
             self.last_frame_bytes = image_bytes
             self.last_camera_id = camera_id
             self.last_yolo_count = yolo_count
@@ -842,6 +748,7 @@ class NightTracker:
 
 
 def _parse_qwen_json(content) -> dict:
+    import json as json_module
     if isinstance(content, dict):
         return content
     if not isinstance(content, str):
@@ -849,83 +756,87 @@ def _parse_qwen_json(content) -> dict:
     text = content.strip()
     if not text:
         return {}
+    # NUEVO: Si la respuesta es texto plano (narrativa), envolverla directamente
+    if not text.startswith("{") and not text.startswith("```"):
+        return {"resumen": text, "scene": text[:200], "persons": []}
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text).strip()
     text = re.sub(r"\{[\s]*\.\.\.[\s]*\}", "{}", text)
     text = re.sub(r"\[[\s]*\.\.\.[\s]*\]", "[]", text)
     try:
-        parsed = json.loads(text)
+        parsed = json_module.loads(text)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         pass
     match = re.search(r"\{[\s\S]*\}", text)
     if match:
         try:
-            parsed = json.loads(match.group())
+            parsed = json_module.loads(match.group())
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             pass
-    for key in ("summary", "description"):
+    for key in ("resumen", "summary", "description"):
         key_match = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', text)
         if key_match:
             try:
-                return {key: json.loads('"' + key_match.group(1) + '"')}
+                return {key: json_module.loads('"' + key_match.group(1) + '"')}
             except Exception:
                 return {key: key_match.group(1)}
-    return {}
+    # Fallback: extraer cualquier texto como descripción
+    return {"resumen": text[:500], "scene": text[:200], "persons": []}
 
 
 def _convert_qwen_vision_response(raw: dict) -> dict:
     if not isinstance(raw, dict):
         return raw
-    if "persons" in raw or "scene" in raw or "cajero" not in raw:
+    # Si ya tiene resumen, devolverlo tal cual
+    if "resumen" in raw or "scene" in raw:
         return raw
-    persons = []
-    cajero = raw.get("cajero", {})
-    if isinstance(cajero, dict) and cajero.get("presente"):
-        p = {"ubicacion": cajero.get("ubicacion", "")}
-        ropa = cajero.get("ropa", "")
-        if ropa:
-            p["clothing"] = [ropa] if isinstance(ropa, str) else ropa
-        accion = cajero.get("accion", "")
-        if accion:
-            p["acciones"] = [accion] if isinstance(accion, str) else accion
-        persons.append(p)
-    clientes = raw.get("clientes", {})
-    if isinstance(clientes, dict):
-        cant = int(clientes.get("cantidad", 0) or 0)
-        for _ in range(min(cant, 5)):
-            p = {"ubicacion": clientes.get("ubicacion", "")}
-            ropa = clientes.get("ropa", "")
+    # Formato legacy con cajero/clientes
+    if "cajero" in raw or "clientes" in raw:
+        persons = []
+        cajero = raw.get("cajero", {})
+        if isinstance(cajero, dict) and cajero.get("presente"):
+            p = {"ubicacion": cajero.get("ubicacion", "")}
+            ropa = cajero.get("ropa", "")
             if ropa:
                 p["clothing"] = [ropa] if isinstance(ropa, str) else ropa
-            accion = clientes.get("accion", "")
+            accion = cajero.get("accion", "")
             if accion:
                 p["acciones"] = [accion] if isinstance(accion, str) else accion
             persons.append(p)
-    objects = []
-    caja = raw.get("caja", {})
-    if isinstance(caja, dict):
-        if caja.get("estado"):
-            objects.append(f"caja {caja['estado']}")
-        if caja.get("dinero"):
-            objects.append("dinero visible")
-        if caja.get("datafono"):
-            objects.append("datáfono")
-    scene_parts = []
-    for key in ("accion", "descripcion"):
-        val = raw.get(key, "")
-        if val and isinstance(val, str) and val.strip() and val.strip().lower() != "no visible":
-            scene_parts.append(val.strip())
-    scene = ". ".join(scene_parts) if scene_parts else ""
-    result = dict(raw)
-    result["persons"] = persons
-    result["scene"] = scene
-    result["objects"] = objects
-    result.setdefault("counts", {})
-    result.setdefault("attention_hits", [])
-    result.setdefault("transaccion", {})
-    return result
+        clientes = raw.get("clientes", {})
+        if isinstance(clientes, dict):
+            cant = int(clientes.get("cantidad", 0) or 0)
+            for _ in range(min(cant, 5)):
+                p = {"ubicacion": clientes.get("ubicacion", "")}
+                ropa = clientes.get("ropa", "")
+                if ropa:
+                    p["clothing"] = [ropa] if isinstance(ropa, str) else ropa
+                accion = clientes.get("accion", "")
+                if accion:
+                    p["acciones"] = [accion] if isinstance(accion, str) else accion
+                persons.append(p)
+        objects = []
+        caja = raw.get("caja", {})
+        if isinstance(caja, dict):
+            if caja.get("estado"):
+                objects.append(f"caja {caja['estado']}")
+            if caja.get("dinero"):
+                objects.append("dinero visible")
+            if caja.get("datafono"):
+                objects.append("datáfono")
+        scene = raw.get("resumen", "")
+        result = dict(raw)
+        result["persons"] = persons
+        result["scene"] = scene
+        result["objects"] = objects
+        result.setdefault("counts", {})
+        result.setdefault("attention_hits", [])
+        result.setdefault("transaccion", {})
+        return result
+    # Si es texto plano sin formato, crear estructura básica
+    return {"resumen": raw.get("resumen", ""), "scene": raw.get("scene", ""), "persons": [], "objects": []}
 
 
 def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
@@ -955,11 +866,6 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
         qwen_json["attention_hits"] = []
     if not isinstance(qwen_json.get("counts"), dict):
         qwen_json["counts"] = {}
-    # Garantizar que los campos de counts siempre existan (aunque Qwen no los devuelva)
-    counts_defaults = {"clientes": 0, "empleados": 0, "platos_visibles": 0, "bebidas_visibles": 0, "fundas_visibles": 0}
-    for k, v in counts_defaults.items():
-        if k not in qwen_json["counts"]:
-            qwen_json["counts"][k] = v
     if not qwen_json.get("search_tags"):
         tags = []
         for value in details.values():
@@ -970,95 +876,96 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
 
 
 def _build_summary_from_rich_qwen(qwen_json: dict, zone: str, attention_detected: bool) -> str:
-    """Construye resumen legible desde JSON de Qwen (nuevo formato paneles[])."""
-    parts = []
-
-    # ═══════════════════════════════════════════════════════════════════
-    # NUEVO FORMATO: vision.paneles[], vision.escena_completa, etc
-    # ═══════════════════════════════════════════════════════════════════
+    details = qwen_json.get("details", {}) if isinstance(qwen_json.get("details"), dict) else {}
+    persons = details.get("persons_description") or ""
+    actions = details.get("actions_visible") or []
+    objects = details.get("objects_visible") or []
+    scene = details.get("scene_context") or ""
     vision = qwen_json.get("vision", {}) if isinstance(qwen_json.get("vision"), dict) else {}
-    paneles = vision.get("paneles", [])
-    if isinstance(paneles, list) and paneles:
-        # Usar escena_completa si existe
-        escena = vision.get("escena_completa", "")
-        if escena and len(escena) > 20:
-            parts.append(escena)
-        else:
-            # Concatenar eventos de cada panel
-            eventos = []
-            for p in paneles:
-                ev = p.get("evento", "")
-                if ev and ev not in eventos:
-                    eventos.append(ev)
-            if eventos:
-                parts.append(" ".join(eventos))
-
-    # Counts (personas, objetos)
-    counts = vision.get("counts", qwen_json.get("counts", {}))
-    if isinstance(counts, dict):
-        count_parts = []
-        if counts.get("clientes", 0) > 0:
-            count_parts.append(f"{counts['clientes']} cliente(s)")
-        if counts.get("empleados", 0) > 0:
-            count_parts.append(f"{counts['empleados']} empleado(s)")
-        if counts.get("platos_visibles", 0) > 0:
-            count_parts.append(f"{counts['platos_visibles']} plato(s)")
-        if counts.get("bebidas_visibles", 0) > 0:
-            count_parts.append(f"{counts['bebidas_visibles']} bebida(s)")
-        if count_parts:
-            parts.append("Conteo: " + ", ".join(count_parts))
-
-    # Atención detectada (frases del dueño)
-    atencion = vision.get("atencion_detectada", [])
-    if isinstance(atencion, list) and atencion:
-        for hit in atencion:
-            frase = hit.get("frase", "")
-            momento = hit.get("momento", "")
-            accion = hit.get("accion_observada", "")
-            if frase:
-                linea = f"⚠️ {frase}"
-                if momento:
-                    linea += f" (en {momento})"
-                if accion:
-                    linea += f" — {accion}"
-                parts.append(linea)
-
-    # Resumen temporal
-    resumen_temp = vision.get("resumen_temporal", "")
-    if resumen_temp and len(resumen_temp) > 10:
-        parts.append(f"Cambio temporal: {resumen_temp}")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # FALLBACK: Formato antiguo (vision.summary, vision.scene, etc.)
-    # ═══════════════════════════════════════════════════════════════════
-    if not parts:
-        vision = qwen_json.get("vision", {}) if isinstance(qwen_json.get("vision"), dict) else {}
-        v_resumen = vision.get("summary", "") or qwen_json.get("summary", "")
-        v_scene = vision.get("scene", "") or qwen_json.get("scene", "")
-        v_persons = vision.get("persons", []) or qwen_json.get("persons", [])
-        if not isinstance(v_persons, list):
-            v_persons = []
-        if v_resumen and len(v_resumen) > 20:
-            parts.append(v_resumen)
-        elif v_scene and len(v_scene) > 20:
-            parts.append(v_scene)
-        elif v_persons:
-            for p in v_persons[:3]:
-                role = p.get("role", "persona")
-                action = p.get("action", p.get("acciones", ""))
-                desc = role.capitalize()
-                if action:
-                    desc += f" — {action}"
-                parts.append(desc)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # RESULTADO FINAL
-    # ═══════════════════════════════════════════════════════════════════
+    v_cliente = vision.get("cliente") or qwen_json.get("cliente")
+    v_empleado = vision.get("empleado") or qwen_json.get("empleado")
+    v_resumen = vision.get("summary", "") or qwen_json.get("summary", "")
+    v_persons = vision.get("persons", []) or qwen_json.get("persons", [])
+    if not isinstance(v_persons, list):
+        v_persons = []
+    v_scene = vision.get("scene", "") or qwen_json.get("scene", "")
+    v_objects = vision.get("objects", []) or qwen_json.get("objects", [])
+    if not isinstance(v_objects, list):
+        v_objects = []
+    parts = []
+    if v_cliente and isinstance(v_cliente, dict) and v_cliente.get("presente"):
+        desc = "Cliente"
+        if v_cliente.get("descripcion"):
+            desc += f" — {v_cliente['descripcion']}"
+            if v_cliente.get("accion") and v_cliente["accion"] not in v_cliente.get("descripcion", ""):
+                desc += f", {v_cliente['accion']}"
+        elif v_cliente.get("accion"):
+            desc += f" — {v_cliente['accion']}"
+        if v_cliente.get("pago"):
+            desc += f" | Pago: {v_cliente['pago']}"
+            if v_cliente.get("cantidad_billetes"):
+                desc += f" ({v_cliente['cantidad_billetes']} billete(s))"
+            if v_cliente.get("denominacion"):
+                desc += f" de {v_cliente['denominacion']}"
+        if v_cliente.get("platos"):
+            desc += f" | Pedido: {v_cliente['platos']} plato(s)"
+        parts.append(desc)
+    if v_empleado and isinstance(v_empleado, dict) and v_empleado.get("presente"):
+        desc = "Empleado (cajero)"
+        if v_empleado.get("descripcion"):
+            desc += f" — {v_empleado['descripcion']}"
+            if v_empleado.get("accion") and v_empleado["accion"] not in v_empleado.get("descripcion", ""):
+                desc += f", {v_empleado['accion']}"
+        elif v_empleado.get("accion"):
+            desc += f" — {v_empleado['accion']}"
+        actions_list = []
+        if v_empleado.get("cajon_abierto"):
+            actions_list.append("abrió cajón")
+        if v_empleado.get("entrego_cambio"):
+            actions_list.append("entregó cambio")
+        if v_empleado.get("uso_datafono"):
+            actions_list.append("usó datáfono")
+        if v_empleado.get("entrego_platos"):
+            actions_list.append(f"entregó {v_empleado['entrego_platos']} plato(s)")
+        if actions_list:
+            desc += f" | {', '.join(actions_list)}"
+        parts.append(desc)
+    if v_persons and not v_cliente and not v_empleado:
+        for p in v_persons:
+            role = p.get("role", "persona")
+            clothing = p.get("clothing", "")
+            action = p.get("action", p.get("acciones", ""))
+            interaction = p.get("interaction", "")
+            desc = role.capitalize()
+            if clothing:
+                desc += f" ({clothing})" if isinstance(clothing, str) else f" ({', '.join(str(c) for c in clothing)})"
+            if action and isinstance(action, list):
+                desc += " — " + ", ".join(str(a) for a in action)
+            elif action and isinstance(action, str):
+                desc += f" — {action.strip()}"
+            if interaction and isinstance(interaction, str) and interaction.strip():
+                desc += f", {interaction.strip()}"
+            parts.append(desc)
+    elif persons:
+        parts.append(str(persons))
+    if v_scene and len(v_scene) > 30:
+        parts.append(v_scene)
+    elif v_resumen and v_resumen != v_scene:
+        parts.append(v_resumen)
+    v_objects_filtered = [str(o) for o in v_objects if str(o).lower() not in ("silla", "mesa", "pared", "techo", "lámpara", "cable")]
+    if v_objects_filtered:
+        parts.append("Objetos: " + ", ".join(v_objects_filtered))
+    elif isinstance(objects, list) and objects:
+        parts.append("objetos visibles: " + ", ".join(str(o) for o in objects[:5]))
     if parts:
         prefix = "Observación relevante" if attention_detected else "Actividad normal"
         return f"{prefix} en {zone}: " + ". ".join(parts) + "."
-
-    # Último fallback
+    if v_resumen:
+        return v_resumen
+    if v_scene:
+        return v_scene
+    if persons:
+        return str(persons)
     return "Actividad normal" if not attention_detected else "Observación relevante"
 
 
@@ -1311,14 +1218,7 @@ def _enrich_qwen_json_from_metadata(qwen_json: dict, metadata: dict, zone: str, 
                 if parts:
                     qwen_json["summary"] = ". ".join(parts) + "."
                 else:
-                    # Fallback: usar escena_completa o resumen de paneles
-                    escena = vision.get("escena_completa", "")
-                    if escena and len(escena) > 20:
-                        qwen_json["summary"] = escena
-                    else:
-                        paneles = qwen_json.get("paneles", [])
-                        eventos = [p.get("evento", "") for p in paneles if p.get("evento")] if isinstance(paneles, list) else []
-                        qwen_json["summary"] = ". ".join(eventos) if eventos else f"Actividad normal en {zone}."
+                    qwen_json["summary"] = f"Actividad normal en {zone}."
     if not details.get("scene_context"):
         horario = "fuera de horario" if after_hours else "dentro de horario"
         details["scene_context"] = f"Zona {zone}, {horario}."
@@ -1713,84 +1613,47 @@ class QwenOrchestrator:
          cam_cfg: dict, frames: list = None, concern: str = "",
          attention_phrases: list = None, owner_notes: list = None
      ) -> dict:
-        """Etapa 1: Qwen analiza 4 panels 2x2 con prompt maestro por rol.
-
-        Qwen es TESTIGO, no juzga. Recibe:
-        - 4 panels (grids 2x2 de 4 frames cada uno = 16 frames totales)
-        - Prompt maestro con rol específico según negocio+zona
-        - Frases de atención del dueño como preguntas directas
-        - Timestamps en cada frame para temporal grounding
-        """
-        # ═══════════════════════════════════════════════════════════════════
-        # 1. CONSTRUIR PROMPT MAESTRO DESDE BIBLIOTECA
-        # ═══════════════════════════════════════════════════════════════════
-        vision_prompt = format_vision_prompt(
-            business_type=business_type,
-            zone=zone,
-            business_name=business_name,
-            is_after_hours=is_after_hours,
-            owner_notes=owner_notes,
+        """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos."""
+        
+        # Prompt optimizado para descripción narrativa natural (sin formato JSON complejo)
+        vision_prompt = (
+            f"Analiza estos 16 fotogramas (en formato cuadrícula). "
+            f"Realiza una descripción narrativa detallada y natural de lo que ocurre en la escena, "
+            f"como si le contaras a alguien lo que está pasando en el video. "
+            f"Enfócate en: personas presentes, qué hacen, cómo visten, y cualquier objeto relevante "
+            f"(dinero, platos, bolsas, datáfono). "
+            f"Si la zona está vacía, indícalo claramente. "
+            f"Responde en español, con lenguaje natural, fluido y directo. "
+            f"NO uses formatos estructurados, solo una narrativa clara."
         )
 
-        # ═══════════════════════════════════════════════════════════════════
-        # 2. FORMATO DE RESPUESTA JSON
-        # ═══════════════════════════════════════════════════════════════════
-        response_format = """
-INSTRUCCIONES DE SALIDA:
-Responde SOLO con JSON válido, sin markdown ni texto adicional:
+        # LOGGING CRUDO - Capa 1: prompt exacto enviado a Qwen
+        logger.info(f"[QWEN_PROMPT] {vision_prompt[:500]}")
 
-{
-  "paneles": [
-    {"rango": "0-2s", "evento": "descripción de lo que pasó", "personas": 0},
-    {"rango": "2-4s", "evento": "descripción de lo que pasó", "personas": 0},
-    {"rango": "4-6s", "evento": "descripción de lo que pasó", "personas": 0},
-    {"rango": "6-8s", "evento": "descripción de lo que pasó", "personas": 0}
-  ],
-  "escena_completa": "Relato continuo de qué pasó en los 8 segundos. Máximo 6 oraciones.",
-  "counts": {
-    "clientes": 0,
-    "empleados": 0,
-    "platos_visibles": 0,
-    "bebidas_visibles": 0,
-    "fundas_visibles": 0
-  },
-  "atencion_detectada": [
-    {"frase": "la frase que coincidió", "momento": "panel 2, frame 3", "accion_observada": "qué pasó exactamente"}
-  ],
-  "resumen_temporal": "Cómo cambió la escena desde el inicio hasta el final"
-}"""
-
-        full_prompt = vision_prompt + "\n\n" + response_format
-
-        logger.info(f"[QWEN_PROMPT] {full_prompt[:800]}")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 3. CONSTRUIR 4 PANELS 2×2 DESDE LOS FRAMES CON WATERMARK
-        # ═══════════════════════════════════════════════════════════════════
+        # Construir content con frames individuales + grid
         content = []
 
-        if frames and len(frames) >= 4:
-            panels = create_panels_2x2(frames)
-            for panel_bytes in panels:
-                panel_b64 = image_to_base64(panel_bytes)
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{panel_b64}"}
-                })
-        else:
-            # Fallback: enviar grid si no hay frames individuales
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{grid_img_b64}"}
-            })
+        # Agregar frames individuales (hasta 4 recientes)
+        if frames:
+            recent_frames = frames[-4:] if len(frames) >= 4 else frames
+            for i, f in enumerate(recent_frames):
+                if "image_bytes" in f and f["image_bytes"]:
+                    try:
+                        frame_b64 = image_to_base64(f["image_bytes"])
+                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}})
+                    except Exception:
+                        pass
 
-        # Agregar prompt de texto al final
-        content.append({"type": "text", "text": full_prompt})
+        # Agregar grid
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{grid_img_b64}"}})
+
+        # Agregar prompt de texto
+        content.append({"type": "text", "text": vision_prompt})
 
         payload = {
             "model": "qwen",
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 600
+            "max_tokens": 500
         }
 
         try:
@@ -1798,14 +1661,15 @@ Responde SOLO con JSON válido, sin markdown ni texto adicional:
                 resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
                 resp.raise_for_status()
                 raw_content = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"[QWEN_RAW] {raw_content[:600]}")
+                # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
+                logger.info(f"[QWEN_RAW] {raw_content[:500]}")
                 parsed = _parse_qwen_json(raw_content)
-                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:600]}")
+                # LOGGING CRUDO - Capa 3: JSON parseado
+                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:500]}")
                 return parsed
         except Exception as e:
             logger.error(f"Vision Analyst error: {e}")
             return {}
-
 
     async def submit(
         self, 
@@ -1818,89 +1682,86 @@ Responde SOLO con JSON válido, sin markdown ni texto adicional:
             return await self._call_qwen(image_bytes, prompt)
     
     async def process_grid(self, prompt: str = None, vigilance_prompt: str = None,
-                           vigilance_rules: str = None, use_grid_image: bool = True,
-                           user_id: str = "default", camera_id: str = "unknown",
-                           mode: str = "normal", grid_size: int = 16) -> Dict[str, Any]:
-        """Process full grid of 16 frames with Qwen.
-
-        Arquitectura 2 etapas:
-        Etapa 1: Qwen Vision Analyst — solo describe (personas, ropa, acciones, objetos)
-        Etapa 2: Attention Hit Detection — detecta si lo observado coincide con frases de atención
-        """
-        grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
-        frames = grid.get_and_reset()
-
-        if not frames:
-            return {"error": "No frames in grid"}
-
-        # ── Normalizar configuración y modo ──
-        cam_cfg = normalize_camera_vigilance_config(get_camera_config(user_id, camera_id))
-        mode = mode or "normal"
-        if mode not in ("normal", "sentinel"):
-            mode = "normal"
-        _sched = cam_cfg.get("schedule", {}) or {}
-        _schedule_open = _sched.get("open", "08:00")
-        _schedule_close = _sched.get("close", "22:00")
-        _now_val = datetime.datetime.now().hour * 60 + datetime.datetime.now().minute
-        try:
-            is_after_hours = _now_val < (int(_schedule_open.split(":")[0]) * 60 + int(_schedule_open.split(":")[1])) or \
-                              _now_val > (int(_schedule_close.split(":")[0]) * 60 + int(_schedule_close.split(":")[1]))
-        except Exception:
-            is_after_hours = False
-        system_prompt = vigilance_prompt or build_witness_prompt(cam_cfg)
-
-        # ── YOLO stats ───────────────────────────────────────────────────────
-        total_yolo_objects = sum(f.get("yolo_count", 0) for f in frames)
-        zone = cam_cfg.get("zone", camera_id)
-
-        business_name = ""
-        business_type = ""
-        concern = ""
-        try:
-            uf2 = f"{STORAGE_ROOT}/users/{user_id}/user.json"
-            if os.path.exists(uf2):
-                with open(uf2) as _uf2:
-                    ud = json.load(_uf2)
-                    business_name = ud.get("business_name", "")
-                    business_type = ud.get("business_type", "")
-                    concern = ud.get("main_concerns", [""])[0] if isinstance(ud.get("main_concerns"), list) else ""
-        except Exception:
-            pass
-
-        # ── Construir analysis_prompt ────────────────────────────────────────
-        after_note = "\nATENCIÓN: Ahora mismo es FUERA DE HORARIO laboral." if is_after_hours else ""
-        yolo_stats = {
-            "total_yolo_objects": total_yolo_objects,
-            "classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
-            "count_by_frame": [f.get("yolo_count", 0) for f in frames],
-        }
-
-        # ── Procesar con Qwen ────────────────────────────────────────────────
-        grid_result = None
-        grid_img = None
-        vision_json = {}
-
-        # ── Extraer attention_phrases y owner_notes de cam_cfg ──────────────
-        attention_phrases = cam_cfg.get("attention_phrases", []) or []
-        owner_notes = cam_cfg.get("owner_notes", []) or []
-        if not attention_phrases:
-            vigilance = cam_cfg.get("vigilance", {}) if isinstance(cam_cfg.get("vigilance"), dict) else {}
-            attention_phases = vigilance.get("attention_phrases", []) or []
-            owner_notes = vigilance.get("owner_notes", []) or []
-
-        if use_grid_image and len(frames) > 1:
-            grid_img = create_grid_image([f["image_bytes"] for f in frames], max_size=280)
-            logger.info(f"[GRID] Grid created: {len(grid_img)} bytes, frames={len(frames)}")
-            # Optimización: comparar con último análisis para evitar llamadas redundantes
-            _scene_key = f"{total_yolo_objects}_{'_'.join(yolo_stats.get('classes',[]))}"
-            _last_scene = getattr(self, '_last_scene_key', None)
-            _scene_unchanged = (_scene_key == _last_scene and _last_scene is not None)
-            self._last_scene_key = _scene_key
+                                vigilance_rules: str = None, use_grid_image: bool = True,
+                                user_id: str = "default", camera_id: str = "unknown",
+                                mode: str = "normal", grid_size: int = 16) -> Dict[str, Any]:
+            """Process full grid of 16 frames with Qwen.
+    
+            Arquitectura 2 etapas:
+            Etapa 1: Qwen Vision Analyst — solo describe (personas, ropa, acciones, objetos)
+            Etapa 2: Attention Hit Detection — detecta si lo observado coincide con frases de atención
+            """
+            grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
+            frames = grid.get_and_reset()
+    
+            if not frames:
+                return {"error": "No frames in grid"}
+    
+            # Extraer vigilance_prompt y vigilance_rules del primer frame (enviados desde api_eva.py)
+            if vigilance_prompt is None and frames:
+                vigilance_prompt = frames[0].get("vigilance_prompt")
+            if vigilance_rules is None and frames:
+                vigilance_rules = frames[0].get("vigilance_rules")
+    
+            # ── Normalizar configuración y modo ──
+            cam_cfg = normalize_camera_vigilance_config(get_camera_config(user_id, camera_id))
+            mode = mode or "normal"
+            if mode not in ("normal", "sentinel"):
+                mode = "normal"
+            _sched = cam_cfg.get("schedule", {}) or {}
+            _schedule_open = _sched.get("open", "08:00")
+            _schedule_close = _sched.get("close", "22:00")
+            _now_val = datetime.datetime.now().hour * 60 + datetime.datetime.now().minute
             try:
-                if _scene_unchanged:
-                    logger.info("[GRID] Escena sin cambios, saltando Qwen")
-                    vision_json = {"persons": [], "summary": "Continúa la misma escena del análisis anterior, sin cambios.", "scene_unchanged": True}
-                else:
+                is_after_hours = _now_val < (int(_schedule_open.split(":")[0]) * 60 + int(_schedule_open.split(":")[1])) or \
+                                  _now_val > (int(_schedule_close.split(":")[0]) * 60 + int(_schedule_close.split(":")[1]))
+            except Exception:
+                is_after_hours = False
+    
+            # ── YOLO stats ───────────────────────────────────────────────────────
+            total_yolo_objects = sum(f.get("yolo_count", 0) for f in frames)
+            zone = cam_cfg.get("zone", camera_id)
+    
+            business_name = ""
+            business_type = ""
+            concern = ""
+            try:
+                uf2 = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+                if os.path.exists(uf2):
+                    with open(uf2) as _uf2:
+                        ud = json.load(_uf2)
+                        business_name = ud.get("business_name", "")
+                        business_type = ud.get("business_type", "")
+                        concern = ud.get("main_concerns", [""])[0] if isinstance(ud.get("main_concerns"), list) else ""
+            except Exception:
+                pass
+    
+            # ── Construir analysis_prompt ────────────────────────────────────────
+            after_note = "\nATENCIÓN: Ahora mismo es FUERA DE HORARIO laboral." if is_after_hours else ""
+            yolo_stats = {
+                "total_yolo_objects": total_yolo_objects,
+                "classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
+                "count_by_frame": [f.get("yolo_count", 0) for f in frames],
+            }
+    
+            use_grid_image = True
+    
+            grid_result = None
+            grid_img = None
+            vision_json = {}
+    
+            # ── Extraer attention_phrases y owner_notes de cam_cfg ──────────────
+            attention_phrases = cam_cfg.get("attention_phrases", []) or []
+            owner_notes = cam_cfg.get("owner_notes", []) or []
+            if not attention_phrases:
+                vigilance = cam_cfg.get("vigilance", {}) if isinstance(cam_cfg.get("vigilance"), dict) else {}
+                attention_phases = vigilance.get("attention_phrases", []) or []
+                owner_notes = vigilance.get("owner_notes", []) or []
+    
+            if use_grid_image and len(frames) > 1:
+                grid_img = create_grid_image([f["image_bytes"] for f in frames], max_size=224)
+                logger.info(f"[GRID] Grid created: {len(grid_img)} bytes, frames={len(frames)}")
+                try:
                     grid_b64 = image_to_base64(grid_img)
                     vision_json = await self._call_qwen_vision(
                          grid_b64, zone, business_name, business_type,
@@ -1909,142 +1770,137 @@ Responde SOLO con JSON válido, sin markdown ni texto adicional:
                          attention_phrases=attention_phrases, owner_notes=owner_notes
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
-                    # Garantizar counts siempre presentes en vision_json
-                    if not isinstance(vision_json.get("counts"), dict):
-                        vision_json["counts"] = {}
-                    for k in ("clientes", "empleados", "platos_visibles", "bebidas_visibles", "fundas_visibles"):
-                        if k not in vision_json["counts"]:
-                            vision_json["counts"][k] = 0
-                logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
-            except Exception as e:
-                logger.error(f"[VISION] Error: {e}", exc_info=True)
-                grid_result = f"Error analizando grid: {str(e)}"
-                vision_json = {}
-        else:
-            logger.info(f"[GRID] Skipping Qwen: use_grid={use_grid_image} frames={len(frames)}")
-
-        # ── Etapa 2: Attention Hit Detection (no reglas, solo observación) ──
-        rule_result = _detect_attention_hits(vision_json, attention_phrases, owner_notes, zone, is_after_hours, mode)
-
-        # ── Armar qwen_json final ─────────────────────────────────────────────
-        qwen_json = {
-            "vision": vision_json,
-            "rule_checks": rule_result["checks"],
-            "attention_hits": rule_result.get("attention_hits", []),
-            "false_positives_detected": rule_result.get("false_positives_detected", 0),
-            "importance": rule_result["importance"],
-            "importancia": rule_result["importance"],
-            "summary": rule_result["summary"],
-            "anomalias": rule_result["anomalias"],
-            "evidence": rule_result["evidence"],
-            "search_tags": _build_search_tags(vision_json, rule_result),
-            "mode": mode,
-        }
-        qwen_json = _normalize_rich_qwen_json(qwen_json, mode)
-        qwen_json = _enrich_qwen_json_from_metadata(qwen_json, {
-            "frames_count": len(frames),
-            "total_yolo_objects": total_yolo_objects,
-            "yolo_classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
-            "yolo_count_by_frame": [f.get("yolo_count", 0) for f in frames],
-            "business_name": business_name,
-            "schedule": f"{_schedule_open}-{_schedule_close}",
-            "after_hours": is_after_hours,
-            "mode": mode,
-        }, zone, is_after_hours, is_after_hours)
-
-        attention_detected = rule_result["violation"]
-        attention_hits = rule_result.get("attention_hits", [])
-
-        # ── Datos del evento ─────────────────────────────────────────────────
-        user_id = frames[0]["user_id"] if frames else user_id
-        camera_id = frames[0]["camera_id"] if frames else "unknown"
-        event_type = "attention" if attention_detected else "normal"
-        summary = qwen_json.get("summary", "") if isinstance(qwen_json, dict) else ""
-        if not summary:
-            summary = _build_summary_from_rich_qwen(qwen_json, zone, attention_detected)
-            qwen_json["summary"] = summary
-        # Extraer resumen del nuevo formato si existe
-        if isinstance(qwen_json, dict):
-            v_resumen = qwen_json.get("vision", {}).get("resumen", "")
-            if not v_resumen:
-                v_escena = qwen_json.get("vision", {}).get("escena_completa", "")
-                if v_escena:
-                    v_resumen = v_escena
-            if v_resumen and len(v_resumen) > len(summary):
-                qwen_json["summary"] = v_resumen
-                summary = v_resumen
-
-        event_id = save_event_to_disk_v2(
-            user_id=user_id,
-            camera_id=camera_id,
-            event_type=event_type,
-            frame_bytes=frames[0]["image_bytes"] if frames else b'',
-            summary=summary,
-            qwen_json=qwen_json,
-            metadata={
+                    logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
+                except Exception as e:
+                    logger.error(f"[VISION] Error: {e}", exc_info=True)
+                    grid_result = f"Error analizando grid: {str(e)}"
+                    vision_json = {}
+            else:
+                logger.info(f"[GRID] Skipping Qwen: use_grid={use_grid_image} frames={len(frames)}")
+    
+            # ── Etapa 2: Attention Hit Detection (no reglas, solo observación) ──
+            rule_result = _detect_attention_hits(vision_json, attention_phrases, owner_notes, zone, is_after_hours, mode)
+    
+            # ── Armar qwen_json final ─────────────────────────────────────────────
+            qwen_json = {
+                "vision": vision_json,
+                "rule_checks": rule_result["checks"],
+                "attention_hits": rule_result.get("attention_hits", []),
+                "false_positives_detected": rule_result.get("false_positives_detected", 0),
+                "importance": rule_result["importance"],
+                "importancia": rule_result["importance"],
+                "summary": rule_result["summary"],
+                "anomalias": rule_result["anomalias"],
+                "evidence": rule_result["evidence"],
+                "search_tags": _build_search_tags(vision_json, rule_result),
+                "mode": mode,
+            }
+            qwen_json = _normalize_rich_qwen_json(qwen_json, mode)
+            qwen_json = _enrich_qwen_json_from_metadata(qwen_json, {
                 "frames_count": len(frames),
                 "total_yolo_objects": total_yolo_objects,
                 "yolo_classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
                 "yolo_count_by_frame": [f.get("yolo_count", 0) for f in frames],
-                "grid_frames": [f.get("image_bytes", b"") for f in frames],
-                "frame_timestamps": [f.get("timestamp") for f in frames],
                 "business_name": business_name,
                 "schedule": f"{_schedule_open}-{_schedule_close}",
                 "after_hours": is_after_hours,
                 "mode": mode,
-                "grid_b64": image_to_base64(grid_img) if grid_img else "",
-                "qwen_details": qwen_json.get("details") if isinstance(qwen_json.get("details"), dict) else {},
-                "qwen_search_tags": qwen_json.get("search_tags") if isinstance(qwen_json.get("search_tags"), list) else [],
+            }, zone, is_after_hours, is_after_hours)
+    
+            attention_detected = rule_result["violation"]
+            attention_hits = rule_result.get("attention_hits", [])
+    
+            # ── Cooldown de notificación por cámara ────────────────────────────
+            cam_key = f"{user_id}_{camera_id}"
+            last_notif = self._last_notification_ts.get(cam_key, 0)
+            cooldown_ok = (time.time() - last_notif) > self._notification_cooldown
+    
+            # ── Datos del evento ─────────────────────────────────────────────────
+            user_id = frames[0]["user_id"] if frames else user_id
+            camera_id = frames[0]["camera_id"] if frames else "unknown"
+            event_type = "attention" if attention_detected else "normal"
+            summary = qwen_json.get("summary", "") if isinstance(qwen_json, dict) else ""
+            if not summary:
+                summary = _build_summary_from_rich_qwen(qwen_json, zone, attention_detected)
+                qwen_json["summary"] = summary
+            # Extraer resumen del nuevo formato si existe
+            if isinstance(qwen_json, dict):
+                v_resumen = qwen_json.get("vision", {}).get("resumen", "")
+                if v_resumen and len(v_resumen) > len(summary):
+                    qwen_json["summary"] = v_resumen
+                    summary = v_resumen
+    
+            event_id = save_event_to_disk_v2(
+                user_id=user_id,
+                camera_id=camera_id,
+                event_type=event_type,
+                frame_bytes=frames[0]["image_bytes"] if frames else b'',
+                summary=summary,
+                qwen_json=qwen_json,
+                metadata={
+                    "frames_count": len(frames),
+                    "total_yolo_objects": total_yolo_objects,
+                    "yolo_classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
+                    "yolo_count_by_frame": [f.get("yolo_count", 0) for f in frames],
+                    "grid_frames": [f.get("image_bytes", b"") for f in frames],
+                    "frame_timestamps": [f.get("timestamp") for f in frames],
+                    "business_name": business_name,
+                    "schedule": f"{_schedule_open}-{_schedule_close}",
+                    "after_hours": is_after_hours,
+                    "mode": mode,
+                    "grid_b64": image_to_base64(grid_img) if grid_img else "",
+                    "qwen_details": qwen_json.get("details") if isinstance(qwen_json.get("details"), dict) else {},
+                    "qwen_search_tags": qwen_json.get("search_tags") if isinstance(qwen_json.get("search_tags"), list) else [],
+                    "attention_hits": attention_hits,
+                    "counts": vision_json.get("counts", {}) if isinstance(vision_json, dict) else {},
+                }
+            )
+    
+            update_camera_metrics(user_id, camera_id, event_type=event_type)
+    
+            # ── Notificación push (solo attention hits + cooldown) ──────────────
+            if attention_detected and cooldown_ok and attention_hits:
+                try:
+                    now_str = time.strftime("%H:%M", time.localtime())
+                    first_hit = attention_hits[0] if attention_hits else "comportamiento observado"
+                    title = f"📷 Algo que quizás quieras revisar — {zone}"
+                    body = (f"Nuestro sistema detectó algo que coincide con lo que me pediste vigilar:\n\n"
+                            f"🔍 {first_hit}\n\n"
+                            f"📝 Contexto: {summary[:100]}\n\n"
+                            f"🕐 {now_str} | 📍 {business_name or zone}")
+                    event_link = f"https://ojoia.com.do/#eva?alert={event_id}&camera={camera_id}"
+                    _fcm_task = asyncio.create_task(send_fcm_notification(
+                        title=title, body=body, user_id=user_id,
+                        image_b64=image_to_base64(frames[0]["image_bytes"]) if frames else None,
+                        link=event_link
+                    ))
+                    _fcm_task.add_done_callback(
+                        lambda t: logging.info(f"FCM sent: {title[:40]}") if not t.exception()
+                        else logging.error(f"FCM error: {t.exception()}")
+                    )
+                    self._last_notification_ts[cam_key] = time.time()
+                except Exception as _fcm_err:
+                    logging.error(f"FCM error: {_fcm_err}")
+            elif attention_detected:
+                remaining = self._notification_cooldown - (time.time() - last_notif)
+                logging.info(f"Notification suppressed for {cam_key} (cooldown, {remaining:.0f}s)")
+    
+            return {
+                "frames_processed": len(frames),
+                "grid_result": grid_result,
+                "qwen_json": qwen_json,
                 "attention_hits": attention_hits,
-                "counts": vision_json.get("counts", {}) if isinstance(vision_json, dict) else {},
+                "attention_detected": attention_detected,
+                "mode": mode,
+                "event_id": event_id,
+                "action_taken": "event_saved_and_notification_sent" if (attention_detected and cooldown_ok and attention_hits) else "event_saved",
             }
-        )
-
-        update_camera_metrics(user_id, camera_id, event_type=event_type)
-
-        # ── Notificación push (solo attention hits + cooldown) ──────────────
-        if attention_detected and cooldown_ok and attention_hits:
-            try:
-                now_str = time.strftime("%H:%M", time.localtime())
-                first_hit = attention_hits[0] if attention_hits else "comportamiento observado"
-                title = f"📷 Algo que quizás quieras revisar — {zone}"
-                body = (f"Nuestro sistema detectó algo que coincide con lo que me pediste vigilar:\n\n"
-                        f"🔍 {first_hit}\n\n"
-                        f"📝 Contexto: {summary[:100]}\n\n"
-                        f"🕐 {now_str} | 📍 {business_name or zone}")
-                event_link = f"https://ojoia.com.do/#eva?alert={event_id}&camera={camera_id}"
-                _fcm_task = asyncio.create_task(send_fcm_notification(
-                    title=title, body=body, user_id=user_id,
-                    image_b64=image_to_base64(frames[0]["image_bytes"]) if frames else None,
-                    link=event_link
-                ))
-                _fcm_task.add_done_callback(
-                    lambda t: logging.info(f"FCM sent: {title[:40]}") if not t.exception()
-                    else logging.error(f"FCM error: {t.exception()}")
-                )
-                self._last_notification_ts[cam_key] = time.time()
-            except Exception as _fcm_err:
-                logging.error(f"FCM error: {_fcm_err}")
-        elif attention_detected:
-            remaining = self._notification_cooldown - (time.time() - last_notif)
-            logging.info(f"Notification suppressed for {cam_key} (cooldown, {remaining:.0f}s)")
-
-        return {
-            "frames_processed": len(frames),
-            "grid_result": grid_result,
-            "qwen_json": qwen_json,
-            "attention_hits": attention_hits,
-            "attention_detected": attention_detected,
-            "mode": mode,
-            "event_id": event_id,
-            "action_taken": "event_saved_and_notification_sent" if (attention_detected and cooldown_ok and attention_hits) else "event_saved",
-        }
-
+    
     async def _call_qwen(self, image_bytes: bytes, prompt: str) -> str:
         """Llama a Qwen con timeout"""
         resized = resize_image(image_bytes, max_size=512)
         img_b64 = image_to_base64(resized)
-        
+
         payload = {
             "model": "qwen",
             "messages": [{
@@ -2056,19 +1912,20 @@ Responde SOLO con JSON válido, sin markdown ni texto adicional:
             }],
             "max_tokens": 1200
         }
-        
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
-    
+
     def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
                   yolo_classes: list = None, yolo_detections: list = None, vigilance_prompt: str = None,
                   vigilance_rules: str = None, burst_mode: bool = False,
                   mode: str = "normal", grid_size: int = 16) -> Dict[str, Any]:
         """Add frame to the specific grid for this camera. When grid is full, triggers analysis."""
         grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
-        is_full = grid.add_frame(image_bytes, camera_id, user_id, yolo_count=yolo_count, yolo_classes=yolo_classes, yolo_detections=yolo_detections, mode=mode)
+        is_full = grid.add_frame(image_bytes, camera_id, user_id, yolo_count=yolo_count, yolo_classes=yolo_classes, yolo_detections=yolo_detections, mode=mode,
+                             vigilance_prompt=vigilance_prompt, vigilance_rules=vigilance_rules)
         result = {
             "frame_count": grid.get_frame_count(),
             "grid_size": grid.max_frames,
@@ -2081,7 +1938,6 @@ Responde SOLO con JSON válido, sin markdown ni texto adicional:
         if burst_mode and not is_full:
             result["burst_active"] = True
         if is_full:
-            # process_grid is called directly from api_eva.py when grid_full=True
             pass
         return result
 
