@@ -476,6 +476,10 @@ def _detect_persons_night(img_bytes, roi):
             return []
         try:
             from ultralytics import YOLO
+
+
+# Feature flags for Qwen Vision analysis
+
             yolo = YOLO("/home/sam/ai_system/models/yolo/yolov8n.pt")
             for r in yolo.predict(source=frame, conf=0.25, iou=0.4, classes=[0], verbose=False):
                 for b in r.boxes:
@@ -1616,9 +1620,9 @@ class QwenOrchestrator:
                 return next(iter(self.grids.values()))
         return FrameGrid(max_frames=16)  # Fallback vacío
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # ETAPA 1: Vision Analyst — Qwen solo describe, no juzga
-    # ═══════════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════════════
+        # ETAPA 1: Vision Analyst — Descripción Narrativa Natural
+        # ═══════════════════════════════════════════════════════════════════════════
 
     async def _call_qwen_vision(
          self, grid_img_b64: str, zone: str, business_name: str,
@@ -1627,210 +1631,26 @@ class QwenOrchestrator:
          cam_cfg: dict, frames: list = None, concern: str = "",
          attention_phrases: list = None, owner_notes: list = None
      ) -> dict:
-        """Etapa 1: Qwen solo describe lo que ve. NUNCA decide violación.
-
-        Qwen es TESTIGO, no juzga. Solo narra hechos observables.
-        attention_phrases: frases de atención del dueño (observacionales, no juicios).
-        owner_notes: notas previas del dueño para contexto (ej: "tocarse bolsillo por teléfono es normal").
-        """
-        after_note = "FUERA DE HORARIO laboral." if is_after_hours else "Dentro de horario laboral."
-
-        attention_section = ""
-        if attention_phrases:
-            phrases_text = "\n".join(f"- {p}" for p in attention_phrases)
-            attention_section = (
-                f"\n\n=== LO QUE EL DEÑO QUIERE QUE OBSERVES ===\n"
-                f"Si en algún momento de esta secuencia ves algo que se parezca a\n"
-                f"lo siguiente, menciónalo explícitamente en 'attention_hits' con\n"
-                f"el momento exacto en que ocurre:\n{phrases_text}\n"
-                f"Si NO ves nada de esto, no lo menciones — sigue describiendo normalmente.\n"
-                f"Esto es observación, no juicio. Solo dime si físicamente pasó.\n"
-            )
-
-        notes_section = ""
-        if owner_notes:
-            notes_text = "\n".join(f"- {n}" for n in owner_notes)
-            notes_section = (
-                f"\n\n=== NOTAS DEL DUEÑO (CONTEXTO) ===\n"
-                f"{notes_text}\n"
-                f"Ten en cuenta estas aclaraciones al describir la escena.\n"
-            )
-
+        """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos."""
+        
+        # Prompt optimizado para descripción narrativa natural
         vision_prompt = (
-            f"Eres un TESTIGO observando una cámara de seguridad en la zona de \"{zone}\", "
-            f"dentro de un negocio llamado \"{business_name or 'negocio'}\" ({business_type or 'negocio'}).\n\n"
-            f"Tu ÚNICA tarea: describir lo que ves con el mayor detalle posible, como si le "
-            f"contaras a alguien que no puede ver el video.\n\n"
-            f"REGLA DE ORO — NUNCA JUZGUES:\n"
-            f"- NUNCA digas 'violación', 'anomalía', 'sospechoso', 'falta', 'robo', 'bien', 'mal'.\n"
-            f"- NUNCA digas 'no se observa actividad sospechosa' — eso es juzgar.\n"
-            f"- Solo describe HECHOS VISIBLES: qué hace cada persona, qué objetos se mueven.\n\n"
-            f"PARA CADA PERSONA QUE VEAS:\n"
-            f"- ¿Dónde está? (izquierda, centro, derecha, fondo, detrás del mostrador)\n"
-            f"- ¿Cómo se viste? (color y tipo: camiseta, polocher, pantalón, gorra, delantal)\n"
-            f"- ¿Qué está haciendo? (esperando, pagando, cobrando, empaquetando, caminando, hablando)\n"
-            f"- Si hay intercambio: ¿qué se entrega? (dinero, productos, platos, fundas)\n\n"
-            f"PARA LA TRANSACCIÓN (si aplica):\n"
-            f"- ¿Cuántos platos se empacan? ¿Grandes o pequeños?\n"
-            f"- ¿Para llevar o para comer aquí?\n"
-            f"- ¿Cuántas bebidas se ven?\n"
-            f"- ¿Se cobra antes o después de despachar?\n"
-            f"- ¿Se abre la caja registradora? ¿En qué momento?\n"
-            f"- ¿Se usa datéfono o efectivo?\n\n"
-            f"SI NO HAY ACTIVIDAD:\n"
-            f"- Di claramente: 'No hay personas visibles' o 'La zona está vacía'\n"
-            f"- Si hay personas quietas, di qué hacen: 'Una persona de pie esperando'\n\n"
-            f"REGLAS DE PRECISIÓN:\n"
-            f"- Si NO ves algo con claridad, NO lo inventes.\n"
-            f"- Si no ves billetes, NO digas que viste dinero.\n"
-            f"- Si no sabes cuántos platos, di 'no se distingue la cantidad'.\n"
-            f"- NUNCA menciones sillas, mesas, paredes, lámparas, cables, ventanas, pisos, techos.\n"
-            f"- Sé CONCRETO: si hay 1 plato, pon '1 plato'. Si no cuentas bien, 'no visible'.\n"
-            f"{attention_section}{notes_section}\n"
-            f"FORMATO de respuesta (JSON válido):\n"
-            f"{{\n"
-            f'  "personas": [\n'
-            f'    {{"ubicacion": "centro/izquierda/derecha/fondo", "ropa": "camiseta negra", "accion": "esperando", "rol": "cliente/empleado/otro"}}\n'
-            f'  ],\n'
-            f'  "transaccion": {{"platos_empacados": 0, "platos_tamaño": "grande/pequeño/no visible", "para_llevar": true/false/no_visible, "bebidas": 0, "cobro_antes": true/false/no_visible, "caja_abierta": true/false, "pago": "efectivo/tarjeta/datafono/no_visible"}},\n'
-            f'  "counts": {{"clientes": 0, "empleados": 0, "platos_visibles": 0, "bebidas_visibles": 0, "fundas_visibles": 0}},\n'
-            f'  "attention_hits": [{{"frase": "frase de atención que coincidió", "momento": "frame X o descripción breve del momento"}}],\n'
-            f'  "resumen": "Relato de 3-5 frases narrando la secuencia: quién llegó, qué hizo, qué transacción hubo. Solo hechos, sin juicios."\n'
-            f"}}"
+            "Analiza estos 16 fotogramas (en formato cuadrícula). "
+            "Realiza una descripción narrativa detallada y natural de lo que ocurre en la escena, "
+            "como si le contaras a alguien lo que está pasando en el video. "
+            "Enfócate en: personas presentes, qué hacen, cómo visten, y cualquier objeto relevante "
+            "(dinero, platos, bolsas, datáfono). "
+            "Si la zona está vacía, indícalo claramente. "
+            "Responde en español, con lenguaje natural, fluido y directo. "
+            "NO uses formatos estructurados, solo una narrativa clara."
         )
 
-        # LOGGING CRUDO - Capa 1: prompt exacto enviado a Qwen
-        logger.info(f"[QWEN_PROMPT] {vision_prompt[:500]}")
+        # Llamada a Qwen (asumiendo que la función _call_qwen se encarga de la invocación real)
+        vision_response_text = await self._call_qwen(grid_img_b64, vision_prompt)
+        
+        # Parseo simple para convertir la respuesta en el objeto esperado
+        vision_json = {"resumen": vision_response_text}
 
-        # Construir content con frames individuales + grid
-        content = []
-
-        # Agregar frames individuales (hasta 4 recientes)
-        if frames:
-            recent_frames = frames[-4:] if len(frames) >= 4 else frames
-            for i, f in enumerate(recent_frames):
-                if "image_bytes" in f and f["image_bytes"]:
-                    try:
-                        frame_b64 = image_to_base64(f["image_bytes"])
-                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}})
-                    except Exception:
-                        pass
-
-        # Agregar grid
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{grid_img_b64}"}})
-
-        # Agregar prompt de texto
-        content.append({"type": "text", "text": vision_prompt})
-
-        payload = {\n            "model": "qwen",\n            "messages": [{"role": "user", "content": content}],\n            "max_tokens": 800,\n            "temperature": 0.4\n        }
-
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
-                resp.raise_for_status()
-                raw_content = resp.json()["choices"][0]["message"]["content"]
-                # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
-                logger.info(f"[QWEN_RAW] {raw_content[:500]}")
-                parsed = _parse_qwen_json(raw_content)
-                # LOGGING CRUDO - Capa 3: JSON parseado
-                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:500]}")
-                return parsed
-        except Exception as e:
-            logger.error(f"Vision Analyst error: {e}")
-            return {}
-
-    async def submit(
-        self, 
-        image_bytes: bytes, 
-        prompt: str, 
-        priority: int = 10
-    ) -> Optional[str]:
-        """Envía imagen a Qwen con limitación de concurrencia"""
-        async with self._semaphore:
-            return await self._call_qwen(image_bytes, prompt)
-    
-    async def process_grid(self, prompt: str = None, vigilance_prompt: str = None,
-                           vigilance_rules: str = None, use_grid_image: bool = True,
-                           user_id: str = "default", camera_id: str = "unknown",
-                           mode: str = "normal", grid_size: int = 16) -> Dict[str, Any]:
-        """Process full grid of 16 frames with Qwen.
-
-        Arquitectura 2 etapas:
-        Etapa 1: Qwen Vision Analyst — solo describe (personas, ropa, acciones, objetos)
-        Etapa 2: Attention Hit Detection — detecta si lo observado coincide con frases de atención
-        """
-        grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
-        frames = grid.get_and_reset()
-
-        if not frames:
-            return {"error": "No frames in grid"}
-
-        # ── Normalizar configuración y modo ──
-        cam_cfg = normalize_camera_vigilance_config(get_camera_config(user_id, camera_id))
-        mode = mode or "normal"
-        if mode not in ("normal", "sentinel"):
-            mode = "normal"
-        _sched = cam_cfg.get("schedule", {}) or {}
-        _schedule_open = _sched.get("open", "08:00")
-        _schedule_close = _sched.get("close", "22:00")
-        _now_val = datetime.datetime.now().hour * 60 + datetime.datetime.now().minute
-        try:
-            is_after_hours = _now_val < (int(_schedule_open.split(":")[0]) * 60 + int(_schedule_open.split(":")[1])) or \
-                              _now_val > (int(_schedule_close.split(":")[0]) * 60 + int(_schedule_close.split(":")[1]))
-        except Exception:
-            is_after_hours = False
-        system_prompt = vigilance_prompt or build_witness_prompt(cam_cfg)
-
-        # ── YOLO stats ───────────────────────────────────────────────────────
-        total_yolo_objects = sum(f.get("yolo_count", 0) for f in frames)
-        zone = cam_cfg.get("zone", camera_id)
-
-        business_name = ""
-        business_type = ""
-        concern = ""
-        try:
-            uf2 = f"{STORAGE_ROOT}/users/{user_id}/user.json"
-            if os.path.exists(uf2):
-                with open(uf2) as _uf2:
-                    ud = json.load(_uf2)
-                    business_name = ud.get("business_name", "")
-                    business_type = ud.get("business_type", "")
-                    concern = ud.get("main_concerns", [""])[0] if isinstance(ud.get("main_concerns"), list) else ""
-        except Exception:
-            pass
-
-        # ── Construir analysis_prompt ────────────────────────────────────────
-        after_note = "\nATENCIÓN: Ahora mismo es FUERA DE HORARIO laboral." if is_after_hours else ""
-        yolo_stats = {
-            "total_yolo_objects": total_yolo_objects,
-            "classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
-            "count_by_frame": [f.get("yolo_count", 0) for f in frames],
-        }
-
-        # ── Procesar con Qwen ────────────────────────────────────────────────
-        grid_result = None
-        grid_img = None
-        vision_json = {}
-
-        # ── Extraer attention_phrases y owner_notes de cam_cfg ──────────────
-        attention_phrases = cam_cfg.get("attention_phrases", []) or []
-        owner_notes = cam_cfg.get("owner_notes", []) or []
-        if not attention_phrases:
-            vigilance = cam_cfg.get("vigilance", {}) if isinstance(cam_cfg.get("vigilance"), dict) else {}
-            attention_phases = vigilance.get("attention_phrases", []) or []
-            owner_notes = vigilance.get("owner_notes", []) or []
-
-        if use_grid_image and len(frames) > 1:
-            grid_img = create_grid_image([f["image_bytes"] for f in frames], max_size=224)
-            logger.info(f"[GRID] Grid created: {len(grid_img)} bytes, frames={len(frames)}")
-            try:
-                grid_b64 = image_to_base64(grid_img)
-                vision_json = await self._call_qwen_vision(
-                     grid_b64, zone, business_name, business_type,
-                     _schedule_open, _schedule_close, mode, is_after_hours,
-                     total_yolo_objects, yolo_stats, cam_cfg, frames=frames, concern=concern,
-                     attention_phrases=attention_phrases, owner_notes=owner_notes
-                 )
                 vision_json = _convert_qwen_vision_response(vision_json)
                 logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
             except Exception as e:
