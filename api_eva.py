@@ -1172,6 +1172,87 @@ async def get_camera(camera_id: str, user_id: str = None):
             return result
     raise HTTPException(status_code=404, detail="Camara no encontrada")
 
+@app.get("/api/cameras/{camera_id}/vigilance")
+async def get_camera_vigilance(camera_id: str, user_id: Optional[str] = None):
+    """Devuelve la configuracion de vigilancia de una camara."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with open(uf) as f:
+        ud = json.load(f)
+    cam = next((c for c in ud.get("cameras", []) if c.get("camera_id") == camera_id), None)
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camara no encontrada")
+    cam_cfg = get_camera_config_static(user_id, camera_id)
+    vigilance = cam_cfg.get("vigilance", ud.get("vigilance", {}))
+    schedule = ud.get("schedule", {})
+    mode = "vigilante" if _is_vigilante_mode(schedule, vigilance, datetime.now().strftime("%H:%M"), cam_cfg.get("night_mode", False)) else "normal"
+    return {
+        "vigilance": vigilance,
+        "schedule": schedule,
+        "mode": mode,
+        "system_prompt": cam_cfg.get("system_prompt", ud.get("vigilance_prompt", "")),
+        "cam_cfg": cam_cfg,
+    }
+
+@app.put("/api/cameras/{camera_id}/vigilance")
+async def save_camera_vigilance(camera_id: str, request: dict = None):
+    """Guarda configuracion de vigilancia de una camara."""
+    body = request or {}
+    user_id = _resolve_user_id_from_camera(camera_id) if not body.get("user_id") else body["user_id"]
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with open(uf) as f:
+        ud = json.load(f)
+    schedule = body.get("schedule")
+    if schedule:
+        ud["schedule"] = schedule
+    vigilance = body.get("vigilance")
+    if vigilance:
+        ud["vigilance"] = vigilance
+        cam_dir = Path(STORAGE_ROOT) / "users" / user_id / "cameras" / camera_id
+        cam_cfg_path = cam_dir / "camera.json"
+        if cam_cfg_path.exists():
+            try:
+                with open(cam_cfg_path) as f:
+                    cam_cfg = json.load(f)
+                cam_cfg["vigilance"] = vigilance
+                with open(cam_cfg_path, "w") as f:
+                    json.dump(cam_cfg, f, indent=2)
+            except Exception:
+                pass
+    with open(uf, "w") as f:
+        json.dump(ud, f, indent=2)
+    system_prompt = ""
+    try:
+        from eva.vigilance_prompts import format_vision_prompt as _regen
+        cam_cfg = get_camera_config_static(user_id, camera_id)
+        schedule = ud.get("schedule", {})
+        is_after = _is_vigilante_mode(schedule, vigilance or ud.get("vigilance", {}), datetime.now().strftime("%H:%M"), cam_cfg.get("night_mode", False))
+        new_prompt = _regen(
+            business_type=ud.get("business_type", ""),
+            zone=cam.get("zone", ""),
+            business_name=ud.get("business_name", ""),
+            is_after_hours=is_after,
+            owner_notes=ud.get("owner_notes", [])
+        )
+        cam_cfg_path = Path(STORAGE_ROOT) / "users" / user_id / "cameras" / camera_id / "camera.json"
+        if cam_cfg_path.exists():
+            with open(cam_cfg_path) as f:
+                cam_cfg_data = json.load(f)
+            cam_cfg_data["system_prompt"] = new_prompt
+            with open(cam_cfg_path, "w") as f:
+                json.dump(cam_cfg_data, f, indent=2)
+        system_prompt = new_prompt
+    except Exception as e:
+        logger.warning(f"No se pudo regenerar prompt: {e}")
+    return {"success": True, "mode": "vigilante" if _is_vigilante_mode(ud.get("schedule", {}), vigilance or ud.get("vigilance", {}), datetime.now().strftime("%H:%M"), False) else "normal", "system_prompt": system_prompt}
+
 @app.get("/api/cameras/{camera_id}/grid")
 async def get_camera_grid(camera_id: str, user_id: Optional[str] = None):
     grid = orchestrator._get_grid(user_id or "", camera_id)
