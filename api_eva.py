@@ -517,14 +517,47 @@ async def camera_mjpeg_stream(camera_id: str, user_id: str = None, fps: int = 2)
     frame_interval = 1.0 / fps
     boundary = b"--frame"
 
+    def _build_keepalive_jpeg(text: str) -> bytes:
+        """Frame gris con timestamp para mantener el stream vivo y diferenciarlo de frames reales."""
+        import io
+        try:
+            from PIL import Image, ImageDraw
+            img = Image.new("RGB", (480, 320), (22, 22, 22))
+            d = ImageDraw.Draw(img)
+            d.rectangle([6, 6, 474, 36], fill=(8, 8, 8))
+            d.text((14, 12), "OjoIA - sin senal reciente", fill=(255, 255, 255))
+            d.text((14, 280), text[:60], fill=(180, 180, 180))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=55)
+            return buf.getvalue()
+        except Exception:
+            return b"\xff\xd8\xff\xe0"  # bytes  no validos pero >0
+
     async def generate():
         last_frame_bytes = None
         first_frame_sent = False
         repeats = 0
+        no_frame_ticks = 0
 
         while True:
             try:
                 frame_bytes = _read_latest_frame_bytes(user_id, camera_id)
+
+                # ── Heartbeat ──
+                # Si no hay frame del hardware por un tiempo, enviar un frame keepalive
+                # con timestamp para: (a) mantener la conexion TCP activa y evitar idle
+                # timeout de Cloudflare/proxies, (b) que el vea que el stream NO esta
+                # colgado (el campeon dispara >=  por lo cual el watchdog del front no
+                # dispara falsos), (c) senalar al operador que la camara esta offline.
+                if not frame_bytes:
+                    no_frame_ticks += 1
+                    frame_bytes = _build_keepalive_jpeg(
+                        f"{camera_id[:12]} | {datetime.now().strftime('%H:%M:%S')} | esperando camara..."
+                    )
+                    last_frame_bytes = None  # forzar always enviado
+                    repeats = 0
+                else:
+                    no_frame_ticks = 0
 
                 if frame_bytes:
                     if not first_frame_sent or frame_bytes != last_frame_bytes:
@@ -882,7 +915,7 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
                     ev["frame_b64"] = base64.b64encode(resized).decode()
                 except Exception as e:
                     pass
-            ev["thumb_url"] = f"/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
+            ev["thumb_url"] = f"https://api.ojoia.com.do/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
             events.append(ev)
     return {"events": events}
 
