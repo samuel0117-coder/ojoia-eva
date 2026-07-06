@@ -1336,7 +1336,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         # ── WATERMARK: Agregar marca de agua SOLO para análisis Qwen ──
         ts_str = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        img_bytes = add_frame_watermark(img_bytes, f"{camera_id} {ts_str}")
+        img_bytes = add_frame_watermark(img_bytes, camera_id, ts_str, business_name="")
 
         logger.info(f"Frame: IP={client_ip} Cam={camera_id} User={user_id} Size={frame_size}B")
 
