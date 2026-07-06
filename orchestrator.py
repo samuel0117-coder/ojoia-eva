@@ -1719,6 +1719,9 @@ class QwenOrchestrator:
                 is_after_hours = False
     
             # ── YOLO stats ───────────────────────────────────────────────────────
+
+            # Extract tracking summary for person tracking across frames
+            tracking_summary = self._extract_tracking_summary(frames)
             total_yolo_objects = sum(f.get("yolo_count", 0) for f in frames)
             zone = cam_cfg.get("zone", camera_id)
     
@@ -1842,6 +1845,7 @@ class QwenOrchestrator:
                     "total_yolo_objects": total_yolo_objects,
                     "yolo_classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
                     "yolo_count_by_frame": [f.get("yolo_count", 0) for f in frames],
+                    "person_tracking": tracking_summary,
                     "grid_frames": [f.get("image_bytes", b"") for f in frames],
                     "frame_timestamps": [f.get("timestamp") for f in frames],
                     "business_name": business_name,
@@ -1917,6 +1921,41 @@ class QwenOrchestrator:
             resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
+
+
+    def _extract_tracking_summary(self, frames: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Extract tracking summary from frames for person tracking across grid."""
+        if not frames:
+            return {"unique_persons": 0, "total_detections": 0, "tracks": []}
+        track_data = {}
+        total_detections = 0
+        for frame_idx, frame in enumerate(frames):
+            detections = frame.get("yolo_detections", [])
+            for det in detections:
+                if det.get("class", "").lower() == "person":
+                    track_id = det.get("track_id")
+                    if track_id is not None:
+                        total_detections += 1
+                        if track_id not in track_data:
+                            track_data[track_id] = {"frame_count": 0, "frames_set": set(), "confidences": []}
+                        track_data[track_id]["frame_count"] += 1
+                        track_data[track_id]["frames_set"].add(frame_idx)
+                        track_data[track_id]["confidences"].append(det.get("confidence", 0.0))
+        tracks = []
+        for track_id, data in track_data.items():
+            frames_sorted = sorted(data["frames_set"])
+            avg_conf = sum(data["confidences"]) / len(data["confidences"]) if data["confidences"] else 0.0
+            tracks.append({
+                "id": int(track_id),
+                "frames": data["frame_count"],
+                "first_frame": frames_sorted[0] if frames_sorted else 0,
+                "last_frame": frames_sorted[-1] if frames_sorted else 0,
+                "avg_confidence": round(avg_conf, 3),
+                "presence_ratio": round(data["frame_count"] / len(frames), 3)
+            })
+        tracks.sort(key=lambda t: t["frames"], reverse=True)
+        return {"unique_persons": len(track_data), "total_detections": total_detections, "tracks": tracks}
+
 
     def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
                   yolo_classes: list = None, yolo_detections: list = None, vigilance_prompt: str = None,
