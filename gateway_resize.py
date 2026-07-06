@@ -215,7 +215,7 @@ def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
     positions = [(0, 0), (size, 0), (0, size), (size, size)]
     try:
         font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30
         )
     except Exception:
         font = ImageFont.load_default()
@@ -224,8 +224,8 @@ def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
         grid.paste(thumb, pos)
         x, y = pos
         label = f"{idx + 1}"
-        draw.rectangle([x + 3, y + 3, x + 32, y + 32], fill=(0, 0, 0, 180))
-        draw.text((x + 7, y + 5), label, fill="yellow", font=font)
+        draw.rectangle([x + 3, y + 3, x + 40, y + 40], fill=(0, 0, 0, 200))
+        draw.text((x + 9, y + 5), label, fill="yellow", font=font)
 
     try:
         small_font = ImageFont.truetype(
@@ -236,5 +236,5 @@ def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
     draw.text((4, size * 2 - 16), f"Panel {panel_num}", fill="gray", font=small_font)
 
     output = io.BytesIO()
-    grid.save(output, format="JPEG", quality=85)
+    grid.save(output, format="JPEG", quality=90)
     return output.getvalue()

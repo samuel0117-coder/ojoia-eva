@@ -10,7 +10,7 @@ import logging
 import datetime
 import re
 from typing import Optional, List, Dict, Any
-from gateway_resize import resize_image, image_to_base64, create_grid_image
+from gateway_resize import resize_image, image_to_base64, create_grid_image, create_panels_2x2
 from eva.camera_builder import normalize_camera_vigilance_config, build_witness_prompt
 from face_pipeline import identify_from_frame, extract_face_from_frame
 import threading
@@ -1284,6 +1284,15 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
 
     hits = []
 
+    # 0. Nuevo: Qwen responde con "flag" = frase exacta detectada (Eje 3C)
+    flag = vision.get("flag") if isinstance(vision, dict) else None
+    if flag and isinstance(flag, str) and flag.strip() and flag.lower() != "null":
+        hits.append({
+            "frase": flag.strip(),
+            "momento": "",
+            "source": "qwen_flag"
+        })
+
     # 1. Verificar si Qwen reportó attention_hits explícitamente
     if isinstance(attention_hits_raw, list):
         for hit in attention_hits_raw:
@@ -1607,53 +1616,108 @@ class QwenOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def _call_qwen_vision(
-         self, grid_img_b64: str, zone: str, business_name: str,
+         self, panels_b64, zone: str, business_name: str,
          business_type: str, schedule_open: str, schedule_close: str,
          mode: str, is_after_hours: bool, total_yolo: int, yolo_stats: dict,
          cam_cfg: dict, frames: list = None, concern: str = "",
-         attention_phrases: list = None, owner_notes: list = None
+         attention_phrases: list = None, owner_notes: list = None,
+         tracking_summary: dict = None
      ) -> dict:
-        """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos."""
-        
-        # Prompt optimizado para descripción narrativa natural (sin formato JSON complejo)
-        vision_prompt = (
-            f"Analiza estos 16 fotogramas (en formato cuadrícula). "
-            f"Realiza una descripción narrativa detallada y natural de lo que ocurre en la escena, "
-            f"como si le contaras a alguien lo que está pasando en el video. "
-            f"Enfócate en: personas presentes, qué hacen, cómo visten, y cualquier objeto relevante "
-            f"(dinero, platos, bolsas, datáfono). "
-            f"Si la zona está vacía, indícalo claramente. "
-            f"Responde en español, con lenguaje natural, fluido y directo. "
-            f"NO uses formatos estructurados, solo una narrativa clara."
+        """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos.
+
+        Eje 1: recibe panels 2x2 (4 imágenes grandes con numeración amarilla 1-4 por panel).
+        Eje 2: inyecta conteo YOLO/tracker como dato factual (no se le pide contar).
+        Eje 3: dos prompts (preambulo generico + vigilancia con contexto del negocio) + salida JSON.
+        """
+        tracking_summary = tracking_summary or {"unique_persons": 0, "tracks": []}
+        attention_phrases = attention_phrases or []
+        owner_notes = owner_notes or []
+        n_frames = len(frames) if frames else 0
+
+        # ── Eje 2: bloque de datos factual (sensores confirmados) ──
+        tracks_desc = ", ".join(
+            f"#{t['id']} (visto en {t['frames']}/{n_frames} frames)"
+            for t in tracking_summary.get("tracks", [])[:6]
+        ) or "ninguno estable"
+        yolo_seq = yolo_stats.get("count_by_frame", [])
+
+        context_block = (
+            f"DATOS DE SENSORES (ya confirmados, no los infieras):\n"
+            f"- Cámara observando zona \"{zone}\" en {business_name or 'el negocio'} (tipo: {business_type or 'negocio'}).\n"
+            f"- Horario: {schedule_open or '08:00'}-{schedule_close or '22:00'} | "
+            f"Ahora: {'FUERA DE HORARIO' if is_after_hours else 'en horario'}.\n"
+            f"- {tracking_summary.get('unique_persons', 0)} persona(s) única(s) detectada(s) por tracker ID.\n"
+            f"- Tracks: {tracks_desc}.\n"
+            f"- Detecciones YOLO por frame: {yolo_seq}.\n"
         )
 
+        # ── Eje 3A: preambulo generico (independiente del dueño) ──
+        n_panels = len(panels_b64) if isinstance(panels_b64, list) else 0
+        preamble = (
+            f"Eres un testigo de seguridad observando {n_frames} fotogramas consecutivos de una cámara de vigilancia.\n"
+            f"Te muestro {n_panels} imágenes: cada una es una CUADRÍCULA 2×2 con 4 fotogramas numerados del 1 al 4 (números amarillos).\n"
+            f"Lee los números amarillos para entender el ORDEN TEMPORAL: panel 1 = fotogramas 1-4, panel 2 = 5-8, etc.\n"
+            f"Describe SOLO lo que ves, como testigo neutral. No juzgues, no inventes, no supongas.\n"
+            f"NO repitas \"en el primer/segundo fotograma\": describe la escena como UNA NARRATIVA CONTINUA del tiempo observado.\n"
+            f"Por persona: 1-2 frases máximo (apariencia + qué hace).\n"
+            f"Responde SIEMPRE EN ESPAÑOL (todo el JSON debe estar en español).\n"
+        )
+
+        # ── Eje 3B: prompt de vigilancia (contexto del negocio + frases del dueño) ──
+        witness_focus = ""
+        business_description = ""
+        try:
+            from eva.camera_builder import _template
+            tmpl = _template(zone, business_type or "")
+            witness_focus = tmpl.get("witness_focus", "")
+            business_description = tmpl.get("business_description", "")
+        except Exception:
+            pass
+
+        vigilance_prompt = ""
+        if business_description or witness_focus:
+            vigilance_prompt += f"CONTEXTO: \"{zone}\" en {business_name or 'el negocio'} (un {business_description or business_type or 'negocio'}). Foco de observación: {witness_focus}.\n"
+
+        if attention_phrases:
+            ap_list = "\n".join(f"- {p}" for p in attention_phrases[:8])
+            vigilance_prompt += f"\nEL PROPIETARIO QUIERE VIGILAR:\n{ap_list}\n"
+        if owner_notes:
+            on_list = "; ".join(str(n) for n in owner_notes[:5])
+            vigilance_prompt += f"\nNOTAS DEL DUEÑO (contexto, no alertas): {on_list}\n"
+
+        # ── Eje 3C: formato de salida JSON estructurado + flag ──
+        output_format = (
+            "\nResponde EXCLUSIVAMENTE con un JSON válido (sin markdown, sin ```):\n"
+            "{\n"
+            "  \"scene\": \"narrativa de 3-6 frases de lo que ocurre en la secuencia\",\n"
+            "  \"persons\": [{\"id\": <track_id_yolo o 0>, \"desc\": \"1-2 frases: apariencia + qué hace\"}],\n"
+            "  \"objects\": [\"lista de objetos relevantes: dinero, platos, bolsas, datáfono, refrescos, etc.\"],\n"
+            "  \"events\": [\"acciones observadas: cobró a cliente, empacó plato, entró dinero en caja, etc.\"],\n"
+            "  \"flag\": null | \"frase exacta de attention_phrases que detectaste cumplirse, o null\"\n"
+            "}\n"
+            "Reglas: \"scene\" nunca debe decir \"fotograma\" o enumerar frames. \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0."
+        )
+
+        full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{output_format}"
+
         # LOGGING CRUDO - Capa 1: prompt exacto enviado a Qwen
-        logger.info(f"[QWEN_PROMPT] {vision_prompt[:500]}")
+        logger.info(f"[QWEN_PROMPT] {full_prompt[:800]}")
 
-        # Construir content con frames individuales + grid
+        # ── Construir content: solo los panels (no mezclar con frames individuales) ──
         content = []
+        if isinstance(panels_b64, list):
+            for p_b64 in panels_b64:
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{p_b64}"}})
+        elif panels_b64:
+            # fallback string (grid 4x4 viejo) por si pasa asi
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{panels_b64}"}})
 
-        # Agregar frames individuales (hasta 4 recientes)
-        if frames:
-            recent_frames = frames[-4:] if len(frames) >= 4 else frames
-            for i, f in enumerate(recent_frames):
-                if "image_bytes" in f and f["image_bytes"]:
-                    try:
-                        frame_b64 = image_to_base64(f["image_bytes"])
-                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}})
-                    except Exception:
-                        pass
-
-        # Agregar grid
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{grid_img_b64}"}})
-
-        # Agregar prompt de texto
-        content.append({"type": "text", "text": vision_prompt})
+        content.append({"type": "text", "text": full_prompt})
 
         payload = {
             "model": "qwen",
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 500
+            "max_tokens": 900
         }
 
         try:
@@ -1662,10 +1726,10 @@ class QwenOrchestrator:
                 resp.raise_for_status()
                 raw_content = resp.json()["choices"][0]["message"]["content"]
                 # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
-                logger.info(f"[QWEN_RAW] {raw_content[:500]}")
+                logger.info(f"[QWEN_RAW] {raw_content[:600]}")
                 parsed = _parse_qwen_json(raw_content)
                 # LOGGING CRUDO - Capa 3: JSON parseado
-                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:500]}")
+                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:600]}")
                 return parsed
         except Exception as e:
             logger.error(f"Vision Analyst error: {e}")
@@ -1762,15 +1826,17 @@ class QwenOrchestrator:
                 owner_notes = vigilance.get("owner_notes", []) or []
     
             if use_grid_image and len(frames) > 1:
-                grid_img = create_grid_image([f["image_bytes"] for f in frames], max_size=224)
-                logger.info(f"[GRID] Grid created: {len(grid_img)} bytes, frames={len(frames)}")
+                # Eje 1: usar panels 2x2 (4 imágenes grandes con numeración visible) en vez de 1 grid 4x4 chico
+                panels_bytes = create_panels_2x2([f["image_bytes"] for f in frames])
+                panels_b64 = [image_to_base64(p) for p in panels_bytes if p]
+                logger.info(f"[GRID] Panels 2x2 created: {len(panels_b64)} panels, frames={len(frames)}")
                 try:
-                    grid_b64 = image_to_base64(grid_img)
                     vision_json = await self._call_qwen_vision(
-                         grid_b64, zone, business_name, business_type,
+                         panels_b64, zone, business_name, business_type,
                          _schedule_open, _schedule_close, mode, is_after_hours,
                          total_yolo_objects, yolo_stats, cam_cfg, frames=frames, concern=concern,
-                         attention_phrases=attention_phrases, owner_notes=owner_notes
+                         attention_phrases=attention_phrases, owner_notes=owner_notes,
+                         tracking_summary=tracking_summary
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
                     logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
@@ -1826,9 +1892,37 @@ class QwenOrchestrator:
             if not summary:
                 summary = _build_summary_from_rich_qwen(qwen_json, zone, attention_detected)
                 qwen_json["summary"] = summary
-            # Extraer resumen del nuevo formato si existe
+            # Eje 3C: construir summary legible desde el nuevo JSON estructurado de Qwen.
+            # Priorizar la narrativa "scene" enriquecida con persons/objects/events y tracking.
             if isinstance(qwen_json, dict):
-                v_resumen = qwen_json.get("vision", {}).get("resumen", "")
+                vision = qwen_json.get("vision", {}) if isinstance(qwen_json.get("vision"), dict) else {}
+                v_scene = (vision.get("scene") or "").strip()
+                v_persons = vision.get("persons", []) or []
+                v_objects = vision.get("objects", []) or []
+                v_events = vision.get("events", []) or []
+                if v_scene and len(v_scene) > 15:
+                    parts_list = [v_scene]
+                    # Personas (descripción por persona)
+                    if isinstance(v_persons, list) and v_persons:
+                        pers_strs = []
+                        for p in v_persons:
+                            if isinstance(p, dict):
+                                d = (p.get("desc") or "").strip()
+                                if d: pers_strs.append(d)
+                        if pers_strs:
+                            parts_list.append("Personas: " + " | ".join(pers_strs[:6]))
+                    if isinstance(v_objects, list) and v_objects:
+                        objs = [str(o) for o in v_objects if str(o).strip()]
+                        if objs: parts_list.append("Objetos: " + ", ".join(objs[:8]))
+                    if isinstance(v_events, list) and v_events:
+                        evs = [str(e) for e in v_events if str(e).strip()]
+                        if evs: parts_list.append("Acciones: " + ", ".join(evs[:8]))
+                    enriched_summary = " ".join(parts_list)
+                    if len(enriched_summary) > len(summary):
+                        qwen_json["summary"] = enriched_summary
+                        summary = enriched_summary
+                # Mantener ruta vieja: si hay resumen legacy, úsalo si todavía es más largo
+                v_resumen = (vision.get("resumen") or "").strip()
                 if v_resumen and len(v_resumen) > len(summary):
                     qwen_json["summary"] = v_resumen
                     summary = v_resumen
