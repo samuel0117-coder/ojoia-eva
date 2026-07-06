@@ -596,11 +596,6 @@ const App = {
         this._pageHome(document.getElementById('app-content'));
     },
 
-    _fetchHomeFrames() {
-        const cams = this._getHomeViewCams();
-        cams.forEach((cam, i) => this._fetchFrameForCam(cam.camera_id, `home-frame-${i}`));
-    },
-
     async _refreshCamStatus() {
         try {
             const r = await apiFetch(`${this.API}/api/cameras?user_id=${this.userId}`);
@@ -647,7 +642,38 @@ const App = {
     _homeLastDetectionsByCam: {},
     _homeWatermarkTextByCam: {},
     _homeLastYoloFetchByCam: {},
+    _homeStreamStarted: {},  // {camId: true} — MJPEG stream ya iniciado
     _gridSettingsCamId: null,
+
+    _fetchHomeFrames() {
+        const cams = this._getHomeViewCams();
+        cams.forEach((cam, i) => {
+            const camId = cam.camera_id;
+            const targetId = `home-frame-${i}`;
+            const key = `${targetId}:${camId}`;
+            // Iniciar MJPEG stream solo una vez por cámara
+            if (!this._homeStreamStarted[key]) {
+                this._homeStreamStarted[key] = true;
+                this._fetchFrameForCam(camId, targetId);
+            } else {
+                // Stream ya activo, solo actualizar YOLO metadata
+                this._refreshYoloOnly(camId, targetId);
+            }
+        });
+    },
+
+    async _refreshYoloOnly(camId, targetId) {
+        const lastYoloFetch = this._homeLastYoloFetchByCam[camId] || 0;
+        if (Date.now() - lastYoloFetch >= this._homeYoloPollMs) {
+            this._homeLastYoloFetchByCam[camId] = Date.now();
+            const el = document.getElementById(targetId);
+            if (!el) return;
+            const camIdShort = camId.substring(0, 8);
+            const zone = (this._homeCams && this._homeCams.find) ? (this._homeCams.find(c=>c.camera_id===camId)?.zone || '—') : '—';
+            const nowText = new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+            this._fetchYoloMetadata(camId, el, nowText, camIdShort, zone, targetId);
+        }
+    },
 
     async _switchHomeCamera(camId, el) {
         if (!camId) return;
@@ -896,24 +922,24 @@ const App = {
             const el = document.getElementById(targetId);
             if (!el) { clearInFlight(); return; }
             const uid = this.userId || 'default';
-            const ts = Date.now();
-            const rawUrl = `${this.API}/frames/latest-raw.jpg?camera_id=${camId}&user_id=${uid}&_=${ts}`;
             const camIdShort = camId.substring(0, 8);
             const zone = (this._homeCams && this._homeCams.find) ? (this._homeCams.find(c=>c.camera_id===camId)?.zone || '—') : '—';
             const nowText = new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
-                const dateText = new Date().toLocaleDateString('es-ES',{day:'2-digit',month:'2-digit',year:'2-digit'});
-                const watermark = `OJO-${camIdShort} | ${dateText} ${nowText} | ${zone}`;
-
+            const dateText = new Date().toLocaleDateString('es-ES',{day:'2-digit',month:'2-digit',year:'2-digit'});
+            const watermark = `OJO-${camIdShort} | ${dateText} ${nowText} | ${zone}`;
             this._homeWatermarkTextByCam[camId] = watermark;
-            const resetTimer = setTimeout(clearInFlight, 2500);
-            const onImgLoad = () => { clearTimeout(resetTimer); clearInFlight(); this._drawYoloBoxes(camId, this._homeLastDetectionsByCam[camId] || [], this._homeWatermarkTextByCam[camId] || watermark, targetId); };
-            const onImgError = () => { clearTimeout(resetTimer); clearInFlight(); };
-            const dom = this._ensureLiveFrameDom(camId, rawUrl, watermark, onImgLoad, onImgError, targetId);
+
+            // MJPEG stream en lugar de polling JPEG
+            const streamUrl = `${this.API}/cameras/${camId}/stream?user_id=${uid}&fps=5`;
+            const onImgLoad = () => { clearInFlight(); this._drawYoloBoxes(camId, this._homeLastDetectionsByCam[camId] || [], this._homeWatermarkTextByCam[camId] || watermark, targetId); };
+            const onImgError = () => { clearInFlight(); };
+            const dom = this._ensureLiveFrameDom(camId, streamUrl, watermark, onImgLoad, onImgError, targetId);
             if (!dom) { clearInFlight(); return; }
             const { imgEl } = dom;
             imgEl.decoding = 'async';
             imgEl.loading = 'eager';
 
+            // YOLO metadata polling (cada 2s, independiente del stream)
             const lastYoloFetch = this._homeLastYoloFetchByCam[camId] || 0;
             const shouldFetchYolo = Date.now() - lastYoloFetch >= this._homeYoloPollMs;
             if (shouldFetchYolo) {
@@ -1343,16 +1369,19 @@ const App = {
                         <div class="config-grid two">
                             <div class="control-card">
                                 <div class="control-label-row"><span>🔆 Brillo</span><strong id="cfg_brightness_val" class="value-pill">0</strong></div>
-                                <input class="range-control" id="cfg_brightness" min="-100" max="100" value="0" oninput="App._updateImageFilter('${camId}')">
+                                <input class="range-control" id="cfg_brightness" type="range" min="-100" max="100" value="0" oninput="App._updateImageFilter('${camId}')">
                                 <div class="range-labels"><span>Oscuro</span><span>Brillante</span></div>
                             </div>
                             <div class="control-card">
                                 <div class="control-label-row"><span>🎚️ Contraste</span><strong id="cfg_contrast_val" class="value-pill">0</strong></div>
-                                <input class="range-control" id="cfg_contrast" min="-100" max="100" value="0" oninput="App._updateImageFilter('${camId}')">
+                                <input class="range-control" id="cfg_contrast" type="range" min="-100" max="100" value="0" oninput="App._updateImageFilter('${camId}')">
                                 <div class="range-labels"><span>Bajo</span><span>Alto</span></div>
                             </div>
                         </div>
-                        <button class="btn config-action" data-config-cmd="brightness" onclick="App._sendCamCmd('${camId}','brightness',document.getElementById('cfg_brightness').value,this)">💾 Aplicar brillo/contraste</button>
+                        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+                        <button class="btn config-action" data-config-cmd="brightness" onclick="App._sendCamCmd('${camId}','brightness',document.getElementById('cfg_brightness').value,this)">💾 Aplicar</button>
+                        <button class="btn config-action" onclick="App._resetBrightnessContrast('${camId}')">↩️ Restablecer valores</button>
+                        </div>
                     </section>
 
                     <section class="config-section">
@@ -1388,6 +1417,22 @@ const App = {
                     <section class="config-section">
                         <div class="section-heading">
                             <div>
+                                <div class="section-kicker">Frecuencia de frames</div>
+                                <div class="section-title">⚡ Velocidad de envío</div>
+                            </div>
+                        </div>
+                        <div class="segmented four">
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="200" onclick="App._sendCamCmd('${camId}','fps',200,this)">5 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="500" onclick="App._sendCamCmd('${camId}','fps',500,this)">2 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="1000" onclick="App._sendCamCmd('${camId}','fps',1000,this)">1 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="2000" onclick="App._sendCamCmd('${camId}','fps',2000,this)">0.5 fps</button>
+                        </div>
+                        <p class="meta" style="margin:8px 0 0;text-align:center;">2 fps recomendado para vivo fluido. Más fps = más ancho de banda.</p>
+                    </section>
+
+                    <section class="config-section">
+                        <div class="section-heading">
+                            <div>
                                 <div class="section-kicker">LED flash</div>
                                 <div class="section-title">💡 Iluminación</div>
                             </div>
@@ -1414,7 +1459,8 @@ const App = {
 
                     <section class="config-actions">
                         <button class="btn" onclick="App._sendCamCmd('${camId}','snapshot',0,this)">📸 Snapshot</button>
-                    <button class="btn btn-outline" onclick="App._openVigilanceSettings('${camId}')">🛡️ Ajustar protección</button>
+                        <button class="btn btn-outline" onclick="App._exportVideo('${camId}', 45, this)">🎬 Guardar video (45 min)</button>
+                        <button class="btn btn-outline" onclick="App._openVigilanceSettings('${camId}')">🛡️ Ajustar protección</button>
                     </section>
 
                     <button class="btn btn-ghost" onclick="App.go('${returnPage}')">← Volver</button>
@@ -1425,6 +1471,29 @@ const App = {
         } catch(e) {
             if (this.page !== 'settings' && this.page !== 'cameras' && this.page !== 'home') return;
             c.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:32px;text-align:center;"><div style="font-size:3rem;margin-bottom:16px;">❌</div><div style="font-weight:600;margin-bottom:8px;">Error cargando cámara</div><button class="btn" style="margin-top:16px" onclick="App._openCameraConfig(\''+camId+'\')">Reintentar</button></div>';
+        }
+
+        // Aplicar valores por defecto si la cámara es nueva (nunca configurada)
+        this._applyCamDefaults(camId, cam);
+    },
+
+    async _applyCamDefaults(camId, cam) {
+        // Solo aplicar si la cámara nunca ha sido configurada (first_seen == last_announce o no tiene interval_ms)
+        const isNew = cam.first_seen && cam.last_announce && (cam.first_seen === cam.last_announce || !cam.interval_ms);
+        if (!isNew) return;
+
+        console.log(`[CAM_CONFIG] Aplicando defaults a ${camId}`);
+        try {
+            // Valores por defecto recomendados:
+            // quality: 10 (balance tamaño/calidad, ~15-25KB por frame)
+            // interval_ms: 500 (2fps, fluido para vivo)
+            await apiFetch(`${this.API}/cameras/${camId}/cmd?user_id=${this.userId}`, {
+                method: 'POST',
+                body: JSON.stringify({quality: 10, interval_ms: 500})
+            });
+            console.log(`[CAM_CONFIG] Defaults aplicados: quality=10, interval_ms=500`);
+        } catch(e) {
+            console.warn('[CAM_CONFIG] No se pudieron aplicar defaults:', e);
         }
     },
 
@@ -1590,25 +1659,33 @@ const App = {
         }, 500);
     },
 
-    // Polling del viewer en config
+    // MJPEG stream en config viewer
     _configViewerPoll: null,
     _configRotation: 0,
     _configReturnPage: 'cameras',
+    _configStreamStarted: false,
     _startConfigViewerPoll(camId) {
         if (this._configViewerPoll) clearInterval(this._configViewerPoll);
-        this._configViewerPoll = setInterval(() => {
+        this._configStreamStarted = false;
+        const startStream = () => {
             const img = document.getElementById('cfg-live-img');
+            if (!img) return;
+            if (!this._configStreamStarted) {
+                this._configStreamStarted = true;
+                img.src = `${this.API}/cameras/${camId}/stream?user_id=${this.userId}&fps=5`;
+            }
+        };
+        startStream();
+        // Watermark update cada 5s (el stream maneja los frames)
+        this._configViewerPoll = setInterval(() => {
             const wm = document.getElementById('cfg-watermark');
-            if (!img) { clearInterval(this._configViewerPoll); return; }
-            const ts = Date.now();
-            img.src = `${this.API}/frames/latest-raw.jpg?camera_id=${camId}&user_id=${this.userId}&_=${ts}`;
             if (wm) {
                 const now = new Date();
                 const dateText = now.toLocaleDateString('es-ES',{day:'2-digit',month:'2-digit',year:'2-digit'});
                 const ts_str = now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
                 wm.textContent = `OJO-${camId.substring(0,8)} | ${dateText} ${ts_str}`;
             }
-        }, 1000);
+        }, 5000);
     },
 
     // Aplicar filtros de brillo/contraste a la imagen del viewer
@@ -1623,6 +1700,15 @@ const App = {
         if (img) {
             img.style.filter = `brightness(${100 + parseInt(b)}%) contrast(${100 + parseInt(c)}%)`;
         }
+    },
+
+    _resetBrightnessContrast(camId) {
+        const bInput = document.getElementById('cfg_brightness');
+        const cInput = document.getElementById('cfg_contrast');
+        if (bInput) bInput.value = '0';
+        if (cInput) cInput.value = '0';
+        this._updateImageFilter(camId);
+        this._sendCamCmd(camId, 'brightness', '0', null);
     },
 
     _updateCooldownLabel() {
@@ -1678,6 +1764,8 @@ const App = {
                 };
             } else if (cmd === 'quality') {
                 body = {quality: val};
+            } else if (cmd === 'interval_ms' || cmd === 'fps') {
+                body = {interval_ms: val};
             } else if (cmd === 'led') {
                 body = {led_auto: false, led_on: val ? true : false, led_bright: val ? 255 : 0};
             } else if (cmd === 'led_auto') {
@@ -1729,6 +1817,10 @@ const App = {
                 this._toast('', 'Rotación: ' + (this._configRotation * 90) + '°', 'success');
             } else if (cmd === 'brightness') {
                 this._toast('', `Brillo/contraste aplicado 🔆 (${body.brightness}/${body.contrast})`, 'success');
+            } else if (cmd === 'interval_ms' || cmd === 'fps') {
+                const fps = Math.round(1000 / val);
+                this._updateConfigButtonStates('fps', val);
+                this._toast('', `Velocidad: ${fps} fps (${val}ms)`, 'success');
             }
         } catch(e) {
             console.error('SEND CMD ERROR:', e);
@@ -1738,26 +1830,50 @@ const App = {
         }
     },
 
-    async _saveCooldown(camId, btn) {
+async _saveCooldown(camId, btn) {
         this._setConfigButtonBusy(btn, true);
         try {
             const el = document.getElementById('cfg_cooldown_min');
             const val = Math.max(5, Math.min(60, parseInt(el?.value) || 5));
-            if (val < 5) { this._toast('', 'Mínimo 5 minutos', 'warning'); return; }
             const r = await apiFetch(`${this.API}/api/cameras/${camId}/cooldown`, {
                 method: 'POST',
-                body: JSON.stringify({ user_id: this.userId, cooldown_min: val })
+                body: JSON.stringify({cooldown_min: val})
             });
             const d = await r.json();
-            if (d.ok) {
-                this._toast('', `Cooldown guardado: ${val} min`, 'success');
+            if (d.ok || d.success) {
+                this._toast('', `Cooldown: ${val} min`, 'success');
             } else {
-                this._toast('', 'Error guardando', 'danger');
+                this._toast('', d.error || 'Error', 'danger');
             }
         } catch(e) {
             this._toast('', 'Error de red', 'danger');
         } finally {
             this._setConfigButtonBusy(btn, false);
+        }
+    },
+
+    async _exportVideo(camId, minutes = 45, btn = null) {
+        if (btn) this._setConfigButtonBusy(btn, true);
+        this._toast('', `Generando video de últimos ${minutes} min...`, 'info');
+        try {
+            const r = await apiFetch(`${this.API}/api/cameras/${camId}/export-video?user_id=${this.userId}&minutes=${minutes}`, {
+                method: 'POST'
+            });
+            const d = await r.json();
+            if (d.success) {
+                const mins = Math.round(d.duration_seconds / 60);
+                this._toast('', `Video listo: ${d.frames_used} frames, ${mins} min`, 'success');
+                // Abrir descarga
+                const downloadUrl = `${this.API}/api/cameras/${camId}/download-video?user_id=${this.userId}&file=${encodeURIComponent(d.video_url.split('file=')[1] || '')}`;
+                window.open(downloadUrl, '_blank');
+            } else {
+                this._toast('', d.detail || d.error || 'Error generando video', 'danger');
+            }
+        } catch(e) {
+            console.error('EXPORT VIDEO ERROR:', e);
+            this._toast('', 'Error generando video', 'danger');
+        } finally {
+            if (btn) this._setConfigButtonBusy(btn, false);
         }
     },
 
