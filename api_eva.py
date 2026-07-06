@@ -12,7 +12,7 @@ Mejoras v7.1:
 - Sugiere ajustes específicos basados en tipo de negocio + imagen real
 - describe_image mejorado: 60 palabras, análisis de nitidez, ángulo, obstáculos
 """
-import logging
+ 
 import os
 import json
 import re
@@ -20,6 +20,7 @@ import time
 import base64
 import secrets
 import asyncio
+import logging
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
@@ -826,7 +827,7 @@ async def update_user_profile(request: Request):
                 user_data[field] = data[field]
     with open(user_file, "w") as f:
         json.dump(user_data, f, indent=2)
-    return {"success": True}
+        return {"success": True}
 
 @app.get("/api/user/events")
 async def get_user_events(user_id: str, date: str = None, filter: str = None, limit: int = 50):
@@ -1335,7 +1336,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         # ── WATERMARK: Agregar marca de agua SOLO para análisis Qwen ──
         ts_str = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        img_bytes = add_frame_watermark(img_bytes, camera_id, ts_str, business_name="")
+        img_bytes = add_frame_watermark(img_bytes, f"{camera_id} {ts_str}")
 
         logger.info(f"Frame: IP={client_ip} Cam={camera_id} User={user_id} Size={frame_size}B")
 
@@ -1357,6 +1358,8 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         # 2. Determinar modo: normal o centinela
         current_time = now_dt.strftime("%H:%M")
         is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False))
+        mode = "vigilante" if is_vigilante else "normal"
+        is_after_hours = is_vigilante
         logger.info(f"Mode: {'VIGILANTE' if is_vigilante else 'NORMAL'} | Time: {current_time}")
 
         # 3. Ajustar brillo para YOLO (siempre, para que detecte mejor)
@@ -1379,8 +1382,12 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                         if d.get("confidence", 0) >= 0.25:
                             yolo_classes.append(d.get("class", ""))
                             yolo_detections.append(d)
-                    yolo_count = len(yolo_classes)
-                    logger.warning(f"YOLO_DEBUG: raw_count={yolo_data.get('count')} filtered_count={yolo_count} classes={yolo_classes} all_dets={[(d.get('class'),d.get('confidence')) for d in yolo_data.get('detections',[])]}")
+                    # Conteo inteligente: usar track_id para personas únicas
+                    unique_track_ids = set(d.get("track_id") for d in yolo_detections if d.get("track_id"))
+                    yolo_count = len(unique_track_ids) if unique_track_ids else len(yolo_detections)
+                    # Metadata de tracking en español
+                    tracking_info = _build_tracking_info(yolo_detections)
+                    logger.warning(f"YOLO_DEBUG: raw_count={yolo_data.get('count')} filtered_count={yolo_count} classes={yolo_classes} unique_tracks={len(unique_track_ids)} tracking={tracking_info}")
         except Exception as e:
             logger.warning(f"YOLO unavailable: {e}")
 
@@ -1475,17 +1482,25 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             try:
                 import asyncio
                 qwen_result = await asyncio.wait_for(
-                    orchestrator.process_grid(
+                    orchestrator.analyze_grid_and_save_event(
                         user_id=user_id,
                         camera_id=camera_id,
                         vigilance_prompt=v_prompt,
-                        vigilance_rules=v_rules
+                        vigilance_rules=v_rules,
+                        business_name=ud.get("business_name", ""),
+                        business_type=ud.get("business_type", ""),
+                        schedule_open=cam_cfg.get("schedule_open", ""),
+                        schedule_close=cam_cfg.get("schedule_close", ""),
+                        mode=mode,
+                        is_after_hours=is_after_hours,
                     ),
-                    timeout=30
+                    timeout=60 # Timeout de 60 segundos para el análisis completo
                 )
                 logger.info(f"Qwen analysis done: violation={qwen_result.get('violation', False)} event_id={qwen_result.get('event_id','')}")
             except Exception as e:
+                import traceback
                 logger.error(f"Qwen analysis failed: {e}")
+                logger.error(f"Qwen analysis traceback: {traceback.format_exc()}")
         else:
             pass  # Grid not full yet, keep filling
 
@@ -1525,6 +1540,103 @@ _background_objects: dict = {}
 
 # Cooldown tracking: {camera_id: last_alert_timestamp}
 _alert_cooldowns: dict = {}
+
+
+def _build_tracking_info(yolo_detections: list) -> dict:
+    """Construir metadata de tracking en español para las detecciones.
+    
+    Returns:
+        dict con información de tracking en español:
+        - total_personas: número total de detecciones
+        - personas_unicas: número de track_ids únicos
+        - personas_estables: count de track_stable=True
+        - alturas: lista de alturas estimadas
+        - actividades: lista de actividades inferidas
+    """
+    if not yolo_detections:
+        return {"total_personas": 0, "personas_unicas": 0}
+    
+    track_ids = set()
+    estables = 0
+    alturas = []
+    actividades = []
+    
+    for d in yolo_detections:
+        # Track ID
+        tid = d.get("track_id")
+        if tid:
+            track_ids.add(tid)
+        
+        # Estabilidad
+        if d.get("track_stable"):
+            estables += 1
+        
+        # Altura estimada desde pose
+        pose = d.get("pose", {})
+        altura = _estimate_height_from_pose(pose, d.get("bbox", []))
+        if altura:
+            alturas.append(altura)
+        
+        # Actividad inferida
+        actividad = _infer_activity_from_pose(pose)
+        if actividad:
+            actividades.append(actividad)
+    
+    return {
+        "total_personas": len(yolo_detections),
+        "personas_unicas": len(track_ids),
+        "personas_estables": estables,
+        "alturas_estimadas": alturas,
+        "actividades": list(set(actividades))
+    }
+
+
+def _estimate_height_from_pose(pose: dict, bbox: list) -> str:
+    """Estimar altura de persona desde keypoints de pose."""
+    if not pose or not bbox or len(bbox) != 4:
+        return "desconocida"
+    
+    keypoints = pose.get("keypoints", [])
+    if not keypoints or len(keypoints) < 17:
+        return "desconocida"
+    
+    try:
+        # Usar vertical_span como proxy de altura
+        vertical_span = pose.get("vertical_span", 0)
+        
+        if vertical_span > 0.6:
+            return "alta"
+        elif vertical_span > 0.4:
+            return "media"
+        else:
+            return "baja"
+    except Exception:
+        return "desconocida"
+
+
+def _infer_activity_from_pose(pose: dict) -> str:
+    """Inferir actividad desde métricas de pose."""
+    if not pose:
+        return "desconocida"
+    
+    try:
+        vertical_span = pose.get("vertical_span", 0)
+        visible = pose.get("visible", 0)
+        has_pose = pose.get("has_pose", False)
+        
+        if not has_pose:
+            return "desconocida"
+        
+        if vertical_span > 0.5 and visible > 6:
+            return "de_pie"
+        elif vertical_span < 0.3 and visible < 6:
+            return "sentado"
+        elif visible > 6:
+            return "moviendo_manos"
+        else:
+            return "quieto"
+    except Exception:
+        return "desconocida"
 
 
 def _get_background_objects(camera_id: str) -> dict:
@@ -1789,7 +1901,7 @@ async def device_announce(request: dict = None):
     client_ip = request.get("ip", "") or request.get("client_ip", "") or ""
     if not camera_id:
         raise HTTPException(status_code=400, detail="camera_id required")
-    logger.info(f"Device announce: Cam={camera_id} User={user_id} IP={client_ip}")
+        logger.info(f"Device announce: Cam={camera_id} User={user_id} IP={client_ip}")
 
     # Si no viene user_id, resolver desde el camera_id (el firmware no lo envía)
     if not user_id or user_id == "":
@@ -1880,22 +1992,21 @@ set_orchestrator(orchestrator)
 
 @app.post("/config/chat")
 async def config_chat(request: dict):
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info(f"[CHAT] user_id={request.get('user_id')}, message={request.get('message')}, session_id={request.get('session_id')}")
     try:
+        logger = logging.getLogger(__name__)
         result = await handle_eva_chat(
-            user_id=request.get("user_id", ""),
-            message=request.get("message", "hola"),
-            session_id=request.get("session_id", ""),
-            cam_id=request.get("cam_id"),
-            include_frame=request.get("include_frame", False),
-            storage_root=STORAGE_ROOT,
-        )
+        user_id=request.get("user_id", ""),
+        message=request.get("message", "hola"),
+        session_id=request.get("session_id", ""),
+        cam_id=request.get("cam_id"),
+        include_frame=request.get("include_frame", False),
+        storage_root=STORAGE_ROOT,
+    )
         return result
     except Exception as e:
-        logger.error(f"[CHAT ERROR] {e}", exc_info=True)
-        raise
+        local_logger.error(f"[CHAT ERROR] {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
 
 
 # ── NUEVO: Auto-config simple (sin chat) ─────────────────────────────────────
@@ -1983,7 +2094,7 @@ async def config_confirm(request: dict):
     if request.get("user_id", "") in eva_sessions:
         eva_sessions[request.get("user_id", "")]["configured"] = True
         eva_sessions[request.get("user_id", "")]["phase"] = "completado"
-    return {"success": True}
+        return {"success": True}
 
 @app.get("/config/camera_status")
 async def config_camera_status(user_id: str):
@@ -2025,7 +2136,7 @@ async def config_reset(request: dict):
     from eva.eva_chat import _sessions as _eva_s, destroy_session
     if session_id:
         destroy_session(session_id)
-    return {"success": True, "message": "Sesion reiniciada"}
+        return {"success": True, "message": "Sesion reiniciada"}
 
 @app.get("/config/session")
 async def config_session(user_id: str):
@@ -2074,7 +2185,7 @@ async def register_fcm_token(request: dict):
             user_data["fcm_tokens"] = tokens
             with open(uf, "w") as f:
                 json.dump(user_data, f, indent=2)
-    return {"success": True}
+        return {"success": True}
 
 # ── User Plan & Billing Endpoints ───────────────────────────────────────
 
@@ -2186,8 +2297,8 @@ async def upload_payment(
     with open(user_file, "w") as f:
         json.dump(ud, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"Payment uploaded: {payment_id} user={user_id} amount={payment['amount']}")
-    return {"success": True, "payment_id": payment_id, "status": "pending"}
+        logger.info(f"Payment uploaded: {payment_id} user={user_id} amount={payment['amount']}")
+        return {"success": True, "payment_id": payment_id, "status": "pending"}
 
 
 @app.get("/api/user/payments")
@@ -2219,7 +2330,7 @@ async def delete_camera(camera_id: str, user_id: str):
     cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
     if cam_dir.exists():
         shutil.rmtree(cam_dir, ignore_errors=True)
-    return {"success": True, "message": f"Camara {camera_id} eliminada"}
+        return {"success": True, "message": f"Camara {camera_id} eliminada"}
 
 @app.post("/fcm/test")
 async def test_fcm_notification(request: dict):
@@ -2233,6 +2344,7 @@ async def test_fcm_notification(request: dict):
 @app.post("/grid/analyze")
 async def analyze_grid(request: dict):
     user_id = request.get("user_id", "default")
+    camera_id = request.get("camera_id", "")
     prompt = request.get("prompt")
     vigilance_prompt = request.get("vigilance_prompt", "")
     vigilance_rules = request.get("vigilance_rules", "")
@@ -2244,9 +2356,12 @@ async def analyze_grid(request: dict):
             vigilance_prompt = vigilance_prompt or user_data.get("vigilance_prompt", "")
             v_rules_raw = vigilance_rules or user_data.get("vigilance_rules", [])
             vigilance_rules = v_rules_raw if isinstance(v_rules_raw, str) else "\n".join(v_rules_raw) if v_rules_raw else ""
-    result = await orchestrator.process_grid(prompt, vigilance_prompt, vigilance_rules)
-    if "violation_frame" in result and result["violation_frame"]:
-        result["violation_frame"] = "[Frame data excluded from response]"
+    if not camera_id:
+        return {"success": False, "error": "camera_id required"}
+    result = await orchestrator.analyze_grid_and_save_event(
+        user_id=user_id, camera_id=camera_id,
+        vigilance_prompt=vigilance_prompt, vigilance_rules=vigilance_rules,
+    )
     return result
 
 # ── Admin Endpoints ──
@@ -2358,8 +2473,8 @@ async def admin_delete_plan(plan_id: str):
                 except:
                     pass
 
-    logger.info(f"Plan deleted: {plan_id}, migrated {migrated} users to free")
-    return {"success": True, "migrated_users": migrated}
+        logger.info(f"Plan deleted: {plan_id}, migrated {migrated} users to free")
+        return {"success": True, "migrated_users": migrated}
 
 
 # ── Admin: Billing Management ──────────────────────────────────────────
@@ -2504,8 +2619,8 @@ async def admin_renew_user(user_id: str, request: dict):
     with open(user_file, "w") as f:
         json.dump(ud, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"User renewed: {user_id} plan={plan} end={new_end} amount={amount}")
-    return {"success": True, "plan": plan, "plan_end": new_end, "payment_id": payment_id}
+        logger.info(f"User renewed: {user_id} plan={plan} end={new_end} amount={amount}")
+        return {"success": True, "plan": plan, "plan_end": new_end, "payment_id": payment_id}
 
 
 @app.post("/admin/users/{user_id}/payment/{payment_id}/confirm")
@@ -2536,7 +2651,7 @@ async def admin_confirm_payment(user_id: str, payment_id: str, request: dict):
     with open(user_file, "w") as f:
         json.dump(ud, f, indent=2, ensure_ascii=False)
 
-    return {"success": True, "payment_id": payment_id, "status": "confirmed"}
+        return {"success": True, "payment_id": payment_id, "status": "confirmed"}
 
 
 @app.post("/admin/users/{user_id}/suspend")
@@ -2550,8 +2665,8 @@ async def admin_suspend_user(user_id: str, request: dict):
     ud["status"] = "suspended"
     with open(user_file, "w") as f:
         json.dump(ud, f, indent=2, ensure_ascii=False)
-    logger.info(f"User suspended: {user_id}")
-    return {"success": True, "status": "suspended"}
+        logger.info(f"User suspended: {user_id}")
+        return {"success": True, "status": "suspended"}
 
 
 @app.post("/admin/users/{user_id}/reactivate")
@@ -2565,8 +2680,8 @@ async def admin_reactivate_user(user_id: str, request: dict):
     ud["status"] = "active"
     with open(user_file, "w") as f:
         json.dump(ud, f, indent=2, ensure_ascii=False)
-    logger.info(f"User reactivated: {user_id}")
-    return {"success": True, "status": "active"}
+        logger.info(f"User reactivated: {user_id}")
+        return {"success": True, "status": "active"}
 
 
 @app.post("/admin/users/{user_id}/regen-token")
@@ -2581,7 +2696,7 @@ async def admin_regen_token(user_id: str):
     ud["access_token"] = new_token
     with open(user_file, "w") as f:
         json.dump(ud, f, indent=2, ensure_ascii=False)
-    return {"success": True, "access_token": new_token}
+        return {"success": True, "access_token": new_token}
 @app.get("/admin/cameras")
 async def admin_list_cameras():
     cfg = get_disk_config()
@@ -2728,11 +2843,11 @@ async def admin_server_status():
 
 @app.post("/admin/server/cloudflared/save")
 async def admin_cloudflared_save(request: dict):
-    return {"success": True}
+        return {"success": True}
 
 @app.post("/admin/server/sync-firestore")
 async def admin_sync_firestore():
-    return {"success": True}
+        return {"success": True}
 
 @app.get("/admin/users")
 async def admin_users():
@@ -2957,7 +3072,7 @@ async def admin_update_user_storage(user_id: str, request: dict):
         user_data["quota_gb"] = request["quota_gb"]
     with open(user_file, "w") as f:
         json.dump(user_data, f, indent=2)
-    return {"success": True}
+        return {"success": True}
 
 @app.post("/admin/storage/{user_id}/migrate")
 async def admin_migrate_user(user_id: str, request: dict):
@@ -2980,7 +3095,7 @@ async def admin_migrate_user(user_id: str, request: dict):
     compat.mkdir(parents=True, exist_ok=True)
     with open(compat / "user.json", "w") as f:
         json.dump(existing, f, indent=2)
-    return {"success": True, "new_path": str(new_dir)}
+        return {"success": True, "new_path": str(new_dir)}
 
 @app.get("/admin/queue")
 async def admin_queue():
@@ -2996,7 +3111,7 @@ async def admin_queue():
 
 @app.post("/admin/queue/clear")
 async def admin_clear_queue():
-    return {"success": True}
+        return {"success": True}
 
 @app.post("/api/cameras/{camera_id}/cooldown")
 async def save_camera_cooldown(camera_id: str, request: dict):
@@ -3041,7 +3156,7 @@ async def admin_save_prompt(request: dict):
         cfg["violation_cooldown_min"] = request["violation_cooldown_min"]
     with open(EVA_CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
-    return {"success": True}
+        return {"success": True}
 
 @app.get("/admin/eva-docs")
 async def admin_eva_docs():
@@ -3077,7 +3192,7 @@ async def admin_save_eva_doc(request: dict):
         cfg.setdefault("docs", []).append(name)
     with open(EVA_CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
-    return {"success": True}
+        return {"success": True}
 
 @app.post("/admin/calc-tokens")
 async def admin_calc_tokens(request: dict):
@@ -3219,7 +3334,7 @@ async def api_get_violations(user_id: str, limit: int = 20):
 
 @app.post("/admin/firebase/update-server-status")
 async def update_server_status(request: dict):
-    return {"success": True, "backend": "https://api.ojoia.com.do"}
+        return {"success": True, "backend": "https://api.ojoia.com.do"}
 
 
 # ── Firebase Storage Queue Processor ──────────────────────────────────────
@@ -3431,7 +3546,7 @@ async def get_daily_summary(user_id: str, date_str: str = None):
     summary = load_summary(user_id, target_date)
     if not summary or not summary.get("totals", {}).get("events"):
         summary = await generate_daily_summary(user_id, target_date)
-    return {"success": True, "summary": summary}
+        return {"success": True, "summary": summary}
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SDXL Switch — Cambiar entre Turbo y JuggernautXL
@@ -3480,7 +3595,7 @@ async def sdxl_switch(model: str = "turbo"):
     if model not in ["turbo", "juggernaut"]:
         return {"error": "modelo debe ser 'turbo' o 'juggernaut'"}, 400
     
-    result = subprocess.run(
+        result = subprocess.run(
         ['/home/sam/ai_system/scripts/switch_sdxl.sh', model],
         capture_output=True, text=True, timeout=120
     )
@@ -3854,7 +3969,7 @@ async def save_setup_session(user_id: str, data: dict):
     session_file.parent.mkdir(parents=True, exist_ok=True)
     with open(session_file, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    return {"success": True}
+        return {"success": True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
