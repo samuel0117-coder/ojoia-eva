@@ -436,7 +436,11 @@ async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[
         latest_raw = frames_dir / "latest_raw.jpg"
         if latest_raw.exists():
             frame_bytes = latest_raw.read_bytes()
-            return Response(content=frame_bytes, media_type="image/jpeg", headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+            return Response(content=frame_bytes, media_type="image/jpeg", headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+            })
     except:
         pass
     return Response(status_code=204)
@@ -1122,6 +1126,10 @@ def _save_cam_config_to_user(camera_id: str, body: dict):
                             c["v_flip"] = body["v_flip"]
                         if "led_on" in body:
                             c["led_on"] = body["led_on"]
+                        if "brightness" in body:
+                            c["brightness"] = body["brightness"]
+                        if "contrast" in body:
+                            c["contrast"] = body["contrast"]
                         with open(uf, "w") as f:
                             json.dump(ud, f, indent=2)
                         return
@@ -1215,6 +1223,8 @@ async def get_esp32_config(camera_id: str):
                 "led_bright": c.get("led_bright", 128),
                 "h_mirror": c.get("h_mirror", False),
                 "v_flip": c.get("v_flip", False),
+                "brightness": c.get("brightness", 0),
+                "contrast": c.get("contrast", 0),
                 "stream_always": c.get("stream_always", True)
             }
 
