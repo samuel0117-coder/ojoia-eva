@@ -1899,7 +1899,19 @@ class QwenOrchestrator:
                 "event_id": event_id,
                 "action_taken": "event_saved_and_notification_sent" if (attention_detected and cooldown_ok and attention_hits) else "event_saved",
             }
-    
+
+    async def analyze_grid_and_save_event(self, user_id: str = "default", camera_id: str = "unknown",
+                                          vigilance_prompt: str = None, vigilance_rules: str = None,
+                                          business_name: str = "", business_type: str = "",
+                                          schedule_open: str = "", schedule_close: str = "",
+                                          mode: str = "normal", is_after_hours: bool = False) -> dict:
+        """Wrapper around process_grid for api_eva.py compatibility."""
+        return await self.process_grid(
+            user_id=user_id, camera_id=camera_id,
+            vigilance_prompt=vigilance_prompt, vigilance_rules=vigilance_rules,
+            mode=mode,
+        )
+
     async def _call_qwen(self, image_bytes: bytes, prompt: str) -> str:
         """Llama a Qwen con timeout"""
         resized = resize_image(image_bytes, max_size=512)
