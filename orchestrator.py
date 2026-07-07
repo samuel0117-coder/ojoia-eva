@@ -1621,18 +1621,38 @@ class QwenOrchestrator:
          mode: str, is_after_hours: bool, total_yolo: int, yolo_stats: dict,
          cam_cfg: dict, frames: list = None, concern: str = "",
          attention_phrases: list = None, owner_notes: list = None,
-         tracking_summary: dict = None
+         tracking_summary: dict = None, user_id: str = "", camera_id: str = ""
      ) -> dict:
         """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos.
 
         Eje 1: recibe panels 2x2 (4 imágenes grandes con numeración amarilla 1-4 por panel).
         Eje 2: inyecta conteo YOLO/tracker como dato factual (no se le pide contar).
         Eje 3: dos prompts (preambulo generico + vigilancia con contexto del negocio) + salida JSON.
+        Eje 4: inyecta ZONAS CONFIGURADAS por el usuario (áreas de interés dibujadas).
         """
         tracking_summary = tracking_summary or {"unique_persons": 0, "tracks": []}
         attention_phrases = attention_phrases or []
         owner_notes = owner_notes or []
         n_frames = len(frames) if frames else 0
+
+        # ── Eje 4: ZONAS CONFIGURADAS POR EL USUARIO ──
+        zones_html = ""
+        if user_id and camera_id:
+            try:
+                import camera_zones
+                zones = camera_zones.get_camera_zones(user_id, camera_id)
+                if zones:
+                    zones_html = "\n\n--- ZONAS CONFIGURADAS POR EL DUEÑO ---\n"
+                    for z in zones:
+                        c = z.get("coords", {})
+                        x1, y1 = c.get("x", 0), c.get("y", 0)
+                        x2, y2 = x1 + c.get("w", 0), y1 + c.get("h", 0)
+                        zones_html += f"  • [{z.get('name','sin nombre')}]: {z.get('type','otro')} — desde ({x1:.2f},{y1:.2f}) hasta ({x2:.2f},{y2:.2f})\n"
+                        if z.get("description"):
+                            zones_html += f"    Nota: {z['description']}\n"
+                    zones_html += "\n  Para CADA persona que veas, indica en qué ZONA está ubicada.\n"
+            except Exception as e:
+                pass  # Si falla, continuamos sin zonas
 
         # ── Eje 2: bloque de datos factual (sensores confirmados) ──
         tracks_desc = ", ".join(
@@ -1698,7 +1718,7 @@ class QwenOrchestrator:
             "Reglas: \"scene\" nunca debe decir \"fotograma\" o enumerar frames. \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0."
         )
 
-        full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{output_format}"
+        full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"
 
         # LOGGING CRUDO - Capa 1: prompt exacto enviado a Qwen
         logger.info(f"[QWEN_PROMPT] {full_prompt[:800]}")
@@ -1836,7 +1856,7 @@ class QwenOrchestrator:
                          _schedule_open, _schedule_close, mode, is_after_hours,
                          total_yolo_objects, yolo_stats, cam_cfg, frames=frames, concern=concern,
                          attention_phrases=attention_phrases, owner_notes=owner_notes,
-                         tracking_summary=tracking_summary
+                         tracking_summary=tracking_summary, user_id=user_id, camera_id=camera_id
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
                     logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")

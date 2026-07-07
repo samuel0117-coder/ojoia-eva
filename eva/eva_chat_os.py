@@ -98,12 +98,27 @@ def build_system_prompt(user_id: str, session: dict = None) -> str:
 
     qwen_activity = f"\nACTIVIDAD RECIENTE QWEN:\n" + "\n".join(recent_qwen[-5:]) if recent_qwen else ""
 
+    # ── ZONAS CONFIGURADAS ──
+    zones_text = ""
+    try:
+        for cid, cam in cameras.items():
+            zones = cam.get("zones", [])
+            if zones:
+                zones_text += f"  • {cam.get('name', cid)}: "
+                zones_text += ", ".join(f"{z['name']} ({z['type']})" for z in zones[:4])
+                zones_text += "\n"
+    except Exception:
+        pass
+
     return f"""Eres Eva, asistente de seguridad de {biz_name} ({biz_type}). Hablas con {owner}.
 
 CONTEXTO:
 - Horario: {schedule.get('open','07:00')} a {schedule.get('close','19:00')}
 - Preocupaciones: {', '.join(concerns) if concerns else 'seguridad general'}
 - Debilidades: {', '.join(weaknesses) if weaknesses else 'no especificadas'}
+
+ZONAS CONFIGURADAS:
+{zones_text if zones_text else 'Sin zonas definidas'}
 
 HOY: {total_events} eventos | {total_persons} personas | {total_alerts} alertas
 {chr(10).join(cam_lines) if cam_lines else 'Sin cámaras'}

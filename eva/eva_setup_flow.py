@@ -192,20 +192,148 @@ def get_eva_response(phase: str, session: dict, user_message: str) -> dict:
                 "data": {},
             }
     
-    elif phase == "CAMERA_CONNECT":
+elif phase == "CAMERA_CONNECT":
         if is_confirmation(user_message):
             cam_count = session.get("camera_count", 0) + 1
             session["camera_count"] = cam_count
             return {
-                "response": f"¡Vamos! Sigue estos pasos para conectar la cámara {cam_count}:\n\n1. 🔌 Conecta la cámara a la corriente\n2. ⏳ Espera a que el LED parpadee en azul\n3. 📱 Ve a WiFi → conéctate a 'OJO-XXXX'\n4. 🌐 Ponle tu WiFi (nombre y contraseña)\n5. ✅ Cuando el LED esté fijo, escríbeme 'listo'\n\nTómate tu tiempo. 👍",
-                "next_phase": "CAMERA_SHOW_FRAME",
+                "response": f"¡Vamos a conectar la cámara {cam_count}!\n\n1. 🔌 Conecta la cámara a la corriente.\n2. ⏳ Espera ~10 segundos hasta que el LED se encienda.\n3. ✅ Cuando veas el LED encendido, dime 'listo'.\n\nTómate tu tiempo. 👍",
+                "next_phase": "WIZARD_DISPOSITION",
                 "data": {"camera_count": cam_count, "waiting": True},
             }
+        else:
+            return {
+                "response": "No hay prisa. Cuando tengas la cámara conectada, escríbeme 'listo'.",
+                "next_phase": "CAMERA_CONNECT",
+                "data": {},
+            }
+    
+    elif phase == "WIZARD_DISPOSITION":
+        # Verificar si hay frame disponible
+        user_id = session.get("user_id", "")
+        frame_info = None
+        if user_id:
+            frame_info = get_latest_frame(user_id, cam_id=None)
+        
+        if not frame_info and user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "conectada", "ok"]:
+            # Aún no hay frame, seguir esperando
+            return {
+                "response": "Déjame verificar si la cámara ya está enviando imágenes... ⏳",
+                "next_phase": "WIZARD_DISPOSITION",
+                "data": {"waiting_for_frame": True},
+            }
+        
+        if frame_info and user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "conectada", "ok", "bien", "se ve bien"]:
+            session["camera_id"] = frame_info.get("cam_id", "")
+            return {
+                "response": "¡Excelente! 🎉 La cámara está funcionando.\n\nAhora viene lo más importante: **vamos a definir las zonas de interés** (la caja, la entrada, la cocina, etc.).\n\n👉 Toca el botón de abajo para ir a Configurar Zonas. Dibuja un rectángulo sobre cada área importante y ponle nombre. Cuando termines, regresa aquí y dime 'listo'.",
+                "next_phase": "WIZARD_ZONES_DRAW",
+                "data": {"show_camera_frame": True, "camera_id": frame_info.get("cam_id", "")},
+                "camera_id": frame_info.get("cam_id", ""),
+            }
+        
+        if not frame_info:
+             return {
+                "response": "¿Ya ves el LED de la cámara encendido? Cuando esté listo, dime 'listo'.",
+                "next_phase": "WIZARD_DISPOSITION",
+                "data": {"waiting_for_frame": True},
+            }
+        
+        return {
+            "response": "¿Ya ves la imagen de la cámara? Cuando estés listo, di 'listo' y pasaremos a configurar las zonas de interés.",
+            "next_phase": "WIZARD_DISPOSITION",
+            "data": {},
+        }
         else:
             return {
                 "response": "No hay prisa. Cuando tengas la cámara, escríbeme 'listo'.",
                 "next_phase": "CAMERA_CONNECT",
                 "data": {},
+            }
+    
+elif phase == "WIZARD_QR":
+        if user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "conectada", "ok"]:
+            return {
+                "response": "¡Perfecto! Ahora, antes de activar Eva, necesito que aceptes que OjoIA procesa imágenes de video para seguridad. ¿Aceptas los términos de uso?",
+                "next_phase": "WIZARD_LEGAL",
+                "data": {"legal_accepted": True, "claim_token": session.get("claim_token", "")},
+                "claim_token": session.get("claim_token", ""),
+            }
+        else:
+            return {
+                "response": "Cuando hayas escaneado el QR y la cámara se haya conectado a tu WiFi, escríbeme 'listo'.",
+                "next_phase": "WIZARD_QR",
+                "data": {"claim_token": session.get("claim_token", "")},
+                "claim_token": session.get("claim_token", ""),
+            }
+        else:
+            return {
+                "response": "Cuando hayas escaneado el QR y la cámara se haya conectado a tu WiFi, escríbeme 'listo'.",
+                "next_phase": "WIZARD_QR",
+                "data": {},
+            }
+    
+    elif phase == "WIZARD_LEGAL":
+        if is_confirmation(user_message):
+            return {
+                "response": "¡Gracias! 🙌\n\nAhora veamos lo que la cámara está viendo. Te voy a mostrar la previsualización para que me digas si se ve bien o si hay que mover la cámara.",
+                "next_phase": "WIZARD_DISPOSITION",
+                "data": {"legal_accepted": True},
+            }
+        else:
+            return {
+                "response": "Necesito que aceptes los términos para poder activar el monitoreo. ¿Aceptas? (Sí / No)",
+                "next_phase": "WIZARD_LEGAL",
+                "data": {},
+            }
+    
+    elif phase == "WIZARD_DISPOSITION":
+        # Aquí idealmente se mostraría un frame de la cámara
+        frame_info = None
+        user_id = session.get("user_id", "")
+        if user_id:
+            frame_info = get_latest_frame(user_id, cam_id=None)
+        if not frame_info and user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "ok", "bien", "se ve bien", "perfecto"]:
+            return {
+                "response": "¡Excelente! 🎉 Ya tenemos la vista de la cámara.\n\nAhora viene lo más importante: **vamos a definir las zonas de interés** (la caja, la entrada, la cocina, etc.).\n\n👉 Ve a la pestaña **Cámara**, pulsa sobre la imagen, elige 'Agregar zona' y dibuja un rectángulo con tu dedo. Cuando termines, regresa aquí y dime 'listo'.",
+                "next_phase": "WIZARD_ZONES_DRAW",
+                "data": {"show_camera_frame": True},
+            }
+        if not frame_info:
+             return {
+                "response": "¿Ya ves la imagen de la cámara? ¿Se ve bien o necesita moverse/rotarse? (Indícame si está oscuro, de lado, o si algo obstruye la vista)",
+                "next_phase": "WIZARD_DISPOSITION",
+                "data": {"waiting_for_frame": True},
+            }
+        return {
+            "response": "¿Ya ves la imagen de la cámara? Cuando estés listo, di 'listo' y pasaremos a configurar las zonas de interés.",
+            "next_phase": "WIZARD_DISPOSITION",
+            "data": {},
+        }
+    
+    elif phase == "WIZARD_ZONES_DRAW":
+        # El frontend mostrará el overlay para dibujar zonas
+        # Simplemente esperamos a que el usuario regrese
+        if user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "ok", "terminé", "terminado", "hecho"]:
+            # Verificar si tiene zonas
+            user_id = session.get("user_id", "")
+            zones = []
+            if user_id:
+                from camera_zones import get_camera_zones
+                zones = get_camera_zones(user_id, session.get("camera_id", ""))
+            zone_str = f" {len(zones)} zonas dibujadas" if zones else ""
+            return {
+                "response": f"¡Perfecto!{zone_str} ¡Eva ya está vigilando!\n\nTe avisaré si algo importante pasa. Puedes volver al chat en cualquier momento y preguntarme '¿qué pasó hoy?' o 'muéstrame las alertas'.\n\n¿Tienes otra cámara para configurar?",
+                "next_phase": "MORE_CAMERAS",
+                "data": {"zones_count": len(zones)},
+            }
+        else:
+            return {
+                "response": "Regresa cuando hayas dibujado las zonas en la pestaña Cámara (agrega la caja, la entrada, la cocina, etc.) y dime 'listo'.",
+                "next_phase": "WIZARD_ZONES_DRAW",
+                "data": {"camera_id": session.get("camera_id", "")},
+                "camera_id": session.get("camera_id", ""),
+            }
             }
     
     elif phase == "CAMERA_SHOW_FRAME":

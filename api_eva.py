@@ -38,6 +38,7 @@ from firebase_admin import auth, credentials
 # Importar modulos locales
 from gateway_resize import resize_image, image_to_base64, add_frame_watermark
 from orchestrator import orchestrator
+import camera_zones
 
 # Configuracion Global
 STORAGE_ROOT = Path("/home/sam/storage")
@@ -3868,6 +3869,40 @@ async def get_event_frame_by_index(event_id: str, index: int, user_id: str):
     raise HTTPException(status_code=404, detail="Frame no encontrado")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# API: Zonas de interés (ROIs) de cámara
+# ───────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/cameras/{camera_id}/zones")
+async def get_camera_zones_api(camera_id: str, user_id: str):
+    """Devuelve todas las zonas configuradas de una cámara."""
+    zones = camera_zones.get_camera_zones(user_id, camera_id)
+    return {"success": True, "zones": zones}
+
+
+@app.post("/api/cameras/{camera_id}/zones")
+async def add_camera_zone_api(camera_id: str, user_id: str, data: dict):
+    """Agrega o actualiza una zona en una cámara."""
+    zone = camera_zones.add_or_update_zone(user_id, camera_id, data)
+    if not zone:
+        raise HTTPException(status_code=404, detail="Camara no encontrada o error de guardado")
+    return {"success": True, "zone": zone}
+
+
+@app.delete("/api/cameras/{camera_id}/zones/{zone_id}")
+async def del_camera_zone_api(camera_id: str, zone_id: str, user_id: str):
+    """Elimina una zona específica de una cámara."""
+    ok = camera_zones.delete_zone(user_id, camera_id, zone_id)
+    return {"success": ok}
+
+
+@app.get("/api/zone-types")
+async def list_zone_types():
+    """Lista de tipos de zona disponibles para dibujar en la cámara."""
+    return {"success": True, "types": camera_zones.get_zone_types()}
+
+
+# ════════════════════════════════════════════════════════════════════════════
 @app.get("/api/business/{user_id}")
 async def get_business_data(user_id: str):
     """Obtiene el business.json del usuario."""
