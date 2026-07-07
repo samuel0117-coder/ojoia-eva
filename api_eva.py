@@ -3788,6 +3788,42 @@ async def eva_feedback_endpoint(request: EvaFeedbackRequest):
         return {"success": False, "error": str(e)}
 
 
+@app.get("/api/chat/eva/history")
+async def get_eva_history(user_id: str):
+    """Devuelve el historial del chat de Eva persistido en disco (multi-dispositivo)."""
+    try:
+        hist_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
+        if hist_file.exists():
+            with open(hist_file) as f:
+                data = json.load(f)
+            return {"success": True, "history": data.get("history", []), "summary": data.get("summary", "")}
+    except Exception as e:
+        logger.warning(f"Error leyendo historial Eva: {e}")
+    return {"success": True, "history": [], "summary": ""}
+
+
+@app.post("/api/chat/eva/history")
+async def save_eva_history(data: dict):
+    """Persiste el historial del chat de Eva en disco (sincronización multi-dispositivo)."""
+    try:
+        user_id = data.get("user_id", "")
+        if not user_id:
+            return {"success": False, "error": "user_id requerido"}
+        hist_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
+        hist_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "history": data.get("history", [])[-200:],
+            "summary": data.get("summary", ""),
+            "updated_at": time.time()
+        }
+        with open(hist_file, "w") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"Error guardando historial Eva: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/event-frame/{event_id}")
 async def get_event_frame(event_id: str, user_id: str):
     """Sirve el frame (imagen) de un evento específico."""

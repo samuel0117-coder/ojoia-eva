@@ -551,7 +551,11 @@ def _event_persons(evt: dict) -> int:
                 return int(value)
         except Exception:
             pass
+    # ── Preferencia: tracker IDs únicos (datos reales basados en tracking) ──
     metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+    pt = metadata.get("person_tracking") if isinstance(metadata, dict) else None
+    if isinstance(pt, dict) and pt.get("unique_persons"):
+        return int(pt.get("unique_persons"))
     yolo_classes = metadata.get("yolo_classes") or evt.get("yolo_classes") or []
     if isinstance(yolo_classes, str):
         yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
@@ -642,9 +646,12 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
         total_fundas += counts.get("fundas_visibles", 0) or 0
         total_clientes_estimado += counts.get("clientes", 0) or 0
 
+    # ── Personas únicas diarias: máximo de personas entre eventos (no suma) ──
+    unique_persons_day = max(persons_values) if persons_values else 0
+
     summary_parts = [f"📊 Hoy se realizaron {total} análisis de seguridad."]
-    if persons_values:
-        summary_parts.append(f"👥 Se observaron aproximadamente {sum(persons_values)} persona(s) en total.")
+    if unique_persons_day > 0:
+        summary_parts.append(f"👥 Se observaron hasta {unique_persons_day} persona(s) en la escena a la vez (según tracker).")
     if total_clientes_estimado > 0:
         summary_parts.append(f"🧑‍🤝‍🧑 Clientes observados: ~{total_clientes_estimado} (estimado).")
     if total_platos > 0:
@@ -704,7 +711,7 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
         "period": date or "today",
         "total_events": total,
         "attention_events": len(attention_events),
-        "persons_total": sum(persons_values),
+        "persons_total": unique_persons_day,
         "persons_analyses": len(persons_values),
         "counts_total": {
             "platos": total_platos,

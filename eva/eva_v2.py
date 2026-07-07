@@ -1052,7 +1052,7 @@ async def _handle_daily_summary(session, user_id, message, session_id):
         lines.append("✅ No se detectaron coincidencias con lo que me pediste vigilar.")
 
     if persons_total > 0:
-        lines.append(f"👥 Personas observadas: aproximadamente {persons_total} en total.")
+        lines.append(f"👥 Personas en la escena: hasta {persons_total} a la vez (según tracker).")
 
     platos = counts_total.get("platos", 0)
     bebidas = counts_total.get("bebidas", 0)
@@ -1313,7 +1313,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
                 if attention > 0:
                     lines.append(f"🚨 Alertas detectadas: {attention}.")
                 if persons > 0:
-                    lines.append(f"👥 Personas observadas: aproximadamente {persons} en total.")
+                    lines.append(f"👥 Personas en la escena: hasta {persons} a la vez (según tracker).")
                 if summary.get("counts_total", {}).get("empleados", 0) > 0:
                     lines.append(f"👤 Empleados detectados: {summary['counts_total']['empleados']}.")
                 if summary.get("counts_total", {}).get("clientes_estimado", 0) > 0:
