@@ -1440,6 +1440,145 @@ def _adjust_brightness(img_bytes: bytes, target_brightness: int = 80) -> bytes:
     return img_bytes
 
 
+def _resolve_user_id_from_camera(camera_id: str) -> Optional[str]:
+    """Resolver user_id buscando en todos los usuarios por camera_id."""
+    if not camera_id:
+        return None
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for user_folder in users_dir.iterdir():
+            user_file = user_folder / "user.json"
+            if user_file.is_file():
+                try:
+                    with open(user_file) as f:
+                        ud = json.load(f)
+                    for cam in ud.get("cameras", []):
+                        if cam.get("camera_id") == camera_id:
+                            return ud.get("user_id", user_folder.name)
+                except:
+                    pass
+    return None
+
+
+def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night_mode: bool = False) -> bool:
+    """Determinar si la cámara está en modo centinela (fuera de horario laboral + gracia O sentinel_mode activo)."""
+    # Si sentinel_mode está activo → siempre es centinela (alerta directa por persona)
+    if vigilance.get("sentinel_mode", {}).get("enabled", False):
+        return True
+    if not vigilance.get("enabled", False):
+        if not night_mode:
+            return False
+    open_t = schedule.get("open", "07:00")
+    close_t = schedule.get("close", "19:00")
+    grace_min = vigilance.get("grace_minutes", 15)
+    try:
+        from datetime import datetime as dt, timedelta
+        close_dt = dt.strptime(close_t, "%H:%M")
+        vigilante_start = (close_dt + timedelta(minutes=grace_min)).strftime("%H:%M")
+    except:
+        vigilante_start = close_t
+    if current_time < open_t or current_time >= vigilante_start:
+        return True
+    return False
+
+
+_vigilance_cooldowns = {}  # {user_id_camera_id: last_alert_timestamp}
+
+def _save_vigilance_event(user_id: str, camera_id: str, img_bytes: bytes, yolo_count: int, yolo_classes: list, client_ip: str):
+    """Guardar evento de vigilancia (modo centinela) y notificar FCM. Usa cooldown_min de la config."""
+    global _vigilance_cooldowns
+    now = int(time.time())
+    cam_key = f"{user_id}_{camera_id}"
+    try:
+        _cam_cfg = get_camera_config(user_id, camera_id)
+        _cooldown_sec = int(_cam_cfg.get("cooldown_min", 60))
+    except:
+        _cooldown_sec = 60
+    _last = _vigilance_cooldowns.get(cam_key, 0)
+    if now - _last < _cooldown_sec:
+        logger.info(f"Vigilance alert suppressed (cooldown {_cooldown_sec}s): {camera_id}")
+        return None
+    _vigilance_cooldowns[cam_key] = now
+    try:
+        ts = now
+        event_id = f"vigilance_{camera_id}_{ts}"
+        events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+        events_dir.mkdir(parents=True, exist_ok=True)
+        with open(events_dir / f"{event_id}.jpg", "wb") as f:
+            f.write(img_bytes)
+        with open(events_dir / "latest_vigilance.jpg", "wb") as f:
+            f.write(img_bytes)
+        event_data = {
+            "event_id": event_id,
+            "camera_id": camera_id,
+            "user_id": user_id,
+            "event_type": "vigilance_alert",
+            "timestamp": ts,
+            "yolo_count": yolo_count,
+            "yolo_classes": yolo_classes,
+            "source_ip": client_ip,
+            "description": f"Modo centinela: {yolo_count} objeto(s) detectado(s): {', '.join(yolo_classes)}"
+        }
+        with open(events_dir / f"{event_id}.json", "w") as f:
+            json.dump(event_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Vigilance event saved: {event_id}")
+        _send_vigilance_fcm(user_id, camera_id, event_id, yolo_count, yolo_classes)
+    except Exception as e:
+        logger.error(f"Error saving vigilance event: {e}")
+
+
+def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count: int, yolo_classes: list):
+    """Enviar notificación FCM de alerta de vigilancia."""
+    try:
+        uf = find_user_json(user_id)
+        if not uf or not uf.exists():
+            return
+        with open(uf) as f:
+            ud = json.load(f)
+        tokens = ud.get("fcm_tokens", [])
+        if not tokens:
+            logger.info(f"No FCM tokens for user {user_id}")
+            return
+        cam_name = camera_id
+        for c in ud.get("cameras", []):
+            if c.get("camera_id") == camera_id:
+                cam_name = c.get("name", camera_id)
+                break
+        title = f"🚨 Alerta: {cam_name}"
+        body = f"Modo centinela activo. {yolo_count} objeto(s) detectado(s) fuera de horario."
+        from orchestrator import send_fcm_notification
+        for token in tokens[:3]:
+            asyncio.create_task(send_fcm_notification(
+                title=title,
+                body=body,
+                token=token,
+                user_id=user_id,
+                link=f"https://ojoia.com.do/#events?event={event_id}"
+            ))
+        logger.info(f"Vigilance FCM queued to {len(tokens)} tokens")
+    except Exception as e:
+        logger.error(f"Error sending vigilance FCM: {e}")
+
+
+def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = None):
+    """Actualizar last_frame de una cámara en user.json."""
+    if not user_id:
+        return
+    try:
+        uf = find_user_json(user_id)
+        if uf and uf.exists():
+            with open(uf) as f:
+                ud = json.load(f)
+            for c in ud.get("cameras", []):
+                if c.get("camera_id") == camera_id:
+                    c["last_frame"] = int(time.time())
+                    break
+            with open(uf, "w") as f:
+                json.dump(ud, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error updating camera last_frame: {e}")
+
+
 async def _process_ingest(request: Request, camera_id: str, user_id: str, image: UploadFile):
     """Flujo OPTIMIZADO: ESP32 → Guardado → Respuesta rápida → Worker background.
     
@@ -1495,8 +1634,39 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             
             if yolo_count > 0:
                 logger.warning(f"MODO CENTINELA: {yolo_count} objects {yolo_classes} → alerta directa")
+                # Guardar latest_yolo.json para que el frontend muestre las cajas
+                try:
+                    frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                    frames_dir_v.mkdir(parents=True, exist_ok=True)
+                    yolo_data = {
+                        "timestamp": time.time(),
+                        "count": yolo_count,
+                        "detections": yolo_detections,
+                        "classes": yolo_classes,
+                        "mode": "vigilante"
+                    }
+                    with open(frames_dir_v / "latest_yolo.json", "w") as f:
+                        json.dump(yolo_data, f, indent=2)
+                except Exception as e:
+                    logger.error(f"Error guardando latest_yolo.json (centinela): {e}")
+                # Guardar evento de vigilancia
                 _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count, yolo_classes, client_ip)
                 _update_camera_last_frame(user_id, camera_id, client_ip)
+                
+                # También enviar al grid para que se llene (después de la alerta)
+                await FRAME_QUEUE.put({
+                    "frame_id": frame_id,
+                    "user_id": user_id,
+                    "camera_id": camera_id,
+                    "img_bytes": img_bytes,
+                    "timestamp": time.time(),
+                    "client_ip": client_ip,
+                    "cam_cfg": cam_cfg,
+                    "schedule": schedule,
+                    "vigilance": vigilance,
+                    "mode": "centinela_grid"  # Modo especial: ya hay alerta, solo grid
+                })
+                
                 return {
                     "success": True, "camera_id": camera_id, "user_id": user_id,
                     "client_ip": client_ip, "frame_size": frame_size,
