@@ -98,15 +98,24 @@ def build_system_prompt(user_id: str, session: dict = None) -> str:
 
     qwen_activity = f"\nACTIVIDAD RECIENTE QWEN:\n" + "\n".join(recent_qwen[-5:]) if recent_qwen else ""
 
-    # ── ZONAS CONFIGURADAS ──
+    # ── ZONAS CONFIGURADAS (leer de camera.json en disco) ──
     zones_text = ""
     try:
-        for cid, cam in cameras.items():
-            zones = cam.get("zones", [])
-            if zones:
-                zones_text += f"  • {cam.get('name', cid)}: "
-                zones_text += ", ".join(f"{z['name']} ({z['type']})" for z in zones[:4])
-                zones_text += "\n"
+        from camera_zones import get_camera_zones
+        from pathlib import Path as _Path
+        cam_dir = _Path(f"/home/sam/storage/users/{user_id}/cameras")
+        if cam_dir.exists():
+            for cam_path in cam_dir.iterdir():
+                if not cam_path.is_dir(): continue
+                cid = cam_path.name
+                try:
+                    cam_zones = get_camera_zones(user_id, cid)
+                    if cam_zones:
+                        zones_text += f"  • {cid}: "
+                        zones_text += ", ".join(f"{z['name']} ({z['type']})".format() for z in cam_zones[:4])
+                        zones_text += "\n"
+                except Exception:
+                    pass
     except Exception:
         pass
 
