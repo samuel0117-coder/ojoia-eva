@@ -945,6 +945,64 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
         return {"success": False, "error": str(e), "history": []}
 
 
+# Alias POST para /api/chat/eva/history (compatibilidad con frontend)
+@app.post("/api/chat/eva/history")
+async def get_eva_chat_history_post(request: dict):
+    """POST = guardar historial completo (compatibilidad con eva-chat-v5.js).
+    GET (definido arriba) = leer historial.
+    """
+    try:
+        user_id = request.get("user_id", "")
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        uf = find_user_json(user_id)
+        if not uf or not uf.exists():
+            return {"success": True, "history": [], "count": 0}
+        with open(uf) as f:
+            ud = json.load(f)
+        history = request.get("history", [])
+        summary = request.get("summary", "")
+        if history:
+            sessions = ud.get("eva_sessions", {}) or {}
+            session_id = f"os_{user_id}"
+            # Convertir formato frontend [{role,content}] → guardar
+            saved_msgs = []
+            for h in history:
+                if isinstance(h, dict) and h.get("content"):
+                    saved_msgs.append({
+                        "role": h.get("role", "user"),
+                        "content": h.get("content", ""),
+                        "timestamp": int(time.time())
+                    })
+            sessions[session_id] = {
+                "messages": saved_msgs[-200:],
+                "summary": summary,
+                "created_at": ud.get("eva_sessions", {}).get(session_id, {}).get("created_at", int(time.time())),
+                "last_message_at": int(time.time())
+            }
+            ud["eva_sessions"] = sessions
+            with open(uf, "w") as f:
+                json.dump(ud, f, indent=2)
+            logger.info(f"[EVA] Historial guardado: {len(saved_msgs)} mensajes para {user_id}")
+            return {
+                "success": True,
+                "history": saved_msgs[-50:],
+                "count": len(saved_msgs),
+                "saved": True,
+                "user_id": user_id
+            }
+        # Si no hay history, devolver lo existente
+        return {
+            "success": True,
+            "history": ud.get("eva_sessions", {}).get(f"os_{user_id}", {}).get("messages", [])[-50:],
+            "count": len(ud.get("eva_sessions", {}).get(f"os_{user_id}", {}).get("messages", [])),
+            "user_id": user_id
+        }
+    except Exception as e:
+        logger.error(f"[EVA POST history] {e}")
+        return {"success": False, "error": str(e), "history": []}
+
+
 @app.post("/api/chat/eva/save")
 async def save_eva_chat_message(request: dict):
     """Guarda un mensaje del chat con Eva en user.json."""
@@ -985,6 +1043,162 @@ async def save_eva_chat_message(request: dict):
     except Exception as e:
         logger.error(f"Error save_eva_chat_message: {e}")
         return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════
+# EVA CHAT - Endpoint principal de conversación
+# ═══════════════════════════════════════════════════════════
+@app.post("/api/chat/eva/message")
+async def chat_eva_message(request: dict):
+    """Endpoint principal del chat con Eva.
+    
+    Body:
+        user_id: str (requerido)
+        message: str (requerido) - mensaje del usuario
+        session_id: str - ID de sesión (se crea si no existe)
+        cam_id: str - cámara objetivo (opcional)
+        include_frame: bool - incluir frame actual (default True)
+    
+    Returns:
+        success: bool
+        sessionId / session_id: str (compatibilidad)
+        phase: str - estado actual de la sesión
+        response: str - texto de Eva
+        messages: array - historial completo
+        image_url: str - URL de imagen si hay
+        suggestions: array - opciones rápidas
+        ready_to_confirm: bool
+        camera_saved: bool
+        events_found: array
+    """
+    try:
+        user_id = (request.get("user_id") or "").strip()
+        message = (request.get("message") or "").strip()
+        session_id = request.get("session_id") or ""
+        cam_id = request.get("cam_id") or ""
+        include_frame = bool(request.get("include_frame", True))
+        
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        if not message:
+            return {"success": False, "error": "message required"}
+        
+        # Cachear sesión en user.json si existe
+        uf = find_user_json(user_id)
+        ud = {}
+        if uf and uf.exists():
+            try:
+                with open(uf) as f:
+                    ud = json.load(f)
+            except Exception:
+                ud = {}
+        
+        # Si no hay session_id, generar uno
+        if not session_id:
+            session_id = f"chat_{user_id}_{int(time.time())}"
+        
+        logger.info(f"[EVA] user={user_id} session={session_id} msg={message[:80]}")
+        
+        # Llamar al motor Eva (handle_eva_chat versión completa del backup)
+        result = None
+        try:
+            from eva.eva_chat import handle_eva_chat
+            result = await handle_eva_chat(
+                user_id=user_id,
+                message=message,
+                session_id=session_id,
+                cam_id=cam_id or None,
+                include_frame=include_frame,
+                storage_root=STORAGE_ROOT
+            )
+        except Exception as e1:
+            logger.warning(f"[EVA] handle_eva_chat falló: {e1}, intentando v2...")
+            try:
+                from eva_v2 import handle_eva_v2
+                result = await handle_eva_v2(
+                    user_id=user_id,
+                    message=message,
+                    session_id=session_id,
+                    cam_id=cam_id or None,
+                    include_frame=include_frame,
+                    storage_root=STORAGE_ROOT
+                )
+            except Exception as e2:
+                logger.error(f"[EVA] handle_eva_v2 también falló: {e2}")
+                result = {
+                    "success": True,
+                    "response": f"Hola {user_id[:8]}. Recibí tu mensaje pero el motor conversacional no está disponible en este momento. Un técnico lo revisará pronto.",
+                    "image_url": "",
+                    "session_id": session_id,
+                    "phase": "os",
+                    "ready_to_confirm": False,
+                    "camera_saved": False,
+                    "suggestions": [],
+                    "events_found": []
+                }
+        
+        # Normalizar respuesta: agregar sessionId (alias de session_id)
+        result["sessionId"] = result.get("session_id") or session_id
+        result.setdefault("response", "")
+        result.setdefault("image_url", "")
+        result.setdefault("phase", "os")
+        result.setdefault("suggestions", [])
+        result.setdefault("events_found", [])
+        result.setdefault("ready_to_confirm", False)
+        result.setdefault("camera_saved", False)
+        
+        # Construir historial de mensajes para el frontend
+        msgs_session_id = result.get("session_id") or session_id
+        messages = []
+        # Cargar mensajes previos si existen
+        sessions = ud.get("eva_sessions", {}) or {}
+        sess = sessions.get(msgs_session_id, {})
+        prev = sess.get("messages", [])
+        # Solo últimos 50 para no saturar
+        messages = prev[-50:]
+        # Agregar mensaje actual del usuario
+        messages.append({"role": "user", "content": message})
+        # Agregar respuesta de Eva
+        messages.append({"role": "assistant", "content": result["response"]})
+        result["messages"] = messages
+        
+        # Guardar en user.json (best-effort, no falla si no se puede)
+        if uf and uf.exists():
+            try:
+                sessions = ud.get("eva_sessions", {}) or {}
+                if msgs_session_id not in sessions:
+                    sessions[msgs_session_id] = {
+                        "messages": [],
+                        "created_at": int(time.time()),
+                        "last_message_at": int(time.time())
+                    }
+                sessions[msgs_session_id]["messages"] = messages[-100:]  # últimos 100
+                sessions[msgs_session_id]["last_message_at"] = int(time.time())
+                ud["eva_sessions"] = sessions
+                # No escribir sync - hacerlo async para no bloquear
+                def _save_async():
+                    try:
+                        with open(uf, "w") as f:
+                            json.dump(ud, f, indent=2)
+                    except Exception:
+                        pass
+                import threading
+                threading.Thread(target=_save_async, daemon=True).start()
+            except Exception as e:
+                logger.warning(f"[EVA] No se pudo guardar en user.json: {e}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"[EVA] Error en chat_eva_message: {e}")
+        return {"success": False, "error": str(e), "response": "Error procesando mensaje"}
+
+
+# Alias para compatibilidad con frontend actual (/config/chat)
+@app.post("/config/chat")
+async def chat_config_alias(request: dict):
+    """Alias del endpoint de chat para compatibilidad con versiones anteriores."""
+    return await chat_eva_message(request)
 
 
 # Perfil y Eventos de Usuario
@@ -1198,6 +1412,8 @@ async def get_event_frame(event_id: str, index: int, user_id: str):
             if frames_dir.exists():
                 candidates = (
                     list(frames_dir.glob(f"frame_{int(index):02d}.jpg")) +
+                    list(frames_dir.glob(f"frame_{int(index):03d}.jpg")) +
+                    list(frames_dir.glob(f"frame_{int(index):04d}.jpg")) +
                     list(frames_dir.glob(f"frame_{int(index)}_*.jpg")) +
                     list(frames_dir.glob(f"frame_{index}.jpg"))
                 )
