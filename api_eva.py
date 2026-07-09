@@ -2721,3 +2721,208 @@ async def get_report_stats(user_id: str):
     except Exception as e:
         logger.error(f"Error obteniendo stats: {e}")
         return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════
+# NOTIFICACIONES - Endpoint para el frontend
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/notifications/list")
+async def get_notifications(user_id: str, limit: int = 10):
+    """
+    Obtiene notificaciones para un usuario (incluye reportes diarios).
+    El frontend puede pollerar este endpoint cada 30 segundos.
+    """
+    try:
+        notifications_dir = STORAGE_ROOT / "users" / user_id / "notifications"
+        
+        if not notifications_dir.exists():
+            return {"success": True, "notifications": [], "count": 0}
+        
+        # Listar archivos ordenados por fecha (más recientes primero)
+        files = sorted(
+            notifications_dir.glob("*.json"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )[:limit]
+        
+        notifications = []
+        for f in files:
+            try:
+                data = json.loads(f.read_text())
+                notifications.append({
+                    "id": f.stem,
+                    "type": data.get("type", "unknown"),
+                    "title": "📊 Reporte Diario Disponible" if data.get("type") == "daily_report" else "Notificación",
+                    "message": data.get("message", "")[:200],
+                    "pdf_url": data.get("pdf_url"),
+                    "action": data.get("action", "open_chat"),  # "open_chat" o "open_events"
+                    "sent_at": data.get("sent_at"),
+                    "read": data.get("read", False)
+                })
+            except:
+                pass
+        
+        return {
+            "success": True,
+            "notifications": notifications,
+            "count": len(notifications),
+            "unread_count": sum(1 for n in notifications if not n.get("read"))
+        }
+    except Exception as e:
+        logger.error(f"Error obteniendo notificaciones: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/notifications/mark-read")
+async def mark_notification_read(user_id: str, notification_id: str):
+    """Marca una notificación como leída."""
+    try:
+        notifications_dir = STORAGE_ROOT / "users" / user_id / "notifications"
+        notification_file = notifications_dir / f"{notification_id}.json"
+        
+        if notification_file.exists():
+            data = json.loads(notification_file.read_text())
+            data["read"] = True
+            notification_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+            return {"success": True, "message": "Notificación marcada como leída"}
+        
+        return {"success": False, "error": "Notificación no encontrada"}
+    except Exception as e:
+        logger.error(f"Error marcando notificación: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════
+# WHATSAPP - Endpoint genérico (webhook para enviar reportes)
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/api/reports/send-to-channel")
+async def send_report_to_channel(user_id: str, request: dict):
+    """
+    Envía un reporte diario por múltiples canales: chat, push, WhatsApp.
+    
+    Body:
+        channel: str - "chat" | "push" | "whatsapp" | "all"
+        camera_id: str (opcional)
+        whatsapp_number: str (requerido si channel=whatsapp) ej: +18091234567
+    """
+    try:
+        from reportes.daily_report import send_full_daily_report_v2
+        
+        channel = request.get("channel", "all")
+        camera_id = request.get("camera_id")
+        whatsapp_number = request.get("whatsapp_number")
+        date = request.get("date", "yesterday")
+        
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        
+        # Generar y enviar chat + push
+        result = await send_full_daily_report_v2(user_id, camera_id, date)
+        
+        if not result.get("success"):
+            return result
+        
+        # Si pidió WhatsApp, intentar enviar
+        whatsapp_sent = False
+        if channel in ("whatsapp", "all"):
+            whatsapp_sent = await _send_daily_report_whatsapp(
+                user_id=user_id,
+                message=result.get("message", ""),
+                pdf_url=result.get("pdf_url"),
+                phone=whatsapp_number
+            )
+        
+        # Actualizar historial con info de WhatsApp
+        if result.get("chat_injected") or result.get("push_sent"):
+            notifications_dir = STORAGE_ROOT / "users" / user_id / "notifications"
+            notif_files = sorted(notifications_dir.glob("report_*.json"), 
+                                 key=lambda f: f.stat().st_mtime, 
+                                 reverse=True)
+            if notif_files:
+                data = json.loads(notif_files[0].read_text())
+                data["channels_delivered"]["whatsapp"] = whatsapp_sent
+                notif_files[0].write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        
+        return {
+            "success": True,
+            "channels_delivered": {
+                "chat": result.get("chat_injected"),
+                "push_fcm": result.get("push_sent"),
+                "whatsapp": whatsapp_sent
+            },
+            "message": result.get("message"),
+            "pdf_url": result.get("pdf_url"),
+            "report": result.get("report")
+        }
+    except Exception as e:
+        logger.error(f"Error send_report_to_channel: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _send_daily_report_whatsapp(user_id: str, message: str, pdf_url: str = None, phone: str = None):
+    """
+    Envía el reporte por WhatsApp usando la Meta WhatsApp Business API.
+    
+    Configuración requerida:
+    - WHATSAPP_TOKEN en .env
+    - WHATSAPP_PHONE_ID en .env  
+    - phone: número del destinatario (sin '+', solo dígitos)
+    """
+    try:
+        import os
+        import requests as _req
+        
+        whatsapp_token = os.environ.get("WHATSAPP_TOKEN")
+        whatsapp_phone_id = os.environ.get("WHATSAPP_PHONE_ID")
+        
+        if not whatsapp_token or not whatsapp_phone_id:
+            logger.warning("WhatsApp no configurado (falta WHATSAPP_TOKEN o WHATSAPP_PHONE_ID)")
+            return False
+        
+        # Si no se pasó phone, leerlo del user.json
+        if not phone:
+            user_file = STORAGE_ROOT / "users" / user_id / "user.json"
+            if user_file.exists():
+                with open(user_file) as f:
+                    user_data = json.loads(f.read_text())
+                phone = user_data.get("phone", "").replace("+", "").replace(" ", "").replace("-", "")
+        
+        if not phone:
+            logger.warning(f"Sin número WhatsApp para {user_id}")
+            return False
+        
+        # Construir mensaje (WhatsApp usa *bold* igual)
+        wa_message = f"📊 *Reporte Diario*\n\n{message}"
+        if pdf_url:
+            full_url = f"https://ojoia.com.do{pdf_url}" if pdf_url.startswith("/") else pdf_url
+            wa_message += f"\n\n🔗 Ver reporte: {full_url}"
+        
+        # Enviar vía Meta WhatsApp Business API
+        api_url = f"https://graph.facebook.com/v18.0/{whatsapp_phone_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {whatsapp_token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "text",
+            "text": {"body": wa_message[:4000]}  # WhatsApp limit
+        }
+        
+        resp = _req.post(api_url, headers=headers, json=payload, timeout=10)
+        
+        if resp.status_code in (200, 201):
+            result = resp.json()
+            logger.info(f"✅ WhatsApp enviado a {phone}: {result.get('messages', [{}])[0].get('id', '')}")
+            return True
+        else:
+            logger.error(f"❌ WhatsApp error {resp.status_code}: {resp.text[:200]}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error WhatsApp: {e}")
+        return False

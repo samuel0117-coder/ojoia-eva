@@ -1649,7 +1649,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         _sessions[session_id] = session
         return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
     
-    if any(k in msg_lower for k in ("reporte diario", "reporte del día", "envía el reporte", "mandar reporte", "ver reporte", "mostrar reporte", "daily report")):
+    if any(k in msg_lower for k in ("reporte diario", "reporte del día", "envía el reporte", "mandar reporte", "ver reporte", "mostrar reporte", "daily report", "reporte diario automático", "auto reporte")):
         from reportes.daily_report import send_daily_report_to_chat
         best_cam = await _pick_best_camera_id(user_id) or ""
         report_result = await send_daily_report_to_chat(user_id, best_cam, "yesterday")
