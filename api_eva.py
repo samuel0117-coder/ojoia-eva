@@ -1460,26 +1460,75 @@ def _resolve_user_id_from_camera(camera_id: str) -> Optional[str]:
     return None
 
 
-def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night_mode: bool = False) -> bool:
-    """Determinar si la cámara está en modo centinela (fuera de horario laboral + gracia O sentinel_mode activo)."""
-    # Si sentinel_mode está activo → siempre es centinela (alerta directa por persona)
+def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night_mode: bool = False, user_id: str = None, camera_id: str = None) -> bool:
+    """Determinar si la cámara está en modo centinela.
+    
+    Lógica SIMPLE y ROBUSTA:
+    1. Si sentinel_mode.enabled → SIEMPRE centinela
+    2. Si night_mode → SIEMPRE centinela
+    3. Si vigilance.enabled == False → NORMAL (no centinela)
+    4. Si current_time está fuera de [open, close+grace) → CENTINELA
+    """
+    # [1] Sentinel mode activo → siempre centinela
     if vigilance.get("sentinel_mode", {}).get("enabled", False):
         return True
+    
+    # [2] Night mode forzado → centinela
+    if night_mode:
+        return True
+    
+    # [3] Vigilancia deshabilitada → modo normal
     if not vigilance.get("enabled", False):
-        if not night_mode:
-            return False
+        return False
+    
+    # [4] Modo centinela según horario
+    # Si schedule está vacío, intentar cargar desde user.json
+    if (not schedule or not schedule.get("open") or not schedule.get("close")) and user_id:
+        try:
+            from pathlib import Path
+            _uf = STORAGE_ROOT / "users" / user_id / "user.json"
+            if _uf.exists():
+                with open(_uf) as _f:
+                    _ud = json.load(_f)
+                schedule = _ud.get("schedule", {}) or {}
+                if not vigilance:
+                    vigilance = _ud.get("vigilance", {}) or {}
+        except Exception:
+            pass
+    
+    if not schedule or not schedule.get("open") or not schedule.get("close"):
+        # Sin schedule → asumir horario laboral default 07:00-23:59
+        schedule = {"open": "07:00", "close": "23:59"}
+    
     open_t = schedule.get("open", "07:00")
-    close_t = schedule.get("close", "19:00")
+    close_t = schedule.get("close", "23:59")
     grace_min = vigilance.get("grace_minutes", 15)
+    
     try:
         from datetime import datetime as dt, timedelta
+        now_dt = dt.strptime(current_time, "%H:%M")
+        open_dt = dt.strptime(open_t, "%H:%M")
         close_dt = dt.strptime(close_t, "%H:%M")
-        vigilante_start = (close_dt + timedelta(minutes=grace_min)).strftime("%H:%M")
-    except:
-        vigilante_start = close_t
-    if current_time < open_t or current_time >= vigilante_start:
-        return True
-    return False
+        
+        # Calcular fin del horario con gracia
+        close_with_grace = close_dt + timedelta(minutes=grace_min)
+        # Normalizar si pasa de medianoche (hour=24 → day+1, hour=0)
+        if close_with_grace.hour == 0 and close_with_grace.minute > 0 and close_dt.hour >= 23:
+            # Caso especial: horario extendido a día siguiente
+            # En este caso, modo normal mientras now < open del día siguiente
+            # Ahora estamos en horario "vivo" hasta 23:59
+            # Centinela solo si now < open (antes de abrir)
+            if now_dt < open_dt:
+                return True
+            return False
+        
+        # Caso normal: comparar directamente
+        if now_dt < open_dt or now_dt >= close_with_grace:
+            return True
+        return False
+    except Exception:
+        # En caso de error, NO ser centinela (ser conservador)
+        return False
 
 
 _vigilance_cooldowns = {}  # {user_id_camera_id: last_alert_timestamp}
@@ -1580,10 +1629,12 @@ def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = Non
 
 
 async def _process_ingest(request: Request, camera_id: str, user_id: str, image: UploadFile):
-    """Flujo OPTIMIZADO: ESP32 → Guardado → Respuesta rápida → Worker background.
+    """Flujo OPTIMIZADO: guardar + YOLO rápido + encolar grid/Qwen + responder.
     
     Regla de oro: NUNCA se descarta imagen. Frame original SIEMPRE se guarda.
-    YOLO Gate: si yolo_count == 0, frame NO va al grid (ahorro recursos).
+    - YOLO corre SÍNCRONO para que el viewer vea siluetas en tiempo real (~100-200ms).
+    - Grid/Qwen corre en background (worker) para no bloquear al ESP32.
+    - Modo centinela: alerta directa si YOLO detecta personas fuera de horario.
     """
     try:
         client_ip = request.client.host if request.client else "unknown"
@@ -1595,20 +1646,26 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         frame_size = len(img_bytes)
         now_dt = datetime.now()
         frame_id = f"{camera_id}_{int(time.time()*1000)}"
+        mode = "normal"
+        processing = "sync_yolo"
+        yolo_count = 0
+        yolo_classes = []
+        yolo_detections = []
+        is_vigilante = False
 
-        # ── [1] GUARDAR FRAME ORIGINAL (siempre, sin watermark) ──
+        # ── [1] GUARDAR FRAME ORIGINAL (siempre) ──
         try:
             frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
             frames_dir_v.mkdir(parents=True, exist_ok=True)
             frame_path = frames_dir_v / "latest_raw.jpg"
             with open(frame_path, "wb") as f:
                 f.write(img_bytes)
-            # Cache en RAM para MJPEG stream (sin I/O de disco)
+            # Cache en RAM para MJPEG stream
             _cache_frame(user_id, camera_id, img_bytes)
         except Exception as e:
             logger.error(f"Error guardando frame: {e}")
 
-        # ── [2] Leer config rápida (solo lo necesario para modo centinela) ──
+        # ── [2] Leer config y determinar modo centinela ──
         cam_cfg = get_camera_config_static(user_id, camera_id)
         vigilance = cam_cfg.get("vigilance", {})
         schedule = cam_cfg.get("schedule") or {}
@@ -1621,85 +1678,87 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                     schedule = _ud.get("schedule", {})
             except:
                 pass
-
-        # ── [3] Determinar modo centinela (úncio path sincrónico) ──
         current_time = now_dt.strftime("%H:%M")
-        is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False))
-        
-        # ── [4] MODO CENTINELA: alerta directa (sincrónico, no esperar) ──
-        if is_vigilante:
-            # YOLO rápido para centinela
-            yolo_bytes = _adjust_brightness(img_bytes)
-            yolo_count, yolo_classes, yolo_detections = await _run_yolo_detection(yolo_bytes)
-            
-            if yolo_count > 0:
-                logger.warning(f"MODO CENTINELA: {yolo_count} objects {yolo_classes} → alerta directa")
-                # Guardar latest_yolo.json para que el frontend muestre las cajas
-                try:
-                    frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
-                    frames_dir_v.mkdir(parents=True, exist_ok=True)
-                    yolo_data = {
-                        "timestamp": time.time(),
-                        "count": yolo_count,
-                        "detections": yolo_detections,
-                        "classes": yolo_classes,
-                        "mode": "vigilante"
-                    }
-                    with open(frames_dir_v / "latest_yolo.json", "w") as f:
-                        json.dump(yolo_data, f, indent=2)
-                except Exception as e:
-                    logger.error(f"Error guardando latest_yolo.json (centinela): {e}")
-                # Guardar evento de vigilancia
-                _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count, yolo_classes, client_ip)
-                _update_camera_last_frame(user_id, camera_id, client_ip)
-                
-                # También enviar al grid para que se llene (después de la alerta)
-                await FRAME_QUEUE.put({
-                    "frame_id": frame_id,
-                    "user_id": user_id,
-                    "camera_id": camera_id,
-                    "img_bytes": img_bytes,
-                    "timestamp": time.time(),
-                    "client_ip": client_ip,
-                    "cam_cfg": cam_cfg,
-                    "schedule": schedule,
-                    "vigilance": vigilance,
-                    "mode": "centinela_grid"  # Modo especial: ya hay alerta, solo grid
-                })
-                
-                return {
-                    "success": True, "camera_id": camera_id, "user_id": user_id,
-                    "client_ip": client_ip, "frame_size": frame_size,
-                    "mode": "vigilante", "timestamp": now_dt.isoformat(),
-                    "yolo": {"count": yolo_count, "classes": yolo_classes, "detections": yolo_detections},
-                    "frame_id": frame_id, "processing": "sync_vigilante"
-                }
-        
-        # ── [5] MODO NORMAL: guardar + encolar + responder RÁPIDO (~50ms) ──
-        # Encolar para procesamiento background (YOLO + Grid + Qwen)
-        await FRAME_QUEUE.put({
-            "frame_id": frame_id,
-            "user_id": user_id,
-            "camera_id": camera_id,
-            "img_bytes": img_bytes,
-            "timestamp": time.time(),
-            "client_ip": client_ip,
-            "cam_cfg": cam_cfg,
-            "schedule": schedule,
-            "vigilance": vigilance,
-            "mode": "normal"
-        })
-        
-        # Actualizar último frame de la cámara (aunque YOLO no haya corrido aún)
+        is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False), user_id=user_id, camera_id=camera_id)
+        mode = "vigilante" if is_vigilante else "normal"
+
+        # ── [3] YOLO SÍNCRONO RÁPIDO (para siluetas y eventos) ──
+        try:
+            yolo_count, yolo_classes, yolo_detections = await _run_yolo_detection(img_bytes)
+        except Exception as e:
+            logger.error(f"Error YOLO en endpoint: {e}")
+            yolo_count, yolo_classes, yolo_detections = 0, [], []
+
+        # ── [4] Actualizar latest_yolo.json y grid para el viewer ──
+        try:
+            frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            frames_dir_v.mkdir(parents=True, exist_ok=True)
+            yolo_data = {
+                "timestamp": time.time(),
+                "count": yolo_count,
+                "detections": yolo_detections,
+                "classes": yolo_classes,
+                "mode": mode
+            }
+            with open(frames_dir_v / "latest_yolo.json", "w") as f:
+                json.dump(yolo_data, f, indent=2)
+
+            # Actualizar grid inmediatamente con el último frame y detecciones
+            from orchestrator import orchestrator
+            grid = orchestrator._get_grid(user_id, camera_id, grid_size=16)
+            grid.add_frame(
+                image_bytes=img_bytes,
+                camera_id=camera_id,
+                user_id=user_id,
+                yolo_count=yolo_count,
+                yolo_classes=yolo_classes,
+                yolo_detections=yolo_detections,
+                mode=mode
+            )
+        except Exception as e:
+            logger.error(f"Error actualizando YOLO/grid para viewer: {e}")
+
+        # ── [5] MODO CENTINELA: alerta directa si YOLO detecta algo ──
+        if is_vigilante and yolo_count > 0:
+            logger.warning(f"MODO CENTINELA: {yolo_count} objects {yolo_classes} → alerta directa")
+            _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count, yolo_classes, client_ip)
+
+        # ── [6] ENCOLAR para grid + Qwen en background ──
+        # YOLO Gate: si count==0, no pasar al grid (ahorro recursos)
+        if yolo_count > 0:
+            await FRAME_QUEUE.put({
+                "frame_id": frame_id,
+                "user_id": user_id,
+                "camera_id": camera_id,
+                "img_bytes": img_bytes,
+                "timestamp": time.time(),
+                "client_ip": client_ip,
+                "cam_cfg": cam_cfg,
+                "schedule": schedule,
+                "vigilance": vigilance,
+                "mode": mode,
+                "yolo_count": yolo_count,
+                "yolo_classes": yolo_classes,
+                "yolo_detections": yolo_detections
+            })
+            processing = "queued"
+
+        # ── [7] Actualizar last_frame de la cámara ──
         _update_camera_last_frame(user_id, camera_id, client_ip)
-        
-        # Responder INMEDIATAMENTE al ESP32
+
+        # ── [8] Responder RÁPIDO al ESP32 / viewer ──
         return {
-            "success": True, "camera_id": camera_id, "user_id": user_id,
-            "client_ip": client_ip, "frame_size": frame_size,
-            "mode": "normal", "timestamp": now_dt.isoformat(),
-            "frame_id": frame_id, "processing": "queued",
-            "queue_size": FRAME_QUEUE.qsize()
+            "success": True,
+            "camera_id": camera_id,
+            "user_id": user_id,
+            "client_ip": client_ip,
+            "frame_size": frame_size,
+            "mode": mode,
+            "timestamp": now_dt.isoformat(),
+            "frame_id": frame_id,
+            "processing": processing,
+            "queue_size": FRAME_QUEUE.qsize(),
+            "yolo": {"count": yolo_count, "classes": yolo_classes, "detections": yolo_detections}
         }
 
     except Exception as e:
@@ -1740,81 +1799,72 @@ async def _run_yolo_detection(img_bytes: bytes) -> tuple:
 
 async def yolo_worker():
     """Worker que procesa la cola de frames en background.
-    
+
     Flujo:
-    1. Obtiene frame de la cola
-    2. Ejecuta YOLO
-    3. Aplica YOLO Gate (si count==0, no pasa al grid)
-    4. Si pasa: agrega al grid → Qwen → Evento
+    1. Obtiene frame de la cola (con YOLO ya ejecutado en el endpoint)
+    2. Agrega frame al grid para acumulación (análisis Qwen)
+    3. Si el grid se llena o modo centinela con suficientes frames, procesa Qwen
     """
     global WORKER_RUNNING
     WORKER_RUNNING = True
     logger.info("🔧 YOLO Worker iniciado")
-    
+
     while True:
         try:
-            # Obtener frame de la cola (bloqueante hasta que haya frames)
             frame_data = await FRAME_QUEUE.get()
-            
+
             frame_id = frame_data.get("frame_id")
             user_id = frame_data.get("user_id")
             camera_id = frame_data.get("camera_id")
             img_bytes = frame_data.get("img_bytes")
-            cam_cfg = frame_data.get("cam_cfg")
-            schedule = frame_data.get("schedule")
-            vigilance = frame_data.get("vigilance")
+            cam_cfg = frame_data.get("cam_cfg") or {}
+            schedule = frame_data.get("schedule") or {}
+            vigilance = frame_data.get("vigilance") or {}
             mode = frame_data.get("mode", "normal")
-            
-            logger.debug(f"Worker procesando frame {frame_id} (queue: {FRAME_QUEUE.qsize()})")
-            
-            # 1. YOLO detection
-            yolo_count, yolo_classes, yolo_detections = await _run_yolo_detection(img_bytes)
-            
-            # 2. Guardar detecciones YOLO para el frontend
-            try:
-                _frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
-                _frames_dir.mkdir(parents=True, exist_ok=True)
-                yolo_json_path = _frames_dir / "latest_yolo.json"
-                yolo_json_data = {
-                    "timestamp": time.time(),
-                    "count": yolo_count,
-                    "detections": yolo_detections,
-                    "mode": mode
-                }
-                with open(yolo_json_path, "w") as f:
-                    json.dump(yolo_json_data, f)
-            except Exception as e:
-                logger.error(f"Error guardando YOLO JSON: {e}")
-            
-            # 3. YOLO GATE: si count==0, no pasar al grid (ahorro recursos)
-            if yolo_count == 0:
+            yolo_count = frame_data.get("yolo_count", 0)
+            yolo_classes = frame_data.get("yolo_classes", [])
+            yolo_detections = frame_data.get("yolo_detections", [])
+
+            logger.info(f"Worker procesando frame {frame_id} (queue: {FRAME_QUEUE.qsize()})")
+
+            if yolo_count <= 0:
                 logger.info(f"YOLO gate: 0 objects → frame REJECTED del grid (frame_id={frame_id})")
                 FRAME_QUEUE.task_done()
                 continue
-            
-            # 4. Agregar al grid para análisis Qwen
+
+            # Agregar frame al grid para acumulación Qwen
             from orchestrator import orchestrator
-            
-            current_time = datetime.now().strftime("%H:%M")
-            is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False))
-            is_after_hours = is_vigilante
-            
-            logger.info(f"YOLO gate: {yolo_count} objects {yolo_classes} → frame ACCEPTED al grid")
-            
-            # 5. Procesar grid (mismo flujo que antes, pero en background)
-            grid_result = await orchestrator.process_grid(
-                user_id=user_id,
+            grid = orchestrator._get_grid(user_id, camera_id, grid_size=16)
+            grid_is_full = grid.add_frame(
+                image_bytes=img_bytes,
                 camera_id=camera_id,
-                mode="vigilante" if is_vigilante else "normal",
-                use_grid_image=True,
-                grid_size=16
+                user_id=user_id,
+                yolo_count=yolo_count,
+                yolo_classes=yolo_classes,
+                yolo_detections=yolo_detections,
+                mode=mode
             )
-            
-            logger.info(f"Grid procesado: {grid_result.get('frame_count', 0)}/16 frames")
-            
-            # Marcar tarea como completada
+
+            current_time = datetime.now().strftime("%H:%M")
+            is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False), user_id=user_id, camera_id=camera_id)
+
+            logger.info(f"YOLO gate: {yolo_count} objects {yolo_classes} → frame AGREGADO al grid ({grid.get_frame_count()}/16)")
+
+            # Procesar grid cuando esté lleno (16) o en centinela con ≥4 frames
+            if grid_is_full or (is_vigilante and grid.get_frame_count() >= 4):
+                grid_result = await orchestrator.process_grid(
+                    user_id=user_id,
+                    camera_id=camera_id,
+                    mode="vigilante" if is_vigilante else "normal",
+                    use_grid_image=True,
+                    grid_size=16
+                )
+                logger.info(f"Grid procesado: {grid_result.get('frame_count', 0)}/16 frames")
+            else:
+                logger.info(f"Grid aún no lleno ({grid.get_frame_count()}/16), esperando más frames")
+
             FRAME_QUEUE.task_done()
-            
+
         except Exception as e:
             logger.error(f"Error en yolo_worker: {e}", exc_info=True)
             FRAME_QUEUE.task_done()
@@ -1823,14 +1873,21 @@ async def yolo_worker():
 # ═══════════════════════════════════════════════════════════════════════════
 # Entry point — Solo se ejecuta cuando se corre directamente (no cuando se importa)
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Variable global para evitar múltiples workers
+_WORKER_STARTED = False
+
+@app.on_event("startup")
+async def _start_yolo_worker():
+    """Iniciar el YOLO Worker en el mismo event loop de uvicorn."""
+    global _WORKER_STARTED
+    if not _WORKER_STARTED:
+        _WORKER_STARTED = True
+        logger.info("🚀 Iniciando YOLO Worker en background...")
+        asyncio.create_task(yolo_worker())
+
+
 if __name__ == "__main__":
     import uvicorn
-    
-    # Iniciar worker YOLO en background
-    logger.info("🚀 Iniciando YOLO Worker en background...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(yolo_worker())
-    
-    # Arrancar servidor FastAPI
-    uvicorn.run(app, host="0.0.0.0", port=8005)
+    # Arrancar servidor FastAPI (el worker se inicia en el startup event)
+    uvicorn.run(app, host="0.0.0.0", port=8005, loop="asyncio")
