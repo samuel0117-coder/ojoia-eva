@@ -2487,13 +2487,18 @@ async def yolo_worker():
 _WORKER_STARTED = False
 
 @app.on_event("startup")
-async def _start_yolo_worker():
-    """Iniciar el YOLO Worker en el mismo event loop de uvicorn."""
+async def _start_background_tasks():
+    """Iniciar tareas en background: YOLO Worker + Scheduler de Reportes."""
     global _WORKER_STARTED
     if not _WORKER_STARTED:
         _WORKER_STARTED = True
         logger.info("🚀 Iniciando YOLO Worker en background...")
         asyncio.create_task(yolo_worker())
+        
+        # Iniciar scheduler de reportes automáticos (7:30 AM diario)
+        logger.info("⏰ Iniciando scheduler de reportes diarios (7:30 AM)...")
+        from reportes.scheduler import start_scheduler
+        asyncio.create_task(start_scheduler())
 
 
 @app.get("/api/business/is_open")
@@ -2543,3 +2548,176 @@ if __name__ == "__main__":
 
 
 
+
+
+# ═══════════════════════════════════════════════════════════
+# REPORTES AUTOMÁTICOS - ENDPOINTS ADMIN
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/reports/config")
+async def get_report_config(user_id: str):
+    """Obtiene configuración de reportes automáticos para un usuario."""
+    try:
+        from reportes.scheduler import get_user_report_config
+        config = await get_user_report_config(user_id)
+        return {
+            "success": True,
+            "config": config
+        }
+    except Exception as e:
+        logger.error(f"Error obteniendo config de reportes: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/reports/config")
+async def update_report_config(user_id: str, request: dict):
+    """
+    Actualiza configuración de reportes automáticos.
+    
+    Body:
+        enabled: bool - Activar/desactivar reportes
+        hour: int - Hora de envío (0-23)
+        minute: int - Minuto de envío (0-59)
+        cameras: list - Lista de camera_id (vacío = todas)
+        format: str - "html" o "pdf"
+        recipients: list - Emails adicionales
+    """
+    try:
+        from reportes.scheduler import save_user_report_config
+        
+        config = {
+            "enabled": request.get("enabled", True),
+            "hour": request.get("hour", 7),
+            "minute": request.get("minute", 30),
+            "cameras": request.get("cameras", []),
+            "format": request.get("format", "html"),
+            "recipients": request.get("recipients", [])
+        }
+        
+        success = await save_user_report_config(user_id, config)
+        
+        return {
+            "success": success,
+            "message": "Configuración guardada" if success else "Error guardando configuración",
+            "config": config
+        }
+    except Exception as e:
+        logger.error(f"Error actualizando config de reportes: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/reports/send")
+async def send_report_manual(user_id: str, camera_id: str = None, date: str = "yesterday"):
+    """
+    Envía reporte manualmente (para testing).
+    
+    Params:
+        camera_id: str - Cámara específica (opcional, usa todas si no se especifica)
+        date: str - Fecha del reporte (today/yesterday/YYYY-MM-DD)
+    """
+    try:
+        from reportes.daily_report import send_daily_report_to_chat
+        
+        # Si no hay camera_id, obtener primera cámara activa
+        if not camera_id:
+            from reportes.scheduler import _get_user_cameras
+            cameras = await _get_user_cameras(user_id)
+            camera_id = cameras[0] if cameras else None
+        
+        if not camera_id:
+            return {"success": False, "error": "No hay cámaras disponibles"}
+        
+        result = await send_daily_report_to_chat(user_id, camera_id, date)
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error enviando reporte manual: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/reports/list")
+async def list_reports(user_id: str, limit: int = 10):
+    """
+    Lista reportes generados para un usuario.
+    
+    Params:
+        limit: int - Cantidad máxima de reportes a retornar
+    """
+    try:
+        reports_dir = STORAGE_ROOT / "users" / user_id / "daily_reports"
+        
+        if not reports_dir.exists():
+            return {"success": True, "reports": [], "count": 0}
+        
+        # Listar archivos ordenados por fecha (más recientes primero)
+        files = sorted(
+            reports_dir.glob("*.html"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )[:limit]
+        
+        reports = []
+        for f in files:
+            reports.append({
+                "filename": f.name,
+                "url": f"/storage/users/{user_id}/daily_reports/{f.name}",
+                "size": f.stat().st_size,
+                "created_at": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+                "type": "html"
+            })
+        
+        return {
+            "success": True,
+            "reports": reports,
+            "count": len(reports),
+            "directory": str(reports_dir)
+        }
+    except Exception as e:
+        logger.error(f"Error listando reportes: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/reports/test")
+async def test_report_send(user_id: str, camera_id: str = None):
+    """
+    Prueba envío de reporte (para debugging).
+    """
+    try:
+        from reportes.scheduler import test_send_report
+        
+        result = await test_send_report(user_id, camera_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error en test de reporte: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/reports/stats")
+async def get_report_stats(user_id: str):
+    """
+    Obtiene estadísticas de reportes para un usuario.
+    """
+    try:
+        from reportes.scheduler import get_user_report_config
+        
+        config = await get_user_report_config(user_id)
+        
+        # Contar reportes generados
+        reports_dir = STORAGE_ROOT / "users" / user_id / "daily_reports"
+        total_files = len(list(reports_dir.glob("*.html"))) if reports_dir.exists() else 0
+        
+        return {
+            "success": True,
+            "stats": {
+                "enabled": config.get("enabled", True),
+                "schedule": f"{config.get('hour', 7):02d}:{config.get('minute', 30):02d}",
+                "total_sent": config.get("total_sent", 0),
+                "last_sent": config.get("last_sent"),
+                "total_files": total_files,
+                "cameras_configured": len(config.get("cameras", [])),
+                "format": config.get("format", "html")
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error obteniendo stats: {e}")
+        return {"success": False, "error": str(e)}
