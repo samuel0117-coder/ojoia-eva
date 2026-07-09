@@ -4,6 +4,7 @@ reportes/daily_report.py - Generador de reportes diarios en PDF
 
 import json
 import os
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
@@ -202,10 +203,11 @@ async def send_daily_report_push_notification(user_id: str, report_message: str,
         _creds.refresh(google.auth.transport.requests.Request())
         access_token = _creds.token
         
-        # Preparar el link (mismo formato que eventos)
-        link = "https://ojoia.com.do/#reports"
+        # Preparar el link apuntando AL CHAT de Eva específicamente
+        # duration_seconds: tiempo que la notificación será visible (15s recomendado)
+        chat_link = "https://ojoia.com.do/#chat"
         if pdf_url:
-            link = f"https://ojoia.com.do{pdf_url}" if pdf_url.startswith("/") else pdf_url
+            chat_link = f"https://ojoia.com.do/#chat?report={pdf_url.lstrip('/')}"
         
         sent_count = 0
         for tok in tokens:
@@ -215,26 +217,45 @@ async def send_daily_report_push_notification(user_id: str, report_message: str,
                         "token": tok,
                         "notification": {
                             "title": "📊 Reporte Diario Disponible",
-                            "body": f"Tu reporte de {business_name} está listo para revisar"
+                            "body": f"Tu reporte de {business_name} está listo en el chat de Eva"
                         },
                         "data": {
                             "type": "daily_report",
-                            "url": link,
+                            "url": chat_link,
                             "report_message": report_message[:500],
                             "title": "📊 Reporte Diario Disponible",
-                            "body": f"Tu reporte de {business_name} está listo para revisar",
-                            "tag": "daily_report"
+                            "body": f"Tu reporte de {business_name} está listo en el chat de Eva",
+                            "tag": "daily_report",
+                            "duration_seconds": "15",
+                            "action": "open_chat"
                         },
                         "webpush": {
                             "notification": {
                                 "title": "📊 Reporte Diario Disponible",
-                                "body": f"Tu reporte de {business_name} está listo para revisar",
+                                "body": f"Tu reporte de {business_name} está listo en el chat de Eva",
                                 "icon": "/img/icon-192.png",
                                 "badge": "/img/icon-192.png",
                                 "require_interaction": True,
-                                "tag": "daily_report"
+                                "tag": "daily_report",
+                                "renotify": False,
+                                "silent": False,
+                                "timestamp": int(time.time() * 1000),
+                                "vibrate": [200, 100, 200]
                             },
-                            "fcm_options": {"link": link}
+                            "fcm_options": {"link": chat_link},
+                            "data": {
+                                "duration_seconds": "15",
+                                "action": "open_chat"
+                            }
+                        },
+                        "android": {
+                            "priority": "high",
+                            "ttl": "15s",
+                            "notification": {
+                                "channel_id": "daily_reports",
+                                "visibility": "PUBLIC",
+                                "click_action": "OPEN_CHAT_ACTIVITY"
+                            }
                         }
                     }
                 }
