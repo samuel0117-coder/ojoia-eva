@@ -1648,6 +1648,21 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
         _sessions[session_id] = session
         return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
+    
+    if any(k in msg_lower for k in ("reporte diario", "reporte del día", "envía el reporte", "mandar reporte", "ver reporte", "mostrar reporte", "daily report")):
+        from reportes.daily_report import send_daily_report_to_chat
+        best_cam = await _pick_best_camera_id(user_id) or ""
+        report_result = await send_daily_report_to_chat(user_id, best_cam, "yesterday")
+        if report_result.get("success"):
+            report_text = report_result.get("message", "Reporte generado")
+            session["msgs"].append({"role": "assistant", "content": report_text})
+            _sessions[session_id] = session
+            return _mk_resp(session, report_text, suggestions=suggestions, events_found=[])
+        else:
+            error_text = f"Error generando reporte: {report_result.get('error', 'Unknown')}"
+            session["msgs"].append({"role": "assistant", "content": error_text})
+            _sessions[session_id] = session
+            return _mk_resp(session, error_text, suggestions=suggestions, events_found=[])
 
     intent_result = await _detect_intent_and_route(user_id, message, first, recent, cam_count, session)
     if intent_result:

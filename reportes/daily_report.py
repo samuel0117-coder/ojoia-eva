@@ -153,13 +153,14 @@ async def send_daily_report_to_chat(user_id: str, camera_id: str = None, date: s
     config = report_result.get("config_used", SMART_SUMMARY_CONFIG["default"])
     summary = report_result.get("summary", {})
     
-    message = f"""{config['icon']} *{config['title']}*
-
-{summary.get('summary', 'Sin resumen disponible')}
-
-📄 *Reporte completo:* {report_result.get('pdf_url', 'No disponible')}
-
-_Este reporte se genera automáticamente todos los días a las 7:30 AM_"""
+    chat_url = f"/chat?user={user_id}"
+    message = (
+        f"{config['icon']} *{config['title']}*\n\n"
+        f"{summary.get('summary', 'Sin resumen disponible')}\n\n"
+        f"📄 *Reporte completo:* {report_result.get('pdf_url', 'No disponible')}\n\n"
+        f"[💬 Ver en el Chat]({chat_url})\n\n"
+        f"_Este reporte se genera automáticamente todos los días a las 7:30 AM_"
+    )
     
     return {
         "success": True,
