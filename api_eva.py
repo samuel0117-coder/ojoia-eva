@@ -809,6 +809,184 @@ async def verify_firebase(request: Request):
         logger.error(f"Firebase verify error: {e}")
         return {"success": False, "error": str(e)}
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FCM Token Registration
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/fcm/register")
+async def register_fcm_token(request: dict):
+    """Registra token FCM para push notifications."""
+    try:
+        user_id = request.get("user_id", "") if isinstance(request, dict) else ""
+        fcm_token = request.get("fcm_token", "") if isinstance(request, dict) else ""
+        if isinstance(request, str):
+            try:
+                request = json.loads(request)
+                user_id = request.get("user_id", "")
+                fcm_token = request.get("fcm_token", "")
+            except:
+                pass
+        if not user_id or not fcm_token:
+            raise HTTPException(status_code=400, detail="user_id and fcm_token required")
+        uf = find_user_json(user_id)
+        if uf and uf.exists():
+            with open(uf) as f:
+                user_data = json.load(f)
+            tokens = user_data.get("fcm_tokens", [])
+            if fcm_token not in tokens:
+                tokens.append(fcm_token)
+                user_data["fcm_tokens"] = tokens
+                with open(uf, "w") as f:
+                    json.dump(user_data, f, indent=2)
+                logger.info(f"FCM token registered for user {user_id}")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"FCM register error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/fcm/unregister")
+async def unregister_fcm_token(request: dict):
+    """Elimina token FCM del usuario (logout o cambio de dispositivo)."""
+    try:
+        user_id = request.get("user_id", "") if isinstance(request, dict) else ""
+        fcm_token = request.get("fcm_token", "") if isinstance(request, dict) else ""
+        if not user_id or not fcm_token:
+            raise HTTPException(status_code=400, detail="user_id and fcm_token required")
+        uf = find_user_json(user_id)
+        if uf and uf.exists():
+            with open(uf) as f:
+                user_data = json.load(f)
+            tokens = user_data.get("fcm_tokens", [])
+            if fcm_token in tokens:
+                tokens.remove(fcm_token)
+                user_data["fcm_tokens"] = tokens
+                with open(uf, "w") as f:
+                    json.dump(user_data, f, indent=2)
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/chat/eva/history")
+async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, limit: int = 50):
+    """Historial de mensajes del chat con Eva."""
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id required")
+        # Sessions se guardan en user.json como eva_sessions_dict
+        history = []
+        uf = find_user_json(user_id)
+        if uf and uf.exists():
+            try:
+                with open(uf) as f:
+                    ud = json.load(f)
+                sessions = ud.get("eva_sessions", {}) or {}
+                if session_id and session_id in sessions:
+                    msgs = sessions[session_id].get("messages", [])
+                    history = msgs[-limit:]
+                elif not session_id:
+                    # Todas las sesiones, ordenado por ts
+                    all_msgs = []
+                    for sid, sdata in sessions.items():
+                        for m in sdata.get("messages", []):
+                            m2 = {**m, "session_id": sid}
+                            all_msgs.append(m2)
+                    all_msgs.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+                    history = all_msgs[:limit]
+            except Exception as e:
+                logger.warning(f"Error leyendo eva_sessions from user.json: {e}")
+
+        # Si no hay sesiones en user.json, intentar desde archivo dedicado
+        if not history:
+            try:
+                chat_dir = STORAGE_ROOT / "users" / user_id / "eva_chat"
+                if chat_dir.exists():
+                    if session_id:
+                        session_file = chat_dir / f"{session_id}.json"
+                        if session_file.exists():
+                            with open(session_file) as f:
+                                session_data = json.load(f)
+                            history = session_data.get("messages", [])[-limit:]
+                    else:
+                        # todas las sesiones
+                        all_files = sorted(chat_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                        for session_file in all_files[:5]:
+                            try:
+                                with open(session_file) as f:
+                                    sd = json.load(f)
+                                for m in sd.get("messages", []):
+                                    m2 = {**m, "session_id": session_file.stem}
+                                    history.append(m2)
+                                if len(history) >= limit:
+                                    break
+                            except:
+                                continue
+                        history = history[-limit:]
+            except Exception as e:
+                logger.warning(f"Error leyendo archivos de chat: {e}")
+
+        return {
+            "success": True,
+            "history": history,
+            "count": len(history),
+            "user_id": user_id,
+            "session_id": session_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error get_eva_chat_history: {e}")
+        return {"success": False, "error": str(e), "history": []}
+
+
+@app.post("/api/chat/eva/save")
+async def save_eva_chat_message(request: dict):
+    """Guarda un mensaje del chat con Eva en user.json."""
+    try:
+        user_id = request.get("user_id", "")
+        session_id = request.get("session_id", "")
+        role = request.get("role", "user")
+        content = request.get("content", "")
+        timestamp = request.get("timestamp") or int(time.time())
+        if not user_id or not session_id:
+            raise HTTPException(status_code=400, detail="user_id and session_id required")
+        uf = find_user_json(user_id)
+        if not uf or not uf.exists():
+            return {"success": False, "error": "user not found"}
+        with open(uf) as f:
+            ud = json.load(f)
+        sessions = ud.get("eva_sessions", {}) or {}
+        if session_id not in sessions:
+            sessions[session_id] = {
+                "messages": [],
+                "created_at": timestamp,
+                "last_message_at": timestamp
+            }
+        sessions[session_id]["messages"].append({
+            "role": role,
+            "content": content,
+            "timestamp": timestamp
+        })
+        sessions[session_id]["last_message_at"] = timestamp
+        # Mantener solo últimos 100 mensajes por sesión
+        sessions[session_id]["messages"] = sessions[session_id]["messages"][-100:]
+        ud["eva_sessions"] = sessions
+        with open(uf, "w") as f:
+            json.dump(ud, f, indent=2)
+        return {"success": True, "saved": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error save_eva_chat_message: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # Perfil y Eventos de Usuario
 @app.get("/api/user/profile")
 async def get_user_profile(user_id: str):
