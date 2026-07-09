@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional
-import aiohttp
 
 logger = logging.getLogger(__name__)
 STORAGE_ROOT = Path("/home/sam/storage")
