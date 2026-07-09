@@ -1194,7 +1194,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks"):
+        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "count_kids", "is_open_hours", "list_employees", "identify_face"):
             result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
@@ -1634,6 +1634,21 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     suggestions = _get_business_suggestions_list(ud.get("business_type",""), cam_count, first)
     recent = await _get_recent_summary(user_id)
 
+    # Hardcoded intents para herramientas críticas
+    msg_lower = message.lower()
+    if any(k in msg_lower for k in ("cuántas personas", "cuantas personas", "cuanta gente", "cuánta gente", "afluencia", "tráfico de personas", "han venido", "vinieron hoy", "personas vinieron")):
+        best_cam = await _pick_best_camera_id(user_id) or ""
+        tool_result = await _execute_os_tool_v2(user_id, "count_people", {"date": "today", "camera_id": best_cam}, message, first, recent, cam_count, session)
+        session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
+        _sessions[session_id] = session
+        return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
+    
+    if any(k in msg_lower for k in ("está abierto", "esta abierto", "estamos abiertos", "horario de apertura", "cerrado ahora", "abierto ahora")):
+        tool_result = await _execute_os_tool_v2(user_id, "is_open_hours", {}, message, first, recent, cam_count, session)
+        session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
+        _sessions[session_id] = session
+        return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
+
     intent_result = await _detect_intent_and_route(user_id, message, first, recent, cam_count, session)
     if intent_result:
         session["msgs"].append({"role":"assistant","content":intent_result["text"]})
@@ -1672,7 +1687,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks"):
+        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "count_kids", "is_open_hours", "list_employees", "identify_face"):
             result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
@@ -1748,7 +1763,9 @@ async def _route_os_message(user_id, session, message, recent, cam_count, ud=Non
          "- Si el usuario pregunta qué es Eva, quién eres o se queja de que Eva sigue instalando/configurando, usa tool='none' y explica en reason.\n"
          "- Si pide ajustar, activar, desactivar o cambiar protección, usa update_vigilance_config o get_vigilance_config.\n"
          "- Si pregunta por alertas, sospechas, anomalías, riesgos, incendio, humo, actividad actual o última actividad, elige la herramienta de diario que corresponda.\n"
-         "- Si pregunta por personas, conteo, empleados o quién está en cámara, usa identify_face/list_employees/get_activity_summary según corresponda.\n"
+         "- Si pregunta por personas, conteo, cuántas personas vinieron, afluencia o tráfico de clientes, usa count_people.\n"
+         "- Si pregunta por empleados o quién está en cámara, usa identify_face/list_employees según corresponda.\n"
+         "- Si pregunta por horario de apertura, si está abierto o cerrado, usa is_open_hours.\n"
          "- Si no hay intención clara o es conversación general, usa tool='none'.\n"
          "- params debe contener solo los campos necesarios y valores concretos.\n"
          "Contexto del negocio:\n"
@@ -1927,6 +1944,47 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
             parts.append(f"- {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('description', '')[:120]}")
         return {"text": "\n".join(parts), "events": data.get("risks", [])}
 
+
+    if tool_name == "count_people":
+        params = {**params}
+        if not params.get("camera_id"):
+            params["camera_id"] = await _pick_best_camera_id(user_id) or ""
+        if not params.get("date"):
+            params["date"] = "today"
+        data = await _tool_call("count_people", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude contar personas: {data.get('error', 'error')}", "events": []}
+        total = data.get("total_people", 0)
+        sessions = data.get("sessions", 0)
+        peak = data.get("peak_count", 0)
+        peak_time = data.get("peak_time", "")
+        cameras = ", ".join(data.get("cameras", [])) or "cámara principal"
+        text = f"Detecté **{total} persona(s)** hoy en {cameras}."
+        if sessions > 1:
+            text += f" Fueron {sessions} visitas distintas."
+        if peak > 0 and peak_time:
+            text += f" El pico fue de {peak} persona(s) a las {peak_time}."
+        return {"text": text, "events": []}
+
+    if tool_name == "is_open_hours":
+        data = await _tool_call("is_open_hours", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude consultar horario: {data.get('error', 'error')}", "events": []}
+        status = "abierto" if data.get("is_open") else "cerrado"
+        hours = data.get("business_hours", "08:00–18:00")
+        return {"text": f"El negocio está **{status}**. Horario de hoy: {hours}.", "events": []}
+
+    if tool_name == "count_kids":
+        # Por ahora delega a count_people con nota
+        params = {**params, "date": params.get("date", "today")}
+        if not params.get("camera_id"):
+            params["camera_id"] = await _pick_best_camera_id(user_id) or ""
+        data = await _tool_call("count_people", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude consultar: {data.get('error', 'error')}", "events": []}
+        total = data.get("total_people", 0)
+        return {"text": f"No tengo aún clasificación específica de niños. En total detecté **{total} persona(s)** en el período. Pronto habilitaré detección de edad.", "events": []}
+
     if tool_name == "identify_face":
         params = {**params}
         if not params.get("camera_id"):
@@ -1948,6 +2006,9 @@ def _sanitize_os_tool_params(params):
     date = str(params.get("date") or "today")
     if date not in allowed_dates and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         params["date"] = "today"
+    if tool_name in ("count_people", "count_kids") and not params.get("camera_id"):
+        params["camera_id"] = ""
+
     if "limit" in params:
         try:
             params["limit"] = max(1, min(int(params["limit"]), MAX_OS_TOOL_LIMIT))
@@ -1976,7 +2037,7 @@ def _sanitize_os_tool_params(params):
 def _normalize_os_tool_params(tool_name, params, message):
     params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
     m = _normalize_text(message)
-    if tool_name in ("get_activity_summary", "find_anomalies", "latest_events", "search_events", "find_risks"):
+    if tool_name in ("get_activity_summary", "find_anomalies", "latest_events", "search_events", "find_risks", "count_people", "count_kids"):
         if not params.get("date"):
             if any(w in m for w in ("ayer", "dia anterior", "día anterior", "anoche")):
                 params["date"] = "yesterday"
@@ -2054,6 +2115,18 @@ _OS_TOOL_DEFINITIONS = {
     "identify_face": {
         "description": "Identifica quién aparece en el frame actual usando face recognition.",
         "parameters": {"camera_id": "string"},
+    },
+    "count_people": {
+        "description": "Cuenta personas únicas detectadas por cámara. '¿Cuántas personas han venido hoy?'",
+        "parameters": {"camera_id": "string", "date": "today|yesterday"},
+    },
+    "count_kids": {
+        "description": "Cuenta niños detectados (aproximado).",
+        "parameters": {"camera_id": "string", "date": "today|yesterday"},
+    },
+    "is_open_hours": {
+        "description": "Consulta si el negocio está abierto según horario registrado.",
+        "parameters": {"timestamp": "number"},
     },
     "list_employees": {
         "description": "Lista empleados registrados con faceid.",

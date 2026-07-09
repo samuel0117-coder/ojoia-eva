@@ -1100,11 +1100,11 @@ async def chat_eva_message(request: dict):
         
         logger.info(f"[EVA] user={user_id} session={session_id} msg={message[:80]}")
         
-        # Llamar al motor Eva (handle_eva_chat versión completa del backup)
+        # Llamar al motor Eva v2 primero (tiene las herramientas nuevas: count_people, is_open_hours, etc.)
         result = None
         try:
-            from eva.eva_chat import handle_eva_chat
-            result = await handle_eva_chat(
+            from eva_v2 import handle_eva_v2
+            result = await handle_eva_v2(
                 user_id=user_id,
                 message=message,
                 session_id=session_id,
@@ -1113,10 +1113,10 @@ async def chat_eva_message(request: dict):
                 storage_root=STORAGE_ROOT
             )
         except Exception as e1:
-            logger.warning(f"[EVA] handle_eva_chat falló: {e1}, intentando v2...")
+            logger.warning(f"[EVA] handle_eva_v2 falló: {e1}, intentando chat clásico...")
             try:
-                from eva_v2 import handle_eva_v2
-                result = await handle_eva_v2(
+                from eva.eva_chat import handle_eva_chat
+                result = await handle_eva_chat(
                     user_id=user_id,
                     message=message,
                     session_id=session_id,
@@ -1125,7 +1125,7 @@ async def chat_eva_message(request: dict):
                     storage_root=STORAGE_ROOT
                 )
             except Exception as e2:
-                logger.error(f"[EVA] handle_eva_v2 también falló: {e2}")
+                logger.error(f"[EVA] handle_eva_chat también falló: {e2}")
                 result = {
                     "success": True,
                     "response": f"Hola {user_id[:8]}. Recibí tu mensaje pero el motor conversacional no está disponible en este momento. Un técnico lo revisará pronto.",
@@ -1278,19 +1278,37 @@ async def count_people(
     start: Optional[float] = Query(None, description="Timestamp inicio (default: ahora-48h)"),
     end: Optional[float] = Query(None, description="Timestamp fin (default: ahora)")
 ):
-    """Endpoint: Cuántas personas aparecieron entre start-end en camera_id."""
+    """Endpoint: Cuántas personas aparecieron entre start-end en camera_id.
+    Usa tracker temporal: sesiones separadas por > 5 minutos = visitas distintas."""
     if not user_id:
         return {"success": False, "error": "user_id required", "total_people": 0}
-        
-    base_dir = _resolve_user_events_dir(user_id)
-    result = _sum_people_in_events(base_dir, camera_id, start, end)
+    
+    from eva.tools import tool_count_people
+    
+    # Determinar date
+    date_param = "today"
+    if start or end:
+        date_param = None
+    
+    result = await tool_count_people(
+        user_id=user_id,
+        camera_id=camera_id,
+        date=date_param,
+        start=start,
+        end=end
+    )
     
     return {
         "success": True,
         "user_id": user_id,
         "camera_id": camera_id,
-        **result,
-        "version": "v1",
+        "total_people": result.get("total_people", 0),
+        "sessions": result.get("sessions", 0),
+        "events_count": result.get("events_count", 0),
+        "peak_count": result.get("peak_count", 0),
+        "peak_time": result.get("peak_time", ""),
+        "cameras": result.get("cameras", []),
+        "tracker_version": "v1_time_based",
         "request": {"start": start, "end": end}
     }
 @app.get("/api/user/profile")

@@ -268,29 +268,26 @@ async def tool_identify_face(user_id: str, camera_id: str = "") -> dict:
 
 
 async def tool_list_employees(user_id: str) -> dict:
-    """Lista los empleados registrados con faceid."""
+    """Lista los empleados registrados."""
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"http://localhost:8005/api/identity/employees?user_id={user_id}",
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        employees = data.get("employees", [])
-        if employees:
-            names = ", ".join(e.get("person_name", "?") for e in employees)
-            return {
-                "success": True,
-                "count": len(employees),
-                "employees": employees,
-                "message": f"Hay {len(employees)} empleado(s) registrado(s): {names}.",
-            }
+        employees_file = STORAGE_ROOT / "users" / user_id / "business" / "employees.json"
+        if employees_file.exists():
+            data = json.loads(employees_file.read_text())
+            employees = list(data.get("by_id", {}).values())
+            if employees:
+                names = ", ".join(e.get("name", "?") for e in employees)
+                roles = ", ".join(set(e.get("role", "?") for e in employees))
+                return {
+                    "success": True,
+                    "count": len(employees),
+                    "employees": employees,
+                    "message": f"Hay {len(employees)} empleado(s) registrado(s): {names}. Roles: {roles}.",
+                }
         return {
             "success": True,
             "count": 0,
             "employees": [],
-            "message": "No hay empleados registrados con faceid.",
+            "message": "No hay empleados registrados aún. Puedes registrar uno desde el chat con 'registrar empleado'.",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -974,6 +971,163 @@ async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = No
     except Exception as e:
         return {"success": False, "error": str(e), "action": "none"}
 
+
+
+async def tool_count_people(user_id: str, camera_id: str = None, date: str = "today", start: float = None, end: float = None) -> dict:
+    """Cuenta personas únicas detectadas por cámara usando tracker temporal.
+    
+    Lógica de tracker:
+    - Lee eventos de vigilancia (vigilance_*.json) y eventos normales (evt_*.json)
+    - Obtiene conteo de personas por evento
+    - Agrupa eventos en "sesiones" separadas por gaps > 5 minutos
+    - Suma el máximo de personas por sesión para estimar visitas únicas
+    """
+    try:
+        from datetime import datetime, timedelta
+        import time as _time
+        
+        user_dir = STORAGE_ROOT / "users" / user_id
+        if not user_dir.exists():
+            return {"success": True, "total_people": 0, "sessions": [], "message": "No hay cámaras"}
+        
+        # Resolver timestamps
+        if date == "today":
+            start_ts = start or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            end_ts = end or datetime.now().timestamp()
+        elif date == "yesterday":
+            yest = datetime.now() - timedelta(days=1)
+            start_ts = start or yest.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            end_ts = end or (yest + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        else:
+            start_ts = start or (datetime.now() - timedelta(days=1)).timestamp()
+            end_ts = end or datetime.now().timestamp()
+        
+        # Buscar cámaras
+        cameras_dir = user_dir / "cameras"
+        cameras = []
+        if camera_id:
+            if (cameras_dir / camera_id).exists():
+                cameras = [camera_id]
+        else:
+            cameras = [p.name for p in cameras_dir.iterdir() if p.is_dir()]
+        
+        all_events = []
+        for cam in cameras:
+            events_dir = cameras_dir / cam / "events"
+            if not events_dir.exists():
+                continue
+            
+            # Eventos de vigilancia (modo centinela/vigilancia)
+            for f in events_dir.glob("vigilance_*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                    ts = data.get("timestamp", 0) or data.get("timestamp_created", 0)
+                    if start_ts <= ts <= end_ts:
+                        count = data.get("yolo_count", 0) or 0
+                        if count > 0:
+                            all_events.append({"ts": ts, "count": count, "camera": cam, "id": f.stem})
+                except:
+                    continue
+            
+            # Eventos normales (evt_*.json)
+            for f in events_dir.glob("evt_*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                    ts = data.get("timestamp", 0) or data.get("timestamp_created", 0) or data.get("datetime", 0)
+                    if start_ts <= ts <= end_ts:
+                        count = (
+                            data.get("persons") or
+                            data.get("yolo_count", 0) or
+                            data.get("qwen_json", {}).get("persons", 0) or
+                            0
+                        )
+                        if count > 0:
+                            all_events.append({"ts": ts, "count": count, "camera": cam, "id": f.stem})
+                except:
+                    continue
+        
+        if not all_events:
+            return {
+                "success": True, 
+                "total_people": 0, 
+                "sessions": 0, 
+                "events_count": 0,
+                "message": f"No detecté personas en el período ({date})."
+            }
+        
+        # Tracker: sesiones separadas por > 5 minutos
+        all_events.sort(key=lambda x: x["ts"])
+        GAP_SECONDS = 300  # 5 minutos
+        sessions = []
+        current_session = [all_events[0]]
+        
+        for event in all_events[1:]:
+            if event["ts"] - current_session[-1]["ts"] > GAP_SECONDS:
+                sessions.append(current_session)
+                current_session = [event]
+            else:
+                current_session.append(event)
+        sessions.append(current_session)
+        
+        # Sumar máximo de cada sesión
+        total_people = sum(max(e["count"] for e in session) for session in sessions)
+        
+        # Peak info
+        peak_event = max(all_events, key=lambda x: x["count"])
+        peak_time = datetime.fromtimestamp(peak_event["ts"]).strftime("%H:%M")
+        
+        return {
+            "success": True,
+            "total_people": total_people,
+            "sessions": len(sessions),
+            "events_count": len(all_events),
+            "peak_count": peak_event["count"],
+            "peak_time": peak_time,
+            "cameras": list(set(e["camera"] for e in all_events)),
+            "tracker_version": "v1_time_based",
+            "message": f"Detecté {total_people} persona(s) en {len(sessions)} visita(s) distinta(s)."
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def tool_is_open_hours(user_id: str, timestamp: float = None) -> dict:
+    """Consulta si el negocio está abierto según schedule.json."""
+    try:
+        from datetime import datetime
+        schedule_file = STORAGE_ROOT / "users" / user_id / "business" / "schedule.json"
+        if not schedule_file.exists():
+            return {"success": True, "is_open": False, "message": "No hay horario registrado."}
+        
+        sched = json.loads(schedule_file.read_text())
+        ts = timestamp or datetime.now().timestamp()
+        now = datetime.fromtimestamp(ts)
+        weekday = now.strftime("%a")
+        current_hour = now.strftime("%H:%M")
+        date_str = now.strftime("%Y-%m-%d")
+        
+        holidays = sched.get("holidays", []) + ["2026-01-01", "2026-12-25"]
+        if date_str in holidays:
+            return {"success": True, "is_open": False, "message": "Hoy es festivo."}
+        
+        hours = sched.get("schedule", {}).get(weekday, "08:00–18:00")
+        start, end = hours.split("–")
+        start, end = start.strip(), end.strip()
+        
+        is_open = start <= current_hour < end if start <= end else (current_hour >= start or current_hour < end)
+        
+        return {
+            "success": True,
+            "is_open": is_open,
+            "weekday": weekday,
+            "current_hour": current_hour,
+            "business_hours": hours,
+            "message": f"El negocio está {'abierto' if is_open else 'cerrado'}. Horario hoy: {hours}."
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 TOOLS_REGISTRY = {
     "save_business_data": {
         "function": tool_save_business_data,
@@ -1078,6 +1232,23 @@ TOOLS_REGISTRY = {
         "function": tool_list_employees,
         "description": "Lista los empleados registrados con faceid. '¿Cuántos empleados hay?' / '¿Quién está registrado?'",
         "parameters": {"type": "object", "properties": {}},
+    },
+    "count_people": {
+        "function": tool_count_people,
+        "description": "Cuenta personas únicas detectadas por cámara. '¿Cuántas personas han venido hoy?' / '¿Cuánta gente?'",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string", "description": "ID de cámara específica u omitir para todas"},
+            "date": {"type": "string", "description": "today, yesterday"},
+            "start": {"type": "number"},
+            "end": {"type": "number"}
+        }},
+    },
+    "is_open_hours": {
+        "function": tool_is_open_hours,
+        "description": "Consulta si el negocio está abierto según horario registrado. '¿Estamos abiertos?' / '¿Horario?'",
+        "parameters": {"type": "object", "properties": {
+            "timestamp": {"type": "number"}
+        }},
     },
     "save_event": {
         "function": tool_save_event,
