@@ -25,7 +25,6 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
-from fastapi import Query
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -2478,50 +2477,56 @@ async def _start_yolo_worker():
         asyncio.create_task(yolo_worker())
 
 
-@app.get("/api/business/is_open")
-async def is_open(user_id: str, timestamp: float = None):
-    """Determina si el negocio está abierto."""
-    if not user_id:
-        return {"success": False, "is_open": False}
-    import json, os
-    from datetime import datetime
-    schedule_file = f"/home/sam/storage/users/{user_id}/business/schedule.json"
-    if not os.path.exists(schedule_file):
-        return {"success": True, "is_open": False, "reason": "schedule no encontrado"}
-    try:
-        with open(schedule_file) as f:
-            sched = json.load(f)
-        ts = timestamp or datetime.now().timestamp()
-        now = datetime.fromtimestamp(ts)
-        date_str = now.strftime("%Y-%m-%d")
-        weekday = now.strftime("%a")
-        current_hour = now.strftime("%H:%M")
-        holidays_rd = ["2026-07-06", "2026-01-01"]
-        if date_str in holidays_rd or date_str in sched.get("holidays", []):
-            return {"success": True, "is_open": False, "reason": "festivo"}
-        biz_hours = sched.get("schedule", {}).get(weekday, "08:00–18:00")
-        biz_start, biz_end = biz_hours.split("–")
-        biz_start = biz_start.strip()
-        biz_end = biz_end.strip()
-        if biz_start <= biz_end:
-            is_open = biz_start <= current_hour < biz_end
-        else:
-            is_open = current_hour >= biz_start or current_hour < biz_end
-        return {
-            "success": True,
-            "is_open": is_open,
-            "confidence": "high",
-            "weekday": weekday,
-            "current_hour": current_hour,
-            "business_hours": biz_hours
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
 if __name__ == "__main__":
     import uvicorn
+    # Arrancar servidor FastAPI (el worker se inicia en el startup event)
     uvicorn.run(app, host="0.0.0.0", port=8005, loop="asyncio")
 
 
-
+# ════════════════════════
+#  OPEN/CLOSED STATUS
+# ════════════════════════
+@app.get("/api/business/is_open")
+async def is_open(
+    user_id: str,
+    timestamp: float = Query(None, description="Timestamp to check (default now)")
+):
+"""Returns true if business should be open at given timestamp."""
+from datetime import datetime, timedelta
+import json
+import os
+try:
+    # Ruta schedule.json
+    sched_file = f"/home/sam/storage/users/{user_id}/business/schedule.json"
+    if not os.path.exists(sched_file):
+        return {"success": True, "is_open": False, "confidence": "no_schedule"}
+        
+    with open(sched_file) as f:
+        sched = json.load(f)
+        
+    ts = timestamp or time.time()
+    now = datetime.fromtimestamp(ts)
+    weekday = now.strftime("%a")
+    today = now.strftime("%Y-%m-%d")
+    
+    # Festivos RD
+    holidays = ["2026-07-06", "2026-01-01"] + sched.get("holidays", [])
+    if today in holidays:
+        return {"success": True, "is_open": False, "confidence": "high", "reason": "holiday"}
+    
+    # Horario default
+    biz_hours = sched.get("schedule", {}).get(weekday, "08:00–22:00")
+    biz_start, biz_end = map(str.strip, biz_hours.split("–"))
+    
+    # Lógica horario
+    is_open = False
+    if biz_start <= biz_end:
+        is_open = biz_start <= now.strftime("%H:%M") <= biz_end
+    else:
+        # Horario noche (19:00–06:00)
+        is_open = now.strftime("%H:%M") >= biz_start or now.strftime("%H:%M") <= biz_end
+        
+    return {"success": True, **sched, "is_open": is_open, "confidence": "high"}
+        
+except Exception as e:
+    return {"success": False, "error": str(e), "is_open": False}

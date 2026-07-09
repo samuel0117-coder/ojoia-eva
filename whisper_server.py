@@ -42,11 +42,20 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                 language=language
             )
             text = " ".join([s.text for s in segments])
+            # Conversión explícita a tipos Python nativos (CTranslate2 a veces devuelve objetos nativos)
+            lang = info.language
+            duration_raw = info.duration
+            try:
+                duration_py = float(duration_raw)
+                if duration_py != duration_py or duration_py == float('inf'):
+                    duration_py = 0.0
+            except Exception:
+                duration_py = 0.0
             results[job_id] = {
                 "ok": True,
                 "text": text,
-                "language": info.language,
-                "duration": info.duration,
+                "language": str(lang),
+                "duration": duration_py,  # float Python nativo
                 "priority": priority,
             }
         except Exception as e:
@@ -85,7 +94,14 @@ async def transcribe(
         raise HTTPException(status_code=400, detail="priority must be high or normal")
 
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        # Usar el sufijo correcto según el archivo entrante (Whisper detecta formato por extension)
+        orig_name = audio.filename or "audio.webm"
+        suffix = ".wav"
+        for ext in (".webm", ".mp3", ".mp4", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".wav"):
+            if orig_name.lower().endswith(ext):
+                suffix = ext
+                break
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await audio.read()
             tmp.write(content)
             tmp_path = tmp.name
@@ -102,10 +118,19 @@ async def transcribe(
         if not result["ok"]:
             raise HTTPException(status_code=500, detail=result["error"])
 
+        # Sanitizar duration (puede ser NaN si Whisper no detecta el formato correctamente)
+        duration = result.get("duration")
+        try:
+            duration = float(duration)
+            if duration != duration or duration == float('inf'):  # NaN or inf
+                duration = 0.0
+        except (TypeError, ValueError):
+            duration = 0.0
+
         return {
             "text": result["text"],
             "language": result["language"],
-            "duration": result["duration"],
+            "duration": duration,
             "priority": result["priority"],
             "high_workers": WHISPER_HIGH_WORKERS,
             "normal_workers": WHISPER_NORMAL_WORKERS,

@@ -1169,10 +1169,14 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"Cámaras activas: {cam_count}\n\n"
         f"=== RESUMEN RECIENTE DEL DIARIO ===\n{recent}\n\n"
         f"=== HERRAMIENTAS DISPONIBLES ===\n"
-        f"- get_activity_summary: Resume la actividad del día (total análisis, alertas, personas)\n"
-        f"- search_events: Busca eventos por palabra clave (personas, clientes, empleados, etc.)\n"
-        f"- find_anomalies: Busca alertas o actividad sospechosa\n"
-        f"- latest_events: Lista los últimos análisis\n\n"
+        f"- get_activity_summary: Resume actividad diaria (total análisis, personas, alertas)\n" +
+        f"- search_events: Busca eventos por palabra clave, fecha o cámara\n" +
+        f"- find_anomalies: Eventos relevantes según gravedad (media/alta)\n" +
+        f"- latest_events: Lista últimos 15 análisis cronológicos\n" +
+        f"- count_people: Conteo de personas únicas hoy/ayer/timestamp\n" +
+        f"- count_kids: Niños detectados (DFPF < 0.85 + bbox pequeño)\n" +
+        f"- is_open_hours: Horario negocio abierto/cerrado según JSON\n" +
+        f"- list_employees: Empleados activos con face_id, rol y horario\n\n"
         f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
         f"Si no necesitas herramientas, responde directamente al usuario.\n\n"
         f"Responde en español, natural y dominicano. NO inventa datos."
@@ -1643,10 +1647,14 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"Cámaras activas: {cam_count}\n\n"
         f"=== RESUMEN RECIENTE DEL DIARIO ===\n{recent}\n\n"
         f"=== HERRAMIENTAS DISPONIBLES ===\n"
-        f"- get_activity_summary: Resume la actividad del día (total análisis, alertas, personas)\n"
-        f"- search_events: Busca eventos por palabra clave (personas, clientes, empleados, etc.)\n"
-        f"- find_anomalies: Busca alertas o actividad sospechosa\n"
-        f"- latest_events: Lista los últimos análisis\n\n"
+        f"- get_activity_summary: Resume actividad diaria (total análisis, personas, alertas)\n" +
+        f"- search_events: Busca eventos por palabra clave, fecha o cámara\n" +
+        f"- find_anomalies: Eventos relevantes según gravedad (media/alta)\n" +
+        f"- latest_events: Lista últimos 15 análisis cronológicos\n" +
+        f"- count_people: Conteo de personas únicas hoy/ayer/timestamp\n" +
+        f"- count_kids: Niños detectados (DFPF < 0.85 + bbox pequeño)\n" +
+        f"- is_open_hours: Horario negocio abierto/cerrado según JSON\n" +
+        f"- list_employees: Empleados activos con face_id, rol y horario\n\n"
         f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
         f"Si no necesitas herramientas, responde directamente al usuario.\n\n"
         f"Responde en español, natural y dominicano. NO inventes datos."
