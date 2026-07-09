@@ -1167,6 +1167,124 @@ async def get_event_detail(event_id: str, user_id: str):
         event["frameCount"] = 0
     return event
 
+
+@app.get("/api/events/{event_id}/frame/{index}")
+async def get_event_frame(event_id: str, index: int, user_id: str):
+    """Endpoint que sirve un frame individual del grid de un evento.
+    
+    Usado por el viewer para mostrar cada uno de los 16 frames del grid
+    como un "video" del momento de la detección.
+    """
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id required")
+        if index < 0:
+            raise HTTPException(status_code=400, detail="invalid index")
+        
+        # Buscar el frame en cualquier carpeta de eventos del usuario
+        frame_path = None
+        for _cam_id, events_dir in resolve_user_events_dirs(user_id):
+            frames_dir = events_dir / event_id / "frames"
+            if frames_dir.exists():
+                # Buscar por nombre frame_NNNNNNNN_N.jpg o frame_NN.jpg
+                candidates = (
+                    list(frames_dir.glob(f"frame_{int(index):02d}.jpg")) +
+                    list(frames_dir.glob(f"frame_{int(index)}_*.jpg")) +
+                    list(frames_dir.glob(f"frame_{index}.jpg"))
+                )
+                for c in candidates:
+                    if c.exists():
+                        frame_path = c
+                        break
+                if frame_path:
+                    break
+        
+        if not frame_path or not frame_path.exists():
+            # Fallback: devolver la imagen principal del evento
+            for _cam_id, events_dir in resolve_user_events_dirs(user_id):
+                main_jpg = events_dir / f"{event_id}.jpg"
+                if main_jpg.exists():
+                    frame_path = main_jpg
+                    break
+        
+        if not frame_path or not frame_path.exists():
+            raise HTTPException(status_code=404, detail="Frame no encontrado")
+        
+        with open(frame_path, "rb") as f:
+            data = f.read()
+        
+        # Headers importantes para evitar OpaqueResponseBlocking:
+        # - content-type: image/jpeg
+        # - cache-control: max-age para que el navegador cache
+        # - access-control-allow-origin: * (CORS para imágenes cross-origin)
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Content-Disposition": "inline",
+                "X-Frame-Options": "SAMEORIGIN"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error get_event_frame: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/events/siblings")
+async def get_event_siblings(event_id: str, user_id: str, camera_id: Optional[str] = None):
+    """Devuelve los eventos vecinos (anterior y siguiente) del actual.
+    
+    Usado para navegación entre eventos en el viewer.
+    """
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id required")
+        events_list = []
+        # Recolectar todos los eventos del usuario (por todas las cámaras)
+        for cam_id, events_dir in resolve_user_events_dirs(user_id):
+            if cam_id == "_global":
+                continue
+            if not events_dir.exists():
+                continue
+            for fname in sorted(events_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+                if not fname.name.endswith(".json"):
+                    continue
+                ev_id = fname.name[:-5]  # remove .json
+                if ev_id == event_id:
+                    continue
+                if camera_id and cam_id != camera_id:
+                    continue
+                try:
+                    with open(fname) as f:
+                        ev = json.load(f)
+                    events_list.append({
+                        "event_id": ev_id,
+                        "camera_id": cam_id,
+                        "timestamp": ev.get("timestamp", 0),
+                        "event_type": ev.get("event_type", ""),
+                        "description": ev.get("description", "")[:140]
+                    })
+                except:
+                    continue
+        # Ordenar por timestamp descendente
+        events_list.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return {
+            "success": True,
+            "current_event_id": event_id,
+            "events": events_list[:50]  # máximo 50 vecinos
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error get_event_siblings: {e}")
+        return {"success": False, "events": [], "error": str(e)}
+
 @app.get("/api/user/events/stats")
 async def get_user_events_stats(user_id: str, date: str = None):
     now = int(time.time())
