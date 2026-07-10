@@ -22,33 +22,68 @@ def resize_image(img_bytes: bytes, max_size: int = 512) -> bytes:
 
 
 def create_grid_image(image_bytes_list: List[bytes], max_size: int = 256) -> bytes:
-    """Create a 4x4 grid image from multiple frames"""
-    thumbnails = []
-    for img_bytes in image_bytes_list[:16]:
+    """Create a 4x4 grid image from multiple frames with frame numbers visible"""
+    return _create_grid_4x4(image_bytes_list, max_size=max_size, annotate=True)
+
+
+def _create_grid_4x4(image_bytes_list: List[bytes], max_size: int = 256, annotate: bool = True) -> bytes:
+    """Crea grid 4x4 numerado (1..N) de hasta 16 frames. Si annotate=False, sin números."""
+    cols, rows = 4, 4
+    n_target = rows * cols  # 16
+    images = []
+    
+    # Decidir frames a usar: si hay <16, repetir el último para mantener layout uniforme
+    if not image_bytes_list:
+        return b''
+    src = list(image_bytes_list)
+    while len(src) < n_target:
+        src.append(src[-1])
+    src = src[:n_target]
+    
+    for idx, img_bytes in enumerate(src):
         try:
             img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            thumbnails.append(img)
+            if annotate:
+                # Marco amarillo con número en esquina superior izquierda
+                draw = ImageDraw.Draw(img)
+                pad = max(2, max_size // 80)
+                # rectángulo de fondo del número
+                box_w, box_h = max(20, max_size // 8), max(20, max_size // 8)
+                draw.rectangle([0, 0, box_w, box_h], fill=(255, 215, 0), outline=(0, 0, 0), width=1)
+                # número
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(14, max_size // 14))
+                except Exception:
+                    font = ImageFont.load_default()
+                txt = str(idx + 1)
+                # centrar dentro del box
+                try:
+                    bb = draw.textbbox((0, 0), txt, font=font)
+                    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+                except Exception:
+                    tw, th = font.getsize(txt)
+                draw.text(((box_w - tw) // 2, (box_h - th) // 2 - 2), txt, fill=(0, 0, 0), font=font)
+            images.append(img)
         except Exception:
-            continue
+            # Si falla, crear rectángulo negro con el número para mantener el layout
+            placeholder = Image.new('RGB', (max_size, max_size), (32, 32, 32))
+            images.append(placeholder)
     
-    if not thumbnails:
+    if not images:
         return b''
     
-    n = len(thumbnails)
-    cols = 4
-    rows = (n + cols - 1) // cols
-    
-    thumb_w, thumb_h = thumbnails[0].size
-    grid = Image.new('RGB', (thumb_w * cols, thumb_h * rows), (0, 0, 0))
-    
-    for i, thumb in enumerate(thumbnails):
-        x = (i % cols) * thumb_w
-        y = (i // cols) * thumb_h
-        grid.paste(thumb, (x, y))
+    cols_final = cols
+    rows_final = rows
+    thumb_w, thumb_h = images[0].size
+    grid = Image.new('RGB', (thumb_w * cols_final, thumb_h * rows_final), (0, 0, 0))
+    for i, im in enumerate(images):
+        x = (i % cols_final) * thumb_w
+        y = (i // cols_final) * thumb_h
+        grid.paste(im, (x, y))
     
     output = io.BytesIO()
-    grid.save(output, format='JPEG', quality=85)
+    grid.save(output, format='JPEG', quality=82)
     return output.getvalue()
 
 

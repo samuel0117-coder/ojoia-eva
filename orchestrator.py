@@ -1846,6 +1846,9 @@ class QwenOrchestrator:
                 owner_notes = vigilance.get("owner_notes", []) or []
     
             if use_grid_image and len(frames) > 1:
+                # 4×4 mosaico numerado de TODOS los frames en disco (P1)
+                # para verificacion rapida del usuario desde el listado.
+                grid_img = create_grid_image([f.get("image_bytes") or b"" for f in frames], max_size=240)
                 # Eje 1: usar panels 2x2 (4 imágenes grandes con numeración visible) en vez de 1 grid 4x4 chico
                 panels_bytes = create_panels_2x2([f["image_bytes"] for f in frames])
                 panels_b64 = [image_to_base64(p) for p in panels_bytes if p]
