@@ -174,6 +174,138 @@ def _compute_access_status(user_data: dict) -> str:
 # App FastAPI
 app = FastAPI(title="OjoIA Eva API", version="7.0")
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Push tokens — registro, baja y podado automático
+# ═══════════════════════════════════════════════════════════════════════════
+FIREBASE_PROJECT_ID = "ojoia-67216"
+PUSH_TOKEN_MAX_PER_USER = 5
+PUSH_TOKEN_PRUNE_EVERY_SEC = 6 * 60 * 60
+
+
+async def _prune_stale_push_tokens():
+    """Cada 6h prueba los tokens recientes con dry_run y elimina stale."""
+    from google.oauth2 import service_account
+    import google.auth.transport.requests
+    import requests as _req
+    while True:
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                "/home/sam/ai_system/firebase-key.json",
+                scopes=["https://www.googleapis.com/auth/firebase.messaging"]
+            )
+            creds.refresh(google.auth.transport.requests.Request())
+            acc = creds.token
+            probe_url = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
+            headers = {"Authorization": f"Bearer {acc}", "Content-Type": "application/json"}
+            users_dir = STORAGE_ROOT / "users"
+            if not users_dir.is_dir():
+                await asyncio.sleep(PUSH_TOKEN_PRUNE_EVERY_SEC); continue
+            for u in users_dir.iterdir():
+                uf = u / "user.json"
+                if not uf.exists(): continue
+                try:
+                    ud = json.loads(uf.read_text())
+                except Exception:
+                    continue
+                tokens = ud.get("fcm_tokens", []) or []
+                if not tokens: continue
+                probed = tokens[-2:]
+                kept = []
+                removed = 0
+                for t in probed:
+                    try:
+                        resp = _req.post(
+                            probe_url, params={"dry_run": "true"}, headers=headers,
+                            json={"message": {"token": t, "notification": {"title": "_", "body": "_"}}},
+                            timeout=8
+                        )
+                        if resp.status_code == 200:
+                            kept.append(t)
+                        elif resp.status_code in (400, 404):
+                            removed += 1
+                            logger.info(f"[push-prune] drop {u.name}: {t[:18]}...")
+                        else:
+                            kept.append(t)
+                    except Exception:
+                        kept.append(t)
+                if removed:
+                    ud["fcm_tokens"] = ([t for t in tokens if t not in probed] + kept)[-PUSH_TOKEN_MAX_PER_USER:]
+                    try:
+                        uf.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"[push-prune] cycle error: {e}")
+        await asyncio.sleep(PUSH_TOKEN_PRUNE_EVERY_SEC)
+
+
+@app.on_event("startup")
+async def _start_push_token_pruner():
+    try:
+        asyncio.create_task(_prune_stale_push_tokens())
+        logger.info("[push-prune] pruner cada 6h")
+    except Exception as e:
+        logger.error(f"[push-prune] start fail: {e}")
+
+
+@app.post("/api/users/push-token")
+async def register_push_token(request: Request):
+    """Registra token FCM del dispositivo actual."""
+    try:
+        body = await request.json()
+        token = (body.get("token") or "").strip()
+        user_id = body.get("user_id")
+        device = body.get("device")
+        if not token or not user_id:
+            return {"success": False, "error": "user_id y token requeridos"}
+        # Buscar user.json con el helper existente para soportar paths custom
+        uf = None
+        for cand in [STORAGE_ROOT / "users" / user_id / "user.json"]:
+            if cand.exists():
+                uf = cand
+        if not uf:
+            return {"success": False, "error": f"usuario {user_id} no encontrado"}
+        with open(uf) as f:
+            ud = json.load(f)
+        tokens = [t for t in (ud.get("fcm_tokens") or []) if (t or "").strip() != token]
+        tokens.append(token)
+        ud["fcm_tokens"] = tokens[-PUSH_TOKEN_MAX_PER_USER:]
+        if device:
+            devs = ud.get("fcm_devices") or {}
+            devs[token] = device
+            ud["fcm_devices"] = devs
+        ud["last_token_refresh"] = int(time.time())
+        uf.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+        logger.info(f"[push-token] {user_id}: {token[:18]}... (count={len(ud['fcm_tokens'])})")
+        return {"success": True, "count": len(ud["fcm_tokens"])}
+    except Exception as e:
+        logger.error(f"[push-token] error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/users/push-token")
+async def unregister_push_token(user_id: str, token: str):
+    """Baja token (logout o NotRegistered)."""
+    try:
+        uf = STORAGE_ROOT / "users" / user_id / "user.json"
+        if not uf.exists():
+            return {"success": False, "error": "usuario no encontrado"}
+        with open(uf) as f:
+            ud = json.load(f)
+        before = len(ud.get("fcm_tokens", []) or [])
+        ud["fcm_tokens"] = [t for t in (ud.get("fcm_tokens") or []) if (t or "").strip() != token.strip()]
+        devs = ud.get("fcm_devices") or {}
+        if token in devs:
+            del devs[token]
+            ud["fcm_devices"] = devs
+        uf.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+        logger.info(f"[push-token] unregister {user_id}: {before}->{len(ud['fcm_tokens'])}")
+        return {"success": True, "remaining": len(ud["fcm_tokens"])}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # CORS middleware — permisivo para todos los orígenes
 app.add_middleware(
     CORSMiddleware,
