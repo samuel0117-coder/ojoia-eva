@@ -27,19 +27,29 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import tempfile
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 
-WHISPER_HIGH_WORKERS = int(os.getenv("WHISPER_HIGH_WORKERS", "2"))
-WHISPER_NORMAL_WORKERS = int(os.getenv("WHISPER_NORMAL_WORKERS", "2"))
-WHISPER_GLOBAL_CONCURRENT = int(os.getenv("WHISPER_GLOBAL_CONCURRENT", "2"))
+WHISPER_HIGH_WORKERS = int(os.getenv("WHISPER_HIGH_WORKERS", "4"))
+WHISPER_NORMAL_WORKERS = int(os.getenv("WHISPER_NORMAL_WORKERS", "4"))
+WHISPER_GLOBAL_CONCURRENT = int(os.getenv("WHISPER_GLOBAL_CONCURRENT", "4"))
 WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "4"))
-WHISPER_MEM_FRAC = float(os.getenv("WHISPER_MEM_FRAC", "0.15"))
+WHISPER_MEM_FRAC = float(os.getenv("WHISPER_MEM_FRAC", "0.20"))
+# Compute type: float16 is faster but CTranslate2 crashes on certain audio
+# with "type_error.302". int8 never crashes but is ~150ms slower per audio.
+# Default is int8 for production reliability. Override with WHISPER_COMPUTE=float16.
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8").lower()  # "float16" or "int8"
+USE_BATCHED = os.getenv("WHISPER_USER_BATCHED", "false").lower() in ("true", "1", "yes")
 
 app = FastAPI(title="Whisper Turbo ASR", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("whisper_server")
+
 model = None
 _fallback_model = None  # int8 fallback, lazy-loaded on CTranslate2 type_error.302
-_fallback_lock = None   # asyncio.Lock, created in startup
+_fallback_lock = None   # asyncio.Lock for lazy-loading the fallback model
+_fallback_transient_lock = None  # asyncio.Lock for serializing int8 retries
 queue = asyncio.Queue()
 results = {}
 next_id = 1
@@ -54,8 +64,8 @@ normal_semaphore = asyncio.Semaphore(WHISPER_NORMAL_WORKERS)
 # for concurrent calls from multiple Python threads (causes
 # "type must be number, but is number" JSON errors). We force the global
 # semaphore to 1 when batched mode is active, serializing GPU access.
-# Each inference is ~300-500ms with float16, so single-user latency is fine.
-_global_concurrent = 1 if _HAS_BATCHED else WHISPER_GLOBAL_CONCURRENT
+# Without batching, global_concurrent can be >1 for much higher throughput.
+_global_concurrent = 1 if (USE_BATCHED and _HAS_BATCHED) else WHISPER_GLOBAL_CONCURRENT
 global_semaphore = asyncio.Semaphore(_global_concurrent)
 active_lock = asyncio.Lock()
 
@@ -79,7 +89,7 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                         max_speech_duration_s=20,
                     ),
                 )
-                if _HAS_BATCHED:
+                if USE_BATCHED and _HAS_BATCHED:
                     transcribe_kwargs["batch_size"] = WHISPER_BATCH_SIZE  # segment-level batching
 
                 try:
@@ -91,13 +101,19 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                 except RuntimeError as e:
                     if "type_error.302" not in str(e):
                         raise
+                    if WHISPER_COMPUTE != "float16":
+                        # Already on int8, can't fallback further
+                        log.warning(f"CTranslate2 type_error on int8 (job {job_id}): {e}")
+                        raise
                     # CTranslate2 float16 bug: certain audio triggers
                     # "[json.exception.type_error.302] type must be number, but is number"
                     # during model.generate(). Retry with int8 fallback model.
                     log.warning(f"CTranslate2 type_error (job {job_id}), retrying with int8 fallback")
-                    global _fallback_model, _fallback_lock
+                    global _fallback_model, _fallback_lock, _fallback_transient_lock
                     if _fallback_lock is None:
                         _fallback_lock = asyncio.Lock()
+                    if _fallback_transient_lock is None:
+                        _fallback_transient_lock = asyncio.Lock()
                     async with _fallback_lock:
                         if _fallback_model is None:
                             log.info("[Whisper] Loading int8 fallback model...")
@@ -109,14 +125,15 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                                 )
                             _fallback_model = await asyncio.to_thread(_load_int8)
                             log.info("[Whisper] int8 fallback model loaded")
-                    # Retry with int8 (no batch — BatchedInferencePipeline not available for int8)
+                    # int8 retry: serialize to be safe, same pattern as fallback.
                     fallback_kwargs = dict(transcribe_kwargs)
                     fallback_kwargs.pop("batch_size", None)
-                    segments, info = await asyncio.to_thread(
-                        _fallback_model.transcribe,
-                        tmp_path,
-                        **fallback_kwargs,
-                    )
+                    async with _fallback_transient_lock:
+                        segments, info = await asyncio.to_thread(
+                            _fallback_model.transcribe,
+                            tmp_path,
+                            **fallback_kwargs,
+                        )
 
                 text = " ".join([s.text for s in segments])
                 lang = info.language
@@ -159,22 +176,25 @@ async def load_model():
         base = WhisperModel(
             "openai/whisper-large-v3-turbo",
             device="cuda",
-            compute_type="float16",     # ← FP16: ~2x throughput vs int8
+            compute_type=WHISPER_COMPUTE,
         )
-        if _HAS_BATCHED:
+        if USE_BATCHED and _HAS_BATCHED:
             model = BatchedInferencePipeline(base)
             print(f"[Whisper] BatchedInferencePipeline wrapped (batch={WHISPER_BATCH_SIZE})")
         else:
             model = base
-            print(f"[Whisper] BatchedInferencePipeline NO disponible — usando modo sin batch")
-        print(f"[Whisper] Modelo cargado (float16, batch={WHISPER_BATCH_SIZE}, workers={WHISPER_HIGH_WORKERS}/{WHISPER_NORMAL_WORKERS})")
+            print(f"[Whisper] Non-batched mode (global_concurrent={_global_concurrent})")
+        print(f"[Whisper] Modelo cargado (compute={WHISPER_COMPUTE}, batch={WHISPER_BATCH_SIZE}, workers={WHISPER_HIGH_WORKERS}/{WHISPER_NORMAL_WORKERS})")
     except Exception as e:
-        print(f"[Whisper] ERROR cargando modelo float16, fallback base int8: {e}")
+        print(f"[Whisper] ERROR cargando modelo ({WHISPER_COMPUTE}), fallback base int8: {e}")
         model = WhisperModel("base", device="cuda", compute_type="int8")
 
-    # Preload int8 fallback model (lazy: only loaded on first type_error.302).
     _fallback_model = None
-    print(f"[Whisper] int8 fallback: lazy-loaded on first CTranslate2 type_error.302")
+    if WHISPER_COMPUTE == "float16":
+        print(f"[Whisper] int8 fallback: lazy-loaded on first CTranslate2 type_error.302")
+    else:
+        print(f"[Whisper] Primary model is {WHISPER_COMPUTE} - no fallback needed")
+    log.info(f"[Whisper] Active compute_type={WHISPER_COMPUTE}, global_concurrent={_global_concurrent}, mem_frac={WHISPER_MEM_FRAC}")
 
 
 @app.post("/transcribe")
