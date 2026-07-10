@@ -857,6 +857,36 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
     details.setdefault("objects_visible", [])
     details.setdefault("scene_context", "")
     details.setdefault("camera_condition", "visible")
+    # ── Normalización P3: clasificaciones por persona ──
+    vision_norm = qwen_json.get("vision") if isinstance(qwen_json.get("vision"), dict) else {}
+    persons_norm = vision_norm.get("persons", []) if isinstance(vision_norm.get("persons"), list) else []
+    genders = []
+    ages = []
+    clothing_top_list = []
+    clothing_bottom_list = []
+    for p in persons_norm:
+        if isinstance(p, dict):
+            g = (p.get("gender_guess") or "desconocido").lower().strip()
+            a = (p.get("age_group") or "desconocido").lower().strip()
+            if g not in ("hombre", "mujer", "desconocido"):
+                g = "desconocido"
+            if a not in ("nino", "adolescente", "adulto", "anciano", "desconocido"):
+                a = "desconocido"
+            genders.append(g); ages.append(a)
+            ct = p.get("clothing_top"); cb = p.get("clothing_bottom")
+            if isinstance(ct, str) and ct.strip() and ct != "desconocido":
+                clothing_top_list.append(ct.strip())
+            if isinstance(cb, str) and cb.strip() and cb != "desconocido":
+                clothing_bottom_list.append(cb.strip())
+    if genders: details["genders_visible"] = genders
+    if ages: details["ages_visible"] = ages
+    if clothing_top_list: details["clothing_top_visible"] = clothing_top_list
+    if clothing_bottom_list: details["clothing_bottom_visible"] = clothing_bottom_list
+    # contadores separados por clase
+    details.setdefault("count_hombres", sum(1 for g in genders if g == "hombre"))
+    details.setdefault("count_mujeres", sum(1 for g in genders if g == "mujer"))
+    details.setdefault("count_ninos", sum(1 for a in ages if a == "nino"))
+    details.setdefault("count_ancianos", sum(1 for a in ages if a == "anciano"))
     for key in ("clothing_visible", "actions_visible", "objects_visible", "search_tags", "evidence"):
         if not isinstance(qwen_json.get(key), list):
             qwen_json[key] = []
@@ -1705,17 +1735,32 @@ class QwenOrchestrator:
             on_list = "; ".join(str(n) for n in owner_notes[:5])
             vigilance_prompt += f"\nNOTAS DEL DUEÑO (contexto, no alertas): {on_list}\n"
 
-        # ── Eje 3C: formato de salida JSON estructurado + flag ──
+        # ── Eje 3C: formato de salida JSON estructurado + clasificaciones P3 ──
         output_format = (
             "\nResponde EXCLUSIVAMENTE con un JSON válido (sin markdown, sin ```):\n"
             "{\n"
             "  \"scene\": \"narrativa de 3-6 frases de lo que ocurre en la secuencia\",\n"
-            "  \"persons\": [{\"id\": <track_id_yolo o 0>, \"desc\": \"1-2 frases: apariencia + qué hace\"}],\n"
+            "  \"persons\": [\n"
+            "    {\n"
+            "      \"id\": <track_id_yolo o 0>,\n"
+            "      \"desc\": \"1-2 frases: apariencia + qué hace\",\n"
+            "      \"gender_guess\": \"hombre\" | \"mujer\" | \"desconocido\",\n"
+            "      \"age_group\": \"nino\" | \"adolescente\" | \"adulto\" | \"anciano\" | \"desconocido\",\n"
+            "      \"clothing_top\": \"camiseta verde\" | \"camisa blanca\" | \"desconocido\",\n"
+            "      \"clothing_bottom\": \"jean azul\" | \"pantalon negro\" | \"desconocido\"\n"
+            "    }\n"
+            "  ],\n"
             "  \"objects\": [\"lista de objetos relevantes: dinero, platos, bolsas, datáfono, refrescos, etc.\"],\n"
             "  \"events\": [\"acciones observadas: cobró a cliente, empacó plato, entró dinero en caja, etc.\"],\n"
             "  \"flag\": null | \"frase exacta de attention_phrases que detectaste cumplirse, o null\"\n"
             "}\n"
-            "Reglas: \"scene\" nunca debe decir \"fotograma\" o enumerar frames. \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0."
+            "Reglas críticas:\n"
+            "  - NUNCA fusionar dos personas en una sola. Si hay alguien detrás o al lado, descríbelas por separado; cada persona debe tener su propio id único y entradas gender/age/clothing_\n"
+            "  - Si una persona está parcialmente oculta, indícalo en desc con 'parcial' pero cuéntala igual\n"
+            "  - gender_guess se basa en rasgos visibles (cabello, ropa, complexión). Si no puedes determinarlo, devuelve 'desconocido'\n"
+            "  - age_group: 'nino' si complexión/del cuerpo indica claramente menor (~12 años o menos); 'anciano' solo si claramente es mayor; si dudas, 'adulto'\n"
+            "  - clothing_top y clothing_bottom describen color + tipo de prenda visible\n"
+            "  - \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0"
         )
 
         full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"
