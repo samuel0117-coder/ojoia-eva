@@ -3188,3 +3188,41 @@ async def send_report_v2(user_id: str, request: dict = None):
     except Exception as e:
         logger.error(f"Error send_report_v2: {e}")
         return {"success": False, "error": str(e)}
+
+
+# Endpoint para servir páginas de reportes desde el directorio de storage
+@app.get("/reportes/{user_id}/{filename}")
+async def serve_report_page(user_id: str, filename: str):
+    """
+    Sirve páginas HTML y PDFs de reportes.
+    URL: https://ojoia.com.do/reportes/{user_id}/reporte_2026-07-09.html
+    """
+    try:
+        from fastapi.responses import FileResponse, HTMLResponse
+        
+        file_path = REPORTS_DIR / user_id / filename
+        
+        if not file_path.exists():
+            return HTMLResponse(
+                content="<h1>Reporte no encontrado</h1><p>El reporte solicitado no existe o fue generado.</p>",
+                status_code=404
+            )
+        
+        if filename.endswith('.pdf'):
+            return FileResponse(
+                str(file_path),
+                media_type='application/pdf',
+                filename=filename
+            )
+        else:
+            # HTML
+            html_content = file_path.read_text(encoding='utf-8')
+            return HTMLResponse(content=html_content)
+            
+    except Exception as e:
+        logger.error(f"Error sirviendo reporte: {e}")
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(
+            content=f"<h1>Error</h1><p>{str(e)}</p>",
+            status_code=500
+        )
