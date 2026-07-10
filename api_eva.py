@@ -906,29 +906,39 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
         # Si no hay sesiones en user.json, intentar desde archivo dedicado
         if not history:
             try:
-                chat_dir = STORAGE_ROOT / "users" / user_id / "eva_chat"
-                if chat_dir.exists():
-                    if session_id:
-                        session_file = chat_dir / f"{session_id}.json"
-                        if session_file.exists():
-                            with open(session_file) as f:
-                                session_data = json.load(f)
-                            history = session_data.get("messages", [])[-limit:]
-                    else:
-                        # todas las sesiones
-                        all_files = sorted(chat_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                        for session_file in all_files[:5]:
-                            try:
+                # Intentar eva_chat_history.json (formato legacy)
+                chat_history_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
+                if chat_history_file.exists():
+                    with open(chat_history_file) as f:
+                        chat_data = json.load(f)
+                    history = chat_data.get("history", [])[-limit:]
+                    logger.info(f"Leyendo {len(history)} mensajes de eva_chat_history.json")
+                
+                # Si aún no hay, intentar carpeta eva_chat/
+                if not history:
+                    chat_dir = STORAGE_ROOT / "users" / user_id / "eva_chat"
+                    if chat_dir.exists():
+                        if session_id:
+                            session_file = chat_dir / f"{session_id}.json"
+                            if session_file.exists():
                                 with open(session_file) as f:
-                                    sd = json.load(f)
-                                for m in sd.get("messages", []):
-                                    m2 = {**m, "session_id": session_file.stem}
-                                    history.append(m2)
-                                if len(history) >= limit:
-                                    break
-                            except:
-                                continue
-                        history = history[-limit:]
+                                    session_data = json.load(f)
+                                history = session_data.get("messages", [])[-limit:]
+                        else:
+                            # todas las sesiones
+                            all_files = sorted(chat_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                            for session_file in all_files[:5]:
+                                try:
+                                    with open(session_file) as f:
+                                        sd = json.load(f)
+                                    for m in sd.get("messages", []):
+                                        m2 = {**m, "session_id": session_file.stem}
+                                        history.append(m2)
+                                    if len(history) >= limit:
+                                        break
+                                except:
+                                    continue
+                            history = history[-limit:]
             except Exception as e:
                 logger.warning(f"Error leyendo archivos de chat: {e}")
 
@@ -2926,3 +2936,93 @@ async def _send_daily_report_whatsapp(user_id: str, message: str, pdf_url: str =
     except Exception as e:
         logger.error(f"Error WhatsApp: {e}")
         return False
+
+
+@app.post("/api/reports/inject-to-active-chat")
+async def inject_report_to_active_chat(user_id: str, request: dict = None):
+    """
+    Inyecta el reporte diario directamente en la sesión ACTIVA del chat de Eva.
+    Esto funciona porque usa el mismo diccionario _sessions que el chat en vivo.
+    """
+    try:
+        from eva_v2 import _sessions
+        from reportes.daily_report import generate_daily_report_pdf
+        
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        
+        # 1. Generar el reporte
+        report = await generate_daily_report_pdf(user_id, None, "yesterday")
+        if not report.get("success"):
+            return {"success": False, "error": report.get("error")}
+        
+        # 2. Construir el mensaje
+        business_name = report.get("business_name", "Tu negocio")
+        summary = report.get("summary", {})
+        
+        message = f"""🍽️ *Reporte Diario - {business_name}*
+
+📊 Análisis realizados: {summary.get('total_events', 0)}
+👥 Personas únicas detectadas: {summary.get('persons_total', 0)}
+
+📄 [Ver reporte completo](https://ojoia.com.do{report.get('pdf_url', '')})
+
+_Este reporte se genera automáticamente todos los días a las 7:30 AM_"""
+        
+        # 3. Buscar la sesión ACTIVA de este usuario en _sessions
+        active_session_id = None
+        for sid, sdata in _sessions.items():
+            if sdata.get("user_id") == user_id:
+                active_session_id = sid
+                break
+        
+        if not active_session_id:
+            # Crear una nueva sesión si no existe
+            active_session_id = f"chat_{user_id}_{int(time.time())}"
+            _sessions[active_session_id] = {
+                "user_id": user_id,
+                "camera_id": "",
+                "msgs": [],
+                "messages": [],
+                "last_activity": time.time()
+            }
+        
+        # 4. Inyectar el mensaje en la sesión ACTIVA
+        _sessions[active_session_id]["msgs"].append({
+            "role": "assistant",
+            "content": message,
+            "timestamp": time.time(),
+            "summary": True,
+            "is_daily_report": True
+        })
+        
+        _sessions[active_session_id]["messages"].append({
+            "role": "assistant",
+            "content": message,
+            "timestamp": time.time()
+        })
+        
+        logger.info(f"✅ Reporte inyectado en sesión activa {active_session_id} para {user_id}")
+        
+        # 5. También enviar push FCM
+        from reportes.daily_report import send_daily_report_push_notification
+        push_sent = await send_daily_report_push_notification(
+            user_id=user_id,
+            report_message=message,
+            pdf_url=report.get("pdf_url")
+        )
+        
+        return {
+            "success": True,
+            "session_id": active_session_id,
+            "message": message,
+            "pdf_url": report.get("pdf_url"),
+            "push_sent": push_sent,
+            "injected_to_active_chat": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error inyectando reporte: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
