@@ -243,14 +243,16 @@ def _run_yolo(imgs, conf):
     """Run build-mode inference on a list of PIL images (1 or N).
 
     Returns a list (per input image) of lists of raw detection dicts.
+    EACH detection now includes rgb_center: average RGB of the bbox
+    central crop (typically the torso / shirt) for identity matching.
     """
     results = model(imgs, imgsz=YOLO_IMGSZ, conf=conf, verbose=False)
     per_image = []
-    for r in results:
+    for img_idx, (r, pil_img) in enumerate(zip(results, imgs)):
         boxes = r.boxes
         keypoints = getattr(r, "keypoints", None)
         kp_list = _tensor_list(getattr(keypoints, "xy", None)
-                               if keypoints is not None else None)
+                                if keypoints is not None else None)
         dets = []
         for idx, box in enumerate(boxes):
             cls_id = int(box.cls)
@@ -260,15 +262,53 @@ def _run_yolo(imgs, conf):
             conf_val = float(box.conf[0])
             kps = kp_list[idx] if idx < len(kp_list) else []
             pose = _pose_metrics(kps, bbox)
+            # Extraer color promedio del centro del bbox (idéntica región)
+            try:
+                rgb_center = _avg_rgb_center(pil_img, bbox)
+            except Exception:
+                rgb_center = None
             dets.append({
                 "class": cls,
                 "confidence": round(conf_val, 3),
                 "bbox": [round(x, 2) for x in bbox],
                 "keypoints": kps,
                 "pose": pose,
+                "rgb_center": rgb_center,
             })
         per_image.append(dets)
     return per_image
+
+
+def _avg_rgb_center(pil_img, bbox):
+    """Devuelve el RGB promedio de la zona central del bbox.
+
+    Recorta una caja central pequena (30% ancho x 40% alto, verticalmente
+    centrada en el torso). Devuelve [r, g, b] como ints, o None si falla.
+    """
+    from PIL import Image as _PILImage
+    if pil_img is None or not bbox or len(bbox) != 4:
+        return None
+    x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+    w_img, h_img = pil_img.size
+    x1 = max(0, min(w_img - 1, x1))
+    x2 = max(0, min(w_img, x2))
+    y1 = max(0, min(h_img - 1, y1))
+    y2 = max(0, min(h_img, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    cx1 = x1 + int(0.35 * (x2 - x1))
+    cx2 = x1 + int(0.65 * (x2 - x1))
+    # Zona central vertical: 35-65% (típicamente torso)
+    cy1 = y1 + int(0.35 * (y2 - y1))
+    cy2 = y1 + int(0.65 * (y2 - y1))
+    crop = pil_img.crop((cx1, cy1, cx2, cy2)).convert("RGB")
+    pixels = list(crop.getdata())
+    if not pixels:
+        return None
+    r = sum(p[0] for p in pixels) // len(pixels)
+    g = sum(p[1] for p in pixels) // len(pixels)
+    b = sum(p[2] for p in pixels) // len(pixels)
+    return [r, g, b]
 
 
 def _postprocess(per_image, camera_ids):
