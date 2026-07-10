@@ -564,29 +564,101 @@ def _event_persons(evt: dict) -> int:
 
 
 async def tool_search_events(user_id: str, query: str = "", date: str = None,
-                              camera_id: str = None, limit: int = 10) -> dict:
-    """Busca eventos en el diario. Busca en summary, description y qwen_json."""
+                              camera_id: str = None, limit: int = 10,
+                              person_class: str = None,   # P4: hombre|mujer|nino|anciano
+                              clothing: str = None,        # P4: "rojo", "verde", "camisa blanca"
+                              min_persons: int = None,      # P4: >= N personas
+                              max_persons: int = None,      # P4: <= N personas
+                              activity: str = None,        # P4: "trabajando","hablando","entrando"
+                              importance: str = None) -> dict:
+    """
+    Busca eventos en el diario con filtros semánticos (P4).
+
+    Filtros disponibles:
+      query        — palabras sueltas (compatibilidad vieja)
+      person_class — hombre | mujer | nino | anciano
+      clothing     — color o prenda (rojo, verde, camisa, jean...)
+      min_persons  — >= N personas en el evento
+      max_persons  — <= N
+      activity     — verbo/acción (trabajando, hablando, entrando)
+      importance   — normal | baja | media | alta | critica
+      date         — today | yesterday | YYYY-MM-DD
+      camera_id    — restringe a una cámara concreta
+      limit        — tamaño de página
+
+    Internamente combina las words de 'query' con sinónimos del filtro para
+    hacer match contra summary+description+qwen_json.
+    """
+    # Normalizar filtros
+    pc, cl, act, imp = (person_class or "").lower().strip(), (clothing or "").lower().strip(), (activity or "").lower().strip(), (importance or "").lower().strip()
+    query_lower = (query or "").lower().strip()
+    # Sinónimos para matching tolerante
+    synonym_map = {
+        "hombre": ["hombre", "masculino", "varón", "varon", "caballero", "chico"],
+        "mujer": ["mujer", "femenino", "fémina", "chica", "señora", "senora", "dam a"],
+        "nino": ["nino", "niño", "nena", "niña", "menor", "infante", "criatura", "bebe", "bebé"],
+        "anciano": ["anciano", "mayor", "viejo", "abuelo", "abuela", "adulto mayor"],
+        "alto": ["alto"], "critico": ["critico", "crítico", "alta", "critica"],
+    }
+    filter_words = []
+    if pc:
+        for syn in [pc] + synonym_map.get(pc, []):
+            filter_words.append(syn)
+    if cl:
+        # clothing match partial — cualquier color/ prenda
+        for token in cl.split():
+            filter_words.append(token)
+    if act:
+        for token in act.split():
+            filter_words.append(token)
+    if query_lower:
+        for w in query_lower.split():
+            if len(w) >= 4: filter_words.append(w)
+
     results = []
-    query_lower = query.lower()
-    query_words = [w for w in query_lower.split() if len(w) >= 4]
     for evt, cam_name in _iter_events(user_id, camera_id, date):
-        if query_lower:
-            qjson = evt.get("qwen_json", {}) if isinstance(evt.get("qwen_json"), dict) else {}
-            searchable_parts = [
-                evt.get("summary", ""),
-                evt.get("description", ""),
-                str(qjson.get("summary", "")),
-                str(qjson.get("anomalias", "")),
-            ]
-            for key in ("details", "evidence"):
-                val = qjson.get(key, {})
-                if isinstance(val, dict):
-                    searchable_parts.append(" ".join(str(v) for v in val.values() if v))
-                elif val:
-                    searchable_parts.append(str(val))
-            searchable = " ".join(searchable_parts).lower()
-            if not any(w in searchable for w in query_words):
+        # Cobertura completa del searchable del evento
+        qjson = evt.get("qwen_json", {}) if isinstance(evt.get("qwen_json"), dict) else {}
+        parts = [
+            evt.get("summary", "") or evt.get("description", ""),
+            str(qjson.get("summary", "") or qjson.get("scene", "")),
+            str(qjson.get("anomalias", "")),
+            str((qjson.get("evidence") or [])),
+        ]
+        vision = qjson.get("vision") if isinstance(qjson.get("vision"), dict) else {}
+        persons = vision.get("persons") if isinstance(vision.get("persons"), list) else []
+        # Texto completo por persona (incluye classifications P3)
+        persona_text = []
+        for p in persons:
+            if not isinstance(p, dict): continue
+            persona_text.append(" ".join(str(p.get(k, "")) for k in ("desc", "gender_guess", "age_group", "clothing_top", "clothing_bottom")))
+        parts.extend(persona_text)
+        # Tags del qwen_details
+        qd = qjson.get("details") if isinstance(qjson.get("details"), dict) else {}
+        parts.extend([
+            " ".join(qd.get("genders_visible") or []),
+            " ".join(qd.get("ages_visible") or []),
+            " ".join(qd.get("clothing_top_visible") or []),
+            " ".join(qd.get("clothing_bottom_visible") or []),
+        ])
+        searchable = " ".join(parts).lower()
+
+        # Filtrar por texto (palabras)
+        if filter_words and not any(w in searchable for w in filter_words):
+            continue
+
+        # Filtros numéricos por count de personas
+        pv = qd.get("persons_visible")
+        if isinstance(pv, (int, float)):
+            if min_persons is not None and pv < min_persons: continue
+            if max_persons is not None and pv > max_persons: continue
+
+        # Filtro por importancia exacta
+        if imp:
+            evt_imp = (qjson.get("importancia") or qjson.get("importance") or "").lower()
+            if evt_imp != imp and not (imp == "alto" and evt_imp == "alta"):
                 continue
+
         evt = _attach_event_package(evt, user_id, cam_name)
         qjson = _event_qwen(evt)
         results.append({
@@ -606,7 +678,15 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
         })
         if len(results) >= limit:
             break
-    return {"found": len(results), "events": results}
+    return {"found": len(results), "events": results, "filters_applied": {
+        "person_class": pc or None,
+        "clothing": cl or None,
+        "min_persons": min_persons,
+        "max_persons": max_persons,
+        "activity": act or None,
+        "importance": imp or None,
+        "query": query or None,
+    }}
 
 
 async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: str = None) -> dict:
