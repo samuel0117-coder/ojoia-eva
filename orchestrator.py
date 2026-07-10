@@ -2121,6 +2121,7 @@ class QwenOrchestrator:
                                 "frame_count": 0, "frames_set": set(),
                                 "confidences": [], "cx_sum": 0, "cy_sum": 0, "n_xy": 0,
                                 "ar_sum": 0, "n_ar": 0,
+                                "rgb_sum": [0, 0, 0], "rgb_n": 0,
                             }
                         track_data[track_id]["frame_count"] += 1
                         track_data[track_id]["frames_set"].add(frame_idx)
@@ -2134,6 +2135,12 @@ class QwenOrchestrator:
                             w = max(1, x2 - x1); h = max(1, y2 - y1)
                             track_data[track_id]["ar_sum"] += h / w
                             track_data[track_id]["n_ar"] += 1
+                        # ── rgb_center (color de torso) para identidad visual P2 ──
+                        rgb = det.get("rgb_center")
+                        if isinstance(rgb, list) and len(rgb) == 3:
+                            for i in range(3):
+                                track_data[track_id]["rgb_sum"][i] += int(rgb[i])
+                            track_data[track_id]["rgb_n"] += 1
         tracks = []
         new_signature_input = []
         for track_id, data in track_data.items():
@@ -2142,6 +2149,14 @@ class QwenOrchestrator:
             cx = (data["cx_sum"] / data["n_xy"]) if data["n_xy"] else 0.0
             cy = (data["cy_sum"] / data["n_xy"]) if data["n_xy"] else 0.0
             ar = (data["ar_sum"] / data["n_ar"]) if data["n_ar"] else 1.0
+            # Color RGB medio del torso a lo largo del track (P2 — rgb_center)
+            dominant_rgb = None
+            if data.get("rgb_n", 0) > 0:
+                dominant_rgb = [
+                    int(data["rgb_sum"][0] / data["rgb_n"]),
+                    int(data["rgb_sum"][1] / data["rgb_n"]),
+                    int(data["rgb_sum"][2] / data["rgb_n"]),
+                ]
             tracks.append({
                 "id": int(track_id),
                 "frames": data["frame_count"],
@@ -2151,13 +2166,14 @@ class QwenOrchestrator:
                 "presence_ratio": round(data["frame_count"] / len(frames), 3),
                 "centroid_xy": {"cx": round(cx, 2), "cy": round(cy, 2)},
                 "bbox_aspect": round(ar, 3),
+                "dominant_rgb": dominant_rgb,
             })
             new_signature_input.append({
                 "track_id": int(track_id),
                 "centroid_xy": {"cx": cx, "cy": cy},
                 "bbox_aspect": ar,
-                "frames_rgb": [],  # color se añadira cuando yolo_server lo emita
-                "dominant_rgb": None,
+                "frames_rgb": [],
+                "dominant_rgb": dominant_rgb,
             })
         tracks.sort(key=lambda t: t["frames"], reverse=True)
 
