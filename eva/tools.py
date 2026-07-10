@@ -689,6 +689,135 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
     }}
 
 
+async def tool_event_book(user_id: str, date: str = "today", camera_id: str = None,
+                          group_by: str = "hour",
+                          only_importance: str = None,
+                          max_entries: int = 40) -> dict:
+    """
+    P5 — Indice cronologico navegable del libro de eventos.
+
+    Devuelve una vista agrupada (por 'hour' | 'camera' | 'camera_hour') del
+    periodo solicitado, optimizada para que el chat pueda 'explicar que
+    paso en la camara X entre 10 y 14' sin enumerar 200 eventos.
+
+    Params:
+      group_by         hour | camera | camera_hour | ten_minute
+      only_importance  normal | baja | media | alta | critica  (filtra)
+      max_entries      limite duro de entradas devueltas
+
+    Respuesta:
+      {
+        period, total_events, cameras,
+        groups: [{label, events_count, earliest, latest, sample_ids, ...}],
+        recent: [...ultimos N eventos crudos para profundizar]
+      }
+    """
+    from collections import defaultdict
+    bins = defaultdict(list)
+    total = 0
+    by_cam = defaultdict(int)
+    cameras_set = set()
+    important_filters = {"normal", "baja", "media", "alta", "critica"}
+
+    def _bucket_key(dt_str: str, cam: str, gb: str) -> str:
+        # dt_str format: 2026-07-10T13:25:31
+        try:
+            hh = dt_str[11:13]
+            mm = dt_str[14:16]
+        except Exception:
+            return "?"
+        if gb == "hour":
+            return f"{dt_str[:10]} {hh}:00"
+        if gb == "ten_minute":
+            tens = (int(mm) // 10) * 10
+            return f"{dt_str[:10]} {hh}:{tens:02d}"
+        if gb == "camera":
+            return cam
+        if gb == "camera_hour":
+            return f"{cam} | {dt_str[:10]} {hh}:00"
+        return hh
+
+    g = group_by if group_by in ("hour", "camera", "camera_hour", "ten_minute") else "hour"
+    only_imp = (only_importance or "").lower().strip()
+    if only_imp not in important_filters:
+        only_imp = ""
+
+    recent = []
+    for evt, cam_name in _iter_events(user_id, camera_id, date):
+        qjson = evt.get("qwen_json", {}) if isinstance(evt.get("qwen_json"), dict) else {}
+        imp = (qjson.get("importancia") or qjson.get("importance") or "baja").lower()
+        if only_imp and imp != only_imp and not (only_imp == "alto" and imp == "alta"):
+            continue
+        dt = evt.get("datetime") or ""
+        cams_canonical = cam_name or "desconocida"
+        cameras_set.add(cams_canonical)
+        by_cam[cams_canonical] += 1
+        bucket = _bucket_key(dt, cams_canonical, g)
+        ev_short = {
+            "event_id": evt.get("event_id", ""),
+            "datetime": dt,
+            "camera": cams_canonical,
+            "importancia": imp,
+            "anomalias": (qjson.get("anomalias") or [])[:3],
+            "persons_visible": (qjson.get("details") or {}).get("persons_visible", 0),
+            "summary": (qjson.get("summary") or evt.get("description") or "")[:160],
+            "frame_url": f"/api/event-frame/{evt.get('event_id','')}?user_id={user_id}",
+        }
+        bins[bucket].append(ev_short)
+        recent.append(ev_short)
+        total += 1
+        if len(recent) > 200: recent.pop(0)  # ventana de recientes acotada
+
+    # Ordenar groups cronológicamente si el bucket incluye hora
+    def _sort_key(label):
+        # Extrae marca temporal si existe
+        # formatos: "2026-07-10 HH:00", "cam | 2026-07-10 HH:00", "HH:00", "2026-07-10 HH:M0"
+        for j in range(len(label) - 1, -1, -1):
+            if label[j] == '|':
+                tail = label[j+2:]; break
+        else:
+            tail = label
+        return tail
+
+    groups = []
+    for label, evs in bins.items():
+        evs_sorted = sorted(evs, key=lambda e: e["datetime"] or "")
+        groups.append({
+            "label": label,
+            "events_count": len(evs_sorted),
+            "earliest": evs_sorted[0]["datetime"] if evs_sorted else "",
+            "latest": evs_sorted[-1]["datetime"] if evs_sorted else "",
+            "importancia_max": _max_importance([e["importancia"] for e in evs_sorted]),
+            "first_event_id": evs_sorted[0]["event_id"] if evs_sorted else "",
+            "sample_ids": [e["event_id"] for e in evs_sorted[:3]]
+        })
+    groups.sort(key=lambda g: _sort_key(g["label"]))
+    if len(groups) > max_entries:
+        groups = groups[-max_entries:]  # recortamos a lo más reciente
+
+    # recent: ultimos 12
+    recent = recent[-12:]
+
+    return {
+        "success": True,
+        "period": date or "today",
+        "group_by": g,
+        "only_importance": only_imp or None,
+        "total_events": total,
+        "cameras": sorted(cameras_set),
+        "camera_counts": dict(by_cam),
+        "groups": groups,
+        "recent": recent
+    }
+
+
+def _max_importance(items):
+    order = ["critica", "alta", "media", "normal", "baja"]
+    for lvl in order:
+        if any(i == lvl for i in items): return lvl
+    return "baja"
+
+
 async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: str = None) -> dict:
     """Resume la actividad de un día desde el diario (enfoque descriptivo).
 
@@ -1257,7 +1386,7 @@ TOOLS_REGISTRY = {
     },
     "search_events": {
         "function": tool_search_events,
-        "description": "Busca eventos en el diario por texto, fecha o cámara. Usa query='' para listar todos.",
+        "description": "Busca eventos en el diario. Filtros: query, person_class=hombre|mujer|nino|anciano, clothing, min/max_persons, activity, importance, date, camera_id.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "Texto a buscar (vacío = todos)"},
             "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
@@ -1272,6 +1401,17 @@ TOOLS_REGISTRY = {
             "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
             "camera_id": {"type": "string"},
         }},
+    },
+    "event_book": {
+        "function": tool_event_book,
+        "description": "Indice cronologico navegable y agrupable del libro. 'Que paso en la camara caja entre 10 y 14?' / 'Resumeme hoy por hora'.",
+        "parameters": {"type": "object", "properties": {
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+            "camera_id": {"type": "string", "description": "Restringir a una camara"},
+            "group_by": {"type": "string", "description": "hour | camera | camera_hour | ten_minute"},
+            "only_importance": {"type": "string", "description": "normal|baja|media|alta|critica", "default": ""},
+            "max_entries": {"type": "integer", "default": 40}
+        }}
     },
     "find_anomalies": {
         "function": tool_find_anomalies,
