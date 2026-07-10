@@ -3066,3 +3066,125 @@ async def send_daily_report_production(user_id: str, request: dict = None):
     except Exception as e:
         logger.error(f"Error send_daily_report_production: {e}")
         return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════
+# REPORTES - Páginas HTML y PDF
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/reportes/view/{user_id}/{date}")
+async def get_report_page(user_id: str, date: str):
+    """
+    Sirve la página HTML del reporte.
+    URL: /api/reportes/view/{user_id}/2026-07-09
+    """
+    try:
+        from reportes.page_generator import generate_report_page
+        
+        # Generar página
+        result = await generate_report_page(user_id, date)
+        
+        if not result.get("success"):
+            return {"error": result.get("error")}
+        
+        # Servir HTML
+        from fastapi.responses import HTMLResponse
+        html_file = Path(result.get("html_path"))
+        if html_file.exists():
+            return HTMLResponse(content=html_file.read_text(encoding='utf-8'))
+        
+        return {"error": "Página no generada"}
+        
+    except Exception as e:
+        logger.error(f"Error sirviendo página: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/reportes/download/{user_id}/{date}.pdf")
+async def download_report_pdf(user_id: str, date: str):
+    """
+    Descarga el PDF del reporte.
+    URL: /api/reportes/download/{user_id}/2026-07-09.pdf
+    """
+    try:
+        from reportes.page_generator import generate_report_page
+        
+        # Generar página (esto también genera PDF)
+        result = await generate_report_page(user_id, date)
+        
+        if not result.get("success"):
+            return {"error": result.get("error")}
+        
+        # Servir PDF
+        from fastapi.responses import FileResponse
+        pdf_file = Path(result.get("pdf_path"))
+        if pdf_file.exists():
+            return FileResponse(
+                str(pdf_file),
+                media_type='application/pdf',
+                filename=f"reporte_{date}.pdf"
+            )
+        
+        return {"error": "PDF no generado"}
+        
+    except Exception as e:
+        logger.error(f"Error sirviendo PDF: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/reportes/url/{user_id}/{date}")
+async def get_report_urls(user_id: str, date: str):
+    """
+    Devuelve URLs públicas del reporte (HTML y PDF).
+    Útil para compartir en chat, push, etc.
+    """
+    try:
+        base_url = "https://ojoia.com.do"
+        html_url = f"{base_url}/api/reportes/view/{user_id}/{date}"
+        pdf_url = f"{base_url}/api/reportes/download/{user_id}/{date}.pdf"
+        
+        return {
+            "success": True,
+            "html_url": html_url,
+            "pdf_url": pdf_url,
+            "share_url": html_url  # URL para compartir (abre página completa)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/reportes/send-v2")
+async def send_report_v2(user_id: str, request: dict = None):
+    """
+    Endpoint FINAL optimizado:
+    - Genera página HTML + PDF
+    - Inyecta en chat con URL real
+    - Envía push FCM apuntando a URL real
+    - Todo en ~2-3 segundos
+    """
+    try:
+        from reportes.daily_report_prod_v2 import send_daily_report_with_real_url
+        
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        
+        camera_id = request.get("camera_id") if request else None
+        date = request.get("date", "yesterday") if request else "yesterday"
+        
+        result = await send_daily_report_with_real_url(user_id, camera_id, date)
+        
+        if result.get("success"):
+            logger.info(
+                f"✅ Reporte v2 enviado a {user_id} | "
+                f"Chat: {result.get('chat_injected')} | "
+                f"Push: {result.get('push_sent')} | "
+                f"Tiempo push: {result.get('push_delivery_time_ms', 0)}ms | "
+                f"Total: {result.get('timing', {}).get('total_ms', 0)}ms | "
+                f"URL: {result.get('html_url', '')[:60]}..."
+            )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error send_report_v2: {e}")
+        return {"success": False, "error": str(e)}
