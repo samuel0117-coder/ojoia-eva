@@ -3026,3 +3026,43 @@ _Este reporte se genera automáticamente todos los días a las 7:30 AM_"""
         import traceback
         traceback.print_exc()
         return {"success": False, "error": str(e)}
+
+
+@app.post("/api/reports/send-daily")
+async def send_daily_report_production(user_id: str, request: dict = None):
+    """
+    Endpoint optimizado para producción:
+    - Envía reporte completo (chat + push)
+    - Mide tiempos de entrega
+    - Botón de descarga directa
+    - Push apunta al chat por 15 segundos
+    
+    Usage:
+        POST /api/reports/send-daily?user_id=xxx
+        Body: {"camera_id": "cam_001", "date": "yesterday"}
+    """
+    try:
+        from reportes.daily_report_prod import send_daily_report_complete
+        
+        if not user_id:
+            return {"success": False, "error": "user_id required"}
+        
+        camera_id = request.get("camera_id") if request else None
+        date = request.get("date", "yesterday") if request else "yesterday"
+        
+        result = await send_daily_report_complete(user_id, camera_id, date)
+        
+        if result.get("success"):
+            logger.info(
+                f"✅ Reporte diario enviado a {user_id} | "
+                f"Chat: {result.get('chat_injected')} | "
+                f"Push: {result.get('push_sent')} | "
+                f"Tiempo push: {result.get('push_delivery_time_ms', 0)}ms | "
+                f"Total: {result.get('timing', {}).get('total_ms', 0)}ms"
+            )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error send_daily_report_production: {e}")
+        return {"success": False, "error": str(e)}
