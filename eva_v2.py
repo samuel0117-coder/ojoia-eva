@@ -1125,6 +1125,52 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
             return {"text": f"No se han registrado alertas de actividad sospechosa hoy. Todo está tranquilo."}
         return {"text": f"Hubo {found} alerta(s) hoy. ¿Quieres ver los detalles?", "events": events[:5]}
 
+    # Detectar FILTROS semánticos para enrutar a tool_search_events (P4)
+    has_class_filter = any(w in msg_norm for w in ["hombre", "mujer", "niño", "niña", "nino", "anciano", "anciana"])
+    has_clothing_filter = any(w in msg_norm for w in ["camisa", "camiseta", "pantalon", "pant", "short", "vestido", "blanca", "blanco", "negro", "negra", "verde", "rojo", "roja", "azul", "amarillo", "gris"])
+    has_minp = any(p in msg_norm for p in ["mas de", "más de", "minimo", "mínimo"])
+
+    if any(p in msg_norm for p in ["ultimo evento", "ultimos eventos", "último evento", "últimos eventos", "ultimo análisis", "último análisis", "ultima actividad", "últimas actividades", "ultimo activity"]) and (has_class_filter or has_clothing_filter or has_minp):
+        # Filtros + listado → usar tool_search_events con extracción heurística
+        from eva.tools import tool_search_events
+        kwargs = {"user_id": user_id, "date": "today", "limit": 10}
+        # persona
+        if "hombre" in msg_norm:
+            kwargs["person_class"] = "hombre"
+        elif "mujer" in msg_norm:
+            kwargs["person_class"] = "mujer"
+        elif any(w in msg_norm for w in ["niño", "niña", "nino"]):
+            kwargs["person_class"] = "nino"
+        elif any(w in msg_norm for w in ["anciano", "anciana"]):
+            kwargs["person_class"] = "anciano"
+        # ropa (puede traer color + prenda)
+        for w in ["camisa", "camiseta", "pantalon", "vestido"]:
+            if w in msg_norm: kwargs["clothing"] = w; break
+        for color in ["blanca","blanco","negro","negra","verde","rojo","roja","azul","amarillo","gris"]:
+            if color in msg_norm:
+                kwargs["clothing"] = (kwargs.get("clothing","") + " " + color).strip()
+                break
+        # rango personas
+        import re as _re
+        m = _re.search(r"mas de (\d+)|m[áa]s de (\d+)|min[íi]mo (\d+)", msg_lower)
+        if m:
+            num = int([g for g in m.groups() if g][0])
+            kwargs["min_persons"] = num + 1
+        # activity
+        for act in ["trabajando", "hablando", "entrando", "comiendo", "sentado", "caminando", "leyendo"]:
+            if act in msg_norm:
+                kwargs["activity"] = act
+                break
+        result = await tool_search_events(**kwargs)
+        found = result.get("found", 0)
+        events = result.get("events", [])
+        if found == 0:
+            return {"text": f"No encontré eventos con esos filtros hoy.", "events": []}
+        parts = [f"Encontré {found} evento(s) con esos filtros:"]
+        for item in events[:5]:
+            parts.append(f"- {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('description', '')[:100]}")
+        return {"text": "\n".join(parts), "events": events[:5]}
+
     if any(p in msg_norm for p in ["ultimo evento", "último evento", "ultimo análisis", "último análisis", "ultima actividad", "última actividad"]):
         from eva.tools import tool_latest_events
         result = await tool_latest_events(user_id, limit=3, date="today")
