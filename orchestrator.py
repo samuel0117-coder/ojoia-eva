@@ -1849,8 +1849,8 @@ class QwenOrchestrator:
     
             # ── YOLO stats ───────────────────────────────────────────────────────
 
-            # Extract tracking summary for person tracking across frames
-            tracking_summary = self._extract_tracking_summary(frames)
+            # Extract tracking summary for person tracking across frames (P2 → global ids)
+            tracking_summary = self._extract_tracking_summary(frames, user_id=user_id, camera_id=camera_id)
             total_yolo_objects = sum(f.get("yolo_count", 0) for f in frames)
             zone = cam_cfg.get("zone", camera_id)
     
@@ -2097,8 +2097,14 @@ class QwenOrchestrator:
             return resp.json()["choices"][0]["message"]["content"]
 
 
-    def _extract_tracking_summary(self, frames: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Extract tracking summary from frames for person tracking across grid."""
+    def _extract_tracking_summary(self, frames: List[Dict[str, Any]],
+                                  user_id: str = "", camera_id: str = "") -> Dict[str, Any]:
+        """Extract tracking summary from frames for person tracking across grid.
+
+        Ademas del summary clasico, si user_id+camera_id presentes, llama a
+        eva.identity.match_and_update para asignar `global_person_id`
+        persistentes entre grids (P2).
+        """
         if not frames:
             return {"unique_persons": 0, "total_detections": 0, "tracks": []}
         track_data = {}
@@ -2111,24 +2117,72 @@ class QwenOrchestrator:
                     if track_id is not None:
                         total_detections += 1
                         if track_id not in track_data:
-                            track_data[track_id] = {"frame_count": 0, "frames_set": set(), "confidences": []}
+                            track_data[track_id] = {
+                                "frame_count": 0, "frames_set": set(),
+                                "confidences": [], "cx_sum": 0, "cy_sum": 0, "n_xy": 0,
+                                "ar_sum": 0, "n_ar": 0,
+                            }
                         track_data[track_id]["frame_count"] += 1
                         track_data[track_id]["frames_set"].add(frame_idx)
                         track_data[track_id]["confidences"].append(det.get("confidence", 0.0))
+                        bbox = det.get("bbox") or []
+                        if len(bbox) == 4:
+                            x1, y1, x2, y2 = bbox
+                            track_data[track_id]["cx_sum"] += (x1 + x2) / 2
+                            track_data[track_id]["cy_sum"] += (y1 + y2) / 2
+                            track_data[track_id]["n_xy"] += 1
+                            w = max(1, x2 - x1); h = max(1, y2 - y1)
+                            track_data[track_id]["ar_sum"] += h / w
+                            track_data[track_id]["n_ar"] += 1
         tracks = []
+        new_signature_input = []
         for track_id, data in track_data.items():
             frames_sorted = sorted(data["frames_set"])
             avg_conf = sum(data["confidences"]) / len(data["confidences"]) if data["confidences"] else 0.0
+            cx = (data["cx_sum"] / data["n_xy"]) if data["n_xy"] else 0.0
+            cy = (data["cy_sum"] / data["n_xy"]) if data["n_xy"] else 0.0
+            ar = (data["ar_sum"] / data["n_ar"]) if data["n_ar"] else 1.0
             tracks.append({
                 "id": int(track_id),
                 "frames": data["frame_count"],
                 "first_frame": frames_sorted[0] if frames_sorted else 0,
                 "last_frame": frames_sorted[-1] if frames_sorted else 0,
                 "avg_confidence": round(avg_conf, 3),
-                "presence_ratio": round(data["frame_count"] / len(frames), 3)
+                "presence_ratio": round(data["frame_count"] / len(frames), 3),
+                "centroid_xy": {"cx": round(cx, 2), "cy": round(cy, 2)},
+                "bbox_aspect": round(ar, 3),
+            })
+            new_signature_input.append({
+                "track_id": int(track_id),
+                "centroid_xy": {"cx": cx, "cy": cy},
+                "bbox_aspect": ar,
+                "frames_rgb": [],  # color se añadira cuando yolo_server lo emita
+                "dominant_rgb": None,
             })
         tracks.sort(key=lambda t: t["frames"], reverse=True)
-        return {"unique_persons": len(track_data), "total_detections": total_detections, "tracks": tracks}
+
+        # P2 — Identity persistente entre grids
+        global_identity = None
+        if user_id and camera_id:
+            try:
+                from eva.identity import match_and_update
+                global_identity = match_and_update(user_id, camera_id, new_signature_input)
+                # Mapear global_person_id al track correspondiente
+                gid_lookup = {it["track_id"]: it for it in global_identity.get("tracks", [])}
+                for t in tracks:
+                    key = t["id"]
+                    if key in gid_lookup:
+                        t["global_person_id"] = gid_lookup[key].get("global_person_id")
+                        t["match_distance"] = gid_lookup[key].get("match_distance")
+            except Exception as e:
+                logger.warning(f"[identity] could not match_and_update: {e}")
+
+        result = {"unique_persons": len(track_data), "total_detections": total_detections, "tracks": tracks}
+        if global_identity is not None:
+            result["global_unique"] = global_identity.get("global_unique_count", 0)
+            result["global_new"] = global_identity.get("new_persons_count", 0)
+            result["global_matched"] = global_identity.get("matched_persons_count", 0)
+        return result
 
 
     def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
