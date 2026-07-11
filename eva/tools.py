@@ -1387,8 +1387,10 @@ async def tool_traffic_flow(user_id: str, camera_id: str = None, zone_id: str = 
             if base.exists():
                 cams_to_check = [p.name for p in base.iterdir() if p.is_dir()]
 
-        # Buscar la primera zona entrance entre las camaras
+        # Buscar zonas relevantes para trafico: entrance, counter, cashier.
+        # Esto incluye puertas, cajas y mostradores — donde el flujo es relevante.
         from camera_zones import get_camera_zones
+        traffic_zone_types = {"entrance", "counter", "cashier"}
         target_zones = []
         for cam in cams_to_check:
             zs = get_camera_zones(user_id, cam)
@@ -1396,8 +1398,14 @@ async def tool_traffic_flow(user_id: str, camera_id: str = None, zone_id: str = 
                 if zone_id:
                     if z.get("id") == zone_id or z.get("name") == zone_id:
                         target_zones.append((cam, z))
-                elif z.get("type") == "entrance" or z.get("type") == "counter":
-                    # 'counter' tambien lo usamos como zona de trafico valida
+                elif z.get("type") in traffic_zone_types:
+                    target_zones.append((cam, z))
+
+        # Si no hay zones de trafico especificas, usar TODAS las zones
+        if not target_zones and not zone_id:
+            for cam in cams_to_check:
+                zs = get_camera_zones(user_id, cam)
+                for z in zs:
                     target_zones.append((cam, z))
 
         # Si no hay zonas configuradas, fallback: estimar trafico basado en
@@ -1664,12 +1672,20 @@ async def tool_zone_dwell(user_id: str, camera_id: str = None, zone_id: str = No
         zones_out.sort(key=lambda z: z["avg_dwell_min"], reverse=True)
 
         # Construir mensaje natural
-        msg_lines = [f"⏱️ Permanencia por zona ({date}):"]
-        for z in zones_out[:8]:
-            alert = f" ⚠️ {len(z['anomalies'])} anomalía(s)" if z['anomalies'] else ""
-            msg_lines.append(f"  • {z['zone']}: avg {z['avg_dwell_min']}min, max {z['max_dwell_min']}min, {z['visits']} visitas{alert}")
-        if anomaly_total:
-            msg_lines.append(f"\n⚠️ {anomaly_total} caso(s) ≥ {anomaly_min_minutes} min en zona sensible.")
+        if zones_out and sum(z['visits'] for z in zones_out) > 0:
+            msg_lines = [f"⏱️ Permanencia por zona ({date}):"]
+            for z in zones_out[:8]:
+                alert = f" ⚠️ {len(z['anomalies'])} anomalía(s)" if z['anomalies'] else ""
+                msg_lines.append(f"  • {z['zone']}: avg {z['avg_dwell_min']}min, max {z['max_dwell_min']}min, {z['visits']} visitas{alert}")
+            if anomaly_total:
+                msg_lines.append(f"\n⚠️ {anomaly_total} caso(s) ≥ {anomaly_min_minutes} min en zona sensible.")
+        else:
+            msg_lines = [
+                f"⏱️ Permanencia por zona ({date}):",
+                f"  Zonas configuradas pero sin tracks asignados hoy.",
+                f"  ({len(target_zone_names)} zonas listas, esperando que se asignen tracks en eventos nuevos)",
+                f"  Tip: las zonas requieren que un tracks ID caiga dentro de las coords dibujadas."
+            ]
 
         return {
             "success": True,
@@ -1908,10 +1924,15 @@ async def tool_peak_hours(user_id: str, camera_id: str = None, date: str = "toda
         ranking.sort(key=lambda h: h["score"], reverse=True)
         # Top N
         top = ranking[:top_n]
-        # Valle: lowest score (excluyendo horas con 0)
-        valle = [r for r in ranking if r["events"] > 0]
-        valle.sort(key=lambda h: h["score"])
-        bottom = valle[:top_n]
+        # Valle: horas con eventos reales pero menor trafico
+        valle_full = [r for r in ranking if r["events"] > 0]
+        valle_full.sort(key=lambda h: h["score"])
+        # Filtrar solo las horas con max_persons > 0 o eventos significativos
+        bottom = []
+        for r in valle_full:
+            if r not in top:  # excluir las top peak
+                bottom.append(r)
+        bottom = bottom[:top_n]
 
         if not ranking:
             return {
