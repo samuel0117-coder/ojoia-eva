@@ -864,6 +864,7 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
     ages = []
     clothing_top_list = []
     clothing_bottom_list = []
+    zones_visible = []
     for p in persons_norm:
         if isinstance(p, dict):
             g = (p.get("gender_guess") or "desconocido").lower().strip()
@@ -878,10 +879,19 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
                 clothing_top_list.append(ct.strip())
             if isinstance(cb, str) and cb.strip() and cb != "desconocido":
                 clothing_bottom_list.append(cb.strip())
+            z = p.get("zone")
+            if isinstance(z, str) and z.strip() and z != "null":
+                zones_visible.append(z.strip())
     if genders: details["genders_visible"] = genders
     if ages: details["ages_visible"] = ages
     if clothing_top_list: details["clothing_top_visible"] = clothing_top_list
     if clothing_bottom_list: details["clothing_bottom_visible"] = clothing_bottom_list
+    if zones_visible:
+        details["zones_visible"] = zones_visible
+        # Contadores por zona
+        from collections import Counter
+        z_counts = Counter(zones_visible)
+        details["zone_counts"] = dict(z_counts)
     # contadores separados por clase
     details.setdefault("count_hombres", sum(1 for g in genders if g == "hombre"))
     details.setdefault("count_mujeres", sum(1 for g in genders if g == "mujer"))
@@ -1747,7 +1757,8 @@ class QwenOrchestrator:
             "      \"gender_guess\": \"hombre\" | \"mujer\" | \"desconocido\",\n"
             "      \"age_group\": \"nino\" | \"adolescente\" | \"adulto\" | \"anciano\" | \"desconocido\",\n"
             "      \"clothing_top\": \"camiseta verde\" | \"camisa blanca\" | \"desconocido\",\n"
-            "      \"clothing_bottom\": \"jean azul\" | \"pantalon negro\" | \"desconocido\"\n"
+            "      \"clothing_bottom\": \"jean azul\" | \"pantalon negro\" | \"desconocido\",\n"
+            "      \"zone\": \"nombre_exacto_de_zona_configurada\" | null\n"
             "    }\n"
             "  ],\n"
             "  \"objects\": [\"lista de objetos relevantes: dinero, platos, bolsas, datáfono, refrescos, etc.\"],\n"
@@ -1760,7 +1771,9 @@ class QwenOrchestrator:
             "  - gender_guess se basa en rasgos visibles (cabello, ropa, complexión). Si no puedes determinarlo, devuelve 'desconocido'\n"
             "  - age_group: 'nino' si complexión/del cuerpo indica claramente menor (~12 años o menos); 'anciano' solo si claramente es mayor; si dudas, 'adulto'\n"
             "  - clothing_top y clothing_bottom describen color + tipo de prenda visible\n"
-            "  - \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0"
+            "  - \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0\n"
+            "  - \"zone\" SIEMPRE: pon el nombre EXACTO de la zona (ej 'Caja', 'Entrada', 'Cocina') si la persona cae en alguna zona definida arriba, o null si está fuera de todas\n"
+            "  - Si dos personas estan en la misma zona, pon el mismo nombre de zona a ambas\n"
         )
 
         full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"
@@ -2198,6 +2211,45 @@ class QwenOrchestrator:
             result["global_unique"] = global_identity.get("global_unique_count", 0)
             result["global_new"] = global_identity.get("new_persons_count", 0)
             result["global_matched"] = global_identity.get("matched_persons_count", 0)
+
+        # ZONA ENGINE: asignar zona a cada track usando ROI point-in-polygon
+        if user_id and camera_id:
+            try:
+                import camera_zones
+                zone_list = camera_zones.get_camera_zones(user_id, camera_id)
+                if zone_list:
+                    img_w = max(1, float(frames[0].get("image_width") or 640))
+                    img_h = max(1, float(frames[0].get("image_height") or 640))
+                    for t in tracks:
+                        cx = float(t.get("centroid_xy", {}).get("cx", 0))
+                        cy = float(t.get("centroid_xy", {}).get("cy", 0))
+                        # Normalizar a 0-1 relativo al frame
+                        nx = cx / img_w
+                        ny = cy / img_h
+                        matched_zone_name = None
+                        for z in zone_list:
+                            c = z.get("coords") or {}
+                            x = float(c.get("x", 0)); y = float(c.get("y", 0))
+                            w = float(c.get("w", 0)); h = float(c.get("h", 0))
+                            # bbox de la zona en coords 0-1
+                            if (x <= nx <= x + w) and (y <= ny <= y + h):
+                                matched_zone_name = z.get("name") or z.get("id")
+                                break
+                        if matched_zone_name:
+                            t["zone"] = matched_zone_name
+                    # zone_events: registrar en qué zona terminó cada track (para heatmap + dwell baseline)
+                    zone_counts = {}
+                    for t in tracks:
+                        z = t.get("zone")
+                        if z:
+                            zone_counts[z] = zone_counts.get(z, 0) + 1
+                    result["zone_events"] = [
+                        {"zone": zn, "count": c, "kind": "presence"}
+                        for zn, c in zone_counts.items()
+                    ]
+                    result["zones_defined"] = [z.get("name") or z.get("id") for z in zone_list]
+            except Exception as e:
+                logger.warning(f"[zones] could not assign zones to tracks: {e}")
         return result
 
 

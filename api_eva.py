@@ -1639,6 +1639,95 @@ async def count_people(
         "tracker_version": "v1_time_based",
         "request": {"start": start, "end": end}
     }
+
+
+# ════════════════════════
+# ENDPOINTS: ZONAS DE INTERÉS (ROI)
+# ════════════════════════
+@app.get("/api/cameras/{camera_id}/zones")
+async def get_camera_zones_endpoint(camera_id: str, user_id: str):
+    """Lee las zonas de interés dibujadas para una cámara."""
+    if not user_id:
+        return {"success": False, "error": "user_id required", "zones": []}
+    try:
+        zones = camera_zones.get_camera_zones(user_id, camera_id)
+        zone_types = camera_zones.get_zone_types()
+        return {
+            "success": True,
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "zones": zones,
+            "zone_types": zone_types,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "zones": []}
+
+
+@app.post("/api/cameras/{camera_id}/zones")
+async def save_camera_zones_endpoint(camera_id: str, user_id: str, request: Request):
+    """Guarda/actualiza las zonas de interés dibujadas para una cámara.
+    Body: {"zones": [...]} o {"zone": {...}} (single add).
+    """
+    if not user_id:
+        return {"success": False, "error": "user_id required"}
+    try:
+        body = await request.json()
+        # Modo 1: recibe lista completa de zonas
+        if isinstance(body, dict) and "zones" in body and isinstance(body["zones"], list):
+            ok = camera_zones.save_camera_zones(user_id, camera_id, body["zones"])
+            return {
+                "success": ok,
+                "user_id": user_id,
+                "camera_id": camera_id,
+                "zones": body["zones"] if ok else [],
+            }
+        # Modo 2: recibe una sola zona para agregar/actualizar
+        if isinstance(body, dict) and "zone" in body and isinstance(body["zone"], dict):
+            saved = camera_zones.add_or_update_zone(user_id, camera_id, body["zone"])
+            return {
+                "success": bool(saved),
+                "user_id": user_id,
+                "camera_id": camera_id,
+                "zone": saved,
+            }
+        # Fallback: body es directamente la lista
+        if isinstance(body, list):
+            ok = camera_zones.save_camera_zones(user_id, camera_id, body)
+            return {
+                "success": ok,
+                "user_id": user_id,
+                "camera_id": camera_id,
+                "zones": body if ok else [],
+            }
+        return {"success": False, "error": "Body debe tener 'zones' (list) o 'zone' (dict)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/cameras/{camera_id}/zones/{zone_id}")
+async def delete_camera_zone_endpoint(camera_id: str, user_id: str, zone_id: str):
+    """Elimina una zona por su ID."""
+    if not user_id:
+        return {"success": False, "error": "user_id required"}
+    try:
+        ok = camera_zones.delete_zone(user_id, camera_id, zone_id)
+        return {
+            "success": ok,
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "zone_id": zone_id,
+            "remaining_zones": camera_zones.get_camera_zones(user_id, camera_id) if ok else [],
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/zone-types")
+async def get_zone_types_endpoint():
+    """Lista los 15 tipos de zona disponibles (entrance, cashier, kitchen, etc.)."""
+    return {"success": True, "zone_types": camera_zones.get_zone_types()}
+
+
 @app.get("/api/user/profile")
 async def get_user_profile(user_id: str):
     user_file = find_user_json(user_id)

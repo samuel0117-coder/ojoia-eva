@@ -1244,12 +1244,18 @@ async def tool_count_people(user_id: str, camera_id: str = None, date: str = "to
                     data = json.loads(f.read_text())
                     ts = data.get("timestamp", 0) or data.get("timestamp_created", 0) or data.get("datetime", 0)
                     if start_ts <= ts <= end_ts:
-                        count = (
-                            data.get("persons") or
-                            data.get("yolo_count", 0) or
-                            data.get("qwen_json", {}).get("persons", 0) or
-                            0
-                        )
+                        # P2: preferir metadata.person_tracking.unique_persons (más preciso)
+                        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+                        pt = metadata.get("person_tracking") if isinstance(metadata, dict) else None
+                        if isinstance(pt, dict) and pt.get("unique_persons"):
+                            count = int(pt["unique_persons"])
+                        else:
+                            count = (
+                                data.get("persons")
+                                or data.get("yolo_count", 0)
+                                or data.get("qwen_json", {}).get("persons", 0)
+                                or 0
+                            )
                         if count > 0:
                             all_events.append({"ts": ts, "count": count, "camera": cam, "id": f.stem})
                 except:

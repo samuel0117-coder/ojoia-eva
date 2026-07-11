@@ -1080,32 +1080,47 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
             return {"text": f"No se han registrado clientes específicos hoy según el registro disponible."}
         return {"text": f"Se detectaron {found} evento(s) relacionado(s) con clientes hoy.", "events": events[:5]}
 
-    if any(p in msg_norm for p in ["cuantas mujeres", "cuántas mujeres", "mujeres hoy", "mujeres detectadas"]):
+    if any(p in msg_norm for p in ["cuantas mulheres", "cuántas mujeres", "mujeres hoy", "mujeres detectadas", "cuantas mujeres", "cuanta mujer"]):
         from eva.tools import tool_search_events
-        result = await tool_search_events(user_id, query="mujer", date="today", limit=20)
+        result = await tool_search_events(user_id, person_class="mujer", date="today", limit=20)
         found = result.get("found", 0)
+        # Count real women from qwen_details using event metadata
         events = result.get("events", [])
+        total_mujeres = sum((e.get("qwen_json", {}).get("details", {}).get("count_mujeres", 0) or 0) for e in events)
         if found == 0:
-            return {"text": f"No se han registrado mujeres específicas hoy según el registro disponible."}
-        return {"text": f"Se detectaron {found} evento(s) con mujeres hoy.", "events": events[:5]}
+            return {"text": f"No se han registrado mujeres hoy según el registro disponible."}
+        return {"text": f"Se detectaron {total_mujeres} mujer(es) en {found} evento(s) hoy.", "events": events[:5]}
 
-    if any(p in msg_norm for p in ["cuantos hombres", "cuántos hombres", "hombres hoy"]):
+    if any(p in msg_norm for p in ["cuantos hombres", "cuántos hombres", "hombres hoy", "cuanto hombre"]):
         from eva.tools import tool_search_events
-        result = await tool_search_events(user_id, query="hombre", date="today", limit=20)
+        result = await tool_search_events(user_id, person_class="hombre", date="today", limit=20)
         found = result.get("found", 0)
         events = result.get("events", [])
+        total_hombres = sum((e.get("qwen_json", {}).get("details", {}).get("count_hombres", 0) or 0) for e in events)
         if found == 0:
-            return {"text": f"No se han registrado hombres específicos hoy según el registro disponible."}
-        return {"text": f"Se detectaron {found} evento(s) con hombres hoy.", "events": events[:5]}
+            return {"text": f"No se han registrado hombres hoy según el registro disponible."}
+        return {"text": f"Se detectaron {total_hombres} hombre(s) en {found} evento(s) hoy.", "events": events[:5]}
 
-    if any(p in msg_norm for p in ["polocher blanco", "polocher", "camiseta blanca", "camisa blanca", "ropa blanca", "polo blanco"]):
+    if any(p in msg_norm for p in ["polocher blanco", "polocher", "camiseta blanca", "camisa blanca", "ropa blanca", "polo blanco", "con gorra", "gorra", "con camisa", "con camiseta"]):
         from eva.tools import tool_search_events
-        result = await tool_search_events(user_id, query="blanco", date="today", limit=20)
+        # Extraer clothing del mensaje
+        cl_parts = []
+        if "blanca" in msg_norm or "blanco" in msg_norm: cl_parts.append("blanco")
+        if "negra" in msg_norm or "negro" in msg_norm: cl_parts.append("negro")
+        if "verde" in msg_norm: cl_parts.append("verde")
+        if "rojo" in msg_norm or "roja" in msg_norm: cl_parts.append("rojo")
+        if "azul" in msg_norm: cl_parts.append("azul")
+        if "gorra" in msg_norm: cl_parts.append("gorra")
+        if "polo" in msg_norm or "polocher" in msg_norm: cl_parts.append("polo")
+        if "camisa" in msg_norm: cl_parts.append("camisa")
+        if "camiseta" in msg_norm: cl_parts.append("camiseta")
+        clothing_str = " ".join(cl_parts) if cl_parts else "blanco"
+        result = await tool_search_events(user_id, clothing=clothing_str, date="today", limit=20)
         found = result.get("found", 0)
         events = result.get("events", [])
         if found == 0:
-            return {"text": f"No se han registrado personas con ropa blanca hoy según el registro disponible."}
-        return {"text": f"Se detectaron {found} persona(s) con ropa blanca hoy.", "events": events[:5]}
+            return {"text": f"No se han registrado personas con {clothing_str} hoy."}
+        return {"text": f"Se detectaron {found} evento(s) con personas vistiendo {clothing_str} hoy.", "events": events[:5]}
 
     if any(p in msg_norm for p in ["cuantos empleados", "cuántos empleados", "empleados hoy"]):
         from eva.tools import tool_search_events
@@ -1152,7 +1167,7 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
                 break
         # rango personas
         import re as _re
-        m = _re.search(r"mas de (\d+)|m[áa]s de (\d+)|min[íi]mo (\d+)", msg_lower)
+        m = _re.search(r"mas de (\d+)|m[áa]s de (\d+)|min[íi]mo (\d+)", msg_norm)
         if m:
             num = int([g for g in m.groups() if g][0])
             kwargs["min_persons"] = num + 1
@@ -1216,13 +1231,13 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"=== RESUMEN RECIENTE DEL DIARIO ===\n{recent}\n\n"
         f"=== HERRAMIENTAS DISPONIBLES ===\n"
         f"- get_activity_summary: Resume actividad diaria (total análisis, personas, alertas)\n" +
-        f"- search_events: Busca eventos por palabra clave, fecha o cámara\n" +
-        f"- find_anomalies: Eventos relevantes según gravedad (media/alta)\n" +
-        f"- latest_events: Lista últimos 15 análisis cronológicos\n" +
-        f"- count_people: Conteo de personas únicas hoy/ayer/timestamp\n" +
-        f"- count_kids: Niños detectados (DFPF < 0.85 + bbox pequeño)\n" +
-        f"- is_open_hours: Horario negocio abierto/cerrado según JSON\n" +
-        f"- list_employees: Empleados activos con face_id, rol y horario\n\n"
+        f"- search_events: Busca eventos con filtros semánticos. Filtros opcionales: person_class (hombre|mujer|nino|anciano), clothing (ej 'camisa blanca'), min_persons, max_persons, activity (trabajando|hablando|entrando), importance (baja|media|alta|critica), date (today|yesterday|YYYY-MM-DD), camera_id, query\n" +
+        f"- event_book: Indice cronologico agrupable. 'Que paso entre 2 y 4 pm?' Parametros: date, group_by (hour|camera|ten_minute), only_importance, camera_id\n" +
+        f"- find_anomalies: Eventos relevantes segun gravedad (media/alta)\n" +
+        f"- latest_events: Lista ultimos análisis cronologicos\n" +
+        f"- count_people: Conteo de personas unicas hoy/ayer\n" +
+        f"- is_open_hours: Horario negocio abierto/cerrado\n" +
+        f"- list_employees: Empleados registrados con face_id, rol y horario\n\n"
         f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
         f"Si no necesitas herramientas, responde directamente al usuario.\n\n"
         f"Responde en español, natural y dominicano. NO inventa datos."
@@ -1240,7 +1255,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "count_kids", "is_open_hours", "list_employees", "identify_face"):
+        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book"):
             result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
@@ -1724,13 +1739,13 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"=== RESUMEN RECIENTE DEL DIARIO ===\n{recent}\n\n"
         f"=== HERRAMIENTAS DISPONIBLES ===\n"
         f"- get_activity_summary: Resume actividad diaria (total análisis, personas, alertas)\n" +
-        f"- search_events: Busca eventos por palabra clave, fecha o cámara\n" +
-        f"- find_anomalies: Eventos relevantes según gravedad (media/alta)\n" +
-        f"- latest_events: Lista últimos 15 análisis cronológicos\n" +
-        f"- count_people: Conteo de personas únicas hoy/ayer/timestamp\n" +
-        f"- count_kids: Niños detectados (DFPF < 0.85 + bbox pequeño)\n" +
-        f"- is_open_hours: Horario negocio abierto/cerrado según JSON\n" +
-        f"- list_employees: Empleados activos con face_id, rol y horario\n\n"
+        f"- search_events: Busca eventos con filtros semánticos. Filtros opcionales: person_class (hombre|mujer|nino|anciano), clothing (ej 'camisa blanca'), min_persons, max_persons, activity (trabajando|hablando|entrando), importance (baja|media|alta|critica), date (today|yesterday|YYYY-MM-DD), camera_id, query\n" +
+        f"- event_book: Indice cronologico agrupable. 'Que paso entre 2 y 4 pm?' Parametros: date, group_by (hour|camera|ten_minute), only_importance, camera_id\n" +
+        f"- find_anomalies: Eventos relevantes segun gravedad (media/alta)\n" +
+        f"- latest_events: Lista ultimos análisis cronologicos\n" +
+        f"- count_people: Conteo de personas unicas hoy/ayer\n" +
+        f"- is_open_hours: Horario negocio abierto/cerrado\n" +
+        f"- list_employees: Empleados registrados con face_id, rol y horario\n\n"
         f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
         f"Si no necesitas herramientas, responde directamente al usuario.\n\n"
         f"Responde en español, natural y dominicano. NO inventes datos."
@@ -1748,7 +1763,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "count_kids", "is_open_hours", "list_employees", "identify_face"):
+        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book"):
             result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
@@ -2035,17 +2050,6 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         hours = data.get("business_hours", "08:00–18:00")
         return {"text": f"El negocio está **{status}**. Horario de hoy: {hours}.", "events": []}
 
-    if tool_name == "count_kids":
-        # Por ahora delega a count_people con nota
-        params = {**params, "date": params.get("date", "today")}
-        if not params.get("camera_id"):
-            params["camera_id"] = await _pick_best_camera_id(user_id) or ""
-        data = await _tool_call("count_people", user_id, params)
-        if not data.get("success"):
-            return {"text": f"No pude consultar: {data.get('error', 'error')}", "events": []}
-        total = data.get("total_people", 0)
-        return {"text": f"No tengo aún clasificación específica de niños. En total detecté **{total} persona(s)** en el período. Pronto habilitaré detección de edad.", "events": []}
-
     if tool_name == "identify_face":
         params = {**params}
         if not params.get("camera_id"):
@@ -2059,6 +2063,21 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         data = await _tool_call("list_employees", user_id, {})
         return {"text": data.get("message", "No hay empleados registrados."), "events": []}
 
+    if tool_name == "event_book":
+        data = await _tool_call("event_book", user_id, params)
+        total = data.get("total_events", 0)
+        groups = data.get("groups", [])
+        period = data.get("period", "")
+        if not data.get("success"):
+            return {"text": f"No pude consultar el libro de eventos: {data.get('error', 'error')}", "events": []}
+        if total == 0:
+            return {"text": f"No hay eventos registrados para {period}.", "events": []}
+        parts = [f"📖 {total} evento(s) en {period}. {len(groups)} grupo(s) por {data.get('group_by','hora')}:"]
+        for g in groups[:8]:
+            imp = g.get('importancia_max', 'baja')
+            parts.append(f"  • {g['label']}: {g['events_count']} eventos (imp: {imp})")
+        return {"text": "\n".join(parts), "events": []}
+
     return {"text": f"Herramienta no reconocida: {tool_name}", "events": []}
 
 
@@ -2067,8 +2086,6 @@ def _sanitize_os_tool_params(params):
     date = str(params.get("date") or "today")
     if date not in allowed_dates and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         params["date"] = "today"
-    if tool_name in ("count_people", "count_kids") and not params.get("camera_id"):
-        params["camera_id"] = ""
 
     if "limit" in params:
         try:
@@ -2098,7 +2115,7 @@ def _sanitize_os_tool_params(params):
 def _normalize_os_tool_params(tool_name, params, message):
     params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
     m = _normalize_text(message)
-    if tool_name in ("get_activity_summary", "find_anomalies", "latest_events", "search_events", "find_risks", "count_people", "count_kids"):
+    if tool_name in ("get_activity_summary", "find_anomalies", "latest_events", "search_events", "find_risks", "count_people", "event_book"):
         if not params.get("date"):
             if any(w in m for w in ("ayer", "dia anterior", "día anterior", "anoche")):
                 params["date"] = "yesterday"
@@ -2181,9 +2198,9 @@ _OS_TOOL_DEFINITIONS = {
         "description": "Cuenta personas únicas detectadas por cámara. '¿Cuántas personas han venido hoy?'",
         "parameters": {"camera_id": "string", "date": "today|yesterday"},
     },
-    "count_kids": {
-        "description": "Cuenta niños detectados (aproximado).",
-        "parameters": {"camera_id": "string", "date": "today|yesterday"},
+    "event_book": {
+        "description": "Indice cronologico agrupable. 'Que paso entre 2 y 4 pm?' Parametros: date, group_by (hour|camera|ten_minute), only_importance, camera_id",
+        "parameters": {"date": "string", "group_by": "string", "only_importance": "string", "camera_id": "string", "max_entries": "integer"},
     },
     "is_open_hours": {
         "description": "Consulta si el negocio está abierto según horario registrado.",
