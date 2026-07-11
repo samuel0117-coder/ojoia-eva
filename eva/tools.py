@@ -1343,6 +1343,621 @@ async def tool_is_open_hours(user_id: str, timestamp: float = None) -> dict:
         return {"success": False, "error": str(e)}
 
 
+# ═══════════════════════════════════════════════════════════════
+# FASE 2: HERRAMIENTAS BASADAS EN ZONAS (ROI)
+# ═══════════════════════════════════════════════════════════════
+
+async def tool_traffic_flow(user_id: str, camera_id: str = None, zone_id: str = None,
+                           date: str = "today") -> dict:
+    """Fase 2.1 - Flujo de tráfico entrada/salida usando zonas tipo 'entrance'.
+
+    Logica:
+    - Agrupa eventos del periodo solicitado
+    - Para track IDs, cuenta transiciones: si una persona estaba en zona
+      type='entrance' en un evento y luego NO esta en evento siguiente
+      = SALIDA. Si NO estaba antes y SI esta despues = ENTRADA.
+    - Como cada evento contiene zonas en metadata.qwen_details.zones_visible,
+      inferimos entrada/salida contando presencia por evento en zona entrance.
+    - Ocupacion = entries - (entries - exits) corrige drift.
+    """
+    try:
+        from collections import defaultdict
+        from datetime import datetime, timedelta
+        import time as _time
+
+        # Resolver ventana temporal
+        now_ts = int(_time.time())
+        if date == "today":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_ts = int(start_dt.timestamp())
+        elif date == "yesterday":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+            start_ts = int(start_dt.timestamp())
+            end_dt = start_dt + timedelta(days=1)
+        else:
+            start_ts = now_ts - 86400
+
+        # Si zone_id explicito, usar esa; si no, buscar la primera zona tipo 'entrance'
+        entrance_zone = None
+        cams_to_check = []
+        if camera_id:
+            cams_to_check = [camera_id]
+        else:
+            base = STORAGE_ROOT / "users" / user_id / "cameras"
+            if base.exists():
+                cams_to_check = [p.name for p in base.iterdir() if p.is_dir()]
+
+        # Buscar la primera zona entrance entre las camaras
+        from camera_zones import get_camera_zones
+        target_zones = []
+        for cam in cams_to_check:
+            zs = get_camera_zones(user_id, cam)
+            for z in zs:
+                if zone_id:
+                    if z.get("id") == zone_id or z.get("name") == zone_id:
+                        target_zones.append((cam, z))
+                elif z.get("type") == "entrance" or z.get("type") == "counter":
+                    # 'counter' tambien lo usamos como zona de trafico valida
+                    target_zones.append((cam, z))
+
+        # Si no hay zonas configuradas, fallback: estimar trafico basado en
+        # fluctuaciones de personas unicas entre eventos consecutivos
+        if not target_zones:
+            previous = None
+            entries = 0
+            exits = 0
+            occupancy_max = 0
+            occupancy_now = 0
+            events_sorted = []
+            for evt, cam in _iter_events(user_id, camera_id, date):
+                ts = evt.get("timestamp", 0)
+                if ts < start_ts:
+                    continue
+                metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+                pt = metadata.get("person_tracking", {}) if isinstance(metadata, dict) else {}
+                cur = int(pt.get("unique_persons", 0) or 0)
+                events_sorted.append((ts, cur))
+            # Heuristica: cada evento es una observacion. Si unique_persons sube con
+            # respecto al previo = entraron N personas. Si baja = salieron.
+            events_sorted.sort(key=lambda x: x[0])
+            prev_count = 0
+            entries = 0
+            exits = 0
+            for ts, cur in events_sorted:
+                delta = cur - prev_count
+                if delta > 0:
+                    entries += delta
+                elif delta < 0:
+                    exits += abs(delta)
+                prev_count = cur
+                occupancy_max = max(occupancy_max, cur)
+            occupancy_now = prev_count
+            return {
+                "success": True,
+                "mode": "fallback_no_zones",
+                "user_id": user_id,
+                "camera_id": camera_id or "all",
+                "date": date,
+                "entries": entries,
+                "exits": exits,
+                "current_occupancy": occupancy_now,
+                "peak_occupancy": occupancy_max,
+                "events_analyzed": len(events_sorted),
+                "note": "Sin zonas 'entrance' configuradas. Estimado por fluctuacion de personas unicas.",
+                "message": f"Hoy se estiman {entries} entradas y {exits} salidas. Maximo {occupancy_max} persona(s) simultaneas. (Sin zonas - estimado por fluctuacion)"
+            }
+
+        # Con zonas configuradas: contar presencia de zonas 'entrance' por evento
+        # Entrada = primer evento donde una persona aparece en esta zona del dia
+        # Salida = ult evento donde aparece (siguiente evento no la tiene)
+        previous_events_had_person_in_zone = set()  # set of track_ids en zona
+        entries = 0
+        exits = 0
+        events_analyzed = 0
+        peak_concurrent_in_zone = 0
+        zone_track_appearances = defaultdict(set)  # zone_name -> set(track_ids) del dia
+        sorted_events = []
+        for evt, cam in _iter_events(user_id, camera_id, date):
+            ts = evt.get("timestamp", 0)
+            if ts < start_ts:
+                continue
+            sorted_events.append((ts, evt.get("event_id", ""), cam, evt))
+        sorted_events.sort(key=lambda x: x[0])
+
+        # Reunir todos los track IDs que tocaron cada zona de tipo entrance/counter
+        for ts, eid, cam, evt in sorted_events:
+            events_analyzed += 1
+            metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+            pt = metadata.get("person_tracking", {}) if isinstance(metadata, dict) else {}
+            tracks = pt.get("tracks", []) if isinstance(pt, dict) else []
+            current_in_zone_tracks = set()
+            for t in tracks:
+                if isinstance(t, dict) and t.get("zone"):
+                    zname = t.get("zone")
+                    # Match con cualquiera de las zonas target
+                    if any(z.get("name") == zname or z.get("id") == zname for (_, z) in target_zones):
+                        tid = f"{cam}:{t.get('id')}"
+                        current_in_zone_tracks.add(tid)
+                        zone_track_appearances[zname].add(tid)
+            # Deteccion de entrada/salida por cambios en el set
+            new_tracks = current_in_zone_tracks - previous_events_had_person_in_zone
+            gone_tracks = previous_events_had_person_in_zone - current_in_zone_tracks
+            entries += len(new_tracks)
+            exits += len(gone_tracks)
+            previous_events_had_person_in_zone = current_in_zone_tracks
+            peak_concurrent_in_zone = max(peak_concurrent_in_zone, len(current_in_zone_tracks))
+
+        # Ocupacion actual = personas unicas del ultimo evento en zona
+        current_occupancy = len(previous_events_had_person_in_zone)
+        total_unique_visitors = sum(len(v) for v in zone_track_appearances.values())
+
+        zones_names = sorted(set(z.get("name") or z.get("id") for (_, z) in target_zones))
+
+        return {
+            "success": True,
+            "mode": "zones",
+            "user_id": user_id,
+            "camera_id": camera_id or "all",
+            "zone_ids": zones_names,
+            "date": date,
+            "entries": entries,
+            "exits": exits,
+            "current_occupancy": current_occupancy,
+            "peak_occupancy": peak_concurrent_in_zone,
+            "unique_visitors": total_unique_visitors,
+            "events_analyzed": events_analyzed,
+            "message": f"Flujo: {entries} entradas, {exits} salidas. Ocupacion actual: {current_occupancy}. Pico: {peak_concurrent_in_zone}. Visitantes unicos en zonas: {total_unique_visitors}."
+        }
+    except Exception as e:
+        logger.error(f"tool_traffic_flow error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def tool_zone_dwell(user_id: str, camera_id: str = None, zone_id: str = None,
+                         date: str = "today", anomaly_min_minutes: int = 30) -> dict:
+    """Fase 2.2 - Tiempo de permanencia por zona usando zone_events del tracker.
+
+    Logica:
+    - Por cada track ID, miramos su secuencia de zonas asignadas en eventos consecutivos
+    - Cuando un track esta en zona Z por al menos 1 evento (1 min ≈ 1-2 eventos a fps natural),
+      ese tiempo en zona = delta entre eventos consecutivos
+    - Agrega metricas: avg_dwell_min, max_dwell_min, total_visits, anomalies (>= anomaly_min_minutes)
+    """
+    try:
+        from datetime import datetime, timedelta
+        from collections import defaultdict
+        import time as _time
+
+        # Resolver ventana temporal
+        now_ts = int(_time.time())
+        if date == "today":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_ts = int(start_dt.timestamp())
+        elif date == "yesterday":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+            start_ts = int(start_dt.timestamp())
+        else:
+            start_ts = now_ts - 86400
+
+        cameras_to_check = []
+        if camera_id:
+            cameras_to_check = [camera_id]
+        else:
+            base = STORAGE_ROOT / "users" / user_id / "cameras"
+            if base.exists():
+                cameras_to_check = [p.name for p in base.iterdir() if p.is_dir()]
+
+        from camera_zones import get_camera_zones
+        # Reunir zonas por camara
+        all_zones = {}
+        for cam in cameras_to_check:
+            zs = get_camera_zones(user_id, cam)
+            for z in zs:
+                if zone_id:
+                    if z.get("id") == zone_id or z.get("name") == zone_id:
+                        all_zones.setdefault(cam, []).append(z)
+                else:
+                    all_zones.setdefault(cam, []).append(z)
+        # Flatten a set de nombres
+        target_zone_names = set()
+        for zs in all_zones.values():
+            for z in zs:
+                target_zone_names.add(z.get("name") or z.get("id"))
+
+        if not target_zone_names:
+            return {
+                "success": True,
+                "zones": [],
+                "message": "No hay zonas definidas para esta camara. Dibuja al menos una zona en el editor de zonas."
+            }
+
+        # Trackear presencia por (cam, track_id, zone_name) -> timestamps de eventos
+        presence = defaultdict(list)  # key = (cam, track_global_id, zone_name)
+        sorted_events = []
+        for cam in cameras_to_check:
+            for evt, _ in _iter_events(user_id, cam, date):
+                ts = evt.get("timestamp", 0)
+                if ts < start_ts:
+                    continue
+                metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+                pt = metadata.get("person_tracking", {}) if isinstance(metadata, dict) else {}
+                tracks = pt.get("tracks", []) if isinstance(pt, dict) else []
+                for t in tracks:
+                    if not isinstance(t, dict):
+                        continue
+                    z = t.get("zone")
+                    if z and z in target_zone_names:
+                        gid = t.get("global_person_id")
+                        if gid is not None:
+                            key = (cam, int(gid), z)
+                            presence[key].append(ts)
+                sorted_events.append((ts, evt, cam))
+        sorted_events.sort(key=lambda x: x[0])
+
+        # Calcular dwell: para cada (track_id, zone), ordenar timestamps y
+        # medir cuanto tiempo continuo estuvo en la zona (gaps cortos entre
+        # eventos consecutivos = mismo evento). Usamos gap > 300s (5 min)
+        # como "nueva visita".
+        GAP = 300
+        zone_stats = defaultdict(lambda: {
+            "visits": 0, "total_seconds": 0, "max_seconds": 0,
+            "averages": [], "anomalies": []
+        })
+
+        for key, ts_list in presence.items():
+            ts_list.sort()
+            if not ts_list:
+                continue
+            cam, gid, zone_name = key
+            visit_start = ts_list[0]
+            visit_max_ts = ts_list[0]
+            for i in range(1, len(ts_list)):
+                if ts_list[i] - ts_list[i-1] > GAP:
+                    # cierra visita anterior
+                    dwell = visit_max_ts - visit_start
+                    st = zone_stats[zone_name]
+                    st["visits"] += 1
+                    st["total_seconds"] += dwell
+                    st["max_seconds"] = max(st["max_seconds"], dwell)
+                    st["averages"].append(dwell)
+                    if dwell >= anomaly_min_minutes * 60:
+                        st["anomalies"].append({
+                            "camera": cam,
+                            "global_person_id": gid,
+                            "dwell_minutes": round(dwell / 60, 1),
+                            "first_seen": visit_start,
+                            "last_seen": visit_max_ts
+                        })
+                    visit_start = ts_list[i]
+                visit_max_ts = max(visit_max_ts, ts_list[i])
+            # cierra ultima visita
+            dwell = visit_max_ts - visit_start
+            st = zone_stats[zone_name]
+            st["visits"] += 1
+            st["total_seconds"] += dwell
+            st["max_seconds"] = max(st["max_seconds"], dwell)
+            st["averages"].append(dwell)
+            if dwell >= anomaly_min_minutes * 60:
+                st["anomalies"].append({
+                    "camera": cam,
+                    "global_person_id": gid,
+                    "dwell_minutes": round(dwell / 60, 1),
+                    "first_seen": visit_start,
+                    "last_seen": visit_max_ts
+                })
+
+        # Formatear salida
+        zones_out = []
+        anomaly_total = 0
+        for zname, st in zone_stats.items():
+            n = max(1, len(st["averages"]))
+            avg_sec = st["total_seconds"] / n
+            zones_out.append({
+                "zone": zname,
+                "visits": st["visits"],
+                "avg_dwell_min": round(avg_sec / 60, 1),
+                "max_dwell_min": round(st["max_seconds"] / 60, 1),
+                "total_presence_min": round(st["total_seconds"] / 60, 1),
+                "anomalies": st["anomalies"]
+            })
+            anomaly_total += len(st["anomalies"])
+        zones_out.sort(key=lambda z: z["avg_dwell_min"], reverse=True)
+
+        # Construir mensaje natural
+        msg_lines = [f"⏱️ Permanencia por zona ({date}):"]
+        for z in zones_out[:8]:
+            alert = f" ⚠️ {len(z['anomalies'])} anomalía(s)" if z['anomalies'] else ""
+            msg_lines.append(f"  • {z['zone']}: avg {z['avg_dwell_min']}min, max {z['max_dwell_min']}min, {z['visits']} visitas{alert}")
+        if anomaly_total:
+            msg_lines.append(f"\n⚠️ {anomaly_total} caso(s) ≥ {anomaly_min_minutes} min en zona sensible.")
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "camera_id": camera_id or "all",
+            "date": date,
+            "anomaly_threshold_minutes": anomaly_min_minutes,
+            "events_analyzed": len(sorted_events),
+            "zones": zones_out,
+            "anomaly_count": anomaly_total,
+            "message": "\n".join(msg_lines)
+        }
+    except Exception as e:
+        logger.error(f"tool_zone_dwell error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def tool_heatmap_data(user_id: str, camera_id: str = None, date: str = "today",
+                           grid_size: int = 16) -> dict:
+    """Fase 2.3 - Datos de heatmap zone-density desde centroid_xy acumulado.
+
+    Logica:
+    - Acumula todos los centroid_xy de tracks en una grilla grid_size x grid_size
+    - Normalizada a 0-1 relativo al frame
+    - Retorna matriz 2D + hotspots ranked
+    """
+    try:
+        from datetime import datetime, timedelta
+        import time as _time
+
+        now_ts = int(_time.time())
+        if date == "today":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_ts = int(start_dt.timestamp())
+        elif date == "yesterday":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+            start_ts = int(start_dt.timestamp())
+        else:
+            start_ts = now_ts - 86400
+
+        cameras_to_check = []
+        if camera_id:
+            cameras_to_check = [camera_id]
+        else:
+            base = STORAGE_ROOT / "users" / user_id / "cameras"
+            if base.exists():
+                cameras_to_check = [p.name for p in base.iterdir() if p.is_dir()]
+
+        events_analyzed = 0
+        total_points = 0
+        # Mapa grid_size x grid_size -> conteo
+        heatmap = [[0] * grid_size for _ in range(grid_size)]
+        zone_counts = {}
+        try:
+            from PIL import Image
+            img_w, img_h = 640, 640
+            for cam in cameras_to_check:
+                fs_dir = STORAGE_ROOT / "users" / user_id / "cameras" / cam / "frames"
+                if fs_dir.exists():
+                    last_jpg = None
+                    for ext in ("jpg", "jpeg", "JPG"):
+                        cand = fs_dir / f"latest_raw.{ext}"
+                        if cand.exists():
+                            last_jpg = cand
+                            break
+                    if last_jpg:
+                        try:
+                            with Image.open(last_jpg) as im:
+                                img_w, img_h = im.size
+                        except Exception:
+                            pass
+        except Exception:
+            img_w, img_h = 640, 640
+
+        for cam in cameras_to_check:
+            for evt, _ in _iter_events(user_id, cam, date):
+                ts = evt.get("timestamp", 0)
+                if ts < start_ts:
+                    continue
+                events_analyzed += 1
+                metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+                pt = metadata.get("person_tracking", {}) if isinstance(metadata, dict) else {}
+                tracks = pt.get("tracks", []) if isinstance(pt, dict) else []
+                for t in tracks:
+                    if not isinstance(t, dict):
+                        continue
+                    cx = float(t.get("centroid_xy", {}).get("cx", 0) or 0)
+                    cy = float(t.get("centroid_xy", {}).get("cy", 0) or 0)
+                    if cx <= 0 or cy <= 0:
+                        continue
+                    nx = cx / img_w
+                    ny = cy / img_h
+                    if not (0 <= nx <= 1) or not (0 <= ny <= 1):
+                        continue
+                    gx = min(grid_size - 1, max(0, int(nx * grid_size)))
+                    gy = min(grid_size - 1, max(0, int(ny * grid_size)))
+                    heatmap[gy][gx] += 1
+                    total_points += 1
+                    z = t.get("zone")
+                    if z:
+                        zone_counts[z] = zone_counts.get(z, 0) + 1
+
+        # Identificar hotspots (top 5 celdas con mayor densidad)
+        hotspots = []
+        for gy in range(grid_size):
+            for gx in range(grid_size):
+                c = heatmap[gy][gx]
+                if c > 0:
+                    hotspots.append({
+                        "gx": gx, "gy": gy,
+                        "nx": round((gx + 0.5) / grid_size, 3),
+                        "ny": round((gy + 0.5) / grid_size, 3),
+                        "count": c
+                    })
+        hotspots.sort(key=lambda h: h["count"], reverse=True)
+        top5 = hotspots[:5]
+
+        # Calcular zonas top por densidad
+        zones_top = sorted(zone_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        msg_lines = [f"🔥 Heatmap ({date}) — {events_analyzed} eventos, {total_points} puntos de track:"]
+        if top5:
+            msg_lines.append("  Top zonas de densidad:")
+            for h in top5:
+                msg_lines.append(f"    • Celda ({h['gx']},{h['gy']}): {h['count']} Tracks")
+        if zones_top:
+            msg_lines.append("  Por zona asignada:")
+            for zname, c in zones_top:
+                msg_lines.append(f"    • {zname}: {c} presencias")
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "camera_id": camera_id or "all",
+            "date": date,
+            "grid_size": grid_size,
+            "image_dimensions": {"w": img_w, "h": img_h},
+            "total_points": total_points,
+            "events_analyzed": events_analyzed,
+            "heatmap": heatmap,  # matriz [[gy][gx]] de tamaño grid_size x grid_size
+            "hotspots": top5,
+            "zone_counts": zones_top,  # [(zone_name, count), ...]
+            "message": "\n".join(msg_lines)
+        }
+    except Exception as e:
+        logger.error(f"tool_heatmap_data error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def tool_peak_hours(user_id: str, camera_id: str = None, date: str = "today",
+                          top_n: int = 3) -> dict:
+    """Fase 2.4 - Ranking de horas por personas únicas detectadas.
+
+    Logica:
+    - Agrupa eventos del periodo por hora (HH)
+    - Para cada hora, suma unique_persons (metadata.person_tracking.unique_persons)
+    - Si no hay metadata, usa qwen_details.count_hombres+mujeres approx
+    - Retorna top_n horas pico + ranking completo + valle horas
+    """
+    try:
+        from datetime import datetime, timedelta
+        import time as _time
+
+        now_ts = int(_time.time())
+        if date == "today":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_ts = int(start_dt.timestamp())
+        elif date == "yesterday":
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+            start_ts = int(start_dt.timestamp())
+        else:
+            start_ts = now_ts - 86400
+
+        cameras_to_check = []
+        if camera_id:
+            cameras_to_check = [camera_id]
+        else:
+            base = STORAGE_ROOT / "users" / user_id / "cameras"
+            if base.exists():
+                cameras_to_check = [p.name for p in base.iterdir() if p.is_dir()]
+
+        hour_data = {}  # HH -> {"events": N, "unique_persons_max": N, "sum_persons": N, "hour_label": "HH:00"}
+        events_analyzed = 0
+
+        for cam in cameras_to_check:
+            for evt, _ in _iter_events(user_id, cam, date):
+                ts = evt.get("timestamp", 0)
+                if ts < start_ts:
+                    continue
+                events_analyzed += 1
+                dt_str = evt.get("datetime", "")
+                if not dt_str:
+                    continue
+                try:
+                    # Soporta 'YYYY-MM-DD HH:MM' o ISO 'YYYY-MM-DDTHH:MM:SS'
+                    dt_part = dt_str.replace("T", " ").split(" ")
+                    hour_key = dt_part[1].split(":")[0]
+                except Exception:
+                    continue
+
+                metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+                pt = metadata.get("person_tracking", {}) if isinstance(metadata, dict) else {}
+                qd = metadata.get("qwen_details", {}) if isinstance(metadata, dict) else {}
+
+                # unique_persons preferente, fallback a suma count_*
+                unique_n = int(pt.get("unique_persons", 0) or 0)
+                if unique_n == 0:
+                    unique_n = (
+                        int(qd.get("count_hombres", 0) or 0)
+                        + int(qd.get("count_mujeres", 0) or 0)
+                        + int(qd.get("count_ninos", 0) or 0)
+                        + int(qd.get("count_ancianos", 0) or 0)
+                    )
+
+                if hour_key not in hour_data:
+                    hour_data[hour_key] = {
+                        "hour": int(hour_key),
+                        "events": 0,
+                        "max_persons": 0,
+                        "sum_persons": 0
+                    }
+                hour_data[hour_key]["events"] += 1
+                hour_data[hour_key]["sum_persons"] += unique_n
+                hour_data[hour_key]["max_persons"] = max(hour_data[hour_key]["max_persons"], unique_n)
+
+        # Ordenar y rankear
+        ranking = []
+        for hour_key, data in hour_data.items():
+            ranking.append({
+                "hour_label": f"{int(hour_key):02d}:00",
+                "events": data["events"],
+                "max_persons": data["max_persons"],
+                "avg_persons": round(data["sum_persons"] / data["events"], 2),
+                "score": data["sum_persons"] + data["max_persons"] * 2  # pico vale doble
+            })
+        ranking.sort(key=lambda h: h["score"], reverse=True)
+        # Top N
+        top = ranking[:top_n]
+        # Valle: lowest score (excluyendo horas con 0)
+        valle = [r for r in ranking if r["events"] > 0]
+        valle.sort(key=lambda h: h["score"])
+        bottom = valle[:top_n]
+
+        if not ranking:
+            return {
+                "success": True,
+                "date": date,
+                "events_analyzed": 0,
+                "ranking": [],
+                "top_peak": [],
+                "top_valley": [],
+                "message": f"No hay eventos con personas en {date} para calcular horas pico."
+            }
+
+        if events_analyzed > 0:
+            # Construir mensaje natural con mejor formato
+            hour_predictions = []
+            for r in top[:5]:
+                hour_predictions.append(f"{r['hour_label']} (max {r['max_persons']}p · {r['events']} ev.)")
+
+        msg_lines = [
+            f"📈 Horas pico ({date}):",
+            f"  Eventos analizados: {events_analyzed}",
+            f"  Top {len(top)} horas con mas trafico:"
+        ]
+        for i, r in enumerate(top, 1):
+            msg_lines.append(f"    {i}. {r['hour_label']} — {r['max_persons']} persona(s) pico, {r['events']} eventos")
+        if bottom and bottom[0] != top[0]:
+            msg_lines.append(f"  Horas mas tranquilas:")
+            for r in bottom[:3]:
+                msg_lines.append(f"    • {r['hour_label']} — {r['max_persons']} persona(s) pico")
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "camera_id": camera_id or "all",
+            "date": date,
+            "events_analyzed": events_analyzed,
+            "ranking": ranking,
+            "top_peak": top,
+            "top_valley": bottom,
+            "message": "\n".join(msg_lines)
+        }
+    except Exception as e:
+        logger.error(f"tool_peak_hours error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 TOOLS_REGISTRY = {
     "save_business_data": {
         "function": tool_save_business_data,
@@ -1469,6 +2084,43 @@ TOOLS_REGISTRY = {
             "end": {"type": "number"}
         }},
     },
+    "traffic_flow": {
+        "function": tool_traffic_flow,
+        "description": "Flujo de trafico entrada/salida usando zonas tipo 'entrance'. Calcula entradas, salidas, ocupacion actual, pico y visitantes unicos. Responde: 'cuantas personas entraron hoy', 'cuantas salieron', 'cuanta gente hay ahora', 'cual es la hora pico de trafico'.",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string", "description": "ID de camara especifica o vacio para todas"},
+            "zone_id": {"type": "string", "description": "Nombre o ID de zona especifica (vacio = usar entradas por defecto)"},
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"}
+        }},
+    },
+    "zone_dwell": {
+        "function": tool_zone_dwell,
+        "description": "Tiempo de permanencia por zona desde zone_events del tracker. Calcula avg/max dwell por zona y detecta anomalias (>= N minutos en zona sensible). Responde: 'cuanto tiempo estuvo alguien en caja', 'quien estuvo mas de 30 min en cocina'.",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string", "description": "ID de camara o vacio para todas"},
+            "zone_id": {"type": "string", "description": "Nombre o ID de zona (vacio = todas las zonas)"},
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+            "anomaly_min_minutes": {"type": "integer", "description": "Minutos despues de los cuales se considera anomalo (default 30)", "default": 30}
+        }},
+    },
+    "heatmap_data": {
+        "function": tool_heatmap_data,
+        "description": "Datos de densidad por zona (matriz 16x16) desde centroid_xy de todos los tracks. Para que el frontend pinte un heatmap sobre el stream. Responde: 'donde se acumula la gente', 'que zonas son mas transitadas', 'dame el mapa de calor de hoy'.",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string", "description": "ID de camara o vacio para todas"},
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+            "grid_size": {"type": "integer", "description": "Tamano del grid (default 16)", "default": 16}
+        }},
+    },
+    "peak_hours": {
+        "function": tool_peak_hours,
+        "description": "Ranking de horas por personas unicas (top N) y horas valle. Responde: 'cuales son tus horas pico', 'cuando hay mas gente en el local', 'cuando es mas tranquilo', 'a que hora abunda mas la clientela'.",
+        "parameters": {"type": "object", "properties": {
+            "camera_id": {"type": "string", "description": "ID de camara o vacio para todas"},
+            "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+            "top_n": {"type": "integer", "description": "Cuantas horas top retornar (default 3)", "default": 3}
+        }},
+    },
     "is_open_hours": {
         "function": tool_is_open_hours,
         "description": "Consulta si el negocio está abierto según horario registrado. '¿Estamos abiertos?' / '¿Horario?'",
@@ -1531,6 +2183,67 @@ OPENAI_TOOLS_SCHEMA = [
                 "properties": {
                     "date": {"type": "string", "description": "today, yesterday, reciente, o YYYY-MM-DD"},
                     "camera_id": {"type": "string", "description": "ID de cámara específica (vacío = todas)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "traffic_flow",
+            "description": "Flujo de trafico entrada/salida usando zonas tipo entrance. Calcula entradas, salidas, ocupacion actual, pico y visitantes unicos en zonas configuradas. Si no hay zonas, hace estimado por fluctuacion de personas unicas entre eventos. Responde: 'cuantas personas entraron hoy', 'cuantas salieron', 'cuanta gente hay ahora', 'cual es la hora pico'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de camara especifica (vacio = todas)"},
+                    "zone_id": {"type": "string", "description": "Nombre o ID de zona especifica (vacio = zonas entrance/counter)"},
+                    "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "zone_dwell",
+            "description": "Tiempo de permanencia por zona (avg/max dwell) y deteccion de anomalias cuando alguien esta en una zona sensible mas de N minutos (default 30). Requiere zonas tipo cashier/kitchen/restricted configuradas. Responde: 'cuanto tiempo en caja', 'quien estuvo mas de 30 min en cocina', 'donde pasan mas tiempo'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de camara (vacio = todas)"},
+                    "zone_id": {"type": "string", "description": "Nombre o ID de zona (vacio = todas)"},
+                    "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+                    "anomaly_min_minutes": {"type": "integer", "description": "Umbral en minutos para considerar anomalia (default 30)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "heatmap_data",
+            "description": "Datos de densidad por grid (16x16 por defecto) acumulando centroid_xy de tracks, y conteo por zona. Devuelve matriz, hotspots ranked y zone_counts para que el frontend pinte un heatmap. Responde: 'donde se acumula mas gente', 'que zonas son mas transitadas', 'mapa de calor de hoy'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de camara (vacio = todas)"},
+                    "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+                    "grid_size": {"type": "integer", "description": "Tamano del grid (default 16)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "peak_hours",
+            "description": "Ranking de horas por personas unicas detectadas (top N horas con mas trafico) y horas valle. Usa person_tracking.unique_persons del metadata. Responde: 'cuales son las horas pico', 'cuando hay mas gente', 'cuando es mas tranquilo', 'a que hora abunda mas la clientela'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "ID de camara (vacio = todas)"},
+                    "date": {"type": "string", "description": "today, yesterday, o YYYY-MM-DD"},
+                    "top_n": {"type": "integer", "description": "Cuantas horas top retornar (default 3)"}
                 }
             }
         }

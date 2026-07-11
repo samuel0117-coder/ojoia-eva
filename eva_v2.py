@@ -1186,6 +1186,65 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
             parts.append(f"- {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('description', '')[:100]}")
         return {"text": "\n".join(parts), "events": events[:5]}
 
+    # ── Fase 2: tools basadas en zonas (hardcoded intents) ──
+    # Hora pico / horas pico / cuando hay mas gente / cuando es mas tranquilo
+    if any(p in msg_norm for p in ["hora pico", "horas pico", "cuando hay mas gente", "cuando es mas tranqui", "a que hora abunda", "a que hora hay mas", "cual es la hora con mas"]):
+        from eva.tools import tool_peak_hours
+        date_param = "yesterday" if any(w in msg_norm for w in ("ayer", "anoche", "dia anterior", "día anterior")) else "today"
+        result = await tool_peak_hours(user_id, date=date_param, top_n=3)
+        if result.get("success"):
+            return {"text": result.get("message", ""), "events": []}
+        return {"text": f"No pude calcular las horas pico: {result.get('error', '')}", "events": []}
+
+    # Cuantos entraron / cuantos salieron / cuanta gente hay / ocupacion / visitantes unicos
+    if any(p in msg_norm for p in ["cuantos entraron", "cuántos entraron", "cuantas personas entraron", "cuántas personas entraron",
+                                    "cuantos salieron", "cuántos salieron", "flujo de gente", "cuanta gente hay",
+                                    "cuánta gente hay", "ocupacion actual", "ocupacion del local", "visitantes unicos",
+                                    "visitantes únicos", "personas unicas hoy"]):
+        from eva.tools import tool_traffic_flow
+        date_param = "yesterday" if any(w in msg_norm for w in ("ayer", "anoche")) else "today"
+        result = await tool_traffic_flow(user_id, date=date_param)
+        if result.get("success"):
+            return {"text": result.get("message", ""), "events": []}
+        return {"text": f"No pude calcular el flujo: {result.get('error', '')}", "events": []}
+
+    # Donde se acumula la gente / heatmap / zonas mas transitadas / mapa de calor
+    if any(p in msg_norm for p in ["donde se acumula", "dónde se acumula", "mapa de calor", "heatmap", "heat map",
+                                    "zonas mas transitadas", "zonas más transitadas", "que zonas son mas", "que parte del local"]):
+        from eva.tools import tool_heatmap_data
+        date_param = "yesterday" if any(w in msg_norm for w in ("ayer", "anoche")) else "today"
+        result = await tool_heatmap_data(user_id, date=date_param, grid_size=16)
+        if result.get("success"):
+            return {"text": result.get("message", ""), "events": []}
+        return {"text": f"No pude generar el heatmap: {result.get('error', '')}", "events": []}
+
+    # Cuanto tiempo en X / permanencia / quien estuvo mas de N minutos / dwell
+    if any(p in msg_norm for p in ["cuanto tiempo en ", "cuánto tiempo en ", "cuanto tiempo estuvieron", "permanencia",
+                                    "quien estuvo mas de", "quién estuvo más de", "mas de 30 minutos", "alguien sospechoso en"]):
+        from eva.tools import tool_zone_dwell
+        date_param = "yesterday" if any(w in msg_norm for w in ("ayer", "anoche")) else "today"
+        anomaly = 30
+        # Extraer número del mensaje si existe
+        import re as _re2
+        m = _re2.search(r"(mas|m[áa]s)\s+de\s+(\d+)", msg_norm)
+        if m:
+            try:
+                anomaly = int(m.group(2))
+            except Exception:
+                pass
+        # Extraer zona del mensaje si existe (ej "en caja", "en cocina")
+        extracted_zone = None
+        for zw in ["caja", "cocina", "entrada", "mostrador", "almacen", "almacén", "comedor",
+                    "oficina", "bodega", "pasillo", "produccion", "producción", "restringida",
+                    "parqueo", "estacionamiento", "sala", "inventario"]:
+            if f"en {zw}" in msg_norm or f" en {zw}" in msg_norm:
+                extracted_zone = zw.capitalize()
+                break
+        result = await tool_zone_dwell(user_id, date=date_param, anomaly_min_minutes=anomaly, zone_id=extracted_zone)
+        if result.get("success"):
+            return {"text": result.get("message", ""), "events": []}
+        return {"text": f"No pude calcular permanencia: {result.get('error', '')}", "events": []}
+
     if any(p in msg_norm for p in ["ultimo evento", "último evento", "ultimo análisis", "último análisis", "ultima actividad", "última actividad"]):
         from eva.tools import tool_latest_events
         result = await tool_latest_events(user_id, limit=3, date="today")
@@ -1236,6 +1295,10 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"- find_anomalies: Eventos relevantes segun gravedad (media/alta)\n" +
         f"- latest_events: Lista ultimos análisis cronologicos\n" +
         f"- count_people: Conteo de personas unicas hoy/ayer\n" +
+        f"- traffic_flow: Flujo entrada/salida con zonas entrance. 'cuantos entraron hoy', 'cuanta gente hay ahora'\n" +
+        f"- peak_hours: Top horas por trafico. 'cuales son las horas pico', 'cuando hay mas gente'\n" +
+        f"- heatmap_data: Datos de densidad por celda. 'donde se acumula mas gente', 'mapa de calor'\n" +
+        f"- zone_dwell: Permanencia por zona. 'cuanto tiempo en caja', 'quien estuvo mas de 30 min'\n" +
         f"- is_open_hours: Horario negocio abierto/cerrado\n" +
         f"- list_employees: Empleados registrados con face_id, rol y horario\n\n"
         f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
@@ -1255,7 +1318,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book"):
+        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book", "traffic_flow", "zone_dwell", "heatmap_data", "peak_hours"):
             result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
@@ -1744,6 +1807,10 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"- find_anomalies: Eventos relevantes segun gravedad (media/alta)\n" +
         f"- latest_events: Lista ultimos análisis cronologicos\n" +
         f"- count_people: Conteo de personas unicas hoy/ayer\n" +
+        f"- traffic_flow: Flujo entrada/salida con zonas entrance. 'cuantos entraron hoy', 'cuanta gente hay ahora'\n" +
+        f"- peak_hours: Top horas por trafico. 'cuales son las horas pico', 'cuando hay mas gente'\n" +
+        f"- heatmap_data: Datos de densidad por celda. 'donde se acumula mas gente', 'mapa de calor'\n" +
+        f"- zone_dwell: Permanencia por zona. 'cuanto tiempo en caja', 'quien estuvo mas de 30 min'\n" +
         f"- is_open_hours: Horario negocio abierto/cerrado\n" +
         f"- list_employees: Empleados registrados con face_id, rol y horario\n\n"
         f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
@@ -1763,7 +1830,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book"):
+        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book", "traffic_flow", "zone_dwell", "heatmap_data", "peak_hours"):
             result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
@@ -2078,6 +2145,31 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
             parts.append(f"  • {g['label']}: {g['events_count']} eventos (imp: {imp})")
         return {"text": "\n".join(parts), "events": []}
 
+    # ── Fase 2: tools basadas en zonas ──
+    if tool_name == "traffic_flow":
+        data = await _tool_call("traffic_flow", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude calcular el flujo: {data.get('error', 'error')}", "events": []}
+        return {"text": data.get("message", "Sin datos de trafico."), "events": []}
+
+    if tool_name == "zone_dwell":
+        data = await _tool_call("zone_dwell", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude calcular permanencia: {data.get('error', 'error')}", "events": []}
+        return {"text": data.get("message", "Sin datos de permanencia."), "events": []}
+
+    if tool_name == "heatmap_data":
+        data = await _tool_call("heatmap_data", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude generar el heatmap: {data.get('error', 'error')}", "events": []}
+        return {"text": data.get("message", "Sin datos de heatmap."), "events": []}
+
+    if tool_name == "peak_hours":
+        data = await _tool_call("peak_hours", user_id, params)
+        if not data.get("success"):
+            return {"text": f"No pude calcular horas pico: {data.get('error', 'error')}", "events": []}
+        return {"text": data.get("message", "Sin datos de horas pico."), "events": []}
+
     return {"text": f"Herramienta no reconocida: {tool_name}", "events": []}
 
 
@@ -2115,7 +2207,7 @@ def _sanitize_os_tool_params(params):
 def _normalize_os_tool_params(tool_name, params, message):
     params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
     m = _normalize_text(message)
-    if tool_name in ("get_activity_summary", "find_anomalies", "latest_events", "search_events", "find_risks", "count_people", "event_book"):
+    if tool_name in ("get_activity_summary", "find_anomalies", "latest_events", "search_events", "find_risks", "count_people", "event_book", "traffic_flow", "zone_dwell", "heatmap_data", "peak_hours"):
         if not params.get("date"):
             if any(w in m for w in ("ayer", "dia anterior", "día anterior", "anoche")):
                 params["date"] = "yesterday"
