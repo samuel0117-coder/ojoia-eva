@@ -499,10 +499,30 @@ def _event_description(evt: dict) -> str:
 def _event_yolo(evt: dict) -> dict:
     meta = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
     y = evt.get("yolo", {}) if isinstance(evt.get("yolo"), dict) else {}
-    classes = meta.get("yolo_classes") or evt.get("yolo_classes") or y.get("classes") or []
+    classes = (
+        meta.get("yolo_classes") or
+        evt.get("yolo_classes") or
+        y.get("classes") or
+        []
+    )
     if isinstance(classes, str):
         classes = [c.strip() for c in classes.split(",") if c.strip()]
-    return {"count": evt.get("total_yolo_objects") or evt.get("yolo_count") or y.get("count") or 0, "classes": classes}
+    # Priorizar: top-level → metadata.total_yolo_objects → person count desde classes
+    count = (
+        int(evt.get("total_yolo_objects") or 0) or
+        int(evt.get("yolo_count") or 0) or
+        int(meta.get("total_yolo_objects") or 0) or
+        int(y.get("count") or 0) or
+        0
+    )
+    # Si no hay count pero hay person_track unique, usar ese
+    if count == 0:
+        pt = meta.get("person_tracking") if isinstance(meta, dict) else None
+        if isinstance(pt, dict):
+            up = pt.get("unique_persons")
+            if up:
+                count = int(up)
+    return {"count": count, "classes": classes}
 
 
 def _event_is_alert(evt: dict) -> bool:
