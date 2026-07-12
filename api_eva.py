@@ -1825,7 +1825,20 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
                 qa = ev.get("metadata", {}).get("qwen_analysis", "")[:100]
             is_violation = ev.get("event_type") in ("violation", "vigilance_alert", "night_alert")
             ev["qwen"] = {"violation": is_violation, "description": qa}
-            ev["yolo"] = {"count": 1}
+            # Fix: yolo.count y persons deben usar datos reales del metadata,
+            # no hardcodear a 1. Antes retornaba count:1 para todos los eventos
+            # haciendo que el brief del chat mostrara "0 Detección: 1 objeto".
+            ev_meta = ev.get("metadata", {}) if isinstance(ev.get("metadata"), dict) else {}
+            yolo_classes = ev_meta.get("yolo_classes") if isinstance(ev_meta, dict) else None
+            if isinstance(yolo_classes, str):
+                yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
+            yolo_classes = yolo_classes or []
+            md_persons = ev_meta.get("person_tracking", {}) if isinstance(ev_meta, dict) else {}
+            md_unique = int(md_persons.get("unique_persons") or 0) if isinstance(md_persons, dict) else 0
+            md_total_yolo = int(ev_meta.get("total_yolo_objects") or 0) if isinstance(ev_meta, dict) else 0
+            yolo_count = md_total_yolo or md_unique or len(yolo_classes) or 1
+            ev["yolo"] = {"count": yolo_count, "classes": yolo_classes}
+            ev["persons"] = md_unique or yolo_count
             if "metadata" in ev and "grid_b64" in ev["metadata"]:
                 del ev["metadata"]["grid_b64"]
             img_path = events_dir / f"{ev.get('event_id', '')}.jpg"
