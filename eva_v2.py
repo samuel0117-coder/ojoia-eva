@@ -363,9 +363,14 @@ def _get_concern_examples(biz_type: str, zone: str) -> str:
 # LLM HELPERS
 # =============================================================================
 
-async def _call_qwen(messages: list, max_tokens: int = 300, tools: list = None) -> dict:
+async def _call_qwen(messages: list, max_tokens: int = 600, tools: list = None, temperature: float = 0.3) -> dict:
     try:
-        payload = {"model": "qwen", "messages": messages, "max_tokens": max_tokens}
+        payload = {
+            "model": "qwen",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
         if tools:
             payload["tools"] = tools
         async with httpx.AsyncClient(timeout=QWEN_TIMEOUT) as cl:
