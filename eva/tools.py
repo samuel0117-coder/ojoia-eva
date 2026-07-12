@@ -537,9 +537,24 @@ def _attach_event_package(evt: dict, user_id: str, camera_id: str):
 
 
 def _event_persons(evt: dict) -> int:
+    """Cuenta personas únicas reales del evento.
+
+    Prioridad:
+        1. metadata.person_tracking.unique_persons (tracker ID real)
+        2. qwen_json.details.persons_visible (lo que Qwen describe)
+        3. fallback a conteo de yolo_classes
+    """
     qj = _event_qwen(evt)
     details = qj.get("details", {}) if isinstance(qj.get("details"), dict) else {}
-    for key in ("persons", "person_count", "persons_visible", "personas", "personas_contadas", "people_count"):
+    # ── 1. tracker IDs únicos (real, deduplicado entre frames del mismo grid) ──
+    metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
+    pt = metadata.get("person_tracking") if isinstance(metadata, dict) else None
+    if isinstance(pt, dict):
+        up = pt.get("unique_persons")
+        if up is not None and int(up) > 0:
+            return int(up)
+    # ── 2. fallback a persons_visible (lo que Qwen describe en el grid) ──
+    for key in ("persons_visible", "persons", "person_count", "personas", "personas_contadas", "people_count"):
         try:
             value = details.get(key)
             if value is None:
@@ -548,17 +563,13 @@ def _event_persons(evt: dict) -> int:
                 return int(value)
         except Exception:
             pass
-    # ── Preferencia: tracker IDs únicos (datos reales basados en tracking) ──
-    metadata = evt.get("metadata", {}) if isinstance(evt.get("metadata"), dict) else {}
-    pt = metadata.get("person_tracking") if isinstance(metadata, dict) else None
-    if isinstance(pt, dict) and pt.get("unique_persons"):
-        return int(pt.get("unique_persons"))
+    # ── 3. fallback a conteo de yolo_classes (siempre devuelve al menos 1 si YOLO vio personas) ──
     yolo_classes = metadata.get("yolo_classes") or evt.get("yolo_classes") or []
     if isinstance(yolo_classes, str):
         yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
     if isinstance(yolo_classes, list):
         person_count = sum(1 for c in yolo_classes if str(c).lower() == "person")
-        total_yolo = int(metadata.get("total_yolo_objects") or evt.get("total_yolo_objects") or evt.get("yolo_count") or 0 or 0)
+        total_yolo = int(metadata.get("total_yolo_objects") or evt.get("total_yolo_objects") or evt.get("yolo_count") or 0)
         return max(person_count, 1) if person_count == 0 and total_yolo > 0 else person_count
     return _event_yolo(evt).get("classes", []).count("person")
 
@@ -567,6 +578,7 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
                               camera_id: str = None, limit: int = 10,
                               person_class: str = None,   # P4: hombre|mujer|nino|anciano
                               clothing: str = None,        # P4: "rojo", "verde", "camisa blanca"
+                              head_accessory: str = None,  # P5: "gorra", "sombrero", "gafas"
                               min_persons: int = None,      # P4: >= N personas
                               max_persons: int = None,      # P4: <= N personas
                               activity: str = None,        # P4: "trabajando","hablando","entrando"
@@ -575,39 +587,47 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
     Busca eventos en el diario con filtros semánticos (P4).
 
     Filtros disponibles:
-      query        — palabras sueltas (compatibilidad vieja)
-      person_class — hombre | mujer | nino | anciano
-      clothing     — color o prenda (rojo, verde, camisa, jean...)
-      min_persons  — >= N personas en el evento
-      max_persons  — <= N
-      activity     — verbo/acción (trabajando, hablando, entrando)
-      importance   — normal | baja | media | alta | critica
-      date         — today | yesterday | YYYY-MM-DD
-      camera_id    — restringe a una cámara concreta
-      limit        — tamaño de página
+      query          — palabras sueltas (compatibilidad vieja)
+      person_class   — hombre | mujer | nino | anciano
+      clothing       — color o prenda (rojo, verde, camisa, jean...)
+      head_accessory — gorra, sombrero, gafas, gorro, casco
+      min_persons    — >= N personas en el evento
+      max_persons    — <= N
+      activity       — verbo/acción (trabajando, hablando, entrando)
+      importance     — normal | baja | media | alta | critica
+      date           — today | yesterday | YYYY-MM-DD
+      camera_id      — restringe a una cámara concreta
+      limit          — tamaño de página
 
     Internamente combina las words de 'query' con sinónimos del filtro para
     hacer match contra summary+description+qwen_json.
     """
     # Normalizar filtros
     pc, cl, act, imp = (person_class or "").lower().strip(), (clothing or "").lower().strip(), (activity or "").lower().strip(), (importance or "").lower().strip()
+    ha = (head_accessory or "").lower().strip()
     query_lower = (query or "").lower().strip()
     # Sinónimos para matching tolerante
     synonym_map = {
-        "hombre": ["hombre", "masculino", "varón", "varon", "caballero", "chico"],
-        "mujer": ["mujer", "femenino", "fémina", "chica", "señora", "senora", "dam a"],
+        "hombre": ["hombre", "masculino", "varón", "varon", "caballero", "chico", "se\u00f1or"],
+        "mujer": ["mujer", "femenino", "fémina", "chica", "señora", "senora"],
         "nino": ["nino", "niño", "nena", "niña", "menor", "infante", "criatura", "bebe", "bebé"],
         "anciano": ["anciano", "mayor", "viejo", "abuelo", "abuela", "adulto mayor"],
         "alto": ["alto"], "critico": ["critico", "crítico", "alta", "critica"],
+        # Head accessories
+        "gorra": ["gorra", "cap", "gorrita", "gorra negra", "gorra blanca", "casco", "gorro"],
+        "sombrero": ["sombrero", "hat"],
+        "gafas": ["gafas", "gafas de sol", "lentes", "oculus", "anteojos", "lentes oscuros"],
     }
     filter_words = []
     if pc:
         for syn in [pc] + synonym_map.get(pc, []):
             filter_words.append(syn)
     if cl:
-        # clothing match partial — cualquier color/ prenda
         for token in cl.split():
             filter_words.append(token)
+    if ha:
+        for syn in [ha] + synonym_map.get(ha, []):
+            filter_words.append(syn)
     if act:
         for token in act.split():
             filter_words.append(token)
@@ -631,7 +651,7 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
         persona_text = []
         for p in persons:
             if not isinstance(p, dict): continue
-            persona_text.append(" ".join(str(p.get(k, "")) for k in ("desc", "gender_guess", "age_group", "clothing_top", "clothing_bottom")))
+            persona_text.append(" ".join(str(p.get(k, "")) for k in ("desc", "gender_guess", "age_group", "clothing_top", "clothing_bottom", "head_accessory")))
         parts.extend(persona_text)
         # Tags del qwen_details
         qd = qjson.get("details") if isinstance(qjson.get("details"), dict) else {}
@@ -640,6 +660,7 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
             " ".join(qd.get("ages_visible") or []),
             " ".join(qd.get("clothing_top_visible") or []),
             " ".join(qd.get("clothing_bottom_visible") or []),
+            " ".join(qd.get("head_accessory_visible") or []),
         ])
         searchable = " ".join(parts).lower()
 
@@ -989,8 +1010,9 @@ async def tool_latest_events(user_id: str, limit: int = 5,
     for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
         evt = _attach_event_package(evt, user_id, cam_name)
         qjson = _event_qwen(evt)
+        eid = evt["event_id"]
         events.append({
-            "event_id": evt["event_id"],
+            "event_id": eid,
             "datetime": evt.get("datetime", ""),
             "camera_name": cam_name,
             "event_type": evt.get("event_type", ""),
@@ -1000,7 +1022,8 @@ async def tool_latest_events(user_id: str, limit: int = 5,
             "anomaly": _event_is_alert(evt),
             "persons": _event_persons(evt),
             "yolo": _event_yolo(evt),
-            "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
+            "frame_url": f"/api/event-frame/{eid}?user_id={user_id}",
+            "thumb_url": f"/api/event-thumb/{eid}?user_id={user_id}",
         })
         if len(events) >= limit:
             break

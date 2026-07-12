@@ -1149,26 +1149,45 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
     has_class_filter = any(w in msg_norm for w in ["hombre", "mujer", "niño", "niña", "nino", "anciano", "anciana"])
     has_clothing_filter = any(w in msg_norm for w in ["camisa", "camiseta", "pantalon", "pant", "short", "vestido", "blanca", "blanco", "negro", "negra", "verde", "rojo", "roja", "azul", "amarillo", "gris"])
     has_minp = any(p in msg_norm for p in ["mas de", "más de", "minimo", "mínimo"])
+    has_accessory_filter = any(w in msg_norm for w in ["gorra", "gorrita", "gorro", "sombrero", "gafas", "lentes", "anteojos", "casco"])
 
-    if any(p in msg_norm for p in ["ultimo evento", "ultimos eventos", "último evento", "últimos eventos", "ultimo análisis", "último análisis", "ultima actividad", "últimas actividades", "ultimo activity"]) and (has_class_filter or has_clothing_filter or has_minp):
+    if any(p in msg_norm for p in ["ultimo evento", "ultimos eventos", "último evento", "últimos eventos", "ultimo análisis", "último análisis", "ultima actividad", "últimas actividades", "ultimo activity", "muestrame", "muéstrame", "busca", "enseñame", "ense\u00f1ame"]) and (has_class_filter or has_clothing_filter or has_minp or has_accessory_filter):
         # Filtros + listado → usar tool_search_events con extracción heurística
         from eva.tools import tool_search_events
-        kwargs = {"user_id": user_id, "date": "today", "limit": 10}
+        # Detectar fecha: ayer / hoy
+        date_param = "yesterday" if any(w in msg_norm for w in ("ayer", "anoche", "dia anterior", "día anterior")) else "today"
+        kwargs = {"user_id": user_id, "date": date_param, "limit": 10}
         # persona
-        if "hombre" in msg_norm:
+        if "hombre" in msg_norm or "señor" in msg_norm or "caballero" in msg_norm:
             kwargs["person_class"] = "hombre"
-        elif "mujer" in msg_norm:
+        elif "mujer" in msg_norm or "señora" in msg_norm:
             kwargs["person_class"] = "mujer"
         elif any(w in msg_norm for w in ["niño", "niña", "nino"]):
             kwargs["person_class"] = "nino"
         elif any(w in msg_norm for w in ["anciano", "anciana"]):
             kwargs["person_class"] = "anciano"
-        # ropa (puede traer color + prenda)
+        # ropa (color + prenda) — toma el primero que matchee
         for w in ["camisa", "camiseta", "pantalon", "vestido"]:
             if w in msg_norm: kwargs["clothing"] = w; break
         for color in ["blanca","blanco","negro","negra","verde","rojo","roja","azul","amarillo","gris"]:
             if color in msg_norm:
                 kwargs["clothing"] = (kwargs.get("clothing","") + " " + color).strip()
+                break
+        # head accessory — gorra/sombrero/gafas PRIMERO (más discriminante que la ropa)
+        if "gorra" in msg_norm or "gorro" in msg_norm or "gorrita" in msg_norm:
+            kwargs["head_accessory"] = "gorra"
+        elif "sombrero" in msg_norm:
+            kwargs["head_accessory"] = "sombrero"
+        elif "gafas" in msg_norm or "lentes" in msg_norm or "anteojos" in msg_norm:
+            kwargs["head_accessory"] = "gafas"
+        elif "casco" in msg_norm:
+            kwargs["head_accessory"] = "casco"
+        # Por defecto usar color del accesorio si lo hay (gorra negra)
+        for color in ["negra", "negro", "blanca", "blanco", "roja", "rojo"]:
+            if color in msg_norm:
+                ha = kwargs.get("head_accessory", "")
+                if ha and not any(c in ha for c in ["negra","blanca","roja","negro","blanco","rojo"]):
+                    kwargs["head_accessory"] = ha + " " + color.rstrip("o").rstrip("a") + "a"  # naive plural
                 break
         # rango personas
         import re as _re
@@ -1184,9 +1203,10 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
         result = await tool_search_events(**kwargs)
         found = result.get("found", 0)
         events = result.get("events", [])
+        used_kwargs = {k: v for k, v in kwargs.items() if k not in ("user_id", "limit")}
         if found == 0:
-            return {"text": f"No encontré eventos con esos filtros hoy.", "events": []}
-        parts = [f"Encontré {found} evento(s) con esos filtros:"]
+            return {"text": f"No encontré eventos con esos filtros ({', '.join([f'{k}={v}' for k,v in used_kwargs.items()])}). Intenta quitar alguno.", "events": []}
+        parts = [f"Encontré {found} evento(s) con {[k for k in used_kwargs]}:"]
         for item in events[:5]:
             parts.append(f"- {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('description', '')[:100]}")
         return {"text": "\n".join(parts), "events": events[:5]}

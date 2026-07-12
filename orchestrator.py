@@ -864,6 +864,7 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
     ages = []
     clothing_top_list = []
     clothing_bottom_list = []
+    head_accessory_list = []
     zones_visible = []
     for p in persons_norm:
         if isinstance(p, dict):
@@ -874,11 +875,13 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
             if a not in ("nino", "adolescente", "adulto", "anciano", "desconocido"):
                 a = "desconocido"
             genders.append(g); ages.append(a)
-            ct = p.get("clothing_top"); cb = p.get("clothing_bottom")
+            ct = p.get("clothing_top"); cb = p.get("clothing_bottom"); ha = p.get("head_accessory")
             if isinstance(ct, str) and ct.strip() and ct != "desconocido":
                 clothing_top_list.append(ct.strip())
             if isinstance(cb, str) and cb.strip() and cb != "desconocido":
                 clothing_bottom_list.append(cb.strip())
+            if isinstance(ha, str) and ha.strip() and ha not in ("desconocido", "ninguno", "null"):
+                head_accessory_list.append(ha.strip())
             z = p.get("zone")
             if isinstance(z, str) and z.strip() and z != "null":
                 zones_visible.append(z.strip())
@@ -886,6 +889,10 @@ def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
     if ages: details["ages_visible"] = ages
     if clothing_top_list: details["clothing_top_visible"] = clothing_top_list
     if clothing_bottom_list: details["clothing_bottom_visible"] = clothing_bottom_list
+    if head_accessory_list:
+        details["head_accessory_visible"] = head_accessory_list
+        from collections import Counter
+        details["head_accessory_counts"] = dict(Counter(head_accessory_list))
     if zones_visible:
         details["zones_visible"] = zones_visible
         # Contadores por zona
@@ -1758,6 +1765,7 @@ class QwenOrchestrator:
             "      \"age_group\": \"nino\" | \"adolescente\" | \"adulto\" | \"anciano\" | \"desconocido\",\n"
             "      \"clothing_top\": \"camiseta verde\" | \"camisa blanca\" | \"desconocido\",\n"
             "      \"clothing_bottom\": \"jean azul\" | \"pantalon negro\" | \"desconocido\",\n"
+            "      \"head_accessory\": \"gorra negra\" | \"sombrero\" | \"gafas de sol\" | \"ninguno\" | \"desconocido\",\n"
             "      \"zone\": \"nombre_exacto_de_zona_configurada\" | null\n"
             "    }\n"
             "  ],\n"
