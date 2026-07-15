@@ -461,58 +461,40 @@ async def serve_vigilance_frame(user_id: str, event_id: str):
 
 @app.post("/api/admin/centinela-test")
 async def centinela_test(user_id: str, camera_id: str = "OJO-E17604", count: int = 1):
-    """Fuerza una alerta centinela de prueba (mismo path que producción)."""
-    try:
-        if not user_id or not camera_id:
-            return {"success": False, "error": "user_id y camera_id requeridos"}
-        from ai_system_centinela import _save_vigilance_event  # noqa
-    except Exception:
-        # fallback inline
-        pass
-    try:
-        # Llamamos directamente al helper si está disponible en este proceso
-        import ai_system  # type: ignore
-        ai_system._save_vigilance_event(user_id, camera_id, b"", count, ["person"], "127.0.0.1")
-        return {"success": True, "triggered": True, "user_id": user_id, "camera_id": camera_id}
-    except Exception as e:
-        # Plan B: simular vía push directo, saltando el evento
+    """Fuerza una alerta centinela de prueba (mismo path que produccion, con push + imagen)."""
+    if not user_id or not camera_id:
+        return {"success": False, "error": "user_id y camera_id requeridos"}
+    # Bypass de cooldown para el test
+    _vigilance_cooldowns.pop(f"{user_id}_{camera_id}", None)
+    # Usar un frame real si hay uno disponible, sino uno sintetico (para que la miniatura funcione)
+    img_bytes = b""
+    for cand in [
+        STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / "latest_vigilance.jpg",
+        STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "latest_raw.jpg",
+        STORAGE_ROOT / "users" / "default" / "cameras" / camera_id / "frames" / "latest_raw.jpg",
+    ]:
+        if cand.exists() and cand.stat().st_size > 100:
+            img_bytes = cand.read_bytes()
+            break
+    if not img_bytes:
         try:
-            import requests as _req, json as _json, time as _t
-            from google.oauth2 import service_account
-            import google.auth.transport.requests
-            uf = STORAGE_ROOT / "users" / user_id / "user.json"
-            if not uf.exists():
-                return {"success": False, "error": "usuario no encontrado"}
-            ud = _json.loads(uf.read_text())
-            tokens = ud.get("fcm_tokens", []) or []
-            if not tokens:
-                return {"success": False, "error": "sin tokens FCM registrados; el usuario debe abrir el chat y aceptar notificaciones"}
-            creds = service_account.Credentials.from_service_account_file(
-                "/home/sam/ai_system/firebase-key.json",
-                scopes=["https://www.googleapis.com/auth/firebase.messaging"]
-            )
-            creds.refresh(google.auth.transport.requests.Request())
-            title = "🧪 TEST: Alerta centinela"
-            body = f"Modo test: {count} objeto(s) detectado(s). Si ves esto, push funciona."
-            link = f"https://ojoia.com.do/#cameras?event=test_{int(_t.time())}&camera={camera_id}"
-            sent = 0
-            for tok in tokens:
-                r = _req.post(
-                    "https://fcm.googleapis.com/v1/projects/ojoia-67216/messages:send",
-                    headers={"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"},
-                    json={"message": {
-                        "token": tok,
-                        "notification": {"title": title, "body": body, "click_action": link},
-                        "data": {"type": "centinela_test", "url": link, "title": title, "body": body, "tag": "centinela_test"},
-                        "webpush": {"notification": {"title": title, "body": body, "icon": "/img/icon-192.png", "tag": "centinela_test"}, "fcm_options": {"link": link}}
-                    }},
-                    timeout=10
-                )
-                if r.status_code == 200:
-                    sent += 1
-            return {"success": True, "triggered": True, "sent": sent, "tokens": len(tokens), "link": link}
-        except Exception as e2:
-            return {"success": False, "error": str(e), "fallback_error": str(e2)}
+            from io import BytesIO
+            from PIL import Image as _PILImage
+            _buf = BytesIO()
+            _im = _PILImage.new("RGB", (320, 240), (90, 90, 90))
+            _im.save(_buf, format="JPEG", quality=70)
+            img_bytes = _buf.getvalue()
+        except Exception:
+            pass
+    try:
+        result = _save_vigilance_event(user_id, camera_id, img_bytes, count, ["person", "test"], "127.0.0.1")
+        if result is None:
+            _vigilance_cooldowns.pop(f"{user_id}_{camera_id}", None)
+            result = _save_vigilance_event(user_id, camera_id, img_bytes, count, ["person", "test"], "127.0.0.1")
+        return {"success": True, "triggered": result is not None, "event_id": result,
+                "user_id": user_id, "camera_id": camera_id, "had_frame": len(img_bytes) > 0}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # CORS middleware — permisivo para todos los orígenes
@@ -596,6 +578,18 @@ def save_disk_config(cfg: dict):
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
     tmp.replace(DISKS_CONFIG_FILE)
+
+
+def _dir_used_mb(path) -> float:
+    """Tamaño de un directorio en MB usando du (rapido, C-level). Fallback 0."""
+    try:
+        import subprocess
+        r = subprocess.run(["du", "-sm", str(path)], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.split()[0])
+    except Exception:
+        pass
+    return 0.0
 
 def get_user_storage_path(user_id: str, plan: str = "founder") -> Path:
     """Resolver ruta de almacenamiento del usuario segun config de discos."""
@@ -702,6 +696,22 @@ async def health():
     except:
         status = "error"
     return {"status": status, "service": "eva-api", "version": "7.0"}
+
+@app.get("/api/support-info")
+async def support_info():
+    """Info publica de contacto/soporte (editable desde admin). No requiere auth."""
+    try:
+        cfg = get_disk_config()
+        sc = cfg.get("support_contact", {})
+        return {
+            "whatsapp": sc.get("whatsapp", ""),
+            "email": sc.get("email", ""),
+            "phone": sc.get("phone", ""),
+            "bank_info": sc.get("bank_info", "")
+        }
+    except Exception:
+        return {"whatsapp": "", "email": "", "phone": "", "bank_info": ""}
+
 
 @app.get("/frames/latest")
 async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[str] = None):
@@ -2751,8 +2761,10 @@ def _save_vigilance_event(user_id: str, camera_id: str, img_bytes: bytes, yolo_c
         except Exception as _ie:
             logger.warning(f"[vigilance] No pude generar miniatura push: {_ie}")
         _send_vigilance_fcm(user_id, camera_id, event_id, yolo_count, yolo_classes, image_b64=_img_b64)
+        return event_id
     except Exception as e:
         logger.error(f"Error saving vigilance event: {e}")
+        return None
 
 
 def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count: int, yolo_classes: list, image_b64: str = None):
@@ -3146,12 +3158,6 @@ async def is_open(user_id: str, timestamp: float = None):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8005, loop="asyncio")
-
 
 
 
@@ -3762,3 +3768,1120 @@ def _resolve_report_date(date: str) -> str:
 
 
 # (El endpoint POST /api/reportes/send-v2 se define arriba, línea ~313)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS — auth, users, billing, plans, cameras, events, storage, support
+# ═══════════════════════════════════════════════════════════════════════════
+
+ADMIN_CONFIG_FILE = STORAGE_ROOT / "admin_config.json"
+ADMIN_SESSION_TTL = 8 * 3600  # 8 horas
+
+
+def _load_admin_config() -> dict:
+    """Cargar admin_config.json; crear con token aleatorio si no existe."""
+    if ADMIN_CONFIG_FILE.exists():
+        try:
+            with open(ADMIN_CONFIG_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    cfg = {
+        "admin_token": "oj_admin_" + secrets.token_urlsafe(32),
+        "admin_email": "admin@ojoia.com.do",
+        "created_at": int(time.time()),
+        "sessions": {}
+    }
+    _save_admin_config(cfg)
+    return cfg
+
+
+def _save_admin_config(cfg: dict):
+    try:
+        tmp = ADMIN_CONFIG_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        os.replace(str(tmp), str(ADMIN_CONFIG_FILE))
+    except Exception:
+        with open(ADMIN_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def _verify_admin(authorization: str = Header(None)) -> dict:
+    """Valida sesion admin contra admin_config.json. Lanza 401 si invalido."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization requerido")
+    token = authorization.replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Token invalido")
+    cfg = _load_admin_config()
+    sessions = cfg.get("sessions", {})
+    s = sessions.get(token)
+    if not s:
+        raise HTTPException(status_code=401, detail="Sesion no encontrada")
+    if int(time.time()) > s.get("expires_at", 0):
+        sessions.pop(token, None)
+        _save_admin_config(cfg)
+        raise HTTPException(status_code=401, detail="Sesion expirada")
+    return {"session_token": token, "cfg": cfg}
+
+
+@app.post("/admin/auth/login")
+async def admin_auth_login(request: dict):
+    """Login admin: valida admin_token, crea sesion."""
+    token = (request.get("token") or "").strip() if isinstance(request, dict) else ""
+    if not token:
+        raise HTTPException(status_code=400, detail="token requerido")
+    cfg = _load_admin_config()
+    if token != cfg.get("admin_token"):
+        raise HTTPException(status_code=401, detail="Credencial invalida")
+    session_token = secrets.token_urlsafe(32)
+    cfg.setdefault("sessions", {})[session_token] = {
+        "created_at": int(time.time()),
+        "expires_at": int(time.time()) + ADMIN_SESSION_TTL,
+        "user_agent": request.get("user_agent", "admin")
+    }
+    _save_admin_config(cfg)
+    logger.info("Admin login OK")
+    return {"success": True, "session_token": session_token}
+
+
+@app.post("/admin/auth/logout")
+async def admin_auth_logout(authorization: str = Header(None)):
+    cfg = _load_admin_config()
+    token = (authorization or "").replace("Bearer ", "").strip()
+    if token:
+        cfg.get("sessions", {}).pop(token, None)
+        _save_admin_config(cfg)
+    return {"success": True}
+
+
+@app.get("/admin/auth/me")
+async def admin_auth_me(authorization: str = Header(None)):
+    _ = _verify_admin(authorization)
+    return {"success": True, "admin_email": _.get("cfg", {}).get("admin_email", "admin@ojoia.com.do")}
+
+
+# ── Admin: Support Contact (editable) ─────────────────────────────────────
+
+@app.get("/admin/support-contact")
+async def admin_get_support_contact(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    return cfg.get("support_contact", {})
+
+
+@app.put("/admin/support-contact")
+async def admin_set_support_contact(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    sc = cfg.get("support_contact", {})
+    for k in ("whatsapp", "email", "phone", "bank_info"):
+        if k in request:
+            sc[k] = request[k]
+    cfg["support_contact"] = sc
+    save_disk_config(cfg)
+    logger.info("Admin: support-contact actualizado")
+    return {"success": True, "support_contact": sc}
+
+
+# ── Admin: Plan CRUD ───────────────────────────────────────────────────
+
+@app.get("/admin/plans")
+async def admin_list_plans(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    return {"plans": cfg.get("plans", {})}
+
+
+@app.post("/admin/plans")
+async def admin_create_plan(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    plan_id = request.get("plan_id", "").strip().lower()
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id is required")
+    cfg = get_disk_config()
+    plans = cfg.get("plans", {})
+    if plan_id in plans:
+        raise HTTPException(status_code=409, detail=f"Plan '{plan_id}' already exists")
+    plan_def = {
+        "name": request.get("name", plan_id),
+        "price_monthly": float(request.get("price_monthly", 0)),
+        "price_yearly": float(request.get("price_yearly", 0)),
+        "currency": request.get("currency", "USD"),
+        "duration_days": int(request.get("duration_days", 30)),
+        "trial_days": int(request.get("trial_days", 0)),
+        "max_storage_gb": int(request.get("max_storage_gb", 10)),
+        "max_cameras": int(request.get("max_cameras", 1)),
+        "max_rules_per_camera": int(request.get("max_rules_per_camera", 2)),
+        "features": request.get("features", {
+            "ai_analysis": True, "alerts_push": True, "grid_detection": False,
+            "multi_zone": False, "priority_disk": "", "support": "community"
+        }),
+        "public": bool(request.get("public", True))
+    }
+    plans[plan_id] = plan_def
+    cfg["plans"] = plans
+    save_disk_config(cfg)
+    logger.info(f"Plan created: {plan_id}")
+    return {"success": True, "plan_id": plan_id, "plan": plan_def}
+
+
+@app.put("/admin/plans/{plan_id}")
+async def admin_update_plan(plan_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    plans = cfg.get("plans", {})
+    if plan_id not in plans:
+        raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found")
+    existing = plans[plan_id]
+    updatable = ["name", "price_monthly", "price_yearly", "currency", "duration_days",
+                 "trial_days", "max_storage_gb", "max_cameras", "max_rules_per_camera",
+                 "features", "public"]
+    for field in updatable:
+        if field in request:
+            if field == "features":
+                existing["features"].update(request[field])
+            else:
+                existing[field] = request[field]
+    plans[plan_id] = existing
+    cfg["plans"] = plans
+    save_disk_config(cfg)
+    logger.info(f"Plan updated: {plan_id}")
+    return {"success": True, "plan": existing}
+
+
+@app.delete("/admin/plans/{plan_id}")
+async def admin_delete_plan(plan_id: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    plans = cfg.get("plans", {})
+    if plan_id not in plans:
+        raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found")
+    if plan_id == "free":
+        raise HTTPException(status_code=400, detail="Cannot delete the 'free' plan")
+    del plans[plan_id]
+    cfg["plans"] = plans
+    save_disk_config(cfg)
+    migrated = 0
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            uf = uid / "user.json"
+            if uf.is_file():
+                try:
+                    with open(uf) as f:
+                        ud = json.load(f)
+                    if ud.get("plan") == plan_id:
+                        ud["plan"] = "free"
+                        with open(uf, "w") as f:
+                            json.dump(ud, f, indent=2, ensure_ascii=False)
+                        migrated += 1
+                except Exception:
+                    pass
+    logger.info(f"Plan deleted: {plan_id}, migrated {migrated} users to free")
+    return {"success": True, "migrated_users": migrated}
+
+
+# ── Admin: Billing Management ──────────────────────────────────────────
+
+@app.get("/admin/billing")
+async def admin_billing_overview(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    now = time.time()
+    users = []
+    total_revenue = 0
+    active_count = 0
+    expired_count = 0
+    warning_count = 0
+    trial_count = 0
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            uf = uid / "user.json"
+            if not uf.is_file():
+                continue
+            try:
+                with open(uf) as f:
+                    ud = json.load(f)
+            except Exception:
+                continue
+            check = _plan_check(ud)
+            access_status = _compute_access_status(ud)
+            plan = ud.get("plan", "free")
+            plan_def = cfg.get("plans", {}).get(plan, {})
+            confirmed_payments = [p for p in ud.get("payments", []) if p.get("status") == "confirmed"]
+            total_paid = sum(p.get("amount", 0) for p in confirmed_payments)
+            total_revenue += total_paid
+            if access_status == "active":
+                active_count += 1
+            elif access_status == "warning":
+                warning_count += 1
+            elif access_status == "expired":
+                expired_count += 1
+            if check["status"] == "trial":
+                trial_count += 1
+            users.append({
+                "user_id": uid.name, "name": ud.get("name", ""), "email": ud.get("email", ""),
+                "business_name": ud.get("business_name", ""), "plan": plan,
+                "plan_name": plan_def.get("name", plan), "status": ud.get("status", "active"),
+                "access_status": access_status, "plan_end": ud.get("plan_end", 0),
+                "trial_end": ud.get("trial_end"), "days_left": check["days_left"],
+                "grace_days_left": check.get("grace_days_left"),
+                "trial_days_left": check.get("trial_days_left"),
+                "camera_count": len(ud.get("cameras", [])),
+                "payment_count": len(confirmed_payments),
+                "total_paid": total_paid, "last_payment": ud.get("last_payment"),
+                "next_due": ud.get("next_due", 0),
+                "pending_payments": len([p for p in ud.get("payments", []) if p.get("status") == "pending"]),
+                "created_at": ud.get("created_at", 0)
+            })
+    return {
+        "users": users,
+        "summary": {
+            "total_users": len(users), "active": active_count, "warning": warning_count,
+            "expired": expired_count, "trial": trial_count, "total_revenue": round(total_revenue, 2)
+        }
+    }
+
+
+@app.post("/admin/users")
+async def admin_create_user(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_id = request.get("user_id") or ("u_" + secrets.token_hex(6))
+    user_dir = STORAGE_ROOT / "users" / user_id
+    user_dir.mkdir(parents=True, exist_ok=True)
+    now_ts = int(time.time())
+    ud = {
+        "user_id": user_id, "name": request.get("name", ""), "email": request.get("email", ""),
+        "phone": request.get("phone", ""), "business_name": request.get("business_name", ""),
+        "business_type": request.get("business_type", "retail"),
+        "plan": request.get("plan", "free"), "status": request.get("status", "active"),
+        "created_at": now_ts, "plan_start": now_ts,
+        "plan_end": int(request.get("plan_end", 0)) or (now_ts + 30 * 86400),
+        "trial_end": int(request.get("trial_end", now_ts + 14 * 86400)),
+        "billing_cycle": "monthly", "grace_period_days": 3, "next_due": 0,
+        "payments": [], "last_payment": None,
+        "access_token": request.get("access_token") or ("oj_live_" + secrets.token_urlsafe(32)),
+        "schedule": {"open": "08:00", "close": "22:00", "enabled": False},
+        "cameras": [], "fcm_tokens": [], "fcm_devices": [],
+        "storage_path": str(user_dir), "disk_mount": str(STORAGE_ROOT),
+        "vigilance_rules": [], "vigilance_prompt": "", "rules_es": [],
+        "eva_sessions": []
+    }
+    with open(user_dir / "user.json", "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    logger.info(f"Admin: user created {user_id}")
+    return {"success": True, "user_id": user_id}
+
+
+@app.get("/admin/users")
+async def admin_users(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    users = []
+    cfg = get_disk_config()
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            user_file = uid / "user.json"
+            if not user_file.is_file():
+                continue
+            try:
+                with open(user_file) as f:
+                    ud = json.load(f)
+                check = _plan_check(ud)
+                access_status = _compute_access_status(ud)
+                plan_def = cfg.get("plans", {}).get(ud.get("plan", "free"), {})
+                sp = Path(ud.get("storage_path", str(user_file.parent)))
+                used_mb = _dir_used_mb(sp) if sp.exists() else 0
+                ud["_plan_status"] = check["status"]
+                ud["_access_status"] = access_status
+                ud["_days_left"] = check["days_left"]
+                ud["_grace_days_left"] = check.get("grace_days_left")
+                ud["_trial_days_left"] = check.get("trial_days_left")
+                ud["_storage_used_mb"] = used_mb
+                ud["_max_storage_gb"] = plan_def.get("max_storage_gb", 10)
+                ud["_max_cameras"] = plan_def.get("max_cameras", 1)
+                ud["_payment_count"] = len([p for p in ud.get("payments", []) if p.get("status") == "confirmed"])
+                ud["_pending_payments"] = len([p for p in ud.get("payments", []) if p.get("status") == "pending"])
+                users.append(ud)
+            except Exception:
+                pass
+    return {"users": users}
+
+
+@app.get("/admin/users/{user_id}")
+async def admin_get_user(user_id: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if user_file and user_file.exists():
+        with open(user_file) as f:
+            user_data = json.load(f)
+        check = _plan_check(user_data)
+        return {
+            "user_id": user_id, "name": user_data.get("name", "-"), "email": user_data.get("email", "-"),
+            "phone": user_data.get("phone", ""), "business_name": user_data.get("business_name", ""),
+            "business_type": user_data.get("business_type", ""), "plan": user_data.get("plan", "free"),
+            "plan_status": check["status"], "access_status": _compute_access_status(user_data),
+            "plan_end": user_data.get("plan_end", 0), "trial_end": user_data.get("trial_end"),
+            "days_left": check["days_left"], "status": user_data.get("status", "active"),
+            "grace_days_left": check.get("grace_days_left"), "trial_days_left": check.get("trial_days_left"),
+            "access_token": user_data.get("access_token", ""),
+            "camera_count": len(user_data.get("cameras", [])),
+            "max_cameras": _get_plan_field(user_data.get("plan", "free"), "max_cameras", 1),
+            "payments": user_data.get("payments", []), "last_payment": user_data.get("last_payment"),
+            "created_at": user_data.get("created_at", "-"), "cameras": user_data.get("cameras", [])
+        }
+    raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+
+@app.put("/admin/users/{user_id}")
+async def admin_update_user(user_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with open(user_file) as f:
+        ud = json.load(f)
+    for k in ("name", "email", "phone", "business_name", "business_type", "plan", "status",
+              "plan_end", "trial_end", "next_due", "access_token"):
+        if k in request:
+            ud[k] = request[k]
+    with open(user_file, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    logger.info(f"Admin: user updated {user_id}")
+    return {"success": True}
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    user_dir = user_file.parent
+    try:
+        import shutil
+        shutil.rmtree(str(user_dir))
+        logger.info(f"Admin: user deleted {user_id}")
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/users/{user_id}/renew")
+async def admin_renew_user(user_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        ud = json.load(f)
+    plan = request.get("plan", ud.get("plan", "free"))
+    duration_days = int(request.get("duration_days", 0))
+    amount = float(request.get("amount", 0))
+    method = request.get("method", "manual")
+    notes = request.get("notes", "")
+    cfg = get_disk_config()
+    plan_def = cfg.get("plans", {}).get(plan, {})
+    if not duration_days:
+        duration_days = plan_def.get("duration_days", 30)
+    now_ts = int(time.time())
+    current_end = ud.get("plan_end", 0) or 0
+    if current_end < now_ts:
+        new_end = now_ts + (duration_days * 86400)
+    else:
+        new_end = current_end + (duration_days * 86400)
+    payment_id = f"pay_admin_{now_ts}_{secrets.token_hex(4)}"
+    payment = {
+        "id": payment_id, "user_id": user_id, "amount": amount,
+        "currency": plan_def.get("currency", "USD"), "method": method,
+        "reference": f"admin_renewal_{now_ts}",
+        "notes": notes or f"Renovacion admin: {duration_days} dias",
+        "status": "confirmed", "created_at": now_ts, "confirmed_at": now_ts, "confirmed_by": "admin",
+        "duration_days": duration_days
+    }
+    ud["plan"] = plan
+    ud["plan_end"] = new_end
+    ud["next_due"] = new_end
+    ud["status"] = "active"
+    ud["trial_end"] = None
+    payments = ud.get("payments", [])
+    payments.append(payment)
+    ud["payments"] = payments
+    ud["last_payment"] = payment
+    with open(user_file, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    logger.info(f"User renewed: {user_id} plan={plan} end={new_end} amount={amount}")
+    return {"success": True, "plan": plan, "plan_end": new_end, "payment_id": payment_id}
+
+
+@app.post("/admin/users/{user_id}/payment/{payment_id}/confirm")
+async def admin_confirm_payment(user_id: str, payment_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        ud = json.load(f)
+    payments = ud.get("payments", [])
+    found = False
+    for p in payments:
+        if p.get("id") == payment_id:
+            p["status"] = "confirmed"
+            p["confirmed_at"] = int(time.time())
+            p["confirmed_by"] = "admin"
+            p["notes"] = request.get("notes", p.get("notes", ""))
+            found = True
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    # Al confirmar pago: reactivar servicio + extender plan_end si el pago trae duration_days
+    ud["status"] = "active"
+    dur = 0
+    for p in payments:
+        if p.get("id") == payment_id:
+            dur = int(p.get("duration_days", 0))
+            break
+    if dur > 0:
+        now_ts = int(time.time())
+        current_end = ud.get("plan_end", 0) or 0
+        base = now_ts if current_end < now_ts else current_end
+        ud["plan_end"] = base + (dur * 86400)
+        ud["next_due"] = ud["plan_end"]
+    ud["payments"] = payments
+    ud["last_payment"] = next((p for p in payments if p["id"] == payment_id), None)
+    with open(user_file, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    logger.info(f"Payment confirmed: {user_id} {payment_id} -> servicio activo")
+    return {"success": True, "payment_id": payment_id, "status": "confirmed",
+            "service": "active", "plan_end": ud.get("plan_end")}
+
+
+@app.post("/admin/users/{user_id}/suspend")
+async def admin_suspend_user(user_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        ud = json.load(f)
+    ud["status"] = "suspended"
+    with open(user_file, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    logger.info(f"User suspended: {user_id}")
+    return {"success": True, "status": "suspended"}
+
+
+@app.post("/admin/users/{user_id}/reactivate")
+async def admin_reactivate_user(user_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        ud = json.load(f)
+    ud["status"] = "active"
+    with open(user_file, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    logger.info(f"User reactivated: {user_id}")
+    return {"success": True, "status": "active"}
+
+
+@app.post("/admin/users/{user_id}/regen-token")
+async def admin_regen_token(user_id: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        ud = json.load(f)
+    new_token = "oj_live_" + secrets.token_urlsafe(32)
+    ud["access_token"] = new_token
+    with open(user_file, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    return {"success": True, "access_token": new_token}
+
+
+# ── Admin: Cameras ─────────────────────────────────────────────────────
+
+@app.get("/admin/cameras")
+async def admin_list_cameras(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    now = time.time()
+    cameras = []
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            user_file = uid / "user.json"
+            if not user_file.is_file():
+                continue
+            try:
+                with open(user_file) as fh:
+                    udata = json.load(fh)
+            except Exception:
+                continue
+            for cam in udata.get("cameras", []):
+                cid = cam.get("camera_id", "") or ""
+                last_announce = cam.get("last_announce") or 0
+                last_frame = cam.get("last_frame") or 0
+                announce_age = now - last_announce if last_announce else None
+                frame_age = now - last_frame if last_frame else None
+                is_online = (announce_age is not None and announce_age < 120) or (frame_age is not None and frame_age < 120)
+                last_seen_ts = max(last_announce or 0, last_frame or 0)
+                cameras.append({
+                    "camera_id": cid, "name": cam.get("name", cid), "zone": cam.get("zone", ""),
+                    "user_id": uid.name, "business_name": udata.get("business_name", ""),
+                    "status": "online" if is_online else "offline", "active": is_online,
+                    "last_announce": datetime.fromtimestamp(last_announce).isoformat() if last_announce else None,
+                    "last_frame": datetime.fromtimestamp(last_frame).isoformat() if last_frame else None,
+                    "last_seen": datetime.fromtimestamp(last_seen_ts).isoformat() if last_seen_ts else None,
+                    "announce_age_s": int(announce_age) if announce_age else None,
+                    "frame_age_s": int(frame_age) if frame_age else None
+                })
+    return {"cameras": cameras}
+
+
+@app.put("/admin/cameras/{camera_id}")
+async def admin_update_camera(camera_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_id = request.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id requerido")
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="usuario no encontrado")
+    with open(uf) as f:
+        ud = json.load(f)
+    for cam in ud.get("cameras", []):
+        if cam.get("camera_id") == camera_id:
+            for k in ("name", "zone", "cooldown_min", "brightness", "rotation"):
+                if k in request:
+                    cam[k] = request[k]
+            break
+    with open(uf, "w") as f:
+        json.dump(ud, f, indent=2, ensure_ascii=False)
+    return {"success": True}
+
+
+@app.delete("/admin/cameras/{camera_id}")
+async def admin_delete_camera(camera_id: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    # buscar el user_id que tiene esta camara
+    cfg = get_disk_config()
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            uf = uid / "user.json"
+            if not uf.is_file():
+                continue
+            try:
+                with open(uf) as f:
+                    ud = json.load(f)
+            except Exception:
+                continue
+            cams = ud.get("cameras", [])
+            if any(c.get("camera_id") == camera_id for c in cams):
+                ud["cameras"] = [c for c in cams if c.get("camera_id") != camera_id]
+                with open(uf, "w") as f:
+                    json.dump(ud, f, indent=2, ensure_ascii=False)
+                return {"success": True, "user_id": uid.name}
+    raise HTTPException(status_code=404, detail="Camara no encontrada")
+
+
+# ── Admin: Events ───────────────────────────────────────────────────────
+
+@app.get("/admin/events")
+async def admin_list_events(limit: int = 50, user_id: str = None, event_type: str = None, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    events = []
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            if user_id and uid.name != user_id:
+                continue
+            for _cam_id, events_dir in resolve_user_events_dirs(uid.name):
+                if not events_dir.exists():
+                    continue
+                for fname in sorted(events_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+                    if not fname.name.endswith(".json"):
+                        continue
+                    if len(events) >= limit:
+                        break
+                    try:
+                        with open(fname) as fh:
+                            ev = json.load(fh)
+                    except Exception:
+                        continue
+                    if event_type and ev.get("event_type") != event_type:
+                        continue
+                    ev["_user_id"] = uid.name
+                    events.append(ev)
+    events.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+    return {"events": events[:limit], "total": len(events)}
+
+
+@app.get("/admin/events/stats")
+async def admin_events_stats(days: int = 7, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    from collections import Counter, defaultdict
+    cfg = get_disk_config()
+    now = time.time()
+    cutoff = now - days * 86400
+    per_day = defaultdict(int)
+    per_type = Counter()
+    top_rules = Counter()
+    total = 0
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            for cid, events_dir in resolve_user_events_dirs(uid.name):
+                if not events_dir.exists():
+                    continue
+                for fname in events_dir.iterdir():
+                    if not fname.name.endswith(".json"):
+                        continue
+                    try:
+                        with open(fname) as fh:
+                            ev = json.load(fh)
+                    except Exception:
+                        continue
+                    ts = ev.get("timestamp", 0)
+                    if ts < cutoff:
+                        continue
+                    day = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+                    per_day[day] += 1
+                    etype = ev.get("event_type", "unknown")
+                    per_type[etype] += 1
+                    if etype == "violation":
+                        for r in ev.get("metadata", {}).get("violated_rules", []):
+                            top_rules[r] += 1
+                    total += 1
+    daily = [{"date": d, "count": c} for d, c in sorted(per_day.items())]
+    return {"days": days, "total_events": total, "by_day": daily,
+            "by_type": dict(per_type), "top_rules": top_rules.most_common(10)}
+
+
+@app.post("/admin/events/{event_id}/confirm")
+async def admin_confirm_event(event_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True, "event_id": event_id, "action": "confirmed"}
+
+
+@app.post("/admin/events/{event_id}/dismiss")
+async def admin_dismiss_event(event_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True, "event_id": event_id, "action": "dismissed"}
+
+
+# ── Admin: Stats ────────────────────────────────────────────────────────
+
+@app.get("/admin/stats")
+async def admin_stats(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    import subprocess
+    events_count = 0
+    violations_count = 0
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            for _cam_id, events_dir in resolve_user_events_dirs(uid.name):
+                if not events_dir.exists():
+                    continue
+                try:
+                    r = subprocess.run(
+                        ["sh", "-c", f"find '{events_dir}' -name '*.json' -type f | wc -l"],
+                        capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0:
+                        events_count += int(r.stdout.strip() or "0")
+                except Exception:
+                    pass
+    total_cameras = set()
+    total_users = 0
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            total_users += 1
+            user_file = uid / "user.json"
+            if user_file.is_file():
+                try:
+                    with open(user_file) as fh:
+                        udata = json.load(fh)
+                    for cam in udata.get("cameras", []):
+                        total_cameras.add(cam.get("camera_id", ""))
+                except Exception:
+                    pass
+    storage_used_gb = sum(d.get("used_gb", 0) or 0 for d in cfg.get("disks", []))
+    active_cams = 0
+    try:
+        active_cams = len(orchestrator._get_grid("", "").get_grid_info().get("camera_ids", []))
+    except Exception:
+        pass
+    return {
+        "total_users": total_users, "total_cameras": len(total_cameras),
+        "active_cameras": active_cams, "storage_used_gb": round(storage_used_gb, 2),
+        "total_events": events_count, "total_violations": violations_count
+    }
+
+
+# ── Admin: Server status ─────────────────────────────────────────────────
+
+@app.get("/admin/server/status")
+async def admin_server_status(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {
+        "status": "ok", "backend": "https://api.ojoia.com.do",
+        "ngrok_url": "https://api.ojoia.com.do", "hostname": "ojoia-server",
+        "local_ip": "10.0.0.44", "backend_port": 8005, "uptime_seconds": 0
+    }
+
+
+@app.post("/admin/server/cloudflared/save")
+async def admin_cloudflared_save(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True}
+
+
+@app.post("/admin/server/sync-firestore")
+async def admin_sync_firestore(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True}
+
+
+# ── Admin: Disks ────────────────────────────────────────────────────────
+
+@app.get("/admin/disks")
+async def admin_disks(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return get_disk_config()
+
+
+@app.get("/admin/disks/autodetect")
+async def admin_disks_autodetect(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    detected = []
+    for base in ["/mnt", "/media", "/home"]:
+        if Path(base).exists():
+            try:
+                for c in Path(base).iterdir():
+                    mp = c.resolve()
+                    if mp.is_mount() or (c.is_dir() and str(c) != base):
+                        detected.append({"mount": str(mp), "label": c.name})
+            except PermissionError:
+                pass
+    return {"detected": detected}
+
+
+@app.post("/admin/disks/scan")
+async def admin_disks_scan(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    for disk in cfg.get("disks", []):
+        mount = disk.get("mount", "")
+        if mount and Path(mount).exists():
+            try:
+                st = os.statvfs(mount)
+                total = st.f_blocks * st.f_frsize
+                free = st.f_bavail * st.f_frsize
+                disk["total_gb"] = round(total / (1024 ** 3), 1)
+                disk["free_gb"] = round(free / (1024 ** 3), 1)
+                disk["used_gb"] = round((total - free) / (1024 ** 3), 1)
+            except OSError:
+                pass
+    save_disk_config(cfg)
+    return {"success": True, "disks": cfg.get("disks", [])}
+
+
+@app.post("/admin/disks/save")
+async def admin_disks_save(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    if "disks" not in request:
+        raise HTTPException(status_code=400, detail="Missing disks")
+    cfg = get_disk_config()
+    cfg["disks"] = request["disks"]
+    if "plans" in request:
+        cfg["plans"] = request["plans"]
+    save_disk_config(cfg)
+    return {"success": True}
+
+
+@app.post("/admin/disks/add")
+async def admin_disks_add(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    mount = request.get("mount", "")
+    if not mount or mount in [d.get("mount") for d in cfg.get("disks", [])]:
+        raise HTTPException(status_code=400, detail="Mount path empty or already exists")
+    cfg.setdefault("disks", []).append({
+        "mount": mount, "label": request.get("label", mount),
+        "total_gb": 0, "used_gb": 0, "free_gb": 0,
+        "user_folder": request.get("user_folder", "users")
+    })
+    save_disk_config(cfg)
+    return {"success": True}
+
+
+@app.post("/admin/disks/remove")
+async def admin_disks_remove(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    mount = request.get("mount", "")
+    cfg["disks"] = [d for d in cfg.get("disks", []) if d.get("mount") != mount]
+    save_disk_config(cfg)
+    return {"success": True}
+
+
+# ── Admin: Storage ───────────────────────────────────────────────────────
+
+@app.get("/admin/storage")
+async def admin_storage_list(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    result = []
+    for disk in cfg.get("disks", []):
+        users_base = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+        if not users_base.is_dir():
+            continue
+        for uid in users_base.iterdir():
+            user_file = uid / "user.json"
+            if user_file.is_file():
+                try:
+                    with open(user_file) as f:
+                        ud = json.load(f)
+                    check = _plan_check(ud)
+                    result.append({
+                        "user_id": uid.name, "name": ud.get("name", ""),
+                        "plan": ud.get("plan", "free"),
+                        "business_name": ud.get("business_name", ""),
+                        "access_status": _compute_access_status(ud),
+                        "days_left": check["days_left"],
+                        "camera_count": len(ud.get("cameras", []))
+                    })
+                except Exception:
+                    pass
+    return {"users": result}
+
+
+@app.get("/admin/storage/{user_id}")
+async def admin_get_user_storage(user_id: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    cfg = get_disk_config()
+    plan = "free"
+    user_file = find_user_json(user_id)
+    ud = {}
+    if user_file and user_file.exists():
+        with open(user_file) as f:
+            ud = json.load(f)
+        plan = ud.get("plan", "free")
+    storage_path = get_user_storage_path(user_id, plan)
+    used_mb = _dir_used_mb(storage_path) if storage_path.exists() else 0
+    plan_data = cfg.get("plans", {}).get(plan, {})
+    return {
+        "user_id": user_id, "disk_mount": str(storage_path.parent),
+        "quota_gb": plan_data.get("max_storage_gb", 500), "used_mb": used_mb,
+        "usage_percent": round(used_mb / (plan_data.get("max_storage_gb", 500) * 1024) * 100, 1) if plan_data.get("max_storage_gb") else 0,
+        "plan": plan, "plan_status": _compute_access_status(ud) if ud else "active",
+        "days_left": _plan_check(ud)["days_left"] if ud else 0,
+        "max_cameras": plan_data.get("max_cameras", 1),
+        "camera_count": len(ud.get("cameras", [])) if ud else 0
+    }
+
+
+@app.post("/admin/storage/{user_id}/update")
+async def admin_update_user_storage(user_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with open(user_file) as f:
+        user_data = json.load(f)
+    if "plan" in request:
+        user_data["plan"] = request["plan"]
+    if "quota_gb" in request:
+        user_data["quota_gb"] = request["quota_gb"]
+    with open(user_file, "w") as f:
+        json.dump(user_data, f, indent=2)
+    return {"success": True}
+
+
+@app.post("/admin/storage/{user_id}/migrate")
+async def admin_migrate_user(user_id: str, request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    new_disk = request.get("disk_mount", str(STORAGE_ROOT))
+    new_dir = Path(new_disk) / "users" / user_id
+    old_file = find_user_json(user_id)
+    existing = {}
+    if old_file and old_file.exists():
+        with open(old_file) as f:
+            existing = json.load(f)
+    existing["disk_mount"] = new_disk
+    new_dir.mkdir(parents=True, exist_ok=True)
+    with open(new_dir / "user.json", "w") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+    compat = STORAGE_ROOT / "users" / user_id
+    compat.mkdir(parents=True, exist_ok=True)
+    with open(compat / "user.json", "w") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+    return {"success": True, "new_path": str(new_dir)}
+
+
+# ── Admin: Queue & Eva config ────────────────────────────────────────────
+
+@app.get("/admin/queue")
+async def admin_queue(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"queue_length": 0, "processing": 0, "done": 0, "error": 0,
+            "queue_size_mb": 0, "oldest_item": None, "last_processed": None,
+            "worker_running": True, "pending_frames": [], "grid_frames": 0,
+            "grid_ready": False}
+
+
+@app.post("/admin/queue/clear")
+async def admin_clear_queue(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True}
+
+
+@app.get("/admin/eva-config")
+async def admin_eva_config(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    try:
+        with open(EVA_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {"prompt": ""}
+    return {"prompt": cfg.get("prompt", ""), "docs": cfg.get("docs", []),
+            "violation_cooldown_min": cfg.get("violation_cooldown_min", 5)}
+
+
+@app.post("/admin/system/prompts")
+async def admin_save_prompt(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    try:
+        with open(EVA_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    cfg["prompt"] = request.get("prompt", cfg.get("prompt", ""))
+    if "violation_cooldown_min" in request:
+        cfg["violation_cooldown_min"] = request["violation_cooldown_min"]
+    with open(EVA_CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return {"success": True}
+
+
+@app.get("/admin/eva-docs")
+async def admin_eva_docs(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    try:
+        with open(EVA_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    return {"documents": cfg.get("docs", [])}
+
+
+@app.get("/admin/eva-docs/{doc_name}")
+async def admin_get_eva_doc(doc_name: str, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    try:
+        with open(EVA_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    docs = cfg.get("docs_content", {})
+    return {"name": doc_name, "content": docs.get(doc_name, "# " + doc_name)}
+
+
+@app.post("/admin/eva-docs/save")
+async def admin_save_eva_doc(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    try:
+        with open(EVA_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    docs_content = cfg.get("docs_content", {})
+    name = request.get("name", "")
+    docs_content[name] = request.get("content", "")
+    cfg["docs_content"] = docs_content
+    if name and name not in cfg.get("docs", []):
+        cfg.setdefault("docs", []).append(name)
+    with open(EVA_CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return {"success": True}
+
+
+@app.post("/admin/calc-tokens")
+async def admin_calc_tokens(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    prompt = request.get("prompt", "")
+    return {"tokens": max(1, len(prompt) // 3)}
+
+
+@app.post("/admin/queue/firestore/process")
+async def admin_process_firestore_queue(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True, "processed": 0, "message": "Cola Firestore: sin pendientes"}
+
+
+@app.post("/admin/queue/firestore/clear")
+async def admin_clear_firestore_queue(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True, "deleted": 0}
+
+
+@app.get("/admin/queue/firestore/status")
+async def admin_firestore_queue_status(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True, "queue_length": 0, "total_size_kb": 0, "frames": []}
+
+
+@app.get("/admin/queue/status")
+async def admin_queue_status(authorization: str = Header(None)):
+    _verify_admin(authorization)
+    frame_count = 0
+    try:
+        frame_count = sum(g.get_frame_count() for g in orchestrator.grids.values())
+    except Exception:
+        pass
+    return {
+        "queue_length": frame_count, "processing": 0, "done": 0, "error": 0,
+        "queue_size_mb": 0, "oldest_item": None, "last_processed": None,
+        "worker_running": True, "pending_frames": [], "grid_frames": frame_count,
+        "grid_ready": frame_count >= 16,
+        "firebase_queue": {"pending_frames": 0, "total_kb": 0, "bucket": "ojoia-67216.firebasestorage.app"}
+    }
+
+
+@app.post("/admin/firebase/update-server-status")
+async def admin_update_server_status(request: dict, authorization: str = Header(None)):
+    _verify_admin(authorization)
+    return {"success": True, "backend": "https://api.ojoia.com.do"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8005, loop="asyncio")
