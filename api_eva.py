@@ -1901,15 +1901,26 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
     for cam_id, events_dir in resolve_user_events_dirs(user_id):
         if not events_dir.exists():
             continue
-        for fname in sorted(events_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if not fname.name.endswith(".json"):
-                continue
+        # Usar scandir (mas eficiente) y limitar cuantos examinamos para no recorrer 9000+ archivos
+        try:
+            entries = [e for e in os.scandir(str(events_dir)) if e.name.endswith(".json") and e.is_file()]
+        except Exception:
+            continue
+        entries.sort(key=lambda e: e.stat(follow_symlinks=False).st_mtime, reverse=True)
+        scanned = 0
+        for entry in entries:
+            scanned += 1
             if len(events) >= limit:
                 break
-            with open(fname) as f:
-                ev = json.load(f)
+            if scanned > limit * 20:
+                break  # seguro: no recorrer todo el storage
+            try:
+                with open(entry.path) as f:
+                    ev = json.load(f)
+            except Exception:
+                continue  # json corrupto/vacio -> skip
             if date == "hoy" or filter == "today":
-                if ev.get("timestamp", 0) < start_of_today:
+                if int(ev.get("timestamp", 0) or 0) < start_of_today:
                     continue
             if filter == "alerts" and ev.get("event_type") != "violation":
                 continue
@@ -1917,14 +1928,12 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
             ev["camera_name"] = cam_names.get(cid, cam_id if cam_id != "_global" else "Camara")
             if ev.get("event_type") == "violation":
                 rule_violated = ev.get("metadata", {}).get("rule_violated", "")
-                qa = rule_violated if rule_violated else ev.get("metadata", {}).get("qwen_analysis", "")[:60]
+                qa = rule_violated if rule_violated else ev.get("metadata", {}).get("qwen_analysis", "")[:60] if isinstance(ev.get("metadata", {}).get("qwen_analysis"), str) else ""
             else:
-                qa = ev.get("metadata", {}).get("qwen_analysis", "")[:100]
+                _qa = ev.get("metadata", {}).get("qwen_analysis", "")
+                qa = (_qa[:100] if isinstance(_qa, str) else "")
             is_violation = ev.get("event_type") in ("violation", "vigilance_alert", "night_alert")
             ev["qwen"] = {"violation": is_violation, "description": qa}
-            # Fix: yolo.count y persons deben usar datos reales del metadata,
-            # no hardcodear a 1. Antes retornaba count:1 para todos los eventos
-            # haciendo que el brief del chat mostrara "0 Detección: 1 objeto".
             ev_meta = ev.get("metadata", {}) if isinstance(ev.get("metadata"), dict) else {}
             yolo_classes = ev_meta.get("yolo_classes") if isinstance(ev_meta, dict) else None
             if isinstance(yolo_classes, str):
@@ -1936,18 +1945,8 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
             yolo_count = md_total_yolo or md_unique or len(yolo_classes) or 1
             ev["yolo"] = {"count": yolo_count, "classes": yolo_classes}
             ev["persons"] = md_unique or yolo_count
-            if "metadata" in ev and "grid_b64" in ev["metadata"]:
+            if "metadata" in ev and isinstance(ev["metadata"], dict) and "grid_b64" in ev["metadata"]:
                 del ev["metadata"]["grid_b64"]
-            img_path = events_dir / f"{ev.get('event_id', '')}.jpg"
-            if img_path.exists():
-                try:
-                    from gateway_resize import resize_image
-                    with open(img_path, "rb") as f:
-                        img_bytes = f.read()
-                    resized = resize_image(img_bytes, max_size=128)
-                    ev["frame_b64"] = base64.b64encode(resized).decode()
-                except Exception as e:
-                    pass
             ev["thumb_url"] = f"https://api.ojoia.com.do/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
             events.append(ev)
     return {"events": events}
