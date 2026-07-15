@@ -5,7 +5,7 @@ page_generator.py - Genera páginas HTML y PDF de reportes diarios
 import json
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 import logging
 
@@ -14,6 +14,47 @@ STORAGE_ROOT = Path("/home/sam/storage")
 REPORTS_DIR = STORAGE_ROOT / "report_pages"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Dominio público donde se sirven los reportes (API, no Firebase Hosting SPA)
+BASE_URL = os.environ.get("OJOIA_REPORTS_BASE_URL", "https://api.ojoia.com.do")
+
+
+def _resolve_date_str(date: str) -> str:
+    """Resuelve 'today', 'yesterday' o fecha ISO a una fecha real."""
+    today = datetime.now().date()
+    if date == "today":
+        return today.strftime("%Y-%m-%d")
+    if date == "yesterday":
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    return date or today.strftime("%Y-%m-%d")
+
+
+def _compute_cutoff_range(date: str, cutoff_hour: Optional[int] = None):
+    """Devuelve (start_ts, end_ts) para el corte del reporte.
+
+    - Si cutoff_hour es None (default): ventana full-day 00:00–23:59 del día base.
+    - Si cutoff_hour se especifica: ventana de 24h que termina a las cutoff_hour
+      del día base (ej. cutoff_hour=12 con date='yesterday' cubre desde
+      12:00 PM de hace 2 días hasta 12:00 PM de ayer).
+    """
+    today = datetime.now().date()
+    if date == "today":
+        base = today
+    elif date == "yesterday":
+        base = today - timedelta(days=1)
+    else:
+        try:
+            base = datetime.strptime(date, "%Y-%m-%d").date()
+        except Exception:
+            base = today
+    day_start = datetime.combine(base, datetime.min.time())
+    if cutoff_hour is None:
+        start_dt = day_start
+        end_dt = day_start + timedelta(days=1)
+    else:
+        end_dt = day_start + timedelta(hours=cutoff_hour)
+        start_dt = end_dt - timedelta(days=1)
+    return start_dt.timestamp(), end_dt.timestamp()
+
 def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
     """
     Genera página HTML completa con gráficos Chart.js
@@ -21,6 +62,7 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
     business_name = report_data.get("business_name", "Tu negocio")
     business_type = report_data.get("business_type", "default")
     summary = report_data.get("summary", {})
+    date_str = _resolve_date_str(date)
     
     # Extraer métricas
     total_events = summary.get("total_events", 0)
@@ -40,11 +82,21 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
     
     # Preparar datos para gráficos
     event_labels = []
-    event_counts = []
-    for i, evt in enumerate(notable_events[:5]):
-        hour = evt.get("datetime", "").split("T")[-1][:5] if "T" in evt.get("datetime", "") else f"Evento {i+1}"
+    event_counts = {}
+    for evt in notable_events:
+        hour = "N/A"
+        dt = evt.get("datetime", "")
+        if "T" in dt:
+            hour = dt.split("T")[-1][:5]
+        elif " " in dt:
+            hour = dt.split(" ")[-1][:5]
+        event_counts[hour] = event_counts.get(hour, 0) + 1
+    for hour, count in sorted(event_counts.items()):
         event_labels.append(hour)
-        event_counts.append(1)
+    event_values = [event_counts[h] for h in event_labels]
+    
+    html_url = f"{BASE_URL}/reportes/{user_id}/reporte_{date_str}.html"
+    pdf_url = f"{BASE_URL}/reportes/{user_id}/reporte_{date_str}.pdf"
     
     html = f"""<!DOCTYPE html>
 <html lang="es">
@@ -55,7 +107,7 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; color: #333; }}
         .container {{ max-width: 900px; margin: 0 auto; background: white; border-radius: 20px; padding: 40px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }}
         .header {{ text-align: center; margin-bottom: 40px; padding-bottom: 30px; border-bottom: 3px solid #667eea; }}
         .header h1 {{ font-size: 2.5rem; color: #1a1a1a; margin-bottom: 10px; }}
@@ -73,6 +125,10 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
         .footer {{ text-align: center; margin-top: 40px; padding-top: 20px; border-top: 2px solid #eee; color: #999; font-size: 0.85rem; }}
         .btn-download {{ display: inline-block; margin-top: 20px; padding: 15px 30px; background: #667eea; color: white; text-decoration: none; border-radius: 10px; font-weight: bold; }}
         .btn-download:hover {{ background: #5568d3; }}
+        .links {{ text-align: center; margin: 20px 0; }}
+        .links a {{ display: inline-block; margin: 0 10px; color: #667eea; text-decoration: none; font-weight: 500; }}
+        .links a:hover {{ text-decoration: underline; }}
+        @media (max-width: 600px) {{ .container {{ padding: 20px; }} .header h1 {{ font-size: 1.8rem; }} }}
     </style>
 </head>
 <body>
@@ -80,7 +136,7 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
         <div class="header">
             <div class="icon">{icon}</div>
             <h1>Reporte Diario</h1>
-            <p><b>{business_name}</b> ({biz_label}) • {date}</p>
+            <p><b>{business_name}</b> ({biz_label}) • {date_str}</p>
         </div>
         
         <div class="stats-grid">
@@ -96,6 +152,11 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
                 <div class="stat-value">{len(notable_events)}</div>
                 <div class="stat-label">🔔 Eventos registrados</div>
             </div>
+        </div>
+        
+        <div class="links">
+            <a href="{pdf_url}">📥 Descargar PDF</a>
+            <a href="https://ojoia.com.do/#chat">💬 Abrir chat</a>
         </div>
         
         <div class="chart-container">
@@ -120,7 +181,7 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
         </div>
         
         <div style="text-align: center;">
-            <a href="/api/reportes/download/{user_id}/{date}.pdf" class="btn-download">📥 Descargar PDF</a>
+            <a href="{pdf_url}" class="btn-download">📥 Descargar PDF</a>
         </div>
         
         <div class="footer">
@@ -137,7 +198,7 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
                 labels: {json.dumps(event_labels)},
                 datasets: [{{
                     label: 'Eventos por hora',
-                    data: {json.dumps(event_counts)},
+                    data: {json.dumps(event_values)},
                     backgroundColor: 'rgba(102, 126, 234, 0.6)',
                     borderColor: 'rgba(102, 126, 234, 1)',
                     borderWidth: 2,
@@ -163,37 +224,41 @@ def generate_report_html(user_id: str, report_data: Dict, date: str) -> str:
     return html
 
 
-async def generate_report_page(user_id: str, date: str = "yesterday", camera_id: str = None) -> Dict[str, Any]:
+async def generate_report_page(user_id: str, date: str = "yesterday", camera_id: str = None, cutoff_hour: Optional[int] = None) -> Dict[str, Any]:
     """
     Genera página HTML y PDF del reporte.
-    Devuelve URLs públicas accesibles.
+    Devuelve URLs públicas accesibles (servidas por api.ojoia.com.do).
+    Por defecto reporta el día completo (00:00–23:59); cutoff_hour activa
+    una ventana móvil de 24h terminando a esa hora.
     """
     try:
-        # 1. Obtener datos del reporte
+        # 1. Calcular rango de corte (default: día completo)
+        start_ts, end_ts = _compute_cutoff_range(date, cutoff_hour)
+        
+        # 2. Obtener datos del reporte con el corte
         from .daily_report import generate_daily_report_pdf
-        report = await generate_daily_report_pdf(user_id, camera_id, date)
+        report = await generate_daily_report_pdf(user_id, camera_id, date, start_ts=start_ts, end_ts=end_ts)
         
         if not report.get("success"):
             return report
         
-        # 2. Generar HTML
-        html_content = generate_report_html(user_id, report, date)
+        # 3. Generar HTML
+        date_str = _resolve_date_str(date)
+        html_content = generate_report_html(user_id, report, date_str)
         
-        # 3. Guardar HTML
+        # 4. Guardar HTML
         page_dir = REPORTS_DIR / user_id
         page_dir.mkdir(parents=True, exist_ok=True)
         
-        date_str = date if date != "yesterday" else datetime.now().strftime("%Y-%m-%d")
         html_file = page_dir / f"reporte_{date_str}.html"
         html_file.write_text(html_content, encoding='utf-8')
         
-        # 4. Generar PDF con reportlab
+        # 5. Generar PDF con reportlab
         pdf_file = await _generate_pdf_from_report(report, page_dir, date_str)
         
-        # 5. URLs públicas (asumiendo que se sirven desde /reportes/)
-        base_url = "https://ojoia.com.do"
-        html_url = f"{base_url}/reportes/{user_id}/reporte_{date_str}.html"
-        pdf_url = f"{base_url}/reportes/{user_id}/reporte_{date_str}.pdf"
+        # 6. URLs públicas reales (servidas por api.ojoia.com.do, no Firebase Hosting)
+        html_url = f"{BASE_URL}/reportes/{user_id}/reporte_{date_str}.html"
+        pdf_url = f"{BASE_URL}/reportes/{user_id}/reporte_{date_str}.pdf"
         
         return {
             "success": True,
@@ -201,7 +266,10 @@ async def generate_report_page(user_id: str, date: str = "yesterday", camera_id:
             "pdf_url": pdf_url,
             "html_path": str(html_file),
             "pdf_path": str(pdf_file),
-            "report": report
+            "report": report,
+            "date_str": date_str,
+            "start_ts": start_ts,
+            "end_ts": end_ts
         }
         
     except Exception as e:

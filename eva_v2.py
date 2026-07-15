@@ -254,10 +254,10 @@ def _count_configured_cameras(user_id: str, ud: Dict) -> int:
     cfg = [c for c in cams if c.get("camera_id") or c.get("id")]
     if cfg:
         return len(cfg)
-    if "cameras" not in ud:
-        ucd = STORAGE_ROOT / "users" / user_id / "cameras"
-        if ucd.exists():
-            return len([d for d in ucd.iterdir() if d.is_dir() and (d / "camera.json").exists()])
+    # Si user.json no lista cámaras (o lista vacía), verificar el FS
+    ucd = STORAGE_ROOT / "users" / user_id / "cameras"
+    if ucd.exists():
+        return len([d for d in ucd.iterdir() if d.is_dir() and (d / "camera.json").exists()])
     return 0
 
 def _load_session(session_id: str) -> Optional[Dict]:
@@ -1233,6 +1233,35 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
             return {"text": result.get("message", ""), "events": []}
         return {"text": f"No pude calcular el flujo: {result.get('error', '')}", "events": []}
 
+    # Resumen de ayer / "y ayer que tal" / "como estuvo ayer" / "ayer que paso"
+    is_yesterday_query = any(w in msg_norm for w in ("ayer", "anoche", "dia anterior", "día anterior"))
+    is_summary_intent = any(p in msg_norm for p in (
+        "que tal", "como estuvo", "cómo estuvo", "que paso", "qué pasó", "como nos fue",
+        "cómo nos fue", "resumen", "como nos fue ayer", "que tal ayer", "que paso ayer",
+        "que hubo", "que hicimos", "novedad", "novedades", "algo que sepas", "reporte de ayer",
+    ))
+    if is_yesterday_query and is_summary_intent and not _is_new_camera_intent(msg_norm):
+        from eva.tools import tool_get_activity_summary
+        result = await tool_get_activity_summary(user_id, "yesterday")
+        total = result.get("total_events", 0)
+        persons = result.get("persons_total", 0)
+        if total == 0:
+            return {"text": f"Ayer no se registraron análisis. La cámara pudo estar inactiva o sin movimiento detectado."}
+        last_summary = (result.get("last_summary", "") or "")[:200]
+        return {"text": f"Ayer se realizaron {total} análisis con {persons} persona(s) única(s). {last_summary}", "events": []}
+
+    # Resumen de hoy / "y hoy que tal"
+    if (any(w in msg_norm for w in ("hoy", "este dia", "este día")) and is_summary_intent
+            and not is_yesterday_query and not _is_new_camera_intent(msg_norm)):
+        from eva.tools import tool_get_activity_summary
+        result = await tool_get_activity_summary(user_id, "today")
+        total = result.get("total_events", 0)
+        persons = result.get("persons_total", 0)
+        if total == 0:
+            return {"text": f"Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta."}
+        last_summary = (result.get("last_summary", "") or "")[:200]
+        return {"text": f"Hoy llevamos {total} análisis con {persons} persona(s) única(s). {last_summary}", "events": []}
+
     # Donde se acumula la gente / heatmap / zonas mas transitadas / mapa de calor
     if any(p in msg_norm for p in ["donde se acumula", "dónde se acumula", "mapa de calor", "heatmap", "heat map",
                                     "zonas mas transitadas", "zonas más transitadas", "que zonas son mas", "que parte del local"]):
@@ -1240,7 +1269,19 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
         date_param = "yesterday" if any(w in msg_norm for w in ("ayer", "anoche")) else "today"
         result = await tool_heatmap_data(user_id, date=date_param, grid_size=16)
         if result.get("success"):
-            return {"text": result.get("message", ""), "events": []}
+            return {
+                "text": result.get("message", ""),
+                "events": [],
+                "heatmap": result.get("heatmap"),
+                "heatmap_meta": {
+                    "grid_size": result.get("grid_size"),
+                    "image_dimensions": result.get("image_dimensions"),
+                    "hotspots": result.get("hotspots"),
+                    "zone_counts": result.get("zone_counts"),
+                    "total_points": result.get("total_points"),
+                    "date": date_param,
+                },
+            }
         return {"text": f"No pude generar el heatmap: {result.get('error', '')}", "events": []}
 
     # Cuanto tiempo en X / permanencia / quien estuvo mas de N minutos / dwell
@@ -1305,7 +1346,14 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if intent_result:
         session["msgs"].append({"role":"assistant","content":intent_result["text"]})
         _sessions[session_id] = session
-        return _mk_resp(session, intent_result["text"], suggestions=suggestions, events_found=intent_result.get("events", []))
+        return _mk_resp(
+            session,
+            intent_result["text"],
+            suggestions=suggestions,
+            events_found=intent_result.get("events", []),
+            heatmap=intent_result.get("heatmap"),
+            heatmap_meta=intent_result.get("heatmap_meta"),
+        )
 
     sys_p = (
         f"Eres Eva, asistente de seguridad de OjoIA en República Dominicana.\n"
@@ -1817,7 +1865,14 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     if intent_result:
         session["msgs"].append({"role":"assistant","content":intent_result["text"]})
         _sessions[session_id] = session
-        return _mk_resp(session, intent_result["text"], suggestions=suggestions, events_found=intent_result.get("events", []))
+        return _mk_resp(
+            session,
+            intent_result["text"],
+            suggestions=suggestions,
+            events_found=intent_result.get("events", []),
+            heatmap=intent_result.get("heatmap"),
+            heatmap_meta=intent_result.get("heatmap_meta"),
+        )
 
     sys_p = (
         f"Eres Eva, asistente de seguridad de OjoIA en República Dominicana.\n"
@@ -2415,7 +2470,7 @@ async def _extract_business_data(user_id, message, session):
 # RESP BUILDER
 # =============================================================================
 
-def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=False, suggestions=None, force_image=False, events_found=None):
+def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=False, suggestions=None, force_image=False, events_found=None, heatmap=None, heatmap_meta=None):
     img_url = ""
     if img_b64 and (force_image or not session.get("image_sent")):
         try:
@@ -2438,4 +2493,6 @@ def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=Fal
         "zone": session.get("zone",""), "has_image": bool(session.get("image_b64")),
         "ready_to_confirm": ready_to_confirm, "camera_saved": camera_saved,
         "suggestions": suggestions or [], "events_found": events_found or [],
+        "heatmap": heatmap or None,
+        "heatmap_meta": heatmap_meta or None,
     }

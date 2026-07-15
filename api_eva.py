@@ -324,28 +324,34 @@ async def send_report_v2(user_id: str, request: Request = None):
             body = {}
         camera_id = body.get("camera_id")
         date = body.get("date", "yesterday")
-        # 1) generar página HTML + PDF (URLs ojoia.com.do)
+        cutoff_hour = body.get("cutoff_hour")  # None = día completo (00:00–23:59)
+
+        # 1) generar página HTML + PDF (URLs api.ojoia.com.do)
         from reportes.page_generator import generate_report_page
-        page = await generate_report_page(user_id, date, camera_id)
+        page = await generate_report_page(user_id, date, camera_id, cutoff_hour=cutoff_hour)
         if not page.get("success"):
             return page
         html_url = page["html_url"]
         pdf_url = page["pdf_url"]
         report = page.get("report", {})
         summary = report.get("summary", {})
+        date_str = page.get("date_str", date)
         biz = report.get("business_name", "Tu negocio")
+
+        # 2) mensaje optimizado para el chat
         message = (
             f"🍽️ *Reporte Diario - {biz}*\n\n"
-            f"📊 Análisis: {summary.get('total_events', 0)}\n"
-            f"👥 Personas únicas: {summary.get('persons_total', 0)}\n\n"
-            f"[📊 Ver reporte]({html_url})\n"
+            f"📅 {date_str}\n"
+            f"📊 {summary.get('total_events', 0)} análisis\n"
+            f"👥 {summary.get('persons_total', 0)} personas únicas\n\n"
+            f"[📊 Ver reporte web]({html_url})\n"
             f"[📥 Descargar PDF]({pdf_url})\n\n"
             f"_Generado automáticamente a las 7:30 AM_"
         )
-        # 2) inyectar en chat session (memoria)
+
+        # 3) inyectar en chat session (memoria)
         try:
             from eva_v2 import _sessions
-            # buscar sesion por user_id, si no, crear
             sid = None
             for k, v in _sessions.items():
                 if v.get("user_id") == user_id:
@@ -357,7 +363,8 @@ async def send_report_v2(user_id: str, request: Request = None):
             _sessions[sid]["messages"].append({"role": "assistant", "content": message, "timestamp": time.time()})
         except Exception as e:
             logger.warning(f"[reportes] inject chat session: {e}")
-        # 3) guardar también en eva_chat_history.json (persistente)
+
+        # 4) guardar también en eva_chat_history.json (persistente)
         try:
             hf = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
             hdata = {"history": [], "summary": ""} if not hf.exists() else json.loads(hf.read_text())
@@ -365,7 +372,8 @@ async def send_report_v2(user_id: str, request: Request = None):
             hf.write_text(json.dumps(hdata, indent=2, ensure_ascii=False))
         except Exception as e:
             logger.warning(f"[reportes] write chat_history: {e}")
-        # 4) push FCM apuntando a la página real (no #chat)
+
+        # 5) push FCM apuntando a la página real
         push_sent = False
         push_ms = 0
         try:
@@ -430,6 +438,21 @@ async def serve_report_file(user_id: str, filename: str):
     if filename.lower().endswith(".pdf"):
         return FileResponse(str(fp), media_type="application/pdf", filename=filename)
     return FileResponse(str(fp), media_type="text/html")
+
+
+# Servir imágenes de alerta vigilante: /vigilance-frame/{user_id}/{event_id}.jpg
+@app.get("/vigilance-frame/{user_id}/{event_id}")
+async def serve_vigilance_frame(user_id: str, event_id: str):
+    """Sirve el frame JPG de una alerta de vigilancia/centinela (para push con imagen)."""
+    from fastapi.responses import FileResponse, HTMLResponse, Response
+    cam_dir = STORAGE_ROOT / "users" / user_id / "cameras"
+    # Buscar el event_id.jpg en cualquier carpeta de cámara
+    for cam_sub in cam_dir.iterdir() if cam_dir.exists() else []:
+        cand = cam_sub / "events" / f"{event_id}.jpg"
+        if cand.exists():
+            return FileResponse(str(cand), media_type="image/jpeg",
+                                headers={"Cache-Control": "private, max-age=600"})
+    return HTMLResponse(content="404 frame no encontrado", status_code=404)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1260,18 +1283,42 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
             except Exception as e:
                 logger.warning(f"Error leyendo archivos de chat: {e}")
 
+        # ts de la ultima actualizacion (server side) - permite al frontend detectar
+        # cambios remotos via polling sin necesidad de SSE. Si user.json tiene
+        # eva_sessions con last_message_at, usamos ese; si viene de legacy, usamos mtime.
+        server_ts = 0
+        try:
+            if uf and uf.exists():
+                with open(uf) as f:
+                    _ud_ts = json.load(f)
+                _sessions_ts = _ud_ts.get("eva_sessions", {}) or {}
+                _latest = 0
+                for _sid, _sd in _sessions_ts.items():
+                    _lm = int(_sd.get("last_message_at", 0) or 0)
+                    if _lm > _latest:
+                        _latest = _lm
+                if _latest:
+                    server_ts = _latest
+            if not server_ts:
+                chat_history_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
+                if chat_history_file.exists():
+                    server_ts = int(chat_history_file.stat().st_mtime)
+        except Exception:
+            pass
+
         return {
             "success": True,
             "history": history,
             "count": len(history),
             "user_id": user_id,
-            "session_id": session_id
+            "session_id": session_id,
+            "ts": server_ts
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error get_eva_chat_history: {e}")
-        return {"success": False, "error": str(e), "history": []}
+        return {"success": False, "error": str(e), "history": [], "ts": 0}
 
 
 # Alias POST para /api/chat/eva/history (compatibilidad con frontend)
@@ -1279,6 +1326,11 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
 async def get_eva_chat_history_post(request: dict):
     """POST = guardar historial completo (compatibilidad con eva-chat-v5.js).
     GET (definido arriba) = leer historial.
+
+    F1+2 fix: ahora persiste los campos completos (events, summary por msg,
+    image_url, image_b64, is_daily_report, report_url) para que el carrusel
+    y los reportes sobrevivan la reload desde backend. Y hace MERGE (no
+    replace): solo anade mensajes con ts > last_message_at del server.
     """
     try:
         user_id = request.get("user_id", "")
@@ -1286,50 +1338,85 @@ async def get_eva_chat_history_post(request: dict):
             return {"success": False, "error": "user_id required"}
         uf = find_user_json(user_id)
         if not uf or not uf.exists():
-            return {"success": True, "history": [], "count": 0}
+            return {"success": True, "history": [], "count": 0, "ts": 0}
         with open(uf) as f:
             ud = json.load(f)
-        history = request.get("history", [])
+        history = request.get("history", []) or []
         summary = request.get("summary", "")
-        if history:
-            sessions = ud.get("eva_sessions", {}) or {}
-            session_id = f"os_{user_id}"
-            # Convertir formato frontend [{role,content}] → guardar
-            saved_msgs = []
-            for h in history:
-                if isinstance(h, dict) and h.get("content"):
-                    saved_msgs.append({
-                        "role": h.get("role", "user"),
-                        "content": h.get("content", ""),
-                        "timestamp": int(time.time())
-                    })
-            sessions[session_id] = {
-                "messages": saved_msgs[-200:],
-                "summary": summary,
-                "created_at": ud.get("eva_sessions", {}).get(session_id, {}).get("created_at", int(time.time())),
-                "last_message_at": int(time.time())
+
+        sessions = ud.get("eva_sessions", {}) or {}
+        session_id = f"os_{user_id}"
+        existing = sessions.get(session_id, {}) or {}
+        existing_msgs = existing.get("messages", []) or []
+        last_message_at = int(existing.get("last_message_at", 0) or 0)
+
+        # MERGE: agregar solo mensajes nuevos (timestamp > last_message_at).
+        # Para detectar nuevos, usamos el timestamp del msg si viene del
+        # frontend; si no (no trae), usamos ts=ahora y lo anadimos.
+        # Ademas preservamos todos los fields que el frontend envia (events,
+        # summary, image_url, image_b64, is_daily_report, report_url).
+        now_ts = int(time.time())
+        existing_keys = set()
+        for m in existing_msgs:
+            key = (m.get("role"), m.get("content"), m.get("timestamp", 0))
+            existing_keys.add(key)
+
+        merged = list(existing_msgs)
+        for h in history:
+            if not isinstance(h, dict):
+                continue
+            content = h.get("content")
+            if content is None:
+                continue
+            msg_ts = h.get("timestamp") or now_ts
+            try:
+                msg_ts = int(float(msg_ts))
+            except Exception:
+                msg_ts = now_ts
+            key = (h.get("role", "user"), content, msg_ts)
+            if key in existing_keys:
+                continue
+            # Anadir solo si msg_ts > last_message_at o si no hay msgs aun
+            if existing_msgs and msg_ts <= last_message_at:
+                continue
+            saved_msg = {
+                "role": h.get("role", "user"),
+                "content": str(content),
+                "timestamp": msg_ts,
             }
-            ud["eva_sessions"] = sessions
-            with open(uf, "w") as f:
-                json.dump(ud, f, indent=2)
-            logger.info(f"[EVA] Historial guardado: {len(saved_msgs)} mensajes para {user_id}")
-            return {
-                "success": True,
-                "history": saved_msgs[-50:],
-                "count": len(saved_msgs),
-                "saved": True,
-                "user_id": user_id
-            }
-        # Si no hay history, devolver lo existente
+            # Preservar fields opcionales (carrusel + reportes + imagenes)
+            for opt_key in ("events", "summary", "is_daily_report", "report_url",
+                            "image_url", "image_b64", "heatmap", "heatmap_meta"):
+                if h.get(opt_key) is not None:
+                    saved_msg[opt_key] = h.get(opt_key)
+            merged.append(saved_msg)
+            existing_keys.add(key)
+
+        # Limitar a ultimos 200
+        merged = merged[-200:]
+        new_last_message_at = max([int(m.get("timestamp", 0) or 0) for m in merged] or [now_ts])
+
+        sessions[session_id] = {
+            "messages": merged,
+            "summary": summary or existing.get("summary", ""),
+            "created_at": existing.get("created_at", now_ts),
+            "last_message_at": new_last_message_at,
+        }
+        ud["eva_sessions"] = sessions
+        with open(uf, "w") as f:
+            json.dump(ud, f, indent=2)
+        logger.info(f"[EVA] Historial guardado: {len(merged)} msgs para {user_id} (last_ts={new_last_message_at})")
         return {
             "success": True,
-            "history": ud.get("eva_sessions", {}).get(f"os_{user_id}", {}).get("messages", [])[-50:],
-            "count": len(ud.get("eva_sessions", {}).get(f"os_{user_id}", {}).get("messages", [])),
-            "user_id": user_id
+            "history": merged[-50:],
+            "count": len(merged),
+            "saved": True,
+            "user_id": user_id,
+            "ts": new_last_message_at
         }
     except Exception as e:
         logger.error(f"[EVA POST history] {e}")
-        return {"success": False, "error": str(e), "history": []}
+        return {"success": False, "error": str(e), "history": [], "ts": 0}
 
 
 @app.post("/api/chat/eva/save")
@@ -2061,7 +2148,38 @@ async def get_cameras(user_id: str):
     if user_file and user_file.exists():
         with open(user_file) as f:
             ud = json.load(f)
-        cams = ud.get("cameras", [])
+        cams = ud.get("cameras", []) or []
+        # ── Auto-discovery: registrar cámaras del FS que no estén en user.json ──
+        cams_dir = STORAGE_ROOT / "users" / user_id / "cameras"
+        known_ids = {c.get("camera_id") for c in cams if c.get("camera_id")}
+        if cams_dir.exists():
+            for d in cams_dir.iterdir():
+                if not d.is_dir() or d.name in known_ids:
+                    continue
+                cj = d / "camera.json"
+                if not cj.exists():
+                    continue
+                try:
+                    cc = json.loads(cj.read_text())
+                    cid = cc.get("camera_id") or d.name
+                except Exception:
+                    cc, cid = {}, d.name
+                last_frame = 0
+                lf = d / "frames" / "latest_raw.jpg"
+                if lf.exists():
+                    last_frame = int(lf.stat().st_mtime)
+                cams.append({
+                    "camera_id": cid,
+                    "name": cc.get("name", cid),
+                    "zone": cc.get("zone", ""),
+                    "business_type": cc.get("business_type", ""),
+                    "business_name": cc.get("business_name", ""),
+                    "active": bool(cc.get("active", True)),
+                    "last_announce": 0,
+                    "last_frame": last_frame,
+                    "configured_at": cc.get("configured_at", 0),
+                })
+                logger.info(f"[cameras] Auto-discovered {cid} for user {user_id}")
         now = time.time()
         result = []
         for cam in cams:
@@ -2113,6 +2231,16 @@ async def get_cameras(user_id: str):
             except:
                 cam_copy["metrics"] = {"total_events": 0, "total_alerts": 0, "today_events": 0, "today_alerts": 0}
             result.append(cam_copy)
+        # Si se autodescubrieron cámaras, persistirlas en user.json para futuras requests rápidas
+        discovered = [c for c in cams if c.get("camera_id") not in known_ids]
+        if discovered:
+            try:
+                ud_existing = ud if isinstance(ud, dict) else {}
+                ud_existing["cameras"] = cams
+                with open(user_file, "w") as f:
+                    json.dump(ud_existing, f, indent=2)
+            except Exception:
+                pass
         return {"cameras": result}
     return {"cameras": []}
 
@@ -2610,12 +2738,24 @@ def _save_vigilance_event(user_id: str, camera_id: str, img_bytes: bytes, yolo_c
         with open(events_dir / f"{event_id}.json", "w") as f:
             json.dump(event_data, f, indent=2, ensure_ascii=False)
         logger.info(f"Vigilance event saved: {event_id}")
-        _send_vigilance_fcm(user_id, camera_id, event_id, yolo_count, yolo_classes)
+        # Pre-codificar imagen miniatura (base64) para el push con foto
+        _img_b64 = None
+        try:
+            from io import BytesIO
+            from PIL import Image as _PILImage
+            _im = _PILImage.open(BytesIO(img_bytes)).convert("RGB")
+            _im.thumbnail((320, 240))
+            _buf = BytesIO()
+            _im.save(_buf, format="JPEG", quality=70)
+            _img_b64 = base64.b64encode(_buf.getvalue()).decode("ascii")
+        except Exception as _ie:
+            logger.warning(f"[vigilance] No pude generar miniatura push: {_ie}")
+        _send_vigilance_fcm(user_id, camera_id, event_id, yolo_count, yolo_classes, image_b64=_img_b64)
     except Exception as e:
         logger.error(f"Error saving vigilance event: {e}")
 
 
-def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count: int, yolo_classes: list):
+def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count: int, yolo_classes: list, image_b64: str = None):
     """Enviar notificación FCM de alerta de vigilancia."""
     try:
         uf = find_user_json(user_id)
@@ -2635,21 +2775,25 @@ def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count:
         title = f"🚨 Alerta: {cam_name}"
         body = f"Modo centinela activo. {yolo_count} objeto(s) detectado(s) fuera de horario."
         from orchestrator import send_fcm_notification
+        # URL pública de la imagen del momento (servida por /vigilance-frame/)
+        img_url = f"https://api.ojoia.com.do/vigilance-frame/{user_id}/{event_id}"
         for token in tokens[:3]:
             asyncio.create_task(send_fcm_notification(
                 title=title,
                 body=body,
                 token=token,
                 user_id=user_id,
+                image_b64=image_b64,
+                image_url=img_url,
                 link=f"https://ojoia.com.do/#events?event={event_id}"
             ))
-        logger.info(f"Vigilance FCM queued to {len(tokens)} tokens")
+        logger.info(f"Vigilance FCM queued to {len(tokens)} tokens (image_url={'yes' if img_url else 'no'})")
     except Exception as e:
         logger.error(f"Error sending vigilance FCM: {e}")
 
 
 def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = None):
-    """Actualizar last_frame de una cámara en user.json."""
+    """Actualizar last_frame de una cámara en user.json. Auto-registra si no existe."""
     if not user_id:
         return
     try:
@@ -2657,10 +2801,32 @@ def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = Non
         if uf and uf.exists():
             with open(uf) as f:
                 ud = json.load(f)
-            for c in ud.get("cameras", []):
+            cameras = ud.get("cameras", []) or []
+            now = int(time.time())
+            found = False
+            for c in cameras:
                 if c.get("camera_id") == camera_id:
-                    c["last_frame"] = int(time.time())
+                    c["last_frame"] = now
+                    if client_ip:
+                        c["last_announce_ip"] = client_ip
+                    found = True
                     break
+            # Auto-registrar nueva cámara (basado en camera.json del FS)
+            if not found and camera_id and camera_id != "unknown":
+                cam_cfg = get_camera_config_static(user_id, camera_id) if 'get_camera_config_static' in globals() else {}
+                cameras.append({
+                    "camera_id": camera_id,
+                    "name": cam_cfg.get("name") or camera_id,
+                    "zone": cam_cfg.get("zone", ""),
+                    "business_type": cam_cfg.get("business_type", ""),
+                    "business_name": cam_cfg.get("business_name", ""),
+                    "active": True,
+                    "last_frame": now,
+                    "last_announce_ip": client_ip or "",
+                    "configured_at": cam_cfg.get("configured_at", now),
+                })
+                logger.info(f"[cameras] Auto-registrada cámara {camera_id} para user {user_id}")
+            ud["cameras"] = cameras
             with open(uf, "w") as f:
                 json.dump(ud, f, indent=2)
     except Exception as e:
@@ -2758,13 +2924,20 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             logger.error(f"Error actualizando YOLO/grid para viewer: {e}")
 
         # ── [5] MODO CENTINELA: alerta directa si YOLO detecta algo ──
+        # En modo vigilante SOLO generamos el evento centinela (YOLO + notificacion).
+        # No se encola para Qwen (capa de inteligencia) — el usuario lo pidio asi:
+        # "es solo yolo detecta personas y notifica, sin capa de inteligencia"
         if is_vigilante and yolo_count > 0:
             logger.warning(f"MODO CENTINELA: {yolo_count} objects {yolo_classes} → alerta directa")
             _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count, yolo_classes, client_ip)
 
         # ── [6] ENCOLAR para grid + Qwen en background ──
-        # YOLO Gate: si count==0, no pasar al grid (ahorro recursos)
-        if yolo_count > 0:
+        # YOLO Gate:
+        #   1) count==0 → descartar
+        #   2) is_vigilante → NO encolar (la alerta centinela de [5] ya fue guardada;
+        #      en modo centinela no queremos capa de inteligencia Qwen, solo YOLO)
+        #   3) resto (count>0, modo normal) → encolar
+        if yolo_count > 0 and not is_vigilante:
             await FRAME_QUEUE.put({
                 "frame_id": frame_id,
                 "user_id": user_id,
@@ -2889,8 +3062,11 @@ async def yolo_worker():
 
             logger.info(f"YOLO gate: {yolo_count} objects {yolo_classes} → frame AGREGADO al grid ({grid.get_frame_count()}/16)")
 
-            # Procesar grid cuando esté lleno (16) o en centinela con ≥4 frames
-            if grid_is_full or (is_vigilante and grid.get_frame_count() >= 4):
+            # Procesar grid solo cuando esté lleno (16 frames en modo normal).
+            # En modo vigilante no procesamos Qwen (defensa en profundidad): la
+            # alerta centinela ya fue guardada por _save_vigilance_event en [5]
+            # y los frames vigilantes no se encolaron en [6].
+            if grid_is_full:
                 grid_result = await orchestrator.process_grid(
                     user_id=user_id,
                     camera_id=camera_id,
@@ -3559,90 +3735,30 @@ async def get_report_urls(user_id: str, date: str):
     Útil para compartir en chat, push, etc.
     """
     try:
-        base_url = "https://ojoia.com.do"
-        html_url = f"{base_url}/api/reportes/view/{user_id}/{date}"
-        pdf_url = f"{base_url}/api/reportes/download/{user_id}/{date}.pdf"
+        base_url = "https://api.ojoia.com.do"
+        date_str = _resolve_report_date(date)
+        html_url = f"{base_url}/reportes/{user_id}/reporte_{date_str}.html"
+        pdf_url = f"{base_url}/reportes/{user_id}/reporte_{date_str}.pdf"
         
         return {
             "success": True,
             "html_url": html_url,
             "pdf_url": pdf_url,
-            "share_url": html_url  # URL para compartir (abre página completa)
+            "share_url": html_url
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/reportes/send-v2")
-async def send_report_v2(user_id: str, request: dict = None):
-    """
-    Endpoint FINAL optimizado:
-    - Genera página HTML + PDF
-    - Inyecta en chat con URL real
-    - Envía push FCM apuntando a URL real
-    - Todo en ~2-3 segundos
-    """
-    try:
-        from reportes.daily_report_prod_v2 import send_daily_report_with_real_url
-        
-        if not user_id:
-            return {"success": False, "error": "user_id required"}
-        
-        camera_id = request.get("camera_id") if request else None
-        date = request.get("date", "yesterday") if request else "yesterday"
-        
-        result = await send_daily_report_with_real_url(user_id, camera_id, date)
-        
-        if result.get("success"):
-            logger.info(
-                f"✅ Reporte v2 enviado a {user_id} | "
-                f"Chat: {result.get('chat_injected')} | "
-                f"Push: {result.get('push_sent')} | "
-                f"Tiempo push: {result.get('push_delivery_time_ms', 0)}ms | "
-                f"Total: {result.get('timing', {}).get('total_ms', 0)}ms | "
-                f"URL: {result.get('html_url', '')[:60]}..."
-            )
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error send_report_v2: {e}")
-        return {"success": False, "error": str(e)}
+def _resolve_report_date(date: str) -> str:
+    """Resuelve 'today'/'yesterday' a fecha ISO."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    if date == "today":
+        return today.strftime("%Y-%m-%d")
+    if date == "yesterday":
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    return date or today.strftime("%Y-%m-%d")
 
 
-# Endpoint para servir páginas de reportes desde el directorio de storage
-@app.get("/reportes/{user_id}/{filename}")
-async def serve_report_page(user_id: str, filename: str):
-    """
-    Sirve páginas HTML y PDFs de reportes.
-    URL: https://ojoia.com.do/reportes/{user_id}/reporte_2026-07-09.html
-    """
-    try:
-        from fastapi.responses import FileResponse, HTMLResponse
-        
-        file_path = REPORTS_DIR / user_id / filename
-        
-        if not file_path.exists():
-            return HTMLResponse(
-                content="<h1>Reporte no encontrado</h1><p>El reporte solicitado no existe o fue generado.</p>",
-                status_code=404
-            )
-        
-        if filename.endswith('.pdf'):
-            return FileResponse(
-                str(file_path),
-                media_type='application/pdf',
-                filename=filename
-            )
-        else:
-            # HTML
-            html_content = file_path.read_text(encoding='utf-8')
-            return HTMLResponse(content=html_content)
-            
-    except Exception as e:
-        logger.error(f"Error sirviendo reporte: {e}")
-        from fastapi.responses import HTMLResponse
-        return HTMLResponse(
-            content=f"<h1>Error</h1><p>{str(e)}</p>",
-            status_code=500
-        )
+# (El endpoint POST /api/reportes/send-v2 se define arriba, línea ~313)

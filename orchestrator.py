@@ -341,8 +341,9 @@ def _send_night_fcm(cam_cfg, user_id, camera_id, frame_bytes, event_id, persons)
 
 
 async def send_fcm_notification(title: str, body: str, token: str = None,
-                                    user_id: str = None, image_b64: str = None, link: str = "https://ojoia.com.do/#events"):
-    """Enviar notificación push via Firebase Cloud Messaging (API HTTP v1 con OAuth2)."""
+                                    user_id: str = None, image_b64: str = None, image_url: str = None, link: str = "https://ojoia.com.do/#events"):
+    """Enviar notificación push via Firebase Cloud Messaging (API HTTP v1 con OAuth2).
+    image_b64: imagen embebida (data payload); image_url: URL accesible (webpush.image)."""
     import logging as _log
     try:
         from google.oauth2 import service_account
@@ -379,20 +380,25 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
         }
         
         sent = 0
+        _img_field = image_url or (f"data:image/jpeg;base64,{image_b64}" if image_b64 else None)
         for tok in tokens:
             try:
+                _notif = {"title": title, "body": body}
+                if _img_field:
+                    _notif["image"] = _img_field
                 _payload = {
                     "message": {
                         "token": tok,
-                        "notification": {"title": title, "body": body},
+                        "notification": _notif,
                             "data": {
                             "type": "violation",
                             "url": link,
-                            "event_id": link.split('alert=')[-1].split('&')[0] if 'alert=' in link else "",
+                            "event_id": link.split('alert=')[-1].split('&')[0] if 'alert=' in link else (link.split('event=')[-1].split('&')[0] if 'event=' in link else ""),
                             "camera_id": link.split('camera=')[-1].split('&')[0] if 'camera=' in link else "",
                             "title": title,
                             "body": body,
-                            "tag": "violation"
+                            "tag": "violation",
+                            **({"image": _img_field} if _img_field else {}),
                         },
 
                         "webpush": {
@@ -402,7 +408,8 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
                                 "icon": "/img/icon-192.png",
                                 "badge": "/img/icon-192.png",
                                 "require_interaction": True,
-                                "tag": "violation"
+                                "tag": "violation",
+                                **({"image": _img_field} if _img_field else {}),
                             },
                             "fcm_options": {"link": link}
                         }

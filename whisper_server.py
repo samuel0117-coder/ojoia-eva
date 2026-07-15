@@ -38,6 +38,10 @@ WHISPER_MEM_FRAC = float(os.getenv("WHISPER_MEM_FRAC", "0.20"))
 # with "type_error.302". int8 never crashes but is ~150ms slower per audio.
 # Default is int8 for production reliability. Override with WHISPER_COMPUTE=float16.
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8").lower()  # "float16" or "int8"
+# Modelo CT2. El "openai/whisper-large-v3-turbo" auto-convertido quedó corrupto
+# (config formato transformers, sin alignment_heads/lang_ids -> type_error.302).
+# Usamos una conversión CT2 sana y canónica por defecto.
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
 USE_BATCHED = os.getenv("WHISPER_USER_BATCHED", "false").lower() in ("true", "1", "yes")
 
 app = FastAPI(title="Whisper Turbo ASR", version="2.0")
@@ -79,14 +83,21 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                 active[priority] += 1
             try:
                 # Build kwargs depending on whether batched pipeline is available
+                # VAD params optimizados para rechazo de ruido/tos/"gracias"/"suscríbete"/etc
+                # threshold mayor = menos falsos positivos (ruido no es voz)
+                # min_speech_duration_ms mayor = rechaza tos/respiraciones (cortas <250ms)
+                # min_silence_duration_ms menor = segmenta más rápido
+                # speech_pad_ms = margen en bordes (no recorta palabras iniciales)
                 transcribe_kwargs = dict(
                     language=language,
                     task="transcribe",
-                    vad_filter=True,                # ← Silero VAD
+                    vad_filter=True,                # Silero VAD
                     vad_parameters=dict(
-                        threshold=0.35,
-                        min_speech_duration_ms=150,
+                        threshold=0.40,              # era 0.42 → menos falso-negativo (palabra suave no se corta)
+                        min_speech_duration_ms=200,  # era 300 → palabra corta inicial se acepta
                         max_speech_duration_s=20,
+                        min_silence_duration_ms=400, # era 200 → tolerate natural pauses 200-300ms
+                        speech_pad_ms=250,           # era 200 → +50ms más para no comer sílabas
                     ),
                 )
                 if USE_BATCHED and _HAS_BATCHED:
@@ -119,7 +130,7 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                             log.info("[Whisper] Loading int8 fallback model...")
                             def _load_int8():
                                 return WhisperModel(
-                                    "openai/whisper-large-v3-turbo",
+                                    WHISPER_MODEL,
                                     device="cuda",
                                     compute_type="int8",
                                 )
@@ -174,7 +185,7 @@ async def load_model():
         print(f"[Whisper] WARN: no se pudo fijar VRAM cap: {e}")
     try:
         base = WhisperModel(
-            "openai/whisper-large-v3-turbo",
+            WHISPER_MODEL,
             device="cuda",
             compute_type=WHISPER_COMPUTE,
         )

@@ -26,8 +26,9 @@ for user_dir in "$STORAGE"/users/*/; do
       continue
     fi
   fi
+  # Enviar reporte del día anterior (día completo 00:00–23:59)
   resp=$(curl -sS -X POST -H "Content-Type: application/json" \
-    -d '{"camera_id":null,"date":"today"}' \
+    -d '{"camera_id":null,"date":"yesterday"}' \
     "$API_BASE/api/reportes/send-v2?user_id=$uid" || echo "curl_fail")
   echo "    resp: $(echo "$resp" | head -c 200)" >> "$LOG"
 done

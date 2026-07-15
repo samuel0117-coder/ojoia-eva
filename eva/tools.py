@@ -292,6 +292,15 @@ async def tool_list_employees(user_id: str) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+def _evt_sort_key(p):
+    """Timestamp del evento para ordenar (0 si el JSON está corrupto/vacío)."""
+    try:
+        if not p.name.endswith(".json"):
+            return 0
+        return int(json.loads(p.read_text(encoding='utf-8', errors='ignore')).get("timestamp", 0) or 0)
+    except Exception:
+        return 0
+
 def _iter_events(user_id: str, camera_id: str = None, date_filter: str = None):
     """Iterador sobre eventos del diario con filtros."""
     base = STORAGE_ROOT / "users" / user_id / "cameras"
@@ -304,20 +313,22 @@ def _iter_events(user_id: str, camera_id: str = None, date_filter: str = None):
         events_dir = cam_dir / "events"
         if not events_dir.exists():
             continue
-        for evt_file in sorted(events_dir.glob("*.json"), key=lambda p: (json.loads(p.read_text()).get("timestamp", 0) if p.name.endswith(".json") else 0), reverse=True):
+        for evt_file in sorted(events_dir.glob("*.json"), key=_evt_sort_key, reverse=True):
             try:
-                evt = json.loads(evt_file.read_text())
-                if date_filter:
-                    evt_date = evt.get("datetime", "")[:10]
-                    evt_ts = int(evt.get("timestamp", 0) or 0)
-                    if date_filter == "today" and evt_date != _date.today().isoformat():
-                        continue
-                    if date_filter == "yesterday" and evt_date != (_date.today() - timedelta(days=1)).isoformat():
-                        continue
-                    if date_filter == "recent" and evt_ts < int(time.time()) - 24 * 60 * 60:
-                        continue
-                    if date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
-                        continue
+                evt = json.loads(evt_file.read_text(encoding='utf-8', errors='ignore'))
+            except Exception:
+                continue  # saltar archivos JSON corruptos/vacíos
+            try:
+                evt_date = evt.get("datetime", "")[:10]
+                evt_ts = int(evt.get("timestamp", 0) or 0)
+                if date_filter == "today" and evt_date != _date.today().isoformat():
+                    continue
+                if date_filter == "yesterday" and evt_date != (_date.today() - timedelta(days=1)).isoformat():
+                    continue
+                if date_filter == "recent" and evt_ts < int(time.time()) - 24 * 60 * 60:
+                    continue
+                if date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
+                    continue
                 yield evt, cam_dir.name
             except Exception:
                 pass
@@ -859,14 +870,35 @@ def _max_importance(items):
     return "baja"
 
 
-async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: str = None) -> dict:
-    """Resume la actividad de un día desde el diario (enfoque descriptivo).
+async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: str = None, start_ts: float = None, end_ts: float = None) -> dict:
+    """Resume la actividad de un día o rango desde el diario (enfoque descriptivo).
 
     NUEVO: No cuenta "violaciones" — cuenta observaciones, personas, transacciones.
+    NUEVO 2: soporta start_ts/end_ts para cortes parciales (ej. hasta 12:00 PM).
     """
     events = []
-    for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
-        events.append(evt)
+    if start_ts is not None or end_ts is not None:
+        # Rango horario: escanear los días necesarios y filtrar por timestamp.
+        from datetime import datetime
+        dates_to_scan = set()
+        if start_ts:
+            dates_to_scan.add(datetime.fromtimestamp(start_ts).date().isoformat())
+        if end_ts:
+            dates_to_scan.add(datetime.fromtimestamp(end_ts).date().isoformat())
+        # También incluir el date si es una fecha ISO concreta
+        if date and date not in ("today", "yesterday"):
+            dates_to_scan.add(date)
+        for d in sorted(dates_to_scan):
+            for evt, cam_name in _iter_events(user_id, camera_id, d):
+                evt_ts = int(evt.get("timestamp", 0) or 0)
+                if start_ts is not None and evt_ts < start_ts:
+                    continue
+                if end_ts is not None and evt_ts >= end_ts:
+                    continue
+                events.append(evt)
+    else:
+        for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
+            events.append(evt)
 
     if not events:
         return {"period": date or "today", "total_events": 0, "summary": "Sin eventos registrados."}
@@ -896,7 +928,8 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
     # ── Personas únicas diarias: máximo de personas entre eventos (no suma) ──
     unique_persons_day = max(persons_values) if persons_values else 0
 
-    summary_parts = [f"📊 Hoy se realizaron {total} análisis de seguridad."]
+    period_label = "Hoy" if (date or "today") == "today" else ("Ayer" if (date or "") == "yesterday" else "El período")
+    summary_parts = [f"📊 {period_label} se realizaron {total} análisis de seguridad."]
     if unique_persons_day > 0:
         summary_parts.append(f"👥 Se observaron hasta {unique_persons_day} persona(s) en la escena a la vez (según tracker).")
     if total_clientes_estimado > 0:
@@ -969,9 +1002,11 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
         "last_yolo": latest_yolo,
         "last_summary": last_summary,
         "details": latest_qjson.get("details", {}),
-        "notable_events": notable_events,
         "summary": "\n".join(summary_parts),
+        "notable_events": notable_events,
+        "mode": "descriptivo"
     }
+
 
 
 async def tool_find_anomalies(user_id: str, min_severity: str = "media",

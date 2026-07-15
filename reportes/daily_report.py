@@ -57,10 +57,10 @@ SMART_SUMMARY_CONFIG = {
     }
 }
 
-async def generate_daily_report_pdf(user_id: str, camera_id: str = None, date: str = "today") -> Dict[str, Any]:
+async def generate_daily_report_pdf(user_id: str, camera_id: str = None, date: str = "today", start_ts: float = None, end_ts: float = None) -> Dict[str, Any]:
     try:
         from eva.tools import tool_get_activity_summary
-        summary_data = await tool_get_activity_summary(user_id, date, camera_id)
+        summary_data = await tool_get_activity_summary(user_id, date, camera_id, start_ts=start_ts, end_ts=end_ts)
         
         user_file = STORAGE_ROOT / "users" / user_id / "user.json"
         if user_file.exists():
@@ -76,7 +76,15 @@ async def generate_daily_report_pdf(user_id: str, camera_id: str = None, date: s
         report_dir = STORAGE_ROOT / "users" / user_id / "daily_reports"
         report_dir.mkdir(parents=True, exist_ok=True)
         
-        date_str = date if date != "today" else datetime.now().strftime("%Y-%m-%d")
+        # Fecha real para el archivo. Soporta "today", "yesterday" o fecha ISO.
+        today = datetime.now().date()
+        if date == "today":
+            date_str = today.strftime("%Y-%m-%d")
+        elif date == "yesterday":
+            date_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            date_str = date or today.strftime("%Y-%m-%d")
+        
         camera_suffix = f"_{camera_id}" if camera_id else ""
         pdf_filename = f"reporte_{date_str}{camera_suffix}.html"
         pdf_path = report_dir / pdf_filename
@@ -137,7 +145,8 @@ async def generate_daily_report_pdf(user_id: str, camera_id: str = None, date: s
             "business_type": business_type,
             "business_name": business_name,
             "config_used": config,
-            "generated_at": datetime.now().timestamp()
+            "generated_at": datetime.now().timestamp(),
+            "date_str": date_str
         }
         
     except Exception as e:
@@ -145,22 +154,23 @@ async def generate_daily_report_pdf(user_id: str, camera_id: str = None, date: s
         return {"success": False, "error": str(e)}
 
 
-async def send_daily_report_to_chat(user_id: str, camera_id: str = None, date: str = "today") -> Dict[str, Any]:
-    report_result = await generate_daily_report_pdf(user_id, camera_id, date)
+async def send_daily_report_to_chat(user_id: str, camera_id: str = None, date: str = "today", start_ts: float = None, end_ts: float = None) -> Dict[str, Any]:
+    report_result = await generate_daily_report_pdf(user_id, camera_id, date, start_ts=start_ts, end_ts=end_ts)
     
     if not report_result.get("success"):
         return {"success": False, "error": report_result.get("error")}
     
     config = report_result.get("config_used", SMART_SUMMARY_CONFIG["default"])
     summary = report_result.get("summary", {})
+    date_str = report_result.get("date_str", date)
     
     chat_url = f"/chat?user={user_id}"
     message = (
-        f"{config['icon']} *{config['title']}*\n\n"
+        f"{config['icon']} *{config['title']} - {date_str}*\n\n"
         f"{summary.get('summary', 'Sin resumen disponible')}\n\n"
         f"📄 *Reporte completo:* {report_result.get('pdf_url', 'No disponible')}\n\n"
         f"[💬 Ver en el Chat]({chat_url})\n\n"
-        f"_Este reporte se genera automáticamente todos los días a las 7:30 AM_"
+        f"_Generado automáticamente a las 7:30 AM_"
     )
     
     return {
@@ -169,6 +179,7 @@ async def send_daily_report_to_chat(user_id: str, camera_id: str = None, date: s
         "pdf_url": report_result.get("pdf_url"),
         "pdf_path": report_result.get("pdf_path")
     }
+
 
 
 async def send_daily_report_push_notification(user_id: str, report_message: str, pdf_url: str = None):
