@@ -54,7 +54,7 @@ model = None
 _fallback_model = None  # int8 fallback, lazy-loaded on CTranslate2 type_error.302
 _fallback_lock = None   # asyncio.Lock for lazy-loading the fallback model
 _fallback_transient_lock = None  # asyncio.Lock for serializing int8 retries
-queue = asyncio.Queue(maxsize=0)  # ilimitada: el bus es el gate real de concurrencia
+queue = asyncio.Queue()
 results = {}
 next_id = 1
 active = {"high": 0, "normal": 0}
@@ -104,16 +104,11 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                     transcribe_kwargs["batch_size"] = WHISPER_BATCH_SIZE  # segment-level batching
 
                 try:
-                    segments, info = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            model.transcribe,
-                            tmp_path,
-                            **transcribe_kwargs,
-                        ),
-                        timeout=60,
+                    segments, info = await asyncio.to_thread(
+                        model.transcribe,
+                        tmp_path,
+                        **transcribe_kwargs,
                     )
-                except asyncio.TimeoutError:
-                    raise RuntimeError("transcripcion excedio 60s (audio anomalo)")
                 except RuntimeError as e:
                     if "type_error.302" not in str(e):
                         raise
@@ -184,7 +179,7 @@ async def load_model():
     # Hard cap de VRAM por proceso: protege contra OOM-sistémico en producción.
     # Si se excede, PyTorch lanza RuntimeError en lugar de tirar todo el servidor.
     try:
-        torch.cuda.set_per_process_memory_fraction(WHISPER_MEM_FRAC, device=int(GPU_ID))
+        torch.cuda.set_per_process_memory_fraction(WHISPER_MEM_FRAC, device=0)
         print(f"[Whisper] VRAM hard cap = {WHISPER_MEM_FRAC*100:.0f}% del total (GPU {GPU_ID}, visible device=0)")
     except Exception as e:
         print(f"[Whisper] WARN: no se pudo fijar VRAM cap: {e}")
@@ -239,10 +234,7 @@ async def transcribe(
 
         job_id = str(next_id)
         next_id += 1
-        # El bus (service_bus) ya es el gate de concurrencia real.
-        # Aqui solo encolamos y esperamos; NO rechazamos (evita 429 espurios
-        # por cola interna llena cuando el upstream ya esta limitado).
-        await queue.put((job_id, tmp_path, language, priority))
+        queue.put_nowait((job_id, tmp_path, language, priority))
         asyncio.create_task(transcribe_worker(job_id, tmp_path, language, priority))
 
         while job_id not in results:
@@ -299,4 +291,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8008)
+    uvicorn.run(app, host="0.0.0.0", port=8008)
