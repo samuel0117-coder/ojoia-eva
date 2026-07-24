@@ -34,6 +34,9 @@ WHISPER_NORMAL_WORKERS = int(os.getenv("WHISPER_NORMAL_WORKERS", "4"))
 WHISPER_GLOBAL_CONCURRENT = int(os.getenv("WHISPER_GLOBAL_CONCURRENT", "4"))
 WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "4"))
 WHISPER_MEM_FRAC = float(os.getenv("WHISPER_MEM_FRAC", "0.20"))
+# Beam size: default 5. Bajar a 1 reduce ~40-60% tiempo por audio corto
+# (calidad WER sube levemente, aceptable para transcripcion/streaming de baja latencia).
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
 # Compute type: float16 is faster but CTranslate2 crashes on certain audio
 # with "type_error.302". int8 never crashes but is ~150ms slower per audio.
 # Default is int8 for production reliability. Override with WHISPER_COMPUTE=float16.
@@ -92,12 +95,14 @@ async def transcribe_worker(job_id, tmp_path, language, priority):
                     language=language,
                     task="transcribe",
                     vad_filter=True,                # Silero VAD
+                    beam_size=WHISPER_BEAM_SIZE,   # 1 = baja latencia (streaming), 5 = max calidad
+                    condition_on_previous_text=False,  # evita arrastrar errores/alucinaciones entre chunks
                     vad_parameters=dict(
                         threshold=0.40,              # era 0.42 → menos falso-negativo (palabra suave no se corta)
-                        min_speech_duration_ms=200,  # era 300 → palabra corta inicial se acepta
+                        min_speech_duration_ms=200,  # era 150 → rechaza tos/clics <200ms (llamadas Whisper inutiles)
                         max_speech_duration_s=20,
-                        min_silence_duration_ms=400, # era 200 → tolerate natural pauses 200-300ms
-                        speech_pad_ms=250,           # era 200 → +50ms más para no comer sílabas
+                        min_silence_duration_ms=500, # era 300 → no corta en micro-pausas entre palabras/frases
+                        speech_pad_ms=300,           # era 200 → margen para no recortar bordes de palabras
                     ),
                 )
                 if USE_BATCHED and _HAS_BATCHED:

@@ -1243,14 +1243,14 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
                     msgs = sessions[session_id].get("messages", [])
                     history = msgs[-limit:]
                 elif not session_id:
-                    # Todas las sesiones, ordenado por ts
+                    # Todas las sesiones, ordenado por ts cronologico (viejo -> nuevo)
                     all_msgs = []
                     for sid, sdata in sessions.items():
                         for m in sdata.get("messages", []):
                             m2 = {**m, "session_id": sid}
                             all_msgs.append(m2)
-                    all_msgs.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-                    history = all_msgs[:limit]
+                    all_msgs.sort(key=lambda x: x.get("timestamp", 0), reverse=False)
+                    history = all_msgs[-limit:] if limit else all_msgs
             except Exception as e:
                 logger.warning(f"Error leyendo eva_sessions from user.json: {e}")
 

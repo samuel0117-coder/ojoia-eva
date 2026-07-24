@@ -13,6 +13,7 @@ import math
 import time
 import logging
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # --- GPU selection (must run BEFORE torch is imported) ---
 GPU_ID = os.getenv("YOLO_GPU", "1")
@@ -32,7 +33,20 @@ import uvicorn
 YOLO_MEM_FRAC = float(os.getenv("YOLO_MEM_FRAC", "0.10"))
 YOLO_GLOBAL_CONCURRENT = int(os.getenv("YOLO_GLOBAL_CONCURRENT", "2"))
 YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
-YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8s-pose.pt")
+# Preferencia de modelo: TensorRT engine (.engine) si existe (FP16, 2x mas
+# rapido en batch=1), fallback a PyTorch (.pt). Override via YOLO_MODEL.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def _default_model():
+    env = os.getenv("YOLO_MODEL")
+    if env:
+        return env
+    eng = os.path.join(_BASE_DIR, "yolov8s-pose.engine")
+    pt = os.path.join(_BASE_DIR, "yolov8s-pose.pt")
+    if os.path.exists(eng):
+        print(f"[yolo_server] Modelo TRT encontrado: {eng} (FP16)", flush=True)
+        return eng
+    return pt
+YOLO_MODEL = _default_model()
 DEFAULT_PERSON_CONF = float(os.getenv("YOLO_PERSON_CONF", "0.35"))
 DEFAULT_MIN_POSE = float(os.getenv("YOLO_MIN_POSE_SCORE", "0.35"))
 TRACK_SMOOTHING = float(os.getenv("TRACK_SMOOTHING", "0.35"))
@@ -46,6 +60,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 model = None
 global_semaphore = asyncio.Semaphore(YOLO_GLOBAL_CONCURRENT)
 trackers = {}
+
+# ThreadPool dedicado al decode de imagenes (PIL libera el GIL => paralelo real).
+# Tamano = concurrent * 2 (fuerza de trabajo para prefill de colas).
+_DECODE_WORKERS = max(YOLO_GLOBAL_CONCURRENT * 2, 8)
+decode_pool = ThreadPoolExecutor(max_workers=_DECODE_WORKERS,
+                                 thread_name_prefix="yolo-decode")
+
+# ThreadPool dedicado al postproceso (tracking + rgb_center tiene peso CPU).
+# Separar del decode evita que el postproceso bloquee la cola de inferencia.
+_POST_WORKERS = max(YOLO_GLOBAL_CONCURRENT * 2, 8)
+post_pool = ThreadPoolExecutor(max_workers=_POST_WORKERS,
+                               thread_name_prefix="yolo-post")
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +262,27 @@ def _get_tracker(camera_id):
 
 
 # ---------------------------------------------------------------------------
+# Image decode (paralelo en threads; PIL libera el GIL durante el decode)
+# ---------------------------------------------------------------------------
+
+def _pil_from_bytes(b):
+    """Decode de una imagen en un thread. Devuelve PIL.Image RGB."""
+    return Image.open(io.BytesIO(b)).convert('RGB')
+
+
+async def _decode_parallel(imgs_bytes, loop=None):
+    """Decodifica N imagenes en paralelo usando el decode_pool.
+    No bloquea el event loop: corre en threads (PIL libera GIL).
+    """
+    loop = loop or asyncio.get_event_loop()
+    decoded = await asyncio.gather(
+        *[loop.run_in_executor(decode_pool, _pil_from_bytes, b)
+          for b in imgs_bytes]
+    )
+    return list(decoded)
+
+
+# ---------------------------------------------------------------------------
 # Inference core (shared /detect and /detect_batch)
 # ---------------------------------------------------------------------------
 
@@ -280,14 +327,14 @@ def _run_yolo(imgs, conf):
 
 
 def _avg_rgb_center(pil_img, bbox):
-    """Devuelve el RGB promedio de la zona central del bbox.
+    """RGB promedio de la zona central del bbox (torso).
 
-    Recorta una caja central pequena (30% ancho x 40% alto, verticalmente
-    centrada en el torso). Devuelve [r, g, b] como ints, o None si falla.
+    Vectorizado con NumPy: evita la lista Python de píxeles, que era
+    el cuello de CPU (sum() en Python por cada pixel de cada persona).
     """
-    from PIL import Image as _PILImage
     if pil_img is None or not bbox or len(bbox) != 4:
         return None
+    import numpy as np
     x1, y1, x2, y2 = [int(round(v)) for v in bbox]
     w_img, h_img = pil_img.size
     x1 = max(0, min(w_img - 1, x1))
@@ -298,17 +345,14 @@ def _avg_rgb_center(pil_img, bbox):
         return None
     cx1 = x1 + int(0.35 * (x2 - x1))
     cx2 = x1 + int(0.65 * (x2 - x1))
-    # Zona central vertical: 35-65% (típicamente torso)
     cy1 = y1 + int(0.35 * (y2 - y1))
     cy2 = y1 + int(0.65 * (y2 - y1))
     crop = pil_img.crop((cx1, cy1, cx2, cy2)).convert("RGB")
-    pixels = list(crop.getdata())
-    if not pixels:
+    arr = np.asarray(crop, dtype=np.float64)
+    if arr.size == 0:
         return None
-    r = sum(p[0] for p in pixels) // len(pixels)
-    g = sum(p[1] for p in pixels) // len(pixels)
-    b = sum(p[2] for p in pixels) // len(pixels)
-    return [r, g, b]
+    avg = arr.reshape(-1, 3).mean(axis=0)
+    return [int(avg[0]), int(avg[1]), int(avg[2])]
 
 
 def _postprocess(per_image, camera_ids):
@@ -347,6 +391,25 @@ async def load_model():
              f"imgsz={YOLO_IMGSZ} mem_frac={YOLO_MEM_FRAC} "
              f"global_concurrent={YOLO_GLOBAL_CONCURRENT}")
 
+    # --- Fijar paginas en RAM (NO swap): mlockall MCL_CURRENT|MCL_FUTURE ---
+    # Blindaje de YOLO contra swap. Solo este proceso queda en RAM,
+    # el resto del sistema sigue usando swap libremente.
+    try:
+        import ctypes
+        MCL_CURRENT = 0x0001
+        MCL_FUTURE = 0x0002
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        rc = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+        if rc == 0:
+            log.info("mlockall OK: paginas YOLO fijas en RAM (no swap)")
+        else:
+            err = ctypes.get_errno()
+            log.warning(f"mlockall fallo (errno={err}): necesita "
+                        f"CAP_IPC_LOCK o LimitMEMLOCK en systemd. "
+                        f"YOLO podria swappearse bajo presion de RAM.")
+    except Exception as e:
+        log.warning(f"mlockall no disponible: {e}")
+
     # --- VRAM hard cap (must be set before model load) ---
     if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(YOLO_MEM_FRAC)
@@ -355,9 +418,14 @@ async def load_model():
 
     torch.set_num_threads(2)
     model = YOLO(YOLO_MODEL, verbose=False)
-    model.to("cuda")
-    model.eval()
-    log.info(f"Model loaded successfully on cuda (physical GPU {GPU_ID})")
+    _is_engine = YOLO_MODEL.lower().endswith((".engine", ".onnx"))
+    if _is_engine:
+        # Engine TRT/ONNX: ya vive en GPU, no soporta .to()/.eval().
+        log.info(f"Modelo cargado como engine ({YOLO_MODEL}) — GPU interna")
+    else:
+        model.to("cuda")
+        model.eval()
+        log.info(f"Model loaded successfully on cuda (physical GPU {GPU_ID})")
 
 
 @app.post("/detect")
@@ -369,13 +437,15 @@ async def detect(image: UploadFile = File(...), confidence: float = 0.25,
             status_code=503)
 
     img_bytes = await image.read()
-    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    img = await asyncio.get_event_loop().run_in_executor(
+        decode_pool, _pil_from_bytes, img_bytes)
     effective_conf = min(float(confidence), DEFAULT_PERSON_CONF)
 
     async with global_semaphore:
         per_image = await asyncio.to_thread(_run_yolo, [img], effective_conf)
 
-    outputs = _postprocess(per_image, [camera_id])
+    outputs = await asyncio.get_event_loop().run_in_executor(
+        post_pool, _postprocess, per_image, [camera_id])
     out = outputs[0]
     return {
         "detections": out["detections"],
@@ -409,7 +479,7 @@ async def detect_batch(images: list[UploadFile] = File(...),
 
     n = len(images)
     imgs_bytes = await asyncio.gather(*[f.read() for f in images])
-    imgs = [Image.open(io.BytesIO(b)).convert('RGB') for b in imgs_bytes]
+    imgs = await _decode_parallel(imgs_bytes)
     effective_conf = min(float(confidence), DEFAULT_PERSON_CONF)
 
     if camera_ids:
@@ -424,7 +494,8 @@ async def detect_batch(images: list[UploadFile] = File(...),
         per_image = await asyncio.to_thread(_run_yolo, imgs, effective_conf)
     t_infer = (time.monotonic() - t0) * 1000
 
-    outputs = _postprocess(per_image, cam_ids)
+    outputs = await asyncio.get_event_loop().run_in_executor(
+        post_pool, _postprocess, per_image, cam_ids)
     total_count = sum(o["count"] for o in outputs)
     total_stable = sum(o["stable_count"] for o in outputs)
 
@@ -470,4 +541,5 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8002)
+    port = int(os.getenv("PORT", "8002"))
+    uvicorn.run(app, host="127.0.0.1", port=port)
