@@ -523,10 +523,12 @@ async def add_security_headers(request: Request, call_next):
                     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Max-Age": "86400",
+                    "Cross-Origin-Resource-Policy": "cross-origin",
                 }
             )
         response = await call_next(request)
         response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return response
     except Exception as e:
