@@ -1367,9 +1367,19 @@ async def get_eva_chat_history_post(request: dict):
         # summary, image_url, image_b64, is_daily_report, report_url).
         now_ts = int(time.time())
         existing_keys = set()
+        existing_content_keys = set()  # (role, content) sin timestamp — anti-dup de greetings
         for m in existing_msgs:
             key = (m.get("role"), m.get("content"), m.get("timestamp", 0))
             existing_keys.add(key)
+            # Guardar tambien (role, content) para detectar greetings duplicados
+            # que llegan con timestamp distinto cada vez
+            ck = (m.get("role"), m.get("content"))
+            if m.get("summary") or (m.get("role") == "assistant" and m.get("content","").startswith(("Hola", "¡Hola", "Resumen del día"))):
+                if ck not in existing_content_keys:
+                    # Solo marcar como "reciente" si el msg es de los ultimos 30 min
+                    msg_age = now_ts - int(m.get("timestamp", 0) or 0)
+                    if msg_age < 1800:
+                        existing_content_keys.add(ck)
 
         merged = list(existing_msgs)
         for h in history:
@@ -1385,6 +1395,11 @@ async def get_eva_chat_history_post(request: dict):
                 msg_ts = now_ts
             key = (h.get("role", "user"), content, msg_ts)
             if key in existing_keys:
+                continue
+            # ANTI-SPAM: si es un greeting/summary con el MISMO contenido (role+content)
+            # que ya existe en los ultimos 30 min, saltar — previene saludos duplicados
+            ck = (h.get("role", "user"), content)
+            if h.get("summary") and ck in existing_content_keys:
                 continue
             # Anadir solo si msg_ts > last_message_at o si no hay msgs aun
             if existing_msgs and msg_ts <= last_message_at:
