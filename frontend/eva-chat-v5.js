@@ -230,6 +230,11 @@ const EvaChat = {
                 lastRole = msg.role;
                 const text = (msg.content || '').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
                 let formatted = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+                // B4: mapear tags internos del backend (guardados crudos en history) a texto visible.
+                formatted = formatted
+                    .replace(/__daily_summary__/g, '📊 Resumen del día')
+                    .replace(/__yesterday_summary__/g, '📅 Resumen de ayer')
+                    .replace(/__adjust_protection__/g, '🛡️ Ajustar protección');
                 let imgHtml = '';
                 if (msg.image_url && msg.image_url.length > 10) {
                     let imgSrc = msg.image_url;

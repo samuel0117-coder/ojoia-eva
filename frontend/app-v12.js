@@ -15,12 +15,42 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 
+// S1: Auth token (Bearer) para la API. Soft rollout: backend acepta con o sin
+// token y solo loguea warnings. El token se pide una vez por sesion/login en
+// _startAuth() y se guarda en localStorage.
+const AUTH_TOKEN_KEY = 'ojoia_api_token';
+function _getAuthToken() {
+    try { return localStorage.getItem(AUTH_TOKEN_KEY) || ''; } catch(e) { return ''; }
+}
+function _setAuthToken(t) {
+    try {
+        if (t) localStorage.setItem(AUTH_TOKEN_KEY, t);
+        else localStorage.removeItem(AUTH_TOKEN_KEY);
+    } catch(e) {}
+}
+
+// M4.2: helper global de escapado de HTML para uso en interpolaciones de innerHTML.
+// Prevencion de XSS: cualquier string que venga del backend (cam.name, evt.description,
+// business_name, etc.) y se vaya a insertar como HTML debe pasar por aqui.
+function escHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, ch => ({
+        '&':'&','<':'<','>':'>','"':'"',"'":'&#39;'
+    }[ch]));
+}
+
 function apiFetch(url, opts = {}) {
     const headers = { ...opts.headers };
     if (opts.body && typeof opts.body === 'string') {
         try { JSON.parse(opts.body); headers['Content-Type'] = 'application/json'; } catch(e) {}
     }
     if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    // S1: inyectar Bearer token si tenemos uno y el destino es la API de OjoIA.
+    const token = _getAuthToken();
+    if (token && !headers['Authorization'] && typeof url === 'string' &&
+        (url.indexOf('ojoia.com.do') !== -1 || url.indexOf('10.0.0.44') !== -1)) {
+        headers['Authorization'] = 'Bearer ' + token;
+    }
     return fetch(url, { mode: 'cors', headers, ...opts });
 }
 
@@ -48,6 +78,9 @@ const App = {
     _homeYoloPollMs: 2000,
     _homeLastDetections: [],
     _homeWatermarkText: '',
+    // B2: tiempo por defecto del auto-advance de eventos (ms). Const; no se inicializaba
+    // y los toasts decian "NaN s" porque _eventAutoAdvanceTimeout era undefined.
+    _eventAutoAdvanceTimeout: 6000,
     // --- Streaming robusto ---
     _streamWatchdogMs: 8000,
     _streamReconnectDelays: [1500, 3000, 6000, 10000],
@@ -145,6 +178,10 @@ const App = {
                     if (d && d.success) {
                         this.userId = d.user_id;
                         localStorage.setItem('ojoia_uid', this.userId);
+                        // S1: pedir Bearer token propio y guardarlo en localStorage.
+                        // Soft rollout: si falla, el backend sigue atendiendo los requests
+                        // sin Authorization (modo legacy con warnings en logs).
+                        this._ensureApiToken();
                         this._showApp();
                     } else if (d && d.success === false && d.error && /not.*found|incomplet|no.*registr/i.test(d.error)) {
                         // Usuario Firebase OK pero sin registro completo en backend
@@ -176,6 +213,29 @@ const App = {
             const el = document.getElementById(id);
             if (el) el.addEventListener('keypress', e => { if (e.key === 'Enter') this.doLogin(); });
         });
+    },
+
+    // S1: Emite/recupera el Bearer token de la API y lo guarda en localStorage.
+    // Idempotente: si ya tenemos token no cambia. Re-emite solo si está vacío
+    // (caso nuevo dispositivo o logout). Backend: POST /api/auth/token, soft mode.
+    _ensureApiToken() {
+        if (!this.userId) return;
+        // Si ya hay token en localStorage, no re-emitir (evita crear tokens de más).
+        if (_getAuthToken()) return;
+        const apiUrl = this.API || 'https://api.ojoia.com.do';
+        const dev = navigator.userAgent.substring(0, 80) + '|' + (navigator.userAgentData?.platform || 'unknown');
+        fetch(apiUrl + '/api/auth/token', {
+            method: 'POST', mode: 'cors',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: this.userId, device: dev })
+        }).then(r => r.ok ? r.json() : null).then(d => {
+            if (d && d.success && d.token) {
+                _setAuthToken(d.token);
+                console.info('[auth] Bearer token guardado (soft rollout)');
+            } else {
+                console.warn('[auth] no se pudo emitir Bearer token; fallback a modo legacy');
+            }
+        }).catch(e => console.warn('[auth] error pidiendo token:', e.message));
     },
 
     _showLogin() {
@@ -310,6 +370,16 @@ const App = {
 
     logout() {
         this._clearAllPolls();
+        // S1: revocar el Bearer token en el backend antes de limpiar localmente.
+        const token = _getAuthToken();
+        const uid = this.userId;
+        if (token && uid) {
+            const apiUrl = this.API || 'https://api.ojoia.com.do';
+            fetch(apiUrl + '/api/auth/token?user_id=' + encodeURIComponent(uid) +
+                 '&token_to_revoke=' + encodeURIComponent(token),
+                 { method: 'DELETE', mode: 'cors' }).catch(() => {});
+        }
+        _setAuthToken('');
         localStorage.removeItem('ojoia_uid');
         this.userId = null;
         firebase.auth().signOut();
@@ -365,6 +435,9 @@ const App = {
 
     go(page, eventId) {
         if (this.page !== page) {
+            // M6.4: cerrar streams MJPEG antes de limpiar polls, para evitar que sigan
+            // bombando frames en background (consumo CPU/bateria del cliente).
+            this._stopAllStreams();
             this._clearAllPolls();
             // Invalidar caché de streams al cambiar de tab (viewer vacío bug fix)
             this._homeStreamStarted = {};
@@ -439,6 +512,29 @@ const App = {
             imgEl.src = `${baseStreamUrl}&_=${Date.now()}`;
             this._streamLastOnloadTs[key] = Date.now();
         });
+    },
+    // M6.4: cerrar todos los streams MJPEG activos. Para cada clave en
+    // _homeStreamStarted poner img.src='' (el browser corta la conexion HTTP)
+    // y descartar el tag <img> para que el reproductor de vuelta a la tab no
+    // reutilice un objeto con un stream ya cancelado.
+    _stopAllStreams() {
+        try {
+            Object.keys(this._homeStreamStarted || {}).forEach((key) => {
+                const [targetId, ...camParts] = key.split(':');
+                const el = document.getElementById(targetId);
+                const imgEl = el && el.querySelector('img.live-img');
+                if (imgEl) {
+                    imgEl.onerror = null;
+                    imgEl.onload = null;
+                    imgEl.src = '';
+                }
+                // tambien cancelar watchdog pendiente
+                if (this._streamWatchdogTimers && this._streamWatchdogTimers[key]) {
+                    clearTimeout(this._streamWatchdogTimers[key]);
+                    delete this._streamWatchdogTimers[key];
+                }
+            });
+        } catch(e) { console.warn('[streams] _stopAllStreams:', e.message); }
     },
     _resetScrollContent(c) {
         if (!c) return;
@@ -616,13 +712,44 @@ const App = {
         } catch(e) { console.log('Push init skipped:', e.message); }
     },
 
-    _toast(title, msg, type = 'info') {
-        const t = document.createElement('div');
+    _toast(title, msg, type = 'info', opts = {}) {
         const colors = { danger: '#ff453a', warning: '#ffd60a', success: '#30d158', info: '#0a84ff' };
-        t.style.cssText = `position:fixed;top:60px;left:16px;right:16px;background:#1c1c1e;border-left:3px solid ${colors[type]};border-radius:12px;padding:14px 16px;z-index:9999;box-shadow:0 8px 32px rgba(0,0,0,0.5);animation:slideDown .3s ease`;
-        t.innerHTML = `<div style="font-weight:600;font-size:.9rem;margin-bottom:3px">${title}</div><div style="font-size:.82rem;color:#aeaeb2">${msg}</div>`;
+        const t = document.createElement('div');
+        // B1: duration configurable via opts.duration (default 6000ms); action button opcional
+        const duration = opts.duration || 6000;
+        t.style.cssText = `position:fixed;top:60px;left:16px;right:16px;background:#1c1c1e;border-left:3px solid ${colors[type] || colors.info};border-radius:12px;padding:14px 16px;z-index:9999;box-shadow:0 8px 32px rgba(0,0,0,0.5);animation:slideDown .3s ease;cursor:pointer`;
+        // Build inner HTML: title (optional) + body + optional action button (B1)
+        let innerHTML = '';
+        if (title) innerHTML += `<div style="font-weight:600;font-size:.9rem;margin-bottom:3px"></div>`;
+        // Escape content to avoid XSS (M4.2)
+        const esc = (s) => String(s || '').replace(/[&<>"']/g, ch => ({ '&':'&','<':'<','>':'>','"':'"',"'":'&#39;' }[ch]));
+        innerHTML = '';
+        if (title) innerHTML += `<div style="font-weight:600;font-size:.9rem;margin-bottom:3px">${esc(title)}</div>`;
+        innerHTML += `<div style="font-size:.82rem;color:#aeaeb2">${esc(msg)}</div>`;
+        if (opts && opts.action && opts.action.label) {
+            innerHTML += `<button class="toast-action" style="margin-top:8px;background:${colors[type] || colors.info};color:white;border:0;padding:6px 14px;border-radius:8px;font-size:.82rem;font-weight:600;cursor:pointer">${esc(opts.action.label)}</button>`;
+        }
+        t.innerHTML = innerHTML;
         document.body.appendChild(t);
-        setTimeout(() => { t.style.animation = 'fadeOut .3s ease forwards'; setTimeout(() => t.remove(), 300); }, 6000);
+        if (opts && opts.action && opts.action.onClick) {
+            const btn = t.querySelector('.toast-action');
+            if (btn) btn.addEventListener('click', e => { e.stopPropagation(); opts.action.onClick(); t.remove(); });
+        }
+        // Click en el toast entero tambien lo descarta
+        t.addEventListener('click', () => t.remove());
+        setTimeout(() => { t.style.animation = 'fadeOut .3s ease forwards'; setTimeout(() => t.remove(), 300); }, duration);
+    },
+
+    // B1: alias compatible con llamadas existentes _showToast(msg, ms, opts).
+    // Antes NO existia y estos toasts nunca aparecian. Ahora enruta a _toast.
+    _showToast(msg, durationOrType, opts) {
+        if (typeof durationOrType === 'number') {
+            // Formato: _showToast(msg, ms, opts)
+            this._toast('', msg, 'info', { ...(opts || {}), duration: durationOrType });
+        } else {
+            // Formato: _showToast(msg, type) - тихо extendido
+            this._toast('', msg, durationOrType || 'info');
+        }
     },
 
     // ── HOME ─────────────────────────────────────────────────
@@ -712,8 +839,8 @@ const App = {
                     <div class="home-cam-tile" data-home-cam-id="${cam.camera_id}">
                         <div class="home-cam-header">
                             <div>
-                                <div style="font-weight:600">${cam.name || `ojo-${shortId}`}</div>
-                                <div class="meta">${cam.zone || 'sin zona'} · ${shortId}</div>
+                                <div style="font-weight:600">${escHtml(cam.name || `ojo-${shortId}`)}</div>
+                                <div class="meta">${escHtml(cam.zone || 'sin zona')} · ${escHtml(shortId)}</div>
                             </div>
                             <span class="home-cam-status" data-home-status="${cam.camera_id}" style="color:${statusColor}">${status}</span>
                         </div>
@@ -1339,7 +1466,54 @@ const App = {
     },
 
     _loadCamVigilance(cam) {
-        return;
+        // B5: antes era `return;` silencioso. Ahora aplica el estado de centinela
+        // a la cam activa y refresca el badge correspondiente si esta en DOM.
+        // No es bloqueante (best-effort) para no romper el flujo del Home.
+        if (!cam || !cam.camera_id) return;
+        try {
+            // Detectar si estamos en horario de centinela (mismo algoritmo que _pageHome)
+            const sched = cam.schedule || {};
+            const vig = cam.vigilance || {};
+            let isVigilante = false;
+            if (sched && sched.open && sched.close) {
+                const now = new Date();
+                const curMin = now.getHours() * 60 + now.getMinutes();
+                const openParts = (sched.open).split(':');
+                const closeParts = (sched.close).split(':');
+                const openMin = parseInt(openParts[0]) * 60 + parseInt(openParts[1]);
+                const closeMin = parseInt(closeParts[0]) * 60 + parseInt(closeParts[1]);
+                const graceMin = vig.grace_minutes || 15;
+                const vigilanteStart = closeMin + graceMin;
+                isVigilante = (curMin < openMin || curMin >= vigilanteStart);
+            }
+            // Guardar el flag en la cam del cache (para que _pageHome lo use al re-render)
+            cam._isVigilanteCached = isVigilante;
+            // Actualizar el badge del home en vivo si existe
+            const badge = document.getElementById('home-vigilance-badge');
+            if (badge) {
+                if (isVigilante) {
+                    badge.textContent = '🛡️ CENTINELA';
+                    badge.style.background = 'var(--danger)';
+                    badge.style.color = '#fff';
+                    badge.style.display = 'inline-block';
+                    const cooldownMin = cam.cooldown_min || 5;
+                    badge.title = `Modo centinela activo — notificará cada ${cooldownMin} min ante detección`;
+                } else {
+                    badge.textContent = '● NORMAL';
+                    badge.style.background = 'var(--success)';
+                    badge.style.color = '#fff';
+                    badge.style.display = 'inline-block';
+                    badge.title = 'En horario normal — vigilancia desactivada';
+                }
+            }
+            // Sync el cache local del home
+            const idx = this._homeCams ? this._homeCams.findIndex(c => c.camera_id === cam.camera_id) : -1;
+            if (idx >= 0) {
+                this._homeCams[idx] = { ...this._homeCams[idx], ...cam };
+            }
+        } catch(e) {
+            console.warn('[vigilance] _loadCamVigilance error:', e.message);
+        }
     },
 
     async _fetchFrame(targetId) {
@@ -2588,7 +2762,7 @@ async _saveCooldown(camId, btn) {
             if (sel) {
                 sel.innerHTML = '<option value="all">Todas las cámaras</option>';
                 cams.forEach(cam => {
-                    sel.innerHTML += `<option value="${cam.camera_id}">${cam.name}</option>`;
+                    sel.innerHTML += `<option value="${escHtml(cam.camera_id)}">${escHtml(cam.name)}</option>`;
                 });
             }
         } catch(e) {}
@@ -2712,8 +2886,8 @@ async _saveCooldown(camId, btn) {
         const level = violation ? 'alert' : 'ok';
         const label = violation ? '🚨 Análisis' : '✅ Normal';
         const ts = evt.timestamp ? new Date(evt.timestamp * 1000).toLocaleString('es-ES', {hour:'2-digit',minute:'2-digit',month:'short',day:'numeric',hour12:true}) : '--';
-        const camName = evt.camera_name || evt.camera_id || 'Sin nombre';
-        const camZone = evt.metadata?.zone || '';
+        const camName = escHtml(evt.camera_name || evt.camera_id || 'Sin nombre');
+        const camZone = escHtml(evt.metadata?.zone || '');
         const qa = evt.qwen_analysis || {};
         const vision = qa.vision || {};
         const ruleChecks = qa.rule_checks || {};
@@ -2761,14 +2935,14 @@ async _saveCooldown(camId, btn) {
             ? `<img src="${evt.thumb_url}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="App._imgFallback(this,'${icon}')" />`
             : `<span style="font-size:1.3rem;">${icon}</span>`;
         const evtTime = evt.datetime || ts;
-        return `<div class="event-row ${violation ? 'event-alert' : ''}" onclick="App._openEvent('${evt.event_id}')">
-            <div class="event-thumb" id="evthumb-${evt.event_id}" style="background:#222;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:10px;flex-shrink:0;width:80px;height:60px">
+        return `<div class="event-row ${violation ? 'event-alert' : ''}" onclick="App._openEvent('${escHtml(evt.event_id)}')">
+            <div class="event-thumb" id="evthumb-${escHtml(evt.event_id)}" style="background:#222;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:10px;flex-shrink:0;width:80px;height:60px">
                 ${thumbHtml}
             </div>
             <div class="event-info" style="flex:1;min-width:0">
                 <div class="event-title">${camName}${camZone ? ' · ' + camZone : ''}</div>
-                <div class="meta">${evtTime} · Detección: ${yoloCount} objeto(s)</div>
-                <div class="meta event-desc" style="margin-top:2px;font-size:0.78rem;color:var(--text-secondary);white-space:normal;line-height:1.35">${enrichedDesc}</div>
+                <div class="meta">${escHtml(evtTime)} · Detección: ${yoloCount} objeto(s)</div>
+                <div class="meta event-desc" style="margin-top:2px;font-size:0.78rem;color:var(--text-secondary);white-space:normal;line-height:1.35">${escHtml(enrichedDesc)}</div>
             </div>
             <span class="badge badge-${level}" style="flex-shrink:0">${label}</span>
         </div>`;
@@ -3582,7 +3756,7 @@ async _saveCooldown(camId, btn) {
                 <div class="settings-section">
                     <div class="section-lbl">Cámara</div>
                     ${cams.length ? `<select id="settings-grid-camera" style="width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:1rem;outline:none" onchange="App._setGridSettingsCamera(this.value)">
-                        ${cams.map(cam => `<option value="${cam.camera_id}" ${cam.camera_id === this._gridSettingsCamId ? 'selected' : ''}>${cam.name || cam.camera_id} · ${cam.zone || 'sin zona'}</option>`).join('')}
+                        ${cams.map(cam => `<option value="${escHtml(cam.camera_id)}" ${cam.camera_id === this._gridSettingsCamId ? 'selected' : ''}>${escHtml(cam.name || cam.camera_id)} · ${escHtml(cam.zone || 'sin zona')}</option>`).join('')}
                     </select>` : '<div style="padding:12px;color:var(--text-secondary);text-align:center">Sin cámaras configuradas</div>'}
                 </div>
                 <div class="settings-section">
