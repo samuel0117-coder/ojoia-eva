@@ -1,0 +1,31 @@
+# === Secretos (NUNCA commitear) ===
+ai_system/
+**/firebase-key*.json
+**/firebase-service-account*.json
+**/service-account*.json
+*.pem
+.env
+.env.*
+
+# === Datos de cliente (NUNCA commitear) ===
+storage/
+
+# === Logs ===
+**/*.log
+firebase-debug.log
+
+# === Build / cache ===
+node_modules/
+.cache/
+dist/
+__pycache__/
+*.pyc
+
+# === OS / IDE ===
+.DS_Store
+.vscode/
+.idea/
+
+# === Temporales de agentes ===
+*.tmp
+*.bak

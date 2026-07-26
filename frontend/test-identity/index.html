@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Identity Wan — Reconocimiento Facial</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#fff;min-height:100dvh}
+.hdr{background:linear-gradient(180deg,#1a1a2e,#0a0a0a);padding:20px 16px;text-align:center;border-bottom:1px solid #1a1a3a}
+.hdr h1{font-size:1.1rem;font-weight:700;background:linear-gradient(90deg,#0a84ff,#30d158);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hdr .sub{font-size:.7rem;color:#666;margin-top:4px}
+.wrap{padding:12px;max-width:600px;margin:0 auto}
+.card{background:#111;border:1px solid #222;border-radius:14px;padding:14px;margin-bottom:10px}
+.card h3{font-size:.75rem;color:#666;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+.row{margin-bottom:10px}
+label{display:block;font-size:.75rem;color:#888;margin-bottom:5px}
+input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #333;background:#1a1a1a;color:#fff;font-size:.9rem;outline:none}
+input:focus{border-color:#0a84ff}
+.btn{padding:11px;border-radius:8px;border:none;cursor:pointer;font-size:.85rem;font-weight:600;width:100%;margin-bottom:6px}
+.btn:active{opacity:.8}
+.btn-p{background:linear-gradient(135deg,#0a84ff,#0066cc);color:#fff}
+.btn-s{background:linear-gradient(135deg,#30d158,#1a8a34);color:#000}
+.btn-g{background:transparent;color:#0a84ff;border:1px solid #0a84ff}
+.btn-r{background:linear-gradient(135deg,#ff453a,#cc2222);color:#fff}
+.btn-sm{padding:8px;font-size:.75rem}
+.badge{display:inline-block;padding:3px 8px;border-radius:10px;font-size:.65rem;font-weight:700}
+.badge-ok{background:rgba(48,209,88,.15);color:#30d158}
+.badge-w{background:rgba(255,214,10,.15);color:#ffd60a}
+.badge-e{background:rgba(255,69,58,.15);color:#ff453a}
+#liveWrap{position:relative;border-radius:12px;overflow:hidden;background:#000;aspect-ratio:4/3;min-height:240px}
+#liveFrame{width:100%;height:100%;object-fit:cover;display:none}
+#recogLabel{position:absolute;bottom:0;left:0;right:0;padding:10px;background:linear-gradient(transparent,rgba(0,0,0,.8));font-size:.85rem;text-align:center;display:none}
+#recogLabel.ok{background:linear-gradient(transparent,rgba(48,209,88,.3));color:#30d158}
+#recogLabel.warn{background:linear-gradient(transparent,rgba(255,69,58,.3));color:#ff453a}
+#recogLabel .name{font-weight:700;font-size:1rem}
+#recogLabel .conf{font-size:.7rem;opacity:.7}
+#noSignal{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#111;color:#555;font-size:.85rem;text-align:center;padding:20px}
+.face-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:20px;background:#1a1a1a;border:1px solid #333;margin:3px;font-size:.75rem}
+.face-chip img{width:28px;height:28px;border-radius:50%;object-fit:cover}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.log{background:#080808;border-radius:8px;padding:10px;font-family:monospace;font-size:.65rem;max-height:200px;overflow-y:auto;white-space:pre-wrap;color:#666;border:1px solid #1a1a1a}
+.log .i{color:#0a84ff}.log .o{color:#30d158}.log .e{color:#ff453a}.log .w{color:#ffd60a}
+.status-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <h1>Identity Wan</h1>
+  <div class="sub">Reconocimiento facial — ESP32-CAM</div>
+</div>
+
+<div class="wrap">
+
+  <div class="status-row">
+    <span class="badge badge-w" id="bCAM">○ CAM</span>
+    <span class="badge badge-w" id="bIDW">○ IDW</span>
+    <span class="badge badge-w" id="bFACE">○ FACE</span>
+  </div>
+
+  <!-- LIVE -->
+  <div class="card">
+    <h3>📷 Vista en Vivo</h3>
+    <div id="liveWrap">
+      <img id="liveFrame" src="" alt="">
+      <div id="recogLabel">
+        <div class="name" id="recogName">—</div>
+        <div class="conf" id="recogConf">—</div>
+      </div>
+      <div id="noSignal">
+        <div>
+          <div style="font-size:2.5rem;margin-bottom:8px">📷</div>
+          <div style="font-size:.9rem;margin-bottom:4px">Sin señal</div>
+          <div style="font-size:.7rem;color:#444">Selecciona una cámara y toca Iniciar</div>
+        </div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div class="grid2">
+        <div>
+          <label>Cámara</label>
+          <select id="camSel"><option value="">Cargando...</option></select>
+        </div>
+        <div>
+          <label>Refresco</label>
+          <select id="refreshSel">
+            <option value="1000">1s</option>
+            <option value="1500" selected>1.5s</option>
+            <option value="2000">2s</option>
+            <option value="3000">3s</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="grid2">
+      <button class="btn btn-p btn-sm" id="btnStart" onclick="startLive()">▶ Iniciar</button>
+      <button class="btn btn-r btn-sm" onclick="stopLive()">⏹ Detener</button>
+    </div>
+  </div>
+
+  <!-- REGISTRO -->
+  <div class="card">
+    <h3>👤 Registrar Persona</h3>
+    <div style="text-align:center;margin-bottom:12px">
+      <canvas id="regCanvas" width="160" height="160" style="border-radius:50%;border:2px solid #333;background:#1a1a1a;display:none;margin:auto"></canvas>
+      <div id="regPlaceholder" style="width:160px;height:160px;border-radius:50%;border:2px dashed #333;margin:auto;display:flex;align-items:center;justify-content:center;color:#555;font-size:.7rem;text-align:center;padding:20px">
+        La foto aparecerá aquí
+      </div>
+    </div>
+    <div class="row">
+      <label>Paso 1: Captura una foto del rostro</label>
+      <button class="btn btn-p btn-sm" onclick="captureForRegister()">📸 Capturar Foto</button>
+    </div>
+    <div class="row">
+      <label>Paso 2: Nombre de la persona</label>
+      <input id="regName" placeholder="Ej: Juan Pérez">
+    </div>
+    <div class="row">
+      <label>Paso 3: Guardar en el sistema</label>
+      <button class="btn btn-s btn-sm" onclick="saveFace()">💾 Guardar Cara</button>
+    </div>
+  </div>
+
+  <!-- PERSONAS REGISTRADAS -->
+  <div class="card">
+    <h3>👥 Personas Registradas</h3>
+    <div id="facesList" style="margin-bottom:8px;min-height:30px">
+      <span style="color:#555;font-size:.75rem">Cargando...</span>
+    </div>
+    <button class="btn btn-g btn-sm" onclick="loadFaces()">↻ Actualizar</button>
+  </div>
+
+  <!-- LOG -->
+  <div class="card">
+    <h3>📋 Log</h3>
+    <div class="log" id="log">Iniciando...</div>
+    <button class="btn btn-g btn-sm" onclick="clearLog()" style="margin-top:6px">Limpiar</button>
+  </div>
+
+</div>
+
+<script>
+const API = 'https://api.ojoia.com.do';
+let liveTimer = null;
+let capturedB64 = '';
+
+const logEl = document.getElementById('log');
+
+function log(msg, t) {
+  t = t || '';
+  const ts = new Date().toLocaleTimeString('es-DO', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const c = t ? ' class="' + t + '"' : '';
+  logEl.innerHTML += '<div' + c + '>[' + ts + '] ' + msg + '</div>';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function clearLog() { logEl.innerHTML = ''; log('Log limpiado', 'i'); }
+
+function badge(id, s) {
+  var el = document.getElementById('b' + id);
+  if (!el) return;
+  el.className = 'badge badge-' + (s === 'ok' ? 'ok' : s === 'err' ? 'e' : 'w');
+  el.textContent = (s === 'ok' ? '✓' : s === 'err' ? '✗' : '○') + ' ' + id;
+}
+
+function showRecog(list) {
+  var el = document.getElementById('recogLabel');
+  var nameEl = document.getElementById('recogName');
+  var confEl = document.getElementById('recogConf');
+  
+  if (!list || !list.length) {
+    el.style.display = 'none';
+    badge('FACE', 'w');
+    return;
+  }
+  
+  // Buscar coincidencias con confianza > 0 o status registered
+  var known = list.filter(function(p) { 
+    return p.status === 'registered' || p.confidence > 0.3; 
+  });
+  
+  if (known.length > 0) {
+    var best = known[0];
+    el.style.display = 'block';
+    el.className = 'ok';
+    nameEl.textContent = '✓ ' + best.person_name;
+    if (best.confidence > 0) {
+      confEl.textContent = 'Confianza: ' + Math.round(best.confidence * 100) + '%';
+    } else {
+      confEl.textContent = 'Persona registrada';
+    }
+    badge('FACE', 'ok');
+  } else {
+    el.style.display = 'block';
+    el.className = 'warn';
+    nameEl.textContent = '⚠ Desconocido';
+    confEl.textContent = 'No registrado';
+    badge('FACE', 'w');
+  }
+}
+
+async function loadCams() {
+  try {
+    var r = await fetch(API + '/api/cameras?user_id=z6q9KStIs1boz31q2fiHJREPBMH2');
+    var d = await r.json();
+    var s = document.getElementById('camSel');
+    s.innerHTML = '';
+    var cams = d.cameras || [];
+    cams.forEach(function(c) {
+      var o = document.createElement('option');
+      o.value = c.camera_id;
+      o.textContent = c.name + ' (' + c.camera_id.slice(0,8) + '...)';
+      s.appendChild(o);
+    });
+    badge('CAM', cams.length ? 'ok' : 'w');
+    log(cams.length + ' cámara(s) disponible(s)', 'o');
+  } catch(e) {
+    log('Error cargando cámaras: ' + e.message, 'e');
+    badge('CAM', 'err');
+  }
+}
+
+async function fetchFrame() {
+  var cam = document.getElementById('camSel').value;
+  if (!cam) return null;
+  try {
+    var url = API + '/frames/latest?camera_id=' + cam + '&user_id=z6q9KStIs1boz31q2fiHJREPBMH2&_=' + Date.now();
+    var r = await fetch(url);
+    var d = await r.json();
+    if (d.success && d.image_b64) {
+      var b64 = 'data:image/jpeg;base64,' + d.image_b64;
+      document.getElementById('liveFrame').src = b64;
+      document.getElementById('liveFrame').style.display = 'block';
+      document.getElementById('noSignal').style.display = 'none';
+      return b64;
+    } else {
+      log('Frame sin imagen: ' + JSON.stringify(d).slice(0,100), 'w');
+    }
+  } catch(e) {
+    log('fetchFrame error: ' + e.message, 'e');
+  }
+  document.getElementById('liveFrame').style.display = 'none';
+  document.getElementById('noSignal').style.display = 'flex';
+  return null;
+}
+  } catch(e) {}
+  document.getElementById('liveFrame').style.display = 'none';
+  document.getElementById('noSignal').style.display = 'flex';
+  document.getElementById('noSignal').innerHTML = '<div><div style="font-size:2rem;margin-bottom:8px">⚠️</div><div>Sin señal de la cámara</div><div style="font-size:.7rem;margin-top:4px;color:#444">Verifica que esté conectada</div></div>';
+  return null;
+}
+
+async function startLive() {
+  stopLive();
+  var cam = document.getElementById('camSel').value;
+  if (!cam) { log('Selecciona una cámara', 'w'); return; }
+  log('Iniciando live...', 'i');
+  document.getElementById('btnStart').textContent = '⏳ Iniciando...';
+  document.getElementById('btnStart').disabled = true;
+  var refreshMs = parseInt(document.getElementById('refreshSel').value) || 1500;
+  
+  async function tick() {
+    var b64 = await fetchFrame();
+    if (!b64) return;
+    log('Frame recibido, identificando...', 'i');
+    try {
+      var r = await fetch(API + '/api/identity/identify-face', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({image_b64: b64, user_id: 'z6q9KStIs1boz31q2fiHJREPBMH2'})
+      });
+      var d = await r.json();
+      var list = d.identified || [];
+      log('Identificados: ' + list.length + ' (total caras: ' + (d.faces_count||0) + ')', list.length ? 'o' : 'w');
+      showRecog(list);
+    } catch(e) { log('identify error: ' + e.message, 'e'); }
+  }
+  
+  await tick();
+  liveTimer = setInterval(tick, refreshMs);
+  document.getElementById('btnStart').textContent = '▶ Corriendo...';
+  document.getElementById('btnStart').style.background = 'linear-gradient(135deg,#30d158,#1a8a34)';
+}
+
+function stopLive() {
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  document.getElementById('recogLabel').style.display = 'none';
+  document.getElementById('liveFrame').style.display = 'none';
+  document.getElementById('noSignal').style.display = 'flex';
+  document.getElementById('noSignal').innerHTML = '<div><div style="font-size:2.5rem;margin-bottom:8px">📷</div><div style="font-size:.9rem;margin-bottom:4px">Sin señal</div><div style="font-size:.7rem;color:#444">Selecciona una cámara y toca Iniciar</div></div>';
+  var btn = document.getElementById('btnStart');
+  btn.textContent = '▶ Iniciar';
+  btn.disabled = false;
+  btn.style.background = '';
+  log('Live detenido', 'i');
+}
+
+async function captureForRegister() {
+  var cam = document.getElementById('camSel').value;
+  if (!cam) { log('Selecciona una cámara primero', 'w'); return; }
+  log('Capturando foto para registro...', 'i');
+  try {
+    var r = await fetch(API + '/frames/latest?camera_id=' + cam + '&user_id=z6q9KStIs1boz31q2fiHJREPBMH2&_=' + Date.now());
+    var d = await r.json();
+    if (d.success && d.image_b64) {
+      capturedB64 = d.image_b64;
+      // Mostrar en canvas circular
+      var canvas = document.getElementById('regCanvas');
+      var ctx = canvas.getContext('2d');
+      var img = new Image();
+      img.onload = function() {
+        ctx.clearRect(0, 0, 160, 160);
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(80, 80, 78, 0, Math.PI * 2);
+        ctx.clip();
+        // Cortar cuadrado centrado de la imagen
+        var size = Math.min(img.width, img.height);
+        var sx = (img.width - size) / 2;
+        var sy = (img.height - size) / 2;
+        ctx.drawImage(img, sx, sy, size, size, 0, 0, 160, 160);
+        ctx.restore();
+        canvas.style.display = 'block';
+        document.getElementById('regPlaceholder').style.display = 'none';
+      };
+      img.src = 'data:image/jpeg;base64,' + d.image_b64;
+      log('Foto capturada. Ahora escribe el nombre y guarda.', 'o');
+    } else {
+      log('No se pudo capturar la imagen', 'w');
+    }
+  } catch(e) { log('Error: ' + e.message, 'e'); }
+}
+
+async function saveFace() {
+  var name = document.getElementById('regName').value.trim();
+  if (!name) { log('Escribe el nombre de la persona', 'w'); return; }
+  if (!capturedB64) { log('Primero captura una foto', 'w'); return; }
+  log('Guardando cara: ' + name + '...', 'i');
+  try {
+    var r = await fetch(API + '/api/identity/register-face', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        person_name: name,
+        image_b64: capturedB64,
+        user_id: 'z6q9KStIs1boz31q2fiHJREPBMH2'
+      })
+    });
+    var d = await r.json();
+    if (d.status === 'ok') {
+      log('✓ Guardado: ' + d.person_name + ' (' + d.person_id + ')', 'o');
+      document.getElementById('regName').value = '';
+      document.getElementById('regCanvas').style.display = 'none';
+      document.getElementById('regPlaceholder').style.display = 'flex';
+      capturedB64 = '';
+      loadFaces();
+    } else {
+      log('Error: ' + JSON.stringify(d), 'e');
+    }
+  } catch(e) { log('Error: ' + e.message, 'e'); }
+}
+
+async function loadFaces() {
+  try {
+    var r = await fetch(API + '/api/identity/list-faces?user_id=z6q9KStIs1boz31q2fiHJREPBMH2');
+    var d = await r.json();
+    var el = document.getElementById('facesList');
+    if (!d.faces || !d.faces.length) {
+      el.innerHTML = '<span style="color:#555;font-size:.75rem">No hay personas registradas.<br>Registra una cara arriba para empezar.</span>';
+      return;
+    }
+    el.innerHTML = d.faces.map(function(f) {
+      return '<div class="face-chip">' +
+        '<img src="' + API + '/api/identity/face-img/' + f.person_id + '">' +
+        '<span>' + f.person_name + '</span>' +
+        '</div>';
+    }).join('');
+    log(d.faces.length + ' persona(s) registrada(s)', 'o');
+  } catch(e) { log('Error: ' + e.message, 'e'); }
+}
+
+async function checkHealth() {
+  try {
+    var r = await fetch(API + '/api/idw/health');
+    var d = await r.json();
+    log('IDW: ' + d.status + ' | ' + d.gpu_name + ' | VRAM libre: ' + d.vram_free_gb + ' GB', 'o');
+    badge('IDW', d.status === 'ok' ? 'ok' : 'err');
+  } catch(e) { log('IDW no responde: ' + e.message, 'e'); badge('IDW', 'err'); }
+}
+
+// Init
+loadCams();
+loadFaces();
+checkHealth();
+log('Sistema listo. Registra caras y abre el live para reconocer.', 'o');
+</script>
+</body>
+</html>
