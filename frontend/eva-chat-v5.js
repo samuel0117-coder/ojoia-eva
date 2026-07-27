@@ -723,7 +723,9 @@ const EvaChat = {
 
     async _buildDailyBrief() {
         const status = await this._readStatus();
-        const eventsR = await fetch(`${this.API}/api/user/events?user_id=${this.userId}&filter=today&limit=20`);
+        // M4.6: excluir vigilance_alert (centinela de 1 frame) del "último análisis".
+        // El brief debe basarse en análisis reales de Eva, no en disparos operativos.
+        const eventsR = await fetch(`${this.API}/api/user/events?user_id=${this.userId}&filter=today&limit=20&exclude_vigilance=true`);
         const events = eventsR.ok ? (await eventsR.json()).events || [] : [];
         const name = (this.userName || 'amigo').split(' ')[0];
         const business = this._businessName || 'tu negocio';

@@ -2419,10 +2419,21 @@ async _applyCamDefaults(camId, cam) {
     },
 
     async _saveVigilanceSettings(camId) {
+        // M5.2: validar HH:MM antes de guardar para no romper _is_vigilante_mode del backend.
+        const _isValidHHMM = (s) => /^\d{2}:\d{2}$/.test(s) && (() => {
+            const [h, m] = s.split(':').map(Number);
+            return h >= 0 && h <= 23 && m >= 0 && m <= 59;
+        })();
+        const openVal = document.getElementById('vig-open').value.trim() || '08:00';
+        const closeVal = document.getElementById('vig-close').value.trim() || '22:00';
+        if (!_isValidHHMM(openVal) || !_isValidHHMM(closeVal)) {
+            this._toast('Horario inválido', 'Usa formato HH:MM (24h), ej: 08:00 / 22:00', 'danger');
+            return;
+        }
         const payload = {
             schedule: {
-                open: document.getElementById('vig-open').value.trim() || '08:00',
-                close: document.getElementById('vig-close').value.trim() || '22:00'
+                open: openVal,
+                close: closeVal
             },
             vigilance: {
                 enabled: document.getElementById('vig-sentinel-enabled').checked,
@@ -2798,10 +2809,12 @@ async _saveCooldown(camId, btn) {
         el.innerHTML = this._skeleton();
         try {
             const uid = this.userId || 'default';
-            const r = await apiFetch(`${this.API}/api/user/events?user_id=${uid}&filter=${filter}&limit=50`);
+            // M4.4: ahora backend filtra por camera_id (antes el cliente filtraba 50 y podia salir vacio).
+            const camParam = (this._eventFilterCam && this._eventFilterCam !== 'all')
+                ? `&camera_id=${encodeURIComponent(this._eventFilterCam)}` : '';
+            const r = await apiFetch(`${this.API}/api/user/events?user_id=${uid}&filter=${filter}&limit=50${camParam}`);
             let evts = (await r.json()).events || [];
-            
-            // Filtrar por cámara si seleccionó una
+            // Doble check defensivo (por si el backend _global mezcla)
             if (this._eventFilterCam && this._eventFilterCam !== 'all') {
                 evts = evts.filter(e => e.camera_id === this._eventFilterCam);
             }
@@ -2823,18 +2836,9 @@ async _saveCooldown(camId, btn) {
             const moreHtml = evts.length >= 50
                 ? `<button class="btn btn-outline" onclick="App._loadMoreEvents('${filter}')" style="margin:12px 0 24px">Ver más análisis recientes</button>`
                 : '';
+            // M4.5: thumbs con loading="lazy" directo en el row. Eliminamos el loop manual
+            // de asignacion que hacia fetch extra por thumb.
             el.innerHTML = evts.map(evt => this._eventRowHtml(evt)).join('') + moreHtml;
-
-            // Cargar miniaturas de eventos
-            for (const evt of evts) {
-                if (evt.thumb_url) {
-                    const el2 = document.getElementById(`evthumb-${evt.event_id}`);
-                    if (el2) {
-                        el2.style.background = '#222';
-                        el2.innerHTML = `<img src="${evt.thumb_url}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.style.display='none'" />`;
-                    }
-                }
-            }
         } catch(e) {
             el.innerHTML = `<div class="empty-state"><div class="empty-icon">📡</div><p>Error cargando eventos</p></div>`;
         }
@@ -2846,7 +2850,10 @@ async _saveCooldown(camId, btn) {
         el.innerHTML = this._skeleton();
         try {
             const uid = this.userId || 'default';
-            const r = await apiFetch(`${this.API}/api/user/events?user_id=${uid}&filter=${filter}&limit=100`);
+            // M4.4: mismo - pasar camera_id backend-side
+            const camParam = (this._eventFilterCam && this._eventFilterCam !== 'all')
+                ? `&camera_id=${encodeURIComponent(this._eventFilterCam)}` : '';
+            const r = await apiFetch(`${this.API}/api/user/events?user_id=${uid}&filter=${filter}&limit=100${camParam}`);
             const data = await r.json();
             let evts = data.events || [];
             if (this._eventFilterCam && this._eventFilterCam !== 'all') {
@@ -2931,16 +2938,25 @@ async _saveCooldown(camId, btn) {
                 0
             );
         const icon = violation ? '🚨' : '✓';
+        // M4.5: loading="lazy" directo en el row elimina el loop manual de crispado de thumbs.
+        // Usar thumb_url con escHtml para evitar XSS via URL manipulada.
+        const safeThumbUrl = escHtml(evt.thumb_url || '');
         const thumbHtml = evt.thumb_url
-            ? `<img src="${evt.thumb_url}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="App._imgFallback(this,'${icon}')" />`
+            ? `<img src="${safeThumbUrl}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="App._imgFallback(this,'${icon}')" />`
             : `<span style="font-size:1.3rem;">${icon}</span>`;
         const evtTime = evt.datetime || ts;
+        // M4.6: badge "🛡️ Centinela" cuando el evento es vigilance/night_alert (1 frame, no analisis).
+        const isCentinela = evt.is_centinela === true ||
+            evt.event_type === 'vigilance_alert' || evt.event_type === 'night_alert';
+        const centinelaBadge = isCentinela
+            ? '<span class="badge" style="background:#ff9500;color:#fff;font-size:0.62rem;padding:1px 6px;border-radius:8px;margin-left:6px">🛡️ Centinela</span>'
+            : '';
         return `<div class="event-row ${violation ? 'event-alert' : ''}" onclick="App._openEvent('${escHtml(evt.event_id)}')">
             <div class="event-thumb" id="evthumb-${escHtml(evt.event_id)}" style="background:#222;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:10px;flex-shrink:0;width:80px;height:60px">
                 ${thumbHtml}
             </div>
             <div class="event-info" style="flex:1;min-width:0">
-                <div class="event-title">${camName}${camZone ? ' · ' + camZone : ''}</div>
+                <div class="event-title">${camName}${camZone ? ' · ' + camZone : ''}${centinelaBadge}</div>
                 <div class="meta">${escHtml(evtTime)} · Detección: ${yoloCount} objeto(s)</div>
                 <div class="meta event-desc" style="margin-top:2px;font-size:0.78rem;color:var(--text-secondary);white-space:normal;line-height:1.35">${escHtml(enrichedDesc)}</div>
             </div>
@@ -3424,6 +3440,20 @@ async _saveCooldown(camId, btn) {
         const nextEvent = data.events[0];
         if (!nextEvent || nextEvent.event_id === eventId) return;
 
+        // M4.7: prefetch del detalle del siguiente evento para que el cambio sea instantaneo.
+        // Solo se hace durante la pausa de auto-advance (no bloquea, fetch en background).
+        // Abortamos cualquier prefetch previo para no encolar varios.
+        if (this._eventPrefetchController?.[eventId]) {
+            try { this._eventPrefetchController[eventId].abort(); } catch(e) {}
+        }
+        this._eventPrefetchController = this._eventPrefetchController || {};
+        const abortCtl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        this._eventPrefetchController[eventId] = abortCtl;
+        const prefetchUrl = `${this.API}/api/event-thumb/${encodeURIComponent(nextEvent.event_id)}?user_id=${encodeURIComponent(uid)}`;
+        fetch(prefetchUrl, { signal: abortCtl ? abortCtl.signal : undefined, mode: 'cors' })
+            .then(() => { /* warms el thumbnail en el cache HTTP del navegador */ })
+            .catch(() => { /* abort o fallo de red: no crítico */ });
+
         if (window.App?._showToast) {
             App._showToast(`▶ Próximo evento en ${(this._eventAutoAdvanceTimeout / 1000).toFixed(1)}s — click para pausar`, 2000);
         }
@@ -3453,8 +3483,10 @@ async _saveCooldown(camId, btn) {
 
     _pauseEventAutoplay(eventId) {
         this._cancelAutoAdvance(eventId);
-        const total = (this._eventFrameIndex?.[eventId] != null) ? (Object.keys(this._eventFrameIndex || {}).length > 0 ? this._eventFrameTotal?.[eventId] || 0 : 0) : 0;
-        this._stopEventFramePlayback(eventId, total || 0);
+        // M4.8: simplificado. El ternario anidado previo era ilegible y frágil;
+        // _eventFrameTotal[eventId] se setea en _showEventFramePlayback y es la fuente de verdad.
+        const total = this._eventFrameTotal?.[eventId] || 0;
+        this._stopEventFramePlayback(eventId, total);
         const indicator = document.getElementById(`autoplay-status-${eventId}`);
         if (indicator) {
             indicator.innerHTML = '⏸ Pausa';
