@@ -2207,7 +2207,6 @@ async _applyCamDefaults(camId, cam) {
         this._renderZoneList();
         this._drawZonesOnCanvas(canvas);
     },
-    },
 
     _drawZonesOnCanvas(canvas) {
         const ctx = canvas.getContext('2d');
@@ -3579,17 +3578,15 @@ async _saveCooldown(camId, btn) {
             const zone = cam.zone || 'sin zona';
             const events = cam.metrics?.total_events || 0;
             const alertsCam = cam.metrics?.total_alerts || 0;
-            const rules = cam.rules?.length || 0;
             const lastSeen = cam.last_frame ? this._relTime(cam.last_frame) : 'Sin datos';
             return `
                 <button class="ios-row" onclick="App._openCameraConfig('${cam.camera_id}')">
                     <span class="ios-icon">📷</span>
                     <div class="ios-row-main">
-                        <div class="ios-row-title">Ajustes de cámara</div>
-                        <div class="ios-row-sub">${cam.name || cam.camera_id} · ${zone} · ${events} eventos · ${alertsCam} alertas · ${rules} reglas</div>
-                        <div class="ios-row-sub">${lastSeen}</div>
+                        <div class="ios-row-title">${cam.name || cam.camera_id}</div>
+                        <div class="ios-row-sub">${zone} · ${events} eventos · ${alertsCam} alertas · ${lastSeen}</div>
                     </div>
-                    <span class="ios-value ${cam.active ? 'ios-value-ok' : 'ios-value-danger'}">${cam.active ? 'Online' : 'Offline'}</span>
+                    <span class="ios-value ${cam.active ? 'ios-value-ok' : 'ios-value-danger'}">${cam.active ? '🟢' : '⚫'}</span>
                     <span class="ios-chevron">›</span>
                 </button>`;
         }).join('') : `
