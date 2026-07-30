@@ -3635,6 +3635,7 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         <button class="ios-row" onclick="App._showSubscription()">
                             <span class="ios-icon">👤</span>
                             <div class="ios-row-main">
@@ -3644,6 +3645,7 @@ async _saveCooldown(camId, btn) {
                             <span class="ios-value ${active ? 'ios-value-ok' : 'ios-value-danger'}">${plan}</span>
                             <span class="ios-chevron">›</span>
                         </button>
+                        </div>
                     </div>
                 </div>
 
@@ -3655,6 +3657,7 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         ${cameraRows}
                         <button class="ios-row" onclick="App.newCamera()">
                             <span class="ios-icon">➕</span>
@@ -3664,6 +3667,7 @@ async _saveCooldown(camId, btn) {
                             </div>
                             <span class="ios-chevron">›</span>
                         </button>
+                        </div>
                     </div>
                 </div>
 
@@ -3675,7 +3679,9 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         ${vigilanceRows}
+                        </div>
                     </div>
                 </div>
 
@@ -3686,6 +3692,7 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         <button class="ios-row" onclick="App._openGridSettings()">
                             <span class="ios-icon">🔲</span>
                             <div class="ios-row-main">
@@ -3694,6 +3701,7 @@ async _saveCooldown(camId, btn) {
                             </div>
                             <span class="ios-chevron">›</span>
                         </button>
+                        </div>
                     </div>
                 </div>
 
@@ -3704,6 +3712,7 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         <button class="ios-row" onclick="App._clearEvaChat()">
                             <span class="ios-icon">🧹</span>
                             <div class="ios-row-main">
@@ -3712,6 +3721,7 @@ async _saveCooldown(camId, btn) {
                             </div>
                             <span class="ios-value">Acción segura</span>
                         </button>
+                        </div>
                     </div>
                 </div>
 
@@ -3722,6 +3732,7 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         <button class="ios-row" onclick="App._openWhatsApp()">
                             <span class="ios-icon">💬</span>
                             <div class="ios-row-main">
@@ -3746,6 +3757,7 @@ async _saveCooldown(camId, btn) {
                             </div>
                             <span class="ios-chevron">›</span>
                         </button>
+                        </div>
                     </div>
                 </div>
 
@@ -3756,6 +3768,7 @@ async _saveCooldown(camId, btn) {
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         <button class="ios-row" onclick="App._showApiConfig()">
                             <span class="ios-icon">🌐</span>
                             <div class="ios-row-main">
@@ -3773,16 +3786,18 @@ async _saveCooldown(camId, btn) {
                             </div>
                             <span class="ios-chevron">›</span>
                         </button>` : ''}
+                        </div>
                     </div>
                 </div>
 
-                <div class="ios-group danger-group" data-group="sesion">
+                <div class="ios-group danger-group collapsed" data-group="sesion">
                     <div class="ios-group-header" onclick="App._toggleGroup('sesion')">
                         <span class="ios-group-header-icon" style="background:rgba(255,69,58,.12)">🚪</span>
                         <div class="ios-group-header-title" style="color:var(--danger)">Cerrar sesión</div>
                         <span class="ios-group-header-chevron">›</span>
                     </div>
                     <div class="ios-group-body">
+                        <div class="ios-group-body-inner">
                         <button class="ios-row danger-row" onclick="App.logout()">
                             <span class="ios-icon">🚪</span>
                             <div class="ios-row-main">
@@ -3790,6 +3805,7 @@ async _saveCooldown(camId, btn) {
                                 <div class="ios-row-sub">Salir de esta cuenta en este dispositivo</div>
                             </div>
                         </button>
+                        </div>
                     </div>
                 </div>
             </div>`;
