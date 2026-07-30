@@ -1900,42 +1900,16 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         result = await tool_get_activity_summary(user_id, "today")
         total = result.get("total_events", 0)
         attention_events = result.get("attention_events", 0)
-        persons_total = result.get("persons_total", 0)
-        last_summary = result.get("last_summary", "")
-        details = result.get("details", {})
-        last_yolo = result.get("last_yolo", {})
-        counts_total = result.get("counts_total", {})
+        top_phrases = result.get("top_attention_phrases", []) or []
         notable_events = result.get("notable_events", [])
         if total == 0:
             text = "Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta."
         else:
-            lines = []
-            lines.append(f"Resumen del día: Hoy se realizaron {total} análisis de seguridad.")
-            lines.append("")
-            if attention_events > 0:
-                lines.append(f"🔍 {attention_events} evento(s) coincidieron con lo que me pediste vigilar.")
-            else:
-                lines.append("✅ No se detectaron coincidencias con lo que me pediste vigilar.")
-            if persons_total > 0:
-                lines.append(f"👥 Personas en la escena: hasta {persons_total} a la vez (según tracker).")
-            if counts_total:
-                platos = counts_total.get("platos", 0)
-                fundas = counts_total.get("fundas", 0)
-                if platos > 0:
-                    lines.append(f"🍽️ Platos visibles: ~{platos}.")
-                if fundas > 0:
-                    lines.append(f"🛍️ Fundas: ~{fundas}.")
-            lines.append(f"📊 Objetos detectados en último análisis: {last_yolo.get('count', 0)}.")
-            classes = last_yolo.get("classes", [])
-            if classes:
-                lines.append(f"   Tipos: {', '.join(classes[:5])}.")
-            if last_summary:
-                lines.append(f"")
-                lines.append(f"📝 Último análisis: {last_summary[:200]}")
-            scene = details.get("scene_context", "")
-            if scene:
-                lines.append(f"")
-                lines.append(f"🏪 Contexto: {scene}")
+            lines = _render_summary_lines(result, "Hoy")
+            lines[0] = f"Resumen del día: Hoy se realizaron {total} análisis de seguridad."
+            if top_phrases and attention_events > 0:
+                lines.append("")
+                lines.append("¿Quieres que ajuste lo que vigilo o que marque alguna de esas observaciones como falsa alarma?")
             text = "\n".join(lines)
         session["msgs"].append({"role":"assistant","content":text})
         _sessions[session_id] = session
