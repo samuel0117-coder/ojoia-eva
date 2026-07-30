@@ -3798,22 +3798,7 @@ async _saveCooldown(camId, btn) {
     _toggleGroup(name) {
         const el = document.querySelector(`.ios-group[data-group="${name}"]`);
         if (!el) return;
-        const body = el.querySelector('.ios-group-body');
-        const wasCollapsed = el.classList.contains('collapsed');
-        if (wasCollapsed) {
-            body.style.maxHeight = body.scrollHeight + 'px';
-            el.classList.remove('collapsed');
-            body.addEventListener('transitionend', function onEnd() {
-                body.style.maxHeight = 'none';
-                body.removeEventListener('transitionend', onEnd);
-            });
-        } else {
-            body.style.maxHeight = body.scrollHeight + 'px';
-            requestAnimationFrame(() => {
-                body.style.maxHeight = '0px';
-                el.classList.add('collapsed');
-            });
-        }
+        el.classList.toggle('collapsed');
     },
 
     _openGridSettings() {
