@@ -394,10 +394,12 @@ const EvaChat = {
 
     // ── SEND MESSAGE ────────────────────────────────────────────
     async sendMessage() {
+        if (this.isLoading || (this._lastSend && Date.now() - this._lastSend < 600)) return;
+        this._lastSend = Date.now();
         const input = document.getElementById('eva-input');
         const msg = input?.value.trim();
         const intentText = input?.dataset.intentText || msg;
-        if (!msg || this.isLoading) return;
+        if (!msg) return;
         input.value = '';
         input.dataset.intentText = '';
         this.isLoading = true;
@@ -419,17 +421,29 @@ const EvaChat = {
             const chatSessionId = this._isOsIntentText(intentText) && !this._isInstallCameraIntent(intentText)
                 ? `os_${this.userId}`
                 : this.sessionId;
-            const r = await fetch(`${this.API}/config/chat`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user_id: this.userId,
-                    message: intentText,
-                    session_id: chatSessionId,
-                    user_name: this.userName || '',
-                    business_name: this._businessName || ''
-                })
-            });
+            let r = null, lastErr = null;
+            // Reintentar 2 veces con backoff para resistir microcortes de red móvil.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    r = await fetch(`${this.API}/config/chat`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            user_id: this.userId,
+                            message: intentText,
+                            session_id: chatSessionId,
+                            user_name: this.userName || '',
+                            business_name: this._businessName || ''
+                        })
+                    });
+                    if (r.ok) break;
+                    lastErr = new Error('HTTP ' + r.status);
+                } catch (re) {
+                    lastErr = re;
+                    if (attempt < 2) await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
+                }
+            }
+            if (!r || !r.ok) throw lastErr || new Error('fetch-failed');
             const data = await r.json();
             if (data.success) {
                 this.sessionId = data.sessionId || this.sessionId;
@@ -517,6 +531,7 @@ const EvaChat = {
 
     // ── SEND SUGGESTION ─────────────────────────────────────────
     sendSuggestion(text) {
+        if (this._lastSend && Date.now() - this._lastSend < 600) return;
         if (text === '__show_brief_event__') {
             if (this._briefEvent?.event_id) {
                 this.openEventDetail(this._briefEvent.event_id);

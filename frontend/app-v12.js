@@ -757,14 +757,19 @@ const App = {
         this._resetScrollContent(c);
         c.innerHTML = this._skeleton();
         try {
-            const [camsR, evtsR, profileR] = await Promise.all([
+            const [camsSettled, evtsSettled, profileSettled] = await Promise.allSettled([
                 apiFetch(`${this.API}/api/cameras?user_id=${this.userId || 'default'}`),
                 apiFetch(`${this.API}/api/user/events?user_id=${this.userId || 'default'}&limit=1`),
                 apiFetch(`${this.API}/api/user/profile?user_id=${this.userId || 'default'}`)
             ]);
-            const cams = (await camsR.json()).cameras || [];
-            const evts = (await evtsR.json()).events || [];
-            const profile = await profileR.json();
+            // Si el endpoint crítico (cámaras) falla, sí mostrar "Sin conexión".
+            // Pero si solo fallan eventos o perfil, continuar con datos parciales.
+            if (camsSettled.status === 'rejected') {
+                throw new Error('cameras-fetch-failed');
+            }
+            const cams = (await camsSettled.value.json()).cameras || [];
+            const evts = evtsSettled.status === 'fulfilled' ? ((await evtsSettled.value.json()).events || []) : [];
+            const profile = profileSettled.status === 'fulfilled' ? (await profileSettled.value.json()) : {};
             if (!this._isCurrentPage('home') && !this._isCurrentPage('cameras')) return;
 
             this._homeCams = cams;
@@ -2087,10 +2092,13 @@ async _applyCamDefaults(camId, cam) {
 
     async _openZoneEditor(camId) {
         this._zoneEditorCamId = camId;
+        this._zoneDrawing = false;
+        this._zoneStartPos = null;
+        this._zoneCurrentRect = null;
         const section = document.getElementById('zone-editor-section');
         if (!section) return;
         section.style.display = 'block';
-        
+
         // Cargar zonas existentes
         try {
             const r = await fetch(`${this.API}/api/cameras/${encodeURIComponent(camId)}/zones?user_id=${encodeURIComponent(this.userId)}`);
@@ -2099,138 +2107,106 @@ async _applyCamDefaults(camId, cam) {
         } catch(e) {
             this._zoneList = [];
         }
-        
+
         // Configurar canvas con imagen actual de la cámara
         const canvas = document.getElementById('zone-canvas');
         const bgImg = document.getElementById('zone-canvas-bg');
         const liveImg = document.getElementById('cfg-live-img');
         if (liveImg && bgImg) {
-            bgImg.src = liveImg.src;
+            if (liveImg.src) bgImg.src = liveImg.src;
+            // Esperar a que la imagen cargue para dimensionar el canvas correctamente
+            const setupCanvas = () => this._setupZoneCanvas(canvas);
+            if (bgImg.complete && bgImg.naturalWidth) setupCanvas();
+            else bgImg.onload = setupCanvas;
         }
-        
-        if (canvas) {
-            const ctx = canvas.getContext('2d');
-            const rect = canvas.getBoundingClientRect();
-            canvas.width = rect.width;
-            canvas.height = rect.height;
-            
-            // Limpiar eventos previos y reconfigurar
-            const newCanvas = canvas.cloneNode(true);
-            canvas.parentNode.replaceChild(newCanvas, canvas);
-            newCanvas.onmousedown = (e) => this._onZoneDrawStart(e, newCanvas);
-            newCanvas.onmousemove = (e) => this._onZoneDrawMove(e, newCanvas);
-            newCanvas.onmouseup = (e) => this._onZoneDrawEnd(e, newCanvas);
-            
-            // Touch events
-            newCanvas.ontouchstart = (e) => {
-                e.preventDefault();
-                const touch = e.touches[0];
-                const mouseEvent = new MouseEvent('mousedown', {
-                    clientX: touch.clientX,
-                    clientY: touch.clientY
-                });
-                newCanvas.dispatchEvent(mouseEvent);
-            };
-            newCanvas.ontouchmove = (e) => {
-                e.preventDefault();
-                const touch = e.touches[0];
-                const mouseEvent = new MouseEvent('mousemove', {
-                    clientX: touch.clientX,
-                    clientY: touch.clientY
-                });
-                newCanvas.dispatchEvent(mouseEvent);
-            };
-            newCanvas.ontouchend = (e) => {
-                e.preventDefault();
-                const mouseEvent = new MouseEvent('mouseup', {});
-                newCanvas.dispatchEvent(mouseEvent);
-            };
-            
-            this._drawZonesOnCanvas(newCanvas);
-        }
-        
         this._renderZoneList();
     },
 
-    _onZoneDrawStart(e, canvas) {
-        this._zoneDrawing = true;
-        const rect = canvas.getBoundingClientRect();
-        this._zoneStartPos = {
-            x: e.clientX - rect.left,
-            y: e.clientY - rect.top
+    _setupZoneCanvas(canvas) {
+        if (!canvas) return;
+        const container = canvas.parentElement;
+        if (!container) return;
+        // Forzar dimensiones del canvas al contenedor (igual a la imagen bg)
+        const rect = container.getBoundingClientRect();
+        const w = Math.max(100, Math.floor(rect.width));
+        // Proporción de la imagen bg, fallback 4:3
+        const bgImg = document.getElementById('zone-canvas-bg');
+        let ratio = 0.75;
+        if (bgImg && bgImg.naturalWidth && bgImg.naturalHeight) ratio = bgImg.naturalHeight / bgImg.naturalWidth;
+        const h = Math.max(60, Math.floor(w * ratio));
+        container.style.height = h + 'px';
+        canvas.width = w;
+        canvas.height = h;
+        canvas.style.width = w + 'px';
+        canvas.style.height = h + 'px';
+
+        // Limpiar listeners previos asignando handlers nativos
+        const self = this;
+        const getPos = (clientX, clientY) => {
+            const r = canvas.getBoundingClientRect();
+            return { x: clientX - r.left, y: clientY - r.top };
         };
-        this._zoneCurrentRect = { x: this._zoneStartPos.x, y: this._zoneStartPos.y, w: 0, h: 0 };
-    },
+        const start = (x, y) => {
+            self._zoneDrawing = true;
+            const p = getPos(x, y);
+            self._zoneStartPos = p;
+            self._zoneCurrentRect = { x: p.x, y: p.y, w: 0, h: 0 };
+        };
+        const move = (x, y) => {
+            if (!self._zoneDrawing) return;
+            const p = getPos(x, y);
+            const sx = self._zoneStartPos.x, sy = self._zoneStartPos.y;
+            self._zoneCurrentRect = {
+                x: Math.min(sx, p.x), y: Math.min(sy, p.y),
+                w: Math.abs(p.x - sx), h: Math.abs(p.y - sy)
+            };
+            self._drawZonesOnCanvas(canvas);
+        };
+        const end = (x, y) => {
+            if (!self._zoneDrawing) return;
+            self._zoneDrawing = false;
+            if (x != null && y != null) { const p = getPos(x, y); self._zoneLastEnd = p; }
+            self._finalizeZoneDraw(canvas);
+        };
 
-    _onZoneDrawMove(e, canvas) {
-        if (!this._zoneDrawing) return;
-        const rect = canvas.getBoundingClientRect();
-        const currentX = e.clientX - rect.left;
-        const currentY = e.clientY - rect.top;
-        
-        this._zoneCurrentRect.w = currentX - this._zoneStartPos.x;
-        this._zoneCurrentRect.h = currentY - this._zoneStartPos.y;
-        
-        // Redibujar canvas
+        canvas.onmousedown = (e) => { e.preventDefault(); start(e.clientX, e.clientY); };
+        canvas.onmousemove = (e) => move(e.clientX, e.clientY);
+        canvas.onmouseup = () => end(null, null);
+
+        canvas.ontouchstart = (e) => { e.preventDefault(); const t = e.touches[0]; start(t.clientX, t.clientY); };
+        canvas.ontouchmove = (e) => { e.preventDefault(); const t = e.touches[0]; move(t.clientX, t.clientY); };
+        canvas.ontouchend = (e) => { e.preventDefault(); const t = (e.changedTouches && e.changedTouches[0]); end(t ? t.clientX : null, t ? t.clientY : null); };
+
         this._drawZonesOnCanvas(canvas);
     },
 
-    _onZoneDrawEnd(e, canvas) {
-        if (!this._zoneDrawing) return;
-        this._zoneDrawing = false;
-        
-        const rect = canvas.getBoundingClientRect();
-        const endX = e.clientX - rect.left;
-        const endY = e.clientY - rect.top;
-        
-        const w = endX - this._zoneStartPos.x;
-        const h = endY - this._zoneStartPos.y;
-        
-        // Solo crear zona si es suficientemente grande
-        if (Math.abs(w) > 20 && Math.abs(h) > 20) {
-            // Normalizar coordenadas a 0-1
-            const normX = Math.min(this._zoneStartPos.x, endX) / rect.width;
-            const normY = Math.min(this._zoneStartPos.y, endY) / rect.height;
-            const normW = Math.abs(w) / rect.width;
-            const normH = Math.abs(h) / rect.height;
-            
-            // Pedir nombre y tipo de zona
-            const name = prompt('Nombre de la zona (ej: Caja, Entrada, Cocina):', 'Zona ' + (this._zoneList.length + 1));
-            if (!name) {
-                this._drawZonesOnCanvas(canvas);
-                return;
-            }
-            
-            const types = [
-                {id: 'cashier', name: 'Caja'},
-                {id: 'entrance', name: 'Entrada'},
-                {id: 'kitchen', name: 'Cocina'},
-                {id: 'dining', name: 'Comedor'},
-                {id: 'inventory', name: 'Inventario'},
-                {id: 'counter', name: 'Mostrador'},
-                {id: 'restricted', name: 'Restringida'},
-                {id: 'other', name: 'Otra'}
-            ];
-            const typePrompt = 'Tipo de zona:\n' + types.map((t, i) => `${i+1}. ${t.name}`).join('\n') + '\n\nEscribe el número:';
-            const typeIdx = parseInt(prompt(typePrompt, '1')) - 1;
-            const zoneType = types[typeIdx]?.id || 'other';
-            
-            const colors = ['rgba(255,0,0,0.3)', 'rgba(0,255,0,0.3)', 'rgba(0,0,255,0.3)', 'rgba(255,255,0,0.3)', 'rgba(255,0,255,0.3)'];
-            const color = colors[this._zoneList.length % colors.length];
-            
-            this._zoneList.push({
-                id: 'zone_' + Date.now(),
-                name: name,
-                type: zoneType,
-                coords: { x: normX, y: normY, w: normW, h: normH },
-                description: '',
-                color: color
-            });
-            
-            this._renderZoneList();
-        }
-        
+    _finalizeZoneDraw(canvas) {
+        const r = this._zoneCurrentRect;
+        if (!r || Math.abs(r.w) < 20 || Math.abs(r.h) < 20) { this._drawZonesOnCanvas(canvas); return; }
+        // Normalizar coords (0-1) relativas al canvas
+        const cw = canvas.width, ch = canvas.height;
+        const normX = r.x / cw, normY = r.y / ch, normW = r.w / cw, normH = r.h / ch;
+        const name = prompt('Nombre de la zona (ej: Caja, Entrada, Cocina):', 'Zona ' + (this._zoneList.length + 1));
+        if (!name) { this._drawZonesOnCanvas(canvas); return; }
+        const types = [
+            {id: 'cashier', name: 'Caja'}, {id: 'entrance', name: 'Entrada'},
+            {id: 'kitchen', name: 'Cocina'}, {id: 'dining', name: 'Comedor'},
+            {id: 'inventory', name: 'Inventario'}, {id: 'counter', name: 'Mostrador'},
+            {id: 'restricted', name: 'Restringida'}, {id: 'other', name: 'Otra'}
+        ];
+        const typePrompt = 'Tipo de zona:\n' + types.map((t, i) => `${i+1}. ${t.name}`).join('\n') + '\n\nEscribe el número:';
+        const typeIdx = parseInt(prompt(typePrompt, '1')) - 1;
+        const zoneType = types[typeIdx]?.id || 'other';
+        const colors = ['rgba(255,0,0,0.3)', 'rgba(0,255,0,0.3)', 'rgba(0,0,255,0.3)', 'rgba(255,255,0,0.3)', 'rgba(255,0,255,0.3)'];
+        const color = colors[this._zoneList.length % colors.length];
+        this._zoneList.push({
+            id: 'zone_' + Date.now(), name: name, type: zoneType,
+            coords: { x: normX, y: normY, w: normW, h: normH },
+            description: '', color: color
+        });
+        this._renderZoneList();
         this._drawZonesOnCanvas(canvas);
+    },
     },
 
     _drawZonesOnCanvas(canvas) {
@@ -2307,7 +2283,7 @@ async _applyCamDefaults(camId, cam) {
         }
         
         try {
-            const r = await fetch(`${this.API}/api/cameras/${encodeURIComponent(camId)}/zones`, {
+            const r = await fetch(`${this.API}/api/cameras/${encodeURIComponent(camId)}/zones?user_id=${encodeURIComponent(this.userId)}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
