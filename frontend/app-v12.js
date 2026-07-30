@@ -3627,120 +3627,193 @@ async _saveCooldown(camId, btn) {
                     <div><strong>${alerts}</strong><span>Alertas</span></div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Cuenta</div>
-                    <button class="ios-row" onclick="App._showSubscription()">
-                        <span class="ios-icon">👤</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Mi cuenta</div>
-                            <div class="ios-row-sub">Plan, horario y datos del negocio</div>
-                        </div>
-                        <span class="ios-value ${active ? 'ios-value-ok' : 'ios-value-danger'}">${plan}</span>
-                        <span class="ios-chevron">›</span>
-                    </button>
+                <div class="ios-group collapsed" data-group="cuenta">
+                    <div class="ios-group-header" onclick="App._toggleGroup('cuenta')">
+                        <span class="ios-group-header-icon">👤</span>
+                        <div class="ios-group-header-title">Cuenta</div>
+                        <span class="ios-group-header-badge">${plan}</span>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        <button class="ios-row" onclick="App._showSubscription()">
+                            <span class="ios-icon">👤</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Mi cuenta</div>
+                                <div class="ios-row-sub">Plan, horario y datos del negocio</div>
+                            </div>
+                            <span class="ios-value ${active ? 'ios-value-ok' : 'ios-value-danger'}">${plan}</span>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Cámaras</div>
-                    ${cameraRows}
-                    <button class="ios-row" onclick="App.newCamera()">
-                        <span class="ios-icon">📷</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Instalar cámara nueva con Eva</div>
-                            <div class="ios-row-sub">Eva guía la instalación paso a paso</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>
+                <div class="ios-group collapsed" data-group="camaras">
+                    <div class="ios-group-header" onclick="App._toggleGroup('camaras')">
+                        <span class="ios-group-header-icon">📷</span>
+                        <div class="ios-group-header-title">Cámaras</div>
+                        <span class="ios-group-header-badge">${cams.length}</span>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        ${cameraRows}
+                        <button class="ios-row" onclick="App.newCamera()">
+                            <span class="ios-icon">➕</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Instalar cámara nueva con Eva</div>
+                                <div class="ios-row-sub">Eva guía la instalación paso a paso</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Protección</div>
-                    ${vigilanceRows}
+                <div class="ios-group collapsed" data-group="proteccion">
+                    <div class="ios-group-header" onclick="App._toggleGroup('proteccion')">
+                        <span class="ios-group-header-icon">🛡️</span>
+                        <div class="ios-group-header-title">Protección</div>
+                        <span class="ios-group-header-badge">${activeCams}</span>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        ${vigilanceRows}
+                    </div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Detección</div>
-                    <button class="ios-row" onclick="App._openGridSettings()">
-                        <span class="ios-icon">🔲</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Área de análisis</div>
-                            <div class="ios-row-sub">Cuántas imágenes revisa Eva por cámara</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>
+                <div class="ios-group collapsed" data-group="deteccion">
+                    <div class="ios-group-header" onclick="App._toggleGroup('deteccion')">
+                        <span class="ios-group-header-icon">🔲</span>
+                        <div class="ios-group-header-title">Detección</div>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        <button class="ios-row" onclick="App._openGridSettings()">
+                            <span class="ios-icon">🔲</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Área de análisis</div>
+                                <div class="ios-row-sub">Cuántas imágenes revisa Eva por cámara</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Eva</div>
-                    <button class="ios-row" onclick="App._clearEvaChat()">
-                        <span class="ios-icon">🧹</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Limpiar conversación de Eva</div>
-                            <div class="ios-row-sub">Borra el chat actual para que el saludo vuelva a aparecer limpio</div>
-                        </div>
-                        <span class="ios-value">Acción segura</span>
-                    </button>
+                <div class="ios-group collapsed" data-group="eva">
+                    <div class="ios-group-header" onclick="App._toggleGroup('eva')">
+                        <span class="ios-group-header-icon">🧹</span>
+                        <div class="ios-group-header-title">Eva</div>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        <button class="ios-row" onclick="App._clearEvaChat()">
+                            <span class="ios-icon">🧹</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Limpiar conversación de Eva</div>
+                                <div class="ios-row-sub">Borra el chat actual para que el saludo vuelva a aparecer limpio</div>
+                            </div>
+                            <span class="ios-value">Acción segura</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Soporte</div>
-                    <button class="ios-row" onclick="App._openWhatsApp()">
-                        <span class="ios-icon">💬</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Soporte por WhatsApp</div>
-                            <div class="ios-row-sub">Escríbenos directamente, respondemos rápido</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>
-                    <button class="ios-row" onclick="App._openEmail()">
-                        <span class="ios-icon">✉️</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Correo de soporte</div>
-                            <div class="ios-row-sub" id="support-email-sub">soporte@ojoia.com.do</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>
-                    <button class="ios-row" onclick="App._showBankInfo()">
-                        <span class="ios-icon">🏦</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Datos para pagar</div>
-                            <div class="ios-row-sub">Cuenta bancaria y referencia</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>
+                <div class="ios-group collapsed" data-group="soporte">
+                    <div class="ios-group-header" onclick="App._toggleGroup('soporte')">
+                        <span class="ios-group-header-icon">💬</span>
+                        <div class="ios-group-header-title">Soporte</div>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        <button class="ios-row" onclick="App._openWhatsApp()">
+                            <span class="ios-icon">💬</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Soporte por WhatsApp</div>
+                                <div class="ios-row-sub">Escríbenos directamente, respondemos rápido</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                        <button class="ios-row" onclick="App._openEmail()">
+                            <span class="ios-icon">✉️</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Correo de soporte</div>
+                                <div class="ios-row-sub" id="support-email-sub">soporte@ojoia.com.do</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                        <button class="ios-row" onclick="App._showBankInfo()">
+                            <span class="ios-icon">🏦</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Datos para pagar</div>
+                                <div class="ios-row-sub">Cuenta bancaria y referencia</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="ios-group">
-                    <div class="ios-group-title">Sistema</div>
-                    <button class="ios-row" onclick="App._showApiConfig()">
-                        <span class="ios-icon">🌐</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">URL del servidor</div>
-                            <div class="ios-row-sub">${this.API}</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>
-                    ${!this._isPWAInstalled() ? `
-                    <button class="ios-row" onclick="App._installApp()">
-                        <span class="ios-icon">📱</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Instalar app</div>
-                            <div class="ios-row-sub">Acceso rápido desde la pantalla de inicio</div>
-                        </div>
-                        <span class="ios-chevron">›</span>
-                    </button>` : ''}
+                <div class="ios-group collapsed" data-group="sistema">
+                    <div class="ios-group-header" onclick="App._toggleGroup('sistema')">
+                        <span class="ios-group-header-icon">🌐</span>
+                        <div class="ios-group-header-title">Sistema</div>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        <button class="ios-row" onclick="App._showApiConfig()">
+                            <span class="ios-icon">🌐</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">URL del servidor</div>
+                                <div class="ios-row-sub">${this.API}</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
+                        ${!this._isPWAInstalled() ? `
+                        <button class="ios-row" onclick="App._installApp()">
+                            <span class="ios-icon">📱</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Instalar app</div>
+                                <div class="ios-row-sub">Acceso rápido desde la pantalla de inicio</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>` : ''}
+                    </div>
                 </div>
 
-                <div class="ios-group danger-group">
-                    <button class="ios-row danger-row" onclick="App.logout()">
-                        <span class="ios-icon">🚪</span>
-                        <div class="ios-row-main">
-                            <div class="ios-row-title">Cerrar sesión</div>
-                            <div class="ios-row-sub">Salir de esta cuenta en este dispositivo</div>
-                        </div>
-                    </button>
+                <div class="ios-group danger-group" data-group="sesion">
+                    <div class="ios-group-header" onclick="App._toggleGroup('sesion')">
+                        <span class="ios-group-header-icon" style="background:rgba(255,69,58,.12)">🚪</span>
+                        <div class="ios-group-header-title" style="color:var(--danger)">Cerrar sesión</div>
+                        <span class="ios-group-header-chevron">›</span>
+                    </div>
+                    <div class="ios-group-body">
+                        <button class="ios-row danger-row" onclick="App.logout()">
+                            <span class="ios-icon">🚪</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Cerrar sesión</div>
+                                <div class="ios-row-sub">Salir de esta cuenta en este dispositivo</div>
+                            </div>
+                        </button>
+                    </div>
                 </div>
             </div>`;
+    },
+
+    _toggleGroup(name) {
+        const el = document.querySelector(`.ios-group[data-group="${name}"]`);
+        if (!el) return;
+        const body = el.querySelector('.ios-group-body');
+        const wasCollapsed = el.classList.contains('collapsed');
+        if (wasCollapsed) {
+            body.style.maxHeight = body.scrollHeight + 'px';
+            el.classList.remove('collapsed');
+            body.addEventListener('transitionend', function onEnd() {
+                body.style.maxHeight = 'none';
+                body.removeEventListener('transitionend', onEnd);
+            });
+        } else {
+            body.style.maxHeight = body.scrollHeight + 'px';
+            requestAnimationFrame(() => {
+                body.style.maxHeight = '0px';
+                el.classList.add('collapsed');
+            });
+        }
     },
 
     _openGridSettings() {
