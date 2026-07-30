@@ -21,6 +21,7 @@ import base64
 import secrets
 import asyncio
 import logging
+import threading
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
@@ -46,6 +47,114 @@ STORAGE_ROOT = Path("/home/sam/storage")
 DISKS_CONFIG_FILE = STORAGE_ROOT / "disks_config.json"
 EVA_CONFIG_FILE = STORAGE_ROOT / "eva_config.json"
 FIREBASE_KEY_PATH = Path("/home/sam/Downloads/firebase-key.json")
+
+# ─────────────────────────────────────────────────────────────────────────
+# S4: Lock de user.json — protege escrituras concurrentes.
+# 25 puntos del codigo escriben sobre user.json sin sincronizacion. Para
+# evitar races (token FCM perdido, sesion de Eva corrupta) centralizamos
+# aqui un lock por user_id. Los puntos criticos (push-token register/
+# unregister, pruner daemon, save_eva_chat_message, chat_eva_message)
+# usan este helper. El resto se migra en Fase 2.
+# ─────────────────────────────────────────────────────────────────────────
+_USER_JSON_LOCKS: Dict[str, threading.Lock] = {}
+_USER_JSON_LOCKS_GUARD = threading.Lock()
+
+def _get_user_lock(user_id: str) -> threading.Lock:
+    """Devuelve (creando si hace falta) un lock por user_id."""
+    with _USER_JSON_LOCKS_GUARD:
+        lk = _USER_JSON_LOCKS.get(user_id)
+        if lk is None:
+            lk = threading.Lock()
+            _USER_JSON_LOCKS[user_id] = lk
+        return lk
+
+def _atomic_write_user_json(uf: Path, ud: dict) -> None:
+    """Escribe user.json de forma atomica: temp + rename. LLamar dentro del lock."""
+    uf.parent.mkdir(parents=True, exist_ok=True)
+    tmp = uf.with_suffix(uf.suffix + ".tmp")
+    payload = json.dumps(ud, indent=2, ensure_ascii=False)
+    tmp.write_text(payload)
+    tmp.replace(uf)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# S1/M1.1 - Bearer token auth para usuarios (soft rollout)
+#
+# Flujo soft rollout:
+#   - Nuevo endpoint POST /api/auth/token genera token random y lo guarda
+#     en user.json.api_tokens[] (con created_at).
+#   - _verify_user_token(header) valida Authorization: Bearer <token>.
+#   - Endpoints protegidos llaman a _verify_user_token(...) como dependencia
+#     con user_id conocido; si la auth falta, loguea warning pero ACEPTA.
+#   - Adelante (Fase 2): switch a enforce=True para rechazar 401.
+#
+# Rutas PUBLICAS (sin auth, ni ahora ni en rollout strict): /health, /api/auth/token,
+# /admin/auth/login (admin usa su propio sistema), endpoings de ingest de camaras
+# (las camaras no saben portar bearer), /vigilance-frame/*, archivos estaticos.
+# ─────────────────────────────────────────────────────────────────────────
+AUTH_ENFORCE = False  # S1: soft rollout. False = warn-only, True = reject 401
+AUTH_TOKEN_TTL_SEC = 60 * 60 * 24 * 90  # 90 dias por defecto
+
+
+def _generate_user_token() -> str:
+    """Token aleatorio URL-safe de 32 bytes (~256 bits de entropia)."""
+    return secrets.token_urlsafe(32)
+
+
+def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
+    """
+    Valida Authorization: Bearer <token> contra user.json.api_tokens[].
+
+    Soft rollout (AUTH_ENFORCE=False): si la auth falta o es invalida,
+    se loguea WARNING pero el request continúa (devuelve identity=None).
+    Hard rollout (AUTH_ENFORCE=True): lanza 401 si falta o es invalida.
+    """
+    if not authorization:
+        if AUTH_ENFORCE:
+            raise HTTPException(status_code=401, detail="Authorization header requerido")
+        logger.warning(f"[auth:soft] user={user_id} request SIN Authorization header")
+        return {"authenticated": False, "user_id": user_id, "reason": "no_header"}
+
+    token = authorization.replace("Bearer ", "").strip()
+    if not token:
+        if AUTH_ENFORCE:
+            raise HTTPException(status_code=401, detail="Token invalido")
+        logger.warning(f"[auth:soft] user={user_id} Authorization malformado")
+        return {"authenticated": False, "user_id": user_id, "reason": "bad_header"}
+
+    try:
+        uf = find_user_json(user_id)
+        if not uf or not uf.exists():
+            if AUTH_ENFORCE:
+                raise HTTPException(status_code=401, detail="Usuario no encontrado")
+            return {"authenticated": False, "user_id": user_id, "reason": "no_user"}
+        with _get_user_lock(user_id):
+            with open(uf) as f:
+                ud = json.load(f)
+            tokens = ud.get("api_tokens", []) or []
+            now = int(time.time())
+            # Limpiar tokens expirados / revocados
+            valid = [t for t in tokens if not t.get("revoked") and
+                     now < t.get("expires_at", now + AUTH_TOKEN_TTL_SEC * 100)]
+            match = next((t for t in valid if t.get("token") == token), None)
+            if not match:
+                if AUTH_ENFORCE:
+                    raise HTTPException(status_code=401, detail="Token no valido o expirado")
+                logger.warning(f"[auth:soft] user={user_id} token invalido (len={len(token)})")
+                return {"authenticated": False, "user_id": user_id, "reason": "bad_token"}
+            # Refrescar last_used
+            match["last_used"] = now
+            ud["api_tokens"] = valid
+            _atomic_write_user_json(uf, ud)
+        return {"authenticated": True, "user_id": user_id, "token_id": match.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if AUTH_ENFORCE:
+            raise HTTPException(status_code=401, detail=f"Error validacion: {e}")
+        logger.error(f"[auth:soft] error user={user_id}: {e}")
+        return {"authenticated": False, "user_id": user_id, "reason": "error"}
+
 
 # Inicializar Firebase Admin (solo una vez)
 try:
@@ -232,7 +341,9 @@ async def _prune_stale_push_tokens():
                 if removed:
                     ud["fcm_tokens"] = ([t for t in tokens if t not in probed] + kept)[-PUSH_TOKEN_MAX_PER_USER:]
                     try:
-                        uf.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+                        # S4: lock para evitar corrupcion con requests concurrentes.
+                        with _get_user_lock(u.name):
+                            _atomic_write_user_json(uf, ud)
                     except Exception:
                         pass
         except Exception as e:
@@ -266,22 +377,137 @@ async def register_push_token(request: Request):
                 uf = cand
         if not uf:
             return {"success": False, "error": f"usuario {user_id} no encontrado"}
-        with open(uf) as f:
-            ud = json.load(f)
-        tokens = [t for t in (ud.get("fcm_tokens") or []) if (t or "").strip() != token]
-        tokens.append(token)
-        ud["fcm_tokens"] = tokens[-PUSH_TOKEN_MAX_PER_USER:]
-        if device:
-            devs = ud.get("fcm_devices") or {}
-            devs[token] = device
-            ud["fcm_devices"] = devs
-        ud["last_token_refresh"] = int(time.time())
-        uf.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+        # S4: lock durante read+mutate+write para evitar race con pruner/chat
+        with _get_user_lock(user_id):
+            with open(uf) as f:
+                ud = json.load(f)
+            tokens = [t for t in (ud.get("fcm_tokens") or []) if (t or "").strip() != token]
+            tokens.append(token)
+            ud["fcm_tokens"] = tokens[-PUSH_TOKEN_MAX_PER_USER:]
+            if device:
+                devs = ud.get("fcm_devices") or {}
+                devs[token] = device
+                ud["fcm_devices"] = devs
+            ud["last_token_refresh"] = int(time.time())
+            _atomic_write_user_json(uf, ud)
         logger.info(f"[push-token] {user_id}: {token[:18]}... (count={len(ud['fcm_tokens'])})")
         return {"success": True, "count": len(ud["fcm_tokens"])}
     except Exception as e:
         logger.error(f"[push-token] error: {e}")
         return {"success": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# S1: Auth API de usuario (token propio random, soft rollout)
+# ─────────────────────────────────────────────────────────────────────────
+@app.post("/api/auth/token")
+async def issue_user_token(request: dict):
+    """
+    Emite un Bearer token para el usuario identificado por user_id.
+    Soft rollout: NO requiere login previo (la validacion fuerte llegara en
+    Fase 2 con Firebase ID Token). Por ahora, basta con que el user_id exista.
+
+    Body:
+        user_id: str (requerido)
+        device: str (opcional,-info de tracking)
+    Devuelve:
+        token: str
+        expires_at: int (epoch)
+    """
+    user_id = (request.get("user_id") or "").strip()
+    device = request.get("device")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id requerido")
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    token = _generate_user_token()
+    token_id = secrets.token_hex(8)
+    now = int(time.time())
+    expires_at = now + AUTH_TOKEN_TTL_SEC
+    with _get_user_lock(user_id):
+        with open(uf) as f:
+            ud = json.load(f)
+        tokens = ud.get("api_tokens", []) or []
+        # Max 5 tokens activos por usuario; revocar el mas viejo si se excede
+        active = [t for t in tokens if not t.get("revoked") and now < t.get("expires_at", 0)]
+        if len(active) >= 5:
+            active.sort(key=lambda t: t.get("created_at", 0))
+            oldest = active[0]
+            oldest["revoked"] = True
+        tokens.append({
+            "id": token_id,
+            "token": token,
+            "device": device,
+            "created_at": now,
+            "expires_at": expires_at,
+            "last_used": None,
+            "revoked": False
+        })
+        # Limpiar tokens revocados/expirados viejos (mantener ultimos 20)
+        kept = [t for t in tokens if (not t.get("revoked") and
+                now < t.get("expires_at", 0))] + \
+               [t for t in tokens if (t.get("revoked") or
+                now >= t.get("expires_at", 0))][-20:]
+        ud["api_tokens"] = kept
+        _atomic_write_user_json(uf, ud)
+    logger.info(f"[auth] token issued for user={user_id} id={token_id}")
+    return {"success": True, "token": token, "token_id": token_id, "expires_at": expires_at}
+
+
+@app.delete("/api/auth/token")
+async def revoke_user_token(user_id: str, token_to_revoke: str):
+    """Revoca un Bearer token (logout de dispositivo)."""
+    user_id = (user_id or "").strip()
+    if not user_id or not token_to_revoke:
+        raise HTTPException(status_code=400, detail="user_id y token requeridos")
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with _get_user_lock(user_id):
+        with open(uf) as f:
+            ud = json.load(f)
+        tokens = ud.get("api_tokens", []) or []
+        revoked = 0
+        for t in tokens:
+            if t.get("token") == token_to_revoke and not t.get("revoked"):
+                t["revoked"] = True
+                t["revoked_at"] = int(time.time())
+                revoked += 1
+        if revoked:
+            ud["api_tokens"] = tokens
+            _atomic_write_user_json(uf, ud)
+    logger.info(f"[auth] token revoked for user={user_id} count={revoked}")
+    return {"success": True, "revoked": revoked}
+
+
+@app.get("/api/auth/tokens")
+async def list_user_tokens(user_id: str):
+    """Lista tokens activos del usuario (sin valor del token, solo metadatos)."""
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id requerido")
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    with _get_user_lock(user_id):
+        with open(uf) as f:
+            ud = json.load(f)
+        tokens = ud.get("api_tokens", []) or []
+        now = int(time.time())
+        active = [t for t in tokens if not t.get("revoked") and now < t.get("expires_at", 0)]
+    return {
+        "success": True,
+        "active_count": len(active),
+        "tokens": [{
+            "id": t.get("id"),
+            "device": t.get("device"),
+            "created_at": t.get("created_at"),
+            "expires_at": t.get("expires_at"),
+            "last_used": t.get("last_used"),
+            "revoked": t.get("revoked", False)
+        } for t in active]
+    }
 
 
 @app.delete("/api/users/push-token")
@@ -291,15 +517,17 @@ async def unregister_push_token(user_id: str, token: str):
         uf = STORAGE_ROOT / "users" / user_id / "user.json"
         if not uf.exists():
             return {"success": False, "error": "usuario no encontrado"}
-        with open(uf) as f:
-            ud = json.load(f)
-        before = len(ud.get("fcm_tokens", []) or [])
-        ud["fcm_tokens"] = [t for t in (ud.get("fcm_tokens") or []) if (t or "").strip() != token.strip()]
-        devs = ud.get("fcm_devices") or {}
-        if token in devs:
-            del devs[token]
-            ud["fcm_devices"] = devs
-            uf.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+        # S4: lock durante read+mutate+write
+        with _get_user_lock(user_id):
+            with open(uf) as f:
+                ud = json.load(f)
+            before = len(ud.get("fcm_tokens", []) or [])
+            ud["fcm_tokens"] = [t for t in (ud.get("fcm_tokens") or []) if (t or "").strip() != token.strip()]
+            devs = ud.get("fcm_devices") or {}
+            if token in devs:
+                del devs[token]
+                ud["fcm_devices"] = devs
+            _atomic_write_user_json(uf, ud)
         logger.info(f"[push-token] unregister {user_id}: {before}->{len(ud['fcm_tokens'])}")
         return {"success": True, "remaining": len(ud["fcm_tokens"])}
     except Exception as e:
@@ -501,9 +729,9 @@ async def centinela_test(user_id: str, camera_id: str = "OJO-E17604", count: int
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin", "User-Agent", "DNT", "Cache-Control", "Keep-Alive", "X-Api-Key", "Pragma"],
     expose_headers=["*"],
     max_age=86400,
 )
@@ -1460,26 +1688,27 @@ async def save_eva_chat_message(request: dict):
         uf = find_user_json(user_id)
         if not uf or not uf.exists():
             return {"success": False, "error": "user not found"}
-        with open(uf) as f:
-            ud = json.load(f)
-        sessions = ud.get("eva_sessions", {}) or {}
-        if session_id not in sessions:
-            sessions[session_id] = {
-                "messages": [],
-                "created_at": timestamp,
-                "last_message_at": timestamp
-            }
-        sessions[session_id]["messages"].append({
-            "role": role,
-            "content": content,
-            "timestamp": timestamp
-        })
-        sessions[session_id]["last_message_at"] = timestamp
-        # Mantener solo últimos 100 mensajes por sesión
-        sessions[session_id]["messages"] = sessions[session_id]["messages"][-100:]
-        ud["eva_sessions"] = sessions
-        with open(uf, "w") as f:
-            json.dump(ud, f, indent=2)
+        # S4: lock durante read+mutate+write (race vs thread daemon chat_eva_message)
+        with _get_user_lock(user_id):
+            with open(uf) as f:
+                ud = json.load(f)
+            sessions = ud.get("eva_sessions", {}) or {}
+            if session_id not in sessions:
+                sessions[session_id] = {
+                    "messages": [],
+                    "created_at": timestamp,
+                    "last_message_at": timestamp
+                }
+            sessions[session_id]["messages"].append({
+                "role": role,
+                "content": content,
+                "timestamp": timestamp
+            })
+            sessions[session_id]["last_message_at"] = timestamp
+            # Mantener solo últimos 100 mensajes por sesión
+            sessions[session_id]["messages"] = sessions[session_id]["messages"][-100:]
+            ud["eva_sessions"] = sessions
+            _atomic_write_user_json(uf, ud)
         return {"success": True, "saved": True}
     except HTTPException:
         raise
@@ -1555,30 +1784,23 @@ async def chat_eva_message(request: dict):
                 storage_root=STORAGE_ROOT
             )
         except Exception as e1:
-            logger.warning(f"[EVA] handle_eva_v2 falló: {e1}, intentando chat clásico...")
+            logger.exception(f"[EVA] handle_eva_v2 falló: {e1}")
+            from eva_v2 import _make_os_session, _load_session, _mk_resp as _eva_mk_resp
+            session = _load_session(session_id)
+            if not session or session.get("user_id") != user_id:
+                session = _make_os_session(user_id, session_id)
+            _sessions_backup = None
             try:
-                from eva.eva_chat import handle_eva_chat
-                result = await handle_eva_chat(
-                    user_id=user_id,
-                    message=message,
-                    session_id=session_id,
-                    cam_id=cam_id or None,
-                    include_frame=include_frame,
-                    storage_root=STORAGE_ROOT
-                )
-            except Exception as e2:
-                logger.error(f"[EVA] handle_eva_chat también falló: {e2}")
-                result = {
-                    "success": True,
-                    "response": f"Hola {user_id[:8]}. Recibí tu mensaje pero el motor conversacional no está disponible en este momento. Un técnico lo revisará pronto.",
-                    "image_url": "",
-                    "session_id": session_id,
-                    "phase": "os",
-                    "ready_to_confirm": False,
-                    "camera_saved": False,
-                    "suggestions": [],
-                    "events_found": []
-                }
+                from eva_v2 import _sessions
+                _sessions[session_id] = session
+            except Exception:
+                pass
+            result = _eva_mk_resp(
+                session,
+                f"Lo siento {user_id[:8]}, tuve un problema técnico procesando eso. Intenta reformularlo, por favor.",
+                suggestions=["Qué ha pasado hoy", "Cuántas personas han venido hoy", "Muéstrame el pico"]
+            )
+            result["sessionId"] = session_id
         
         # Normalizar respuesta: agregar sessionId (alias de session_id)
         result["sessionId"] = result.get("session_id") or session_id
@@ -1608,21 +1830,27 @@ async def chat_eva_message(request: dict):
         # Guardar en user.json (best-effort, no falla si no se puede)
         if uf and uf.exists():
             try:
-                sessions = ud.get("eva_sessions", {}) or {}
-                if msgs_session_id not in sessions:
-                    sessions[msgs_session_id] = {
-                        "messages": [],
-                        "created_at": int(time.time()),
-                        "last_message_at": int(time.time())
-                    }
-                sessions[msgs_session_id]["messages"] = messages[-100:]  # últimos 100
-                sessions[msgs_session_id]["last_message_at"] = int(time.time())
-                ud["eva_sessions"] = sessions
-                # No escribir sync - hacerlo async para no bloquear
+                msgs_session_id_local = msgs_session_id
+                messages_local = list(messages)
+                # S4: ahora el thread daemon toma lock + relee user.json (no usa el snapshot
+                # possibly-stale 'ud') para evitar race con save_eva_chat_message y pruner.
+                # Capturamos solo lo necesario (session_id, messages) y re-mutamos bajo lock.
                 def _save_async():
                     try:
-                        with open(uf, "w") as f:
-                            json.dump(ud, f, indent=2)
+                        with _get_user_lock(user_id):
+                            with open(uf) as f:
+                                ud_fresh = json.load(f)
+                            sessions = ud_fresh.get("eva_sessions", {}) or {}
+                            if msgs_session_id_local not in sessions:
+                                sessions[msgs_session_id_local] = {
+                                    "messages": [],
+                                    "created_at": int(time.time()),
+                                    "last_message_at": int(time.time())
+                                }
+                            sessions[msgs_session_id_local]["messages"] = messages_local[-100:]
+                            sessions[msgs_session_id_local]["last_message_at"] = int(time.time())
+                            ud_fresh["eva_sessions"] = sessions
+                            _atomic_write_user_json(uf, ud_fresh)
                     except Exception:
                         pass
                 import threading
@@ -1904,7 +2132,7 @@ async def update_user_profile(request: Request):
         return {"success": True}
 
 @app.get("/api/user/events")
-async def get_user_events(user_id: str, date: str = None, filter: str = None, limit: int = 50):
+async def get_user_events(user_id: str, date: str = None, filter: str = None, limit: int = 50, camera_id: str = None, exclude_vigilance: bool = False):
     events = []
     now = int(time.time())
     start_of_today = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -1915,8 +2143,13 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
             ud = json.load(f)
         for cam in ud.get("cameras", []):
             cam_names[cam.get("camera_id", "")] = cam.get("name", "")
+    # M4.4: si filtra por camera_id, no recorrer dirs de otras camaras
+    target_cam_ids = {camera_id} if camera_id else None
     for cam_id, events_dir in resolve_user_events_dirs(user_id):
         if not events_dir.exists():
+            continue
+        # M4.4: saltar dirs de camaras que no nos interesan
+        if target_cam_ids and cam_id not in target_cam_ids and cam_id != "_global":
             continue
         # Usar scandir (mas eficiente) y limitar cuantos examinamos para no recorrer 9000+ archivos
         try:
@@ -1936,10 +2169,20 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
                     ev = json.load(f)
             except Exception:
                 continue  # json corrupto/vacio -> skip
+            # M4.4: filtrar por camera_id del propio evento (fallback si events_dir agrupa _global)
+            if target_cam_ids and ev.get("camera_id", "") not in target_cam_ids:
+                continue
             if date == "hoy" or filter == "today":
                 if int(ev.get("timestamp", 0) or 0) < start_of_today:
                     continue
-            if filter == "alerts" and ev.get("event_type") != "violation":
+            # M4.6: vigilance_alert es centinela de 1 frame. Bandera + opcionalmente excluido.
+            is_centinela = ev.get("event_type") in ("vigilance_alert", "night_alert")
+            ev["is_centinela"] = is_centinela
+            if exclude_vigilance and is_centinela:
+                continue
+            # M4.6: filtro "alerts" ahora incluye centinelas como alertas operacionales,
+            # con prioridad violation > vigilance_alert/night_alert para el chat brief.
+            if filter == "alerts" and not (ev.get("event_type") == "violation" or is_centinela):
                 continue
             cid = ev.get("camera_id", "")
             ev["camera_name"] = cam_names.get(cid, cam_id if cam_id != "_global" else "Camara")
@@ -2435,6 +2678,21 @@ async def save_camera_vigilance(camera_id: str, request: dict = None):
     user_id = _resolve_user_id_from_camera(camera_id) if not body.get("user_id") else body["user_id"]
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
+    # M5.2: validar HH:MM antes de guardar (el frontend tambien valida, defensa en profundidad).
+    _HhMm_re = re.compile(r"^\d{2}:\d{2}$")
+    schedule_in = body.get("schedule") or {}
+    _open = schedule_in.get("open", "") if isinstance(schedule_in, dict) else ""
+    _close = schedule_in.get("close", "") if isinstance(schedule_in, dict) else ""
+    def _valid_hhmm(s):
+        if not _HhMm_re.match(str(s)):
+            return False
+        try:
+            h, m = str(s).split(":")
+            return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except Exception:
+            return False
+    if schedule_in and (not _valid_hhmm(_open) or not _valid_hhmm(_close)):
+        raise HTTPException(status_code=400, detail=f"Horario inválido (usa HH:MM): open={_open} close={_close}")
     uf = find_user_json(user_id)
     if not uf or not uf.exists():
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -2733,9 +2991,17 @@ def _save_vigilance_event(user_id: str, camera_id: str, img_bytes: bytes, yolo_c
     cam_key = f"{user_id}_{camera_id}"
     try:
         _cam_cfg = get_camera_config(user_id, camera_id)
-        _cooldown_sec = int(_cam_cfg.get("cooldown_min", 60))
+        # M5.3: el frontend envia cooldown_min en MINUTOS (slider 5-60, label "min").
+        # Antes se interpretaba como segundos -> con valor 5 habia spam cada 5s.
+        # Ahora multiplicamos por 60. Default 5 min = 300s.
+        _cooldown_min = int(_cam_cfg.get("cooldown_min", 5))
+        if _cooldown_min < 1:
+            _cooldown_min = 1
+        if _cooldown_min > 1440:
+            _cooldown_min = 1440  # cap 24h
+        _cooldown_sec = _cooldown_min * 60
     except:
-        _cooldown_sec = 60
+        _cooldown_sec = 300  # 5 min fallback
     _last = _vigilance_cooldowns.get(cam_key, 0)
     if now - _last < _cooldown_sec:
         logger.info(f"Vigilance alert suppressed (cooldown {_cooldown_sec}s): {camera_id}")
@@ -2813,7 +3079,11 @@ def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count:
                 user_id=user_id,
                 image_b64=image_b64,
                 image_url=img_url,
-                link=f"https://ojoia.com.do/#events?event={event_id}"
+                link=f"https://ojoia.com.do/#cameras?event={event_id}",
+                # M6.1: dedupe por event_id - 3 alertas del mismo evento no apilan 3 notif
+                tag=f"vigilance-{event_id}",
+                event_id=event_id,
+                notif_type="vigilance_alert"
             ))
         logger.info(f"Vigilance FCM queued to {len(tokens)} tokens (image_url={'yes' if img_url else 'no'})")
     except Exception as e:

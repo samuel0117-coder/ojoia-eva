@@ -30,8 +30,9 @@ register_comfyui_endpoints(APP)
 APP.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin", "User-Agent", "Cache-Control", "Keep-Alive", "Pragma"],
     expose_headers=["*"],
 )
 

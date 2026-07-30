@@ -5,6 +5,7 @@ import base64
 import httpx
 import json
 import os
+import sys
 import time
 import logging
 import datetime
@@ -297,7 +298,7 @@ def _send_night_fcm(cam_cfg, user_id, camera_id, frame_bytes, event_id, persons)
                 business_name = json.load(_uf).get("business_name", "")
         except Exception:
             pass
-        link = f"https://ojoia.com.do/#events?event={event_id}" if event_id else "https://ojoia.com.do/#events"
+        link = f"https://ojoia.com.do/#cameras?event={event_id}" if event_id else "https://ojoia.com.do/#cameras"
         b64 = image_to_base64(frame_bytes) if frame_bytes else None
         for tok in tok in tokens:
             payload = {
@@ -341,9 +342,13 @@ def _send_night_fcm(cam_cfg, user_id, camera_id, frame_bytes, event_id, persons)
 
 
 async def send_fcm_notification(title: str, body: str, token: str = None,
-                                    user_id: str = None, image_b64: str = None, image_url: str = None, link: str = "https://ojoia.com.do/#events"):
+                                    user_id: str = None, image_b64: str = None, image_url: str = None,
+                                    link: str = "https://ojoia.com.do/#events",
+                                    tag: str = None, event_id: str = None, notif_type: str = "violation"):
     """Enviar notificación push via Firebase Cloud Messaging (API HTTP v1 con OAuth2).
-    image_b64: imagen embebida (data payload); image_url: URL accesible (webpush.image)."""
+    image_b64: imagen embebida (data payload); image_url: URL accesible (webpush.image).
+    M6.1: tag opcional dedupe. Si no se pasa, se deriva de event_id; fallback 'violation'.
+    notif_type: tipo semantico ('violation'/'vigilance_alert'/'night_alert'/'daily_report')."""
     import logging as _log
     try:
         from google.oauth2 import service_account
@@ -380,7 +385,13 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
         }
         
         sent = 0
+        _dead_tokens = []  # M6.3: tokens UNREGISTERED detectados por FCM
         _img_field = image_url or (f"data:image/jpeg;base64,{image_b64}" if image_b64 else None)
+        # M6.1: dedupe por event_id. Si no se pasa event_id explicito, derivar del link.
+        _event_id = event_id or (link.split('alert=')[-1].split('&')[0] if 'alert=' in link else
+                                  (link.split('event=')[-1].split('&')[0] if 'event=' in link else ""))
+        # tag: pasar por param > derivar > fallback 'violation' (centinela -> sua proprio por evitar apilar)
+        _notif_tag = tag or (_event_id if _event_id else "violation")
         for tok in tokens:
             try:
                 _notif = {"title": title, "body": body}
@@ -391,13 +402,13 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
                         "token": tok,
                         "notification": _notif,
                             "data": {
-                            "type": "violation",
+                            "type": notif_type,
                             "url": link,
-                            "event_id": link.split('alert=')[-1].split('&')[0] if 'alert=' in link else (link.split('event=')[-1].split('&')[0] if 'event=' in link else ""),
+                            "event_id": _event_id,
                             "camera_id": link.split('camera=')[-1].split('&')[0] if 'camera=' in link else "",
                             "title": title,
                             "body": body,
-                            "tag": "violation",
+                            "tag": _notif_tag,
                             **({"image": _img_field} if _img_field else {}),
                         },
 
@@ -408,14 +419,14 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
                                 "icon": "/img/icon-192.png",
                                 "badge": "/img/icon-192.png",
                                 "require_interaction": True,
-                                "tag": "violation",
+                                "tag": _notif_tag,
                                 **({"image": _img_field} if _img_field else {}),
                             },
                             "fcm_options": {"link": link}
                         }
                     }
                 }
-                _log.info(f"FCM payload: title='{title}' body='{body[:80]}' link={link}")
+                _log.info(f"FCM payload: title='{title}' body='{body[:80]}' link={link} tag={_notif_tag}")
                 _resp = _req.post(
                     "https://fcm.googleapis.com/v1/projects/ojoia-67216/messages:send",
                     json=_payload, headers=_headers, timeout=10
@@ -425,10 +436,46 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
                     sent += 1
                 else:
                     _log.warning(f"FCM error {_resp.status_code}: {_resp.text[:200]}")
+                    # M6.3: detectar tokens muertos y marcarlos para borrado en user.json
+                    _err_text = _resp.text or ""
+                    if _resp.status_code in (404, 400) and "UNREGISTERED" in _err_text.upper():
+                        _dead_tokens.append(tok)
             except Exception as _e:
                 _log.warning(f"FCM token error: {_e}")
         
-        _log.info(f"FCM: {sent}/{len(tokens)} enviadas")
+        # M6.3: borrar tokens muertos de user.json (race-safe via S4 lock)
+        if _dead_tokens and user_id:
+            try:
+                import threading as _th
+                _lock_path = user_id
+                # usar el helper de api_eva si esta disponible (mismo proceso)
+                if 'api_eva' in sys.modules and hasattr(api_eva, '_get_user_lock'):
+                    _lock = api_eva._get_user_lock(user_id)
+                else:
+                    # fallback: lock local por user_id
+                    _locks = getattr(send_fcm_notification, '_cleanup_locks', {})
+                    if _lock_path not in _locks:
+                        _locks[_lock_path] = _th.Lock()
+                        send_fcm_notification._cleanup_locks = _locks
+                    _lock = _locks[_lock_path]
+                with _lock:
+                    _uf = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+                    if os.path.exists(_uf):
+                        with open(_uf) as _f: _ud = json.load(_f)
+                        _toks = _ud.get("fcm_tokens", []) or []
+                        _before = len(_toks)
+                        _toks = [t for t in _toks if t not in _dead_tokens]
+                        # tambien limpiar fcm_devices
+                        _devs = _ud.get("fcm_devices") or {}
+                        for _dt in _dead_tokens: _devs.pop(_dt, None)
+                        if len(_toks) != _before:
+                            _ud["fcm_tokens"] = _toks
+                            _ud["fcm_devices"] = _devs
+                            with open(_uf, "w") as _f: json.dump(_ud, _f, indent=2, ensure_ascii=False)
+                            _log.info(f"[FCM cleanup] user={user_id}: removidos {_before - len(_toks)} tokens muertos")
+            except Exception as _ce:
+                _log.warning(f"[FCM cleanup] error user={user_id}: {_ce}")
+        _log.info(f"FCM: {sent}/{len(tokens)} enviadas (dead={len(_dead_tokens)})")
         return sent > 0
 
     except Exception as e:

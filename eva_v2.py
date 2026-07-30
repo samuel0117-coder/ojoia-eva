@@ -844,6 +844,9 @@ def _is_os_intent(text: str) -> bool:
         "encuentra", "quien vino", "persona con", "gorra", "camisa", "color",
         "cuantos clientes", "clientes hay", "clientes entraron", "hay clientes",
         "clientes ahora", "cuantas personas", "personas hay", "gente hay", "cuanta gente",
+        "el pico", "muestrame el pico", "muestra el pico", "cual fue el pico",
+        "cuando fue el pico", "a que hora fue el pico", "aforo pico", "trafico maximo",
+        "maximo de personas", "peak",
         "quien eres", "que eres", "para que sirves", "eres una persona", "eres humano",
         "como te llamas", "confund", "desubic", "sigue en configuracion",
         "no se pudo instalar", "fallo la instalacion", "cuanto gane", "ganancia", "ventas",
@@ -1066,6 +1069,96 @@ def _parse_hermes_tool_call(content):
 async def _detect_intent_and_route(user_id, message, first, recent, cam_count, session):
     """Detecta intenciones comunes y las responde directamente sin pasar por el LLM."""
     msg_norm = _normalize_text(message)
+
+    # ── "muéstrame el pico" / "pico" / "peak": reutiliza el conteo del turno previo si existe ──
+    if any(p in msg_norm for p in [
+        "muestrame el pico", "muéstrame el pico", "el pico", "muestra el pico",
+        "cual fue el pico", "cuál fue el pico", "cuando fue el pico", "cuándo fue el pico",
+        "a que hora fue el pico", "a qué hora fue el pico", "peak", "aforo pico",
+        "trafico maximo", "tráfico máximo", "maximo de personas", "máximo de personas",
+    ]):
+        # 1) Intentar reutilizar el resultado raw del count_people del turno anterior
+        reused = None
+        asked_yesterday = any(w in msg_norm for w in ("ayer", "anoche", "dia anterior", "día anterior"))
+        if isinstance(session, dict):
+            for m in reversed(session.get("msgs", [])):
+                if isinstance(m, dict) and m.get("role") == "tool_full" and m.get("tool") == "count_people":
+                    r = m.get("result", {})
+                    if r.get("peak_count") and r.get("peak_time"):
+                        reused = r
+                    break
+        if reused:
+            total = reused.get("total_people", 0)
+            peak = reused.get("peak_count", 0)
+            peak_time = reused.get("peak_time", "")
+            # Heredar el día del resultado anterior; el usuario puede override con "ayer"
+            dia = "ayer" if (asked_yesterday or reused.get("dia") == "ayer") else "hoy"
+            text = f"El pico de {dia} fue de **{peak} persona(s)** a las **{peak_time}**."
+            if total:
+                text += f" En total detecté {total} persona(s) {dia}."
+            return {"text": text, "events": []}
+        # 2) Sin datos previos → calcular horas pico en el día pedido (sin inventar)
+        from eva.tools import tool_peak_hours
+        date_param = "yesterday" if asked_yesterday else "today"
+        result = await tool_peak_hours(user_id, date=date_param, top_n=3)
+        # Solo si el usuario pregunto por "hoy" y hoy esta vacio, recurrir a ventana 24h ("recent")
+        # NUNCA suplantar hoy con ayer sin que el usuario lo pidiera.
+        if (not result.get("success") or not result.get("top_peak")) and not asked_yesterday:
+            result = await tool_peak_hours(user_id, date="recent", top_n=3)
+        if result.get("success") and result.get("top_peak"):
+            return {"text": result.get("message", ""), "events": []}
+        dia = "ayer" if asked_yesterday else "hoy"
+        return {"text": f"Aún no tengo un pico registrado para {dia}, {first}. En cuanto detecte movimiento te lo digo.", "events": []}
+
+    # ── "qué ha pasado hoy" / "cuéntame" / "novedades": resumen accionable con tool_full persistente ──
+    if any(p in msg_norm for p in [
+        "que ha pasado hoy", "que paso hoy", "que ha pasado", "que paso",
+        "cuentame que", "cuentame que ha pasado", "cuentame que paso", "cuentame",
+        "dime que ha pasado", "dime que paso", "que tal el dia", "que tal el día",
+        "novedades de hoy", "novedades hoy", "algunas novedades", "que hubo hoy", "que hubo",
+        "como va el dia", "como va el día", "que se sabe", "dame un resumen",
+    ]):
+        asked_yesterday = any(w in msg_norm for w in ("ayer", "anoche", "dia anterior", "día anterior"))
+        date_param = "yesterday" if asked_yesterday else "today"
+        from eva.tools import tool_count_people, tool_latest_events
+        cp = await tool_count_people(user_id, date=date_param)
+        le = await tool_latest_events(user_id, limit=4, date=date_param)
+        total_people = cp.get("total_people", 0)
+        peak = cp.get("peak_count", 0)
+        peak_time = cp.get("peak_time", "")
+        events = le.get("events", [])
+        # Persistir tool_full(count_people) para que "muéstrame el pico" pueda reutilizarlo
+        _store_tool_full(session, "count_people", {
+            "text": "", "events": [], "dia": ("ayer" if asked_yesterday else "hoy"),
+            "total_people": total_people, "sessions": cp.get("sessions", 0),
+            "peak_count": peak, "peak_time": peak_time,
+            "cameras": cp.get("cameras", []),
+        })
+        dia_label = "ayer" if asked_yesterday else "hoy"
+        lines = []
+        if total_people or events:
+            if asked_yesterday:
+                lines.append("Resumen de ayer:")
+            else:
+                lines.append("Resumen de hoy:")
+            if total_people:
+                lines.append(f"  · {total_people} persona(s) detectadas"
+                             + (f" en {cp.get('sessions',1)} visita(s)" if cp.get("sessions",1) > 1 else "")
+                             + (f". Pico de {peak} a las {peak_time}." if peak and peak_time else "."))
+            else:
+                lines.append(f"  · No detecté personas {dia_label} (sin objetos contables).")
+            if events:
+                lines.append("  · Últimos registros:")
+                for item in events[:4]:
+                    mode_label = "🛡️ centinela" if item.get("mode") == "centinela" else "📋 normal"
+                    lines.append(f"      - {mode_label} · {item.get('datetime','')[:5]} · {item.get('camera_name','')}: {item.get('description','')[:100]}")
+        else:
+            # HOY sin datos → NUNCA inventar de ayer. Decir honestamente que no hay actividad.
+            if asked_yesterday:
+                lines.append(f"Ayer no se registró actividad. La cámara pudo estar apagada.")
+            else:
+                lines.append(f"Hoy no he detectado actividad todavía. Si la cámara está apagada, no habrá registros hasta que se conecte. En cuanto capte movimiento te aviso.")
+        return {"text": "\n".join(lines), "events": []}
 
     if any(p in msg_norm for p in ["cuantas personas", "cuántas personas", "cuantas personas hoy", "cuántas personas hoy", "cuantas personas has", "cuántas personas has"]):
         from eva.tools import tool_get_activity_summary
@@ -1325,104 +1418,6 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
 
     return None
 
-
-async def _handle_os_mode(session, user_id, message, session_id):
-    return await _handle_os_mode_v2(session, user_id, message, session_id)
-
-
-async def _handle_os_mode_v2(session, user_id, message, session_id):
-    session["msgs"].append({"role":"user","content":message})
-    first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
-    ud = _load_user_data(user_id)
-    cam_count = len([c for c in ud.get("cameras",[]) if c.get("active")]) if ud.get("cameras") else 0
-
-    if message == "__daily_summary__":
-        return await _handle_daily_summary(session, user_id, message, session_id)
-
-    suggestions = _get_business_suggestions_list(ud.get("business_type",""), cam_count, first)
-    recent = await _get_recent_summary(user_id)
-
-    intent_result = await _detect_intent_and_route(user_id, message, first, recent, cam_count, session)
-    if intent_result:
-        session["msgs"].append({"role":"assistant","content":intent_result["text"]})
-        _sessions[session_id] = session
-        return _mk_resp(
-            session,
-            intent_result["text"],
-            suggestions=suggestions,
-            events_found=intent_result.get("events", []),
-            heatmap=intent_result.get("heatmap"),
-            heatmap_meta=intent_result.get("heatmap_meta"),
-        )
-
-    sys_p = (
-        f"Eres Eva, asistente de seguridad de OjoIA en República Dominicana.\n"
-        f"Dueño: {session.get('owner_name','el dueño')}\n"
-        f"Negocio: {ud.get('business_name','')} ({ud.get('business_type','')})\n"
-        f"Cámaras activas: {cam_count}\n\n"
-        f"=== RESUMEN RECIENTE DEL DIARIO ===\n{recent}\n\n"
-        f"=== HERRAMIENTAS DISPONIBLES ===\n"
-        f"- get_activity_summary: Resume actividad diaria (total análisis, personas, alertas)\n" +
-        f"- search_events: Busca eventos con filtros semánticos. Filtros opcionales: person_class (hombre|mujer|nino|anciano), clothing (ej 'camisa blanca'), min_persons, max_persons, activity (trabajando|hablando|entrando), importance (baja|media|alta|critica), date (today|yesterday|YYYY-MM-DD), camera_id, query\n" +
-        f"- event_book: Indice cronologico agrupable. 'Que paso entre 2 y 4 pm?' Parametros: date, group_by (hour|camera|ten_minute), only_importance, camera_id\n" +
-        f"- find_anomalies: Eventos relevantes segun gravedad (media/alta)\n" +
-        f"- latest_events: Lista ultimos análisis cronologicos\n" +
-        f"- count_people: Conteo de personas unicas hoy/ayer\n" +
-        f"- traffic_flow: Flujo entrada/salida con zonas entrance. 'cuantos entraron hoy', 'cuanta gente hay ahora'\n" +
-        f"- peak_hours: Top horas por trafico. 'cuales son las horas pico', 'cuando hay mas gente'\n" +
-        f"- heatmap_data: Datos de densidad por celda. 'donde se acumula mas gente', 'mapa de calor'\n" +
-        f"- zone_dwell: Permanencia por zona. 'cuanto tiempo en caja', 'quien estuvo mas de 30 min'\n" +
-        f"- is_open_hours: Horario negocio abierto/cerrado\n" +
-        f"- list_employees: Empleados registrados con face_id, rol y horario\n\n"
-        f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
-        f"Si no necesitas herramientas, responde directamente al usuario.\n\n"
-        f"Responde en español, natural y dominicano. NO inventa datos."
-    )
-    msgs = [{"role":"system","content":sys_p}]
-    for h in session.get("msgs",[])[-6:]:
-        if isinstance(h,dict) and "role" in h:
-            msgs.append({"role":h["role"],"content":h.get("content","")[:200]})
-    msgs.append({"role":"user","content":message})
-
-    response = await _call_qwen(msgs, max_tokens=500)
-    content = response.get("content", "").strip()
-
-    tool_call = _parse_hermes_tool_call(content)
-    if tool_call:
-        tool_name = tool_call.get("name", "")
-        tool_args = tool_call.get("arguments", {})
-        if tool_name in ("get_activity_summary", "search_events", "find_anomalies", "latest_events", "find_risks", "count_people", "is_open_hours", "list_employees", "identify_face", "event_book", "traffic_flow", "zone_dwell", "heatmap_data", "peak_hours"):
-            result = await _execute_os_tool_v2(user_id, tool_name, tool_args, message, first, recent, cam_count, session)
-            tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
-            msgs.append({"role":"assistant","content":content})
-            msgs.append({"role":"tool","tool_call_id":"hermes","content":tool_result_msg})
-            biz = ud.get('business_name','')
-            biz_type = session.get('business_type','')
-            final_sys_p = (
-                f"Eres Eva, asistente de seguridad de OjoIA en República Dominicana.\n"
-                f"Dueño: {session.get('owner_name','el dueño')}\n"
-                f"Negocio: {biz} ({biz_type})\n\n"
-                f"=== RESULTADO DE HERRAMIENTA ===\n{tool_result_msg}\n\n"
-                f"Responde al usuario de forma natural con estos datos. Sé específico y útil."
-            )
-            final_msgs = [{"role":"system","content":final_sys_p}]
-            for h in session.get("msgs",[])[-4:]:
-                if isinstance(h,dict) and "role" in h:
-                    final_msgs.append({"role":h["role"],"content":h.get("content","")[:200]})
-            final_msgs.append({"role":"user","content":message})
-            final = await _call_qwen(final_msgs, max_tokens=400)
-            text = final.get("content", "").strip() or result.get("text", f"No pude procesarlo, {first}.")
-            session["msgs"].append({"role":"assistant","content":text})
-            _sessions[session_id] = session
-            return _mk_resp(session, text, suggestions=suggestions, events_found=result.get("events", []))
-
-    if not content:
-        text = f"No pude procesarlo, {first}."
-    else:
-        text = content
-    session["msgs"].append({"role":"assistant","content":text})
-    _sessions[session_id] = session
-    return _mk_resp(session, text, suggestions=suggestions)
 
 # =============================================================================
 # SETUP MODE
@@ -1771,6 +1766,51 @@ async def _handle_confirm(session, session_id, user_id, message, first, storage_
 # OS MODE
 # =============================================================================
 
+def _store_tool_full(session, tool_name, result):
+    """Persiste el resultado raw (JSON) de una herramienta para contexto del siguiente turno."""
+    if not isinstance(session, dict):
+        return
+    msgs = session.setdefault("msgs", [])
+    payload = {"role": "tool_full", "tool": tool_name, "result": {
+        k: v for k, v in (result or {}).items() if k in (
+            "success", "text", "message", "dia",
+            "total_people", "sessions", "events_count", "peak_count", "peak_time", "cameras",
+            "total_events", "persons_total", "attention_events",
+            "found", "events", "is_open", "business_hours",
+            "groups", "group_by", "period",
+            "heatmap", "grid_size", "hotspots", "zone_counts", "total_points",
+        ) and not isinstance(v, (bytes,))
+    }}
+    msgs.append(payload)
+    # Limitar a los últimos 4 tool_full para evitar crecimiento indefinido
+    tf = [m for m in msgs if isinstance(m, dict) and m.get("role") == "tool_full"]
+    if len(tf) > 4:
+        for m in tf[:-4]:
+            try:
+                msgs.remove(m)
+            except ValueError:
+                pass
+
+
+def _format_prior_tool_context(session):
+    """Construye un bloque de texto con los datos raw de las últimas herramientas ejecutadas."""
+    if not isinstance(session, dict):
+        return ""
+    tf = [m for m in session.get("msgs", []) if isinstance(m, dict) and m.get("role") == "tool_full"]
+    if not tf:
+        return ""
+    lines = ["=== DATOS DE HERRAMIENTAS ANTERIORES (turno previo) ==="]
+    for m in tf[-3:]:
+        tool = m.get("tool", "?")
+        try:
+            snippet = json.dumps(m.get("result", {}), ensure_ascii=False)[:600]
+        except (TypeError, ValueError):
+            snippet = str(m.get("result", ""))[:600]
+        lines.append(f"[{tool}] {snippet}")
+    lines.append("Si el usuario pregunta por estos datos (ej. 'el pico', 'cuántas personas', 'el total'), RESPONDE usando estos datos exactos. NO pidas fecha ni invoques de nuevo la herramienta.")
+    return "\n".join(lines)
+
+
 async def _handle_os_mode(session, user_id, message, session_id):
     return await _handle_os_mode_v2(session, user_id, message, session_id)
 
@@ -1835,7 +1875,9 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     msg_lower = message.lower()
     if any(k in msg_lower for k in ("cuántas personas", "cuantas personas", "cuanta gente", "cuánta gente", "afluencia", "tráfico de personas", "han venido", "vinieron hoy", "personas vinieron")):
         best_cam = await _pick_best_camera_id(user_id) or ""
-        tool_result = await _execute_os_tool_v2(user_id, "count_people", {"date": "today", "camera_id": best_cam}, message, first, recent, cam_count, session)
+        date_param = "yesterday" if any(w in msg_lower for w in ("ayer", "anoche", "dia anterior", "día anterior")) else "today"
+        tool_result = await _execute_os_tool_v2(user_id, "count_people", {"date": date_param, "camera_id": best_cam}, message, first, recent, cam_count, session)
+        _store_tool_full(session, "count_people", {**tool_result, "dia": ("ayer" if date_param == "yesterday" else "hoy")})
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
         _sessions[session_id] = session
         return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
@@ -1860,6 +1902,13 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
             session["msgs"].append({"role": "assistant", "content": error_text})
             _sessions[session_id] = session
             return _mk_resp(session, error_text, suggestions=suggestions, events_found=[])
+
+    if any(k in msg_lower for k in ("__adjust_protection__", "ajustar proteccion", "ajustar protección", "cambiar proteccion", "cambiar protección", "configurar proteccion")):
+        best_cam = await _pick_best_camera_id(user_id) or ""
+        tool_result = await _execute_os_tool_v2(user_id, "get_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
+        session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
+        _sessions[session_id] = session
+        return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
 
     intent_result = await _detect_intent_and_route(user_id, message, first, recent, cam_count, session)
     if intent_result:
@@ -1898,11 +1947,13 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         f"Responde en español, natural y dominicano. NO inventes datos."
     )
     msgs = [{"role":"system","content":sys_p}]
-    for h in session.get("msgs",[])[-6:]:
-        if isinstance(h,dict) and "role" in h:
-            msgs.append({"role":h["role"],"content":h.get("content","")[:200]})
+    tool_ctx = _format_prior_tool_context(session)
+    if tool_ctx:
+        msgs.insert(0, {"role":"system","content":tool_ctx})
+    for h in session.get("msgs",[])[-3:]:
+        if isinstance(h,dict) and "role" in h and h.get("role") in ("user","assistant"):
+            msgs.append({"role":h["role"],"content":h.get("content","")[:1200]})
     msgs.append({"role":"user","content":message})
-
     response = await _call_qwen(msgs, max_tokens=500)
     content = response.get("content", "").strip()
 
@@ -1915,6 +1966,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
             tool_result_msg = json.dumps(result, ensure_ascii=False)[:800]
             msgs.append({"role":"assistant","content":content})
             msgs.append({"role":"tool","tool_call_id":"hermes","content":tool_result_msg})
+            _store_tool_full(session, tool_name, result)
             biz = ud.get('business_name','')
             biz_type = session.get('business_type','')
             final_sys_p = (
@@ -1925,9 +1977,9 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
                 f"Responde al usuario de forma natural con estos datos. Sé específico y útil."
             )
             final_msgs = [{"role":"system","content":final_sys_p}]
-            for h in session.get("msgs",[])[-4:]:
-                if isinstance(h,dict) and "role" in h:
-                    final_msgs.append({"role":h["role"],"content":h.get("content","")[:200]})
+            for h in session.get("msgs",[])[-3:]:
+                if isinstance(h,dict) and "role" in h and h.get("role") in ("user","assistant"):
+                    final_msgs.append({"role":h["role"],"content":h.get("content","")[:1200]})
             final_msgs.append({"role":"user","content":message})
             final = await _call_qwen(final_msgs, max_tokens=400)
             text = final.get("content", "").strip() or result.get("text", f"No pude procesarlo, {first}.")
@@ -2138,7 +2190,8 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
             return {"text": f"Hubo {data.get('found')} alerta(s). Última: {last.get('datetime', '')} en {last.get('camera_name', '')}: {last.get('descripcion', '')}.", "events": anomalies[:5]}
         parts = [f"Encontré {data.get('found')} alerta(s):"]
         for item in anomalies[:3]:
-            parts.append(f"- {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('descripcion', '')}.")
+            mode_label = "🛡️ centinela" if item.get("mode") == "centinela" else "📋 normal"
+            parts.append(f"- {mode_label} · {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('descripcion', '')}.")
         return {"text": "\n".join(parts), "events": anomalies[:5]}
 
     if tool_name == "latest_events":
@@ -2151,7 +2204,8 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
             return {"text": "No hay análisis recientes.", "events": []}
         parts = [f"Últimos {data['found']} análisis:"]
         for item in data.get("events", [])[:5]:
-            parts.append(f"- {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('description', '')[:120]}")
+            mode_label = "🛡️ centinela" if item.get("mode") == "centinela" else "📋 normal"
+            parts.append(f"- {mode_label} · {item.get('datetime', '')} · {item.get('camera_name', '')}: {item.get('description', '')[:120]}")
         return {"text": "\n".join(parts), "events": data.get("events", [])}
 
     if tool_name == "find_risks":
@@ -2182,12 +2236,18 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         peak = data.get("peak_count", 0)
         peak_time = data.get("peak_time", "")
         cameras = ", ".join(data.get("cameras", [])) or "cámara principal"
-        text = f"Detecté **{total} persona(s)** hoy en {cameras}."
+        dia = "ayer" if params.get("date") == "yesterday" else "hoy"
+        text = f"Detecté **{total} persona(s)** {dia} en {cameras}."
         if sessions > 1:
             text += f" Fueron {sessions} visitas distintas."
         if peak > 0 and peak_time:
             text += f" El pico fue de {peak} persona(s) a las {peak_time}."
-        return {"text": text, "events": []}
+        return {
+            "text": text, "events": [], "dia": dia,
+            "total_people": total, "sessions": sessions,
+            "peak_count": peak, "peak_time": peak_time,
+            "cameras": data.get("cameras", []),
+        }
 
     if tool_name == "is_open_hours":
         data = await _tool_call("is_open_hours", user_id, params)

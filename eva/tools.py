@@ -321,13 +321,15 @@ def _iter_events(user_id: str, camera_id: str = None, date_filter: str = None):
             try:
                 evt_date = evt.get("datetime", "")[:10]
                 evt_ts = int(evt.get("timestamp", 0) or 0)
+                if not evt_date and evt_ts:
+                    evt_date = _date.fromtimestamp(evt_ts).isoformat()
                 if date_filter == "today" and evt_date != _date.today().isoformat():
                     continue
                 if date_filter == "yesterday" and evt_date != (_date.today() - timedelta(days=1)).isoformat():
                     continue
                 if date_filter == "recent" and evt_ts < int(time.time()) - 24 * 60 * 60:
                     continue
-                if date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
+                if date_filter and date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
                     continue
                 yield evt, cam_dir.name
             except Exception:
@@ -1017,20 +1019,26 @@ async def tool_find_anomalies(user_id: str, min_severity: str = "media",
     results = []
     for evt, cam_name in _iter_events(user_id, camera_id, date):
         attention_hits = evt.get("attention_hits", []) if isinstance(evt, dict) else []
+        is_vig = isinstance(evt, dict) and evt.get("event_id", "").startswith("vigilance_")
+        evt_dt = evt.get("datetime", "") if isinstance(evt, dict) else ""
+        if not evt_dt and isinstance(evt, dict) and evt.get("timestamp"):
+            from datetime import datetime as _dt
+            evt_dt = _dt.fromtimestamp(int(evt["timestamp"])).strftime("%Y-%m-%d %H:%M:%S")
         if attention_hits or _event_is_alert(evt):
-            evt = _attach_event_package(evt, user_id, cam_name)
+            evt2 = _attach_event_package(evt, user_id, cam_name)
             results.append({
-                "event_id": evt["event_id"],
-                "datetime": evt.get("datetime", ""),
+                "event_id": evt2["event_id"],
+                "datetime": evt_dt,
                 "camera_name": cam_name,
                 "tipo": "observacion",
-                "descripcion": _event_description(evt),
+                "descripcion": _event_description(evt2),
                 "attention_hits": attention_hits,
                 "severidad": "observacion" if attention_hits else "alta",
+                "mode": "centinela" if is_vig else "normal",
                 "anomaly": True,
-                "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
-                "video_file": evt.get("video_file", ""),
-                "frames": evt.get("frames", []),
+                "frame_url": f"/api/event-frame/{evt2['event_id']}?user_id={user_id}",
+                "video_file": evt2.get("video_file", ""),
+                "frames": evt2.get("frames", []),
             })
             if len(results) >= limit:
                 break
@@ -1038,20 +1046,21 @@ async def tool_find_anomalies(user_id: str, min_severity: str = "media",
         qjson = _event_qwen(evt)
         for anom in (qjson.get("anomalias", []) if isinstance(qjson.get("anomalias"), list) else []):
             if isinstance(anom, dict):
-                sev = anom.get("severidad", "baja")
+                sev = anom.get("severidad") or "baja"
                 if severity_order.get(sev, 0) >= min_level:
-                    evt = _attach_event_package(evt, user_id, cam_name)
+                    evt2 = _attach_event_package(evt, user_id, cam_name)
                     results.append({
-                        "event_id": evt["event_id"],
-                        "datetime": evt.get("datetime", ""),
+                        "event_id": evt2["event_id"],
+                        "datetime": evt_dt,
                         "camera_name": cam_name,
                         "tipo": anom.get("tipo", ""),
                         "descripcion": anom.get("descripcion", ""),
                         "severidad": sev,
+                        "mode": "centinela" if evt["event_id"].startswith("vigilance_") else "normal",
                         "anomaly": True,
-                        "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
-                        "video_file": evt.get("video_file", ""),
-                        "frames": evt.get("frames", []),
+                        "frame_url": f"/api/event-frame/{evt2['event_id']}?user_id={user_id}",
+                        "video_file": evt2.get("video_file", ""),
+                        "frames": evt2.get("frames", []),
                     })
         if len(results) >= limit:
             break
@@ -1059,18 +1068,24 @@ async def tool_find_anomalies(user_id: str, min_severity: str = "media",
 
 
 async def tool_latest_events(user_id: str, limit: int = 5,
-                             date: str = None, camera_id: str = None) -> dict:
+                              date: str = None, camera_id: str = None) -> dict:
     """Lista los últimos análisis del diario."""
     events = []
     for evt, cam_name in _iter_events(user_id, camera_id, date or "today"):
         evt = _attach_event_package(evt, user_id, cam_name)
         qjson = _event_qwen(evt)
         eid = evt["event_id"]
+        is_vigilance = eid.startswith("vigilance_")
+        evt_dt = evt.get("datetime", "")
+        if not evt_dt and evt.get("timestamp"):
+            from datetime import datetime as _dt
+            evt_dt = _dt.fromtimestamp(int(evt["timestamp"])).strftime("%Y-%m-%d %H:%M:%S")
         events.append({
             "event_id": eid,
-            "datetime": evt.get("datetime", ""),
+            "datetime": evt_dt,
             "camera_name": cam_name,
             "event_type": evt.get("event_type", ""),
+            "mode": "centinela" if is_vigilance else "normal",
             "description": _event_description(evt),
             "summary": qjson.get("summary", _event_description(evt)),
             "importancia": qjson.get("importancia", "baja"),
