@@ -103,22 +103,29 @@ const App = {
 
     async _fetchServerUrl() {
         const h = window.location.hostname;
-        try {
-            // Intento HTTPS con timeout más holgado; tls + cf + dns pueden sumar >3s
-            const r = await fetch('https://api.ojoia.com.do/health?_=' + Date.now(), {
-                mode: 'cors',
-                signal: AbortSignal.timeout(8000)
-            });
-            if (r.ok) {
-                this.API = 'https://api.ojoia.com.do';
-                this._apiReady = true;
-                this._startAuth();
-                this._loadSupportInfo();
-                return;
+        const healthUrl = 'https://api.ojoia.com.do/health?_=' + Date.now();
+        // Reintentos para tolerar restarts fugaces del backend (502 durante ~10s
+        // mientras arranca el YOLO worker). 3 intentos con backoff.
+        let httpsOk = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const r = await fetch(healthUrl, {
+                    mode: 'cors',
+                    signal: AbortSignal.timeout(8000)
+                });
+                if (r.ok) { httpsOk = true; break; }
+                console.warn(`[API] HTTPS health returned ${r.status} (intento ${attempt}/3)`);
+            } catch(e) {
+                console.warn(`[API] HTTPS failed (intento ${attempt}/3):`, e.message);
             }
-            console.warn('[API] HTTPS health returned', r.status);
-        } catch(e) {
-            console.warn('[API] HTTPS failed:', e.message);
+            if (attempt < 3) { await new Promise(rs => setTimeout(rs, 1200 * attempt)); }
+        }
+        if (httpsOk) {
+            this.API = 'https://api.ojoia.com.do';
+            this._apiReady = true;
+            this._startAuth();
+            this._loadSupportInfo();
+            return;
         }
         // Fallback a HTTP local solo si la página actual es insegura o es localhost
         const isLocal = h === '10.0.0.44' || h === 'localhost' || h === '127.0.0.1' || h === '';
