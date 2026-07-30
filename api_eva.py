@@ -1717,6 +1717,38 @@ async def save_eva_chat_message(request: dict):
         return {"success": False, "error": str(e)}
 
 
+@app.post("/api/chat/eva/feedback")
+async def eva_event_feedback(request: dict):
+    """Feedback del usuario sobre un evento (falsa alarma / confirmación).
+
+    Lo invoca el frontend desde el widget del evento y, opcionalmente, desde
+    el chat de Eva. Delega en tool_learn_from_feedback, que:
+      - persiste feedback en el JSON del evento
+      - si is_real=False: añade nota como owner_note y registra false_alarm
+    Body: {user_id, event_id, is_real, notes?}
+    """
+    try:
+        user_id = request.get("user_id", "")
+        event_id = request.get("event_id", "")
+        is_real = bool(request.get("is_real", True))
+        notes = request.get("notes") or ""
+        if not user_id or not event_id:
+            return {"success": False, "error": "user_id and event_id required"}
+        from eva.tools import tool_learn_from_feedback
+        result = await tool_learn_from_feedback(
+            event_id=event_id, is_real=is_real,
+            notes=(notes.strip() or None), user_id=user_id,
+        )
+        if not result.get("success"):
+            logger.warning(f"[EVA feedback] {result.get('error', 'error')} (event={event_id})")
+        else:
+            logger.info(f"[EVA feedback] user={user_id[:8]} event={event_id[:18]} is_real={is_real} action={result.get('action')}")
+        return result
+    except Exception as e:
+        logger.error(f"[EVA feedback] error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # ═══════════════════════════════════════════════════════════
 # EVA CHAT - Endpoint principal de conversación
 # ═══════════════════════════════════════════════════════════

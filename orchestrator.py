@@ -1387,19 +1387,39 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
 
     # 0. Nuevo: Qwen responde con "flag" = frase exacta detectada (Eje 3C)
     flag = vision.get("flag") if isinstance(vision, dict) else None
-    if flag and isinstance(flag, str) and flag.strip() and flag.lower() != "null":
-        hits.append({
-            "frase": flag.strip(),
-            "momento": "",
-            "source": "qwen_flag"
-        })
+    if flag and isinstance(flag, str) and flag.strip():
+        flag_text = flag.strip()
+        # Descartar el placeholder descriptivo del schema del prompt: el modelo
+        # puede devolver literalmente "frase exacta de attention_phrases que
+        # detectaste cumplirse, o null" cuando no detecta nada. Solo aceptamos
+        # frases reales (que deben coincidir con una attention_phrase registrada
+        # o ser una descripcion concreta de accion observada).
+        is_placeholder = (
+            flag_text.lower() == "null"
+            or "frase exacta de attention_phrases" in flag_text.lower()
+            or "detectaste cumplirse" in flag_text.lower()
+            or flag_text.lower().endswith(" o null")
+        )
+        if not is_placeholder:
+            hits.append({
+                "frase": flag_text,
+                "momento": "",
+                "source": "qwen_flag"
+            })
 
     # 1. Verificar si Qwen reportó attention_hits explícitamente
     if isinstance(attention_hits_raw, list):
         for hit in attention_hits_raw:
             if isinstance(hit, dict) and hit.get("frase"):
+                frase = str(hit.get("frase", "")).strip()
+                if not frase:
+                    continue
+                f_low = frase.lower()
+                if (f_low == "null" or "frase exacta de attention_phrases" in f_low
+                        or "detectaste cumplirse" in f_low or f_low.endswith(" o null")):
+                    continue
                 hits.append({
-                    "frase": hit["frase"],
+                    "frase": frase,
                     "momento": hit.get("momento", ""),
                     "source": "qwen_explicit"
                 })
@@ -1825,7 +1845,7 @@ class QwenOrchestrator:
             "  ],\n"
             "  \"objects\": [\"lista de objetos relevantes: dinero, platos, bolsas, datáfono, refrescos, etc.\"],\n"
             "  \"events\": [\"acciones observadas: cobró a cliente, empacó plato, entró dinero en caja, etc.\"],\n"
-            "  \"flag\": null | \"frase exacta de attention_phrases que detectaste cumplirse, o null\"\n"
+            "  \"flag\": null\n"
             "}\n"
             "Reglas críticas:\n"
             "  - NUNCA fusionar dos personas en una sola. Si hay alguien detrás o al lado, descríbelas por separado; cada persona debe tener su propio id único y entradas gender/age/clothing_\n"
@@ -1836,6 +1856,7 @@ class QwenOrchestrator:
             "  - \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0\n"
             "  - \"zone\" SIEMPRE: pon el nombre EXACTO de la zona (ej 'Caja', 'Entrada', 'Cocina') si la persona cae en alguna zona definida arriba, o null si está fuera de todas\n"
             "  - Si dos personas estan en la misma zona, pon el mismo nombre de zona a ambas\n"
+            "  - \"flag\": SOLO si alguna de las attention_phrases del dueño (listadas arriba) se cumplió textualmente en la escena, pon ahí esa frase EXACTA. Si ninguna se cumplió, pon null. NO inventes frases, NO pongas aquí descripciones del schema ni repetición texto explicativo; o null o una frase literal de la lista del dueño.\n"
         )
 
         full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"

@@ -691,6 +691,9 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
     vigilance = {}
     schedule = None
     mode = None
+    result_note = ""
+
+    # ── Modo centinela / estándar (no toca frases) ──
     if any(w in m for w in ("centinela", "modo centinela", "activar centinela", "activa centinela")):
         mode = "sentinel"
         vigilance = {"sentinel_mode": {"enabled": True}, "enabled": True}
@@ -706,30 +709,68 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
         elif "media" in m:
             sensitivity = "media"
         vigilance["normal_mode"] = {**(vigilance.get("normal_mode") or {}), "sensitivity": sensitivity}
-    for marker in ("quita falsas alarmas", "quitar falsas alarmas", "no alertes por", "no alertar por", "es normal", "no es falta"):
-        behavior = _clean_behavior(_extract_behavior_after(message, [marker]))
-        if behavior:
-            current = _load_current_vigilance_normal(user_id, camera_id)
-            existing = current.get("owner_notes", [])
-            note = f"Nota del dueño: cuando pasa '{behavior}', es normal, no lo menciones."
-            if note not in existing:
-                existing.append(note)
-            vigilance["owner_notes"] = existing
+
+    current_cfg = normalize_camera_vigilance_config(_load_camera_config(user_id, camera_id)) if camera_id else {}
+    current_phrases = list((current_cfg.get("attention_phrases") or []))
+    current_notes = list((current_cfg.get("owner_notes") or []))
+
+    # ── QUITAR una frase de atención ──
+    remove_markers = ("quita la regla de", "quitar la regla de", "quita la frase de", "quitar la frase de",
+                      "deja de vigilar", "dejar de vigilar", "elimina la regla de", "eliminar la regla de",
+                      "borra la regla de", "borrar la regla de", "no alertes por", "no alertar por")
+    for marker in remove_markers:
+        idx = m.find(marker)
+        if idx >= 0:
+            value = _clean_behavior(_extract_behavior_after(message, [marker]))
+            if not value:
+                break
+            v_low = value.lower()
+            removed = [p for p in current_phrases if v_low == p.lower() or v_low in p.lower() or p.lower() in v_low]
+            if removed:
+                for r in removed:
+                    current_phrases = [p for p in current_phrases if p.lower() != r.lower()]
+                vigilance["attention_phrases"] = current_phrases[-20:]
+                result_note = f"Listo, quité {len(removed)} frase(s) de vigilancia: “{', '.join(removed)}”. Te quedan {len(current_phrases)} frase(s) activa(s)."
+            else:
+                if marker in ("no alertes por", "no alertar por") or any(w in m for w in ("es normal", "no es falta")):
+                    note = f"Nota del dueño: cuando pasa “{value}”, es normal, no lo menciones."
+                    if note not in current_notes:
+                        current_notes.append(note)
+                    vigilance["owner_notes"] = current_notes[-20:]
+                    result_note = f"Anotado: cuando pasa “{value}” lo considero normal y no te alerto."
+                else:
+                    result_note = "No tengo ninguna frase de vigilancia que coincida con “" + value + "”. Tus frases actuales son:\n" + "\n".join(f"  • {p}" for p in current_phrases[:5])
             break
-    for marker in ("solo alerta si", "alerta si", "alertar si", "notifícame cuando", "vigila cuando"):
-        behavior = _clean_behavior(_extract_behavior_after(message, [marker]))
-        if behavior:
-            current = _load_current_vigilance_normal(user_id, camera_id)
-            existing = current.get("attention_phrases", [])
-            if behavior not in existing:
-                existing.append(behavior)
-            vigilance["attention_phrases"] = existing
-            break
+
+    # ── AGREGAR una frase de atención ──
+    add_markers = ("vigila que", "vigilar que", "avísame si", "avisame si", "alerta si", "alertar si",
+                   "alertame si", "notifícame cuando", "notificame cuando", "vigila cuando",
+                   "afínate de", "afínate cuando", "ojo con", "pónme alerta si", "ponme alerta si")
+    add_match = next((mk for mk in add_markers if mk in m), None)
+    if add_match:
+        value = _clean_behavior(_extract_behavior_after(message, [add_match]))
+        if value and value.lower() not in [p.lower() for p in current_phrases]:
+            current_phrases.append(value)
+            vigilance["attention_phrases"] = current_phrases[-20:]
+            result_note = f"Agregué la frase de vigilancia: “{value}”. Ahora vigilo {len(current_phrases)} frase(s)."
+        elif value:
+            result_note = f"Esa frase “{value}” ya la estaba vigilando."
+    else:
+        for marker in ("solo alerta si",):
+            behavior = _clean_behavior(_extract_behavior_after(message, [marker]))
+            if behavior and behavior not in current_phrases:
+                current_phrases.append(behavior)
+                vigilance["attention_phrases"] = current_phrases[-20:]
+                result_note = f"Agregué la frase de vigilancia: “{behavior}”. Ahora vigilo {len(current_phrases)} frase(s)."
+                break
+
+    # ── Horario ──
     if any(w in m for w in ("horario", "abre", "cierra", "apertura", "cierre")):
         schedule = _parse_schedule(message)
         if not schedule:
             return {"needs_clarification": True, "text": "Para cambiar el horario necesito la hora de apertura y cierre. Por ejemplo: “abre 8:00am y cierra 10:00pm”."}
-    return {"vigilance": vigilance, "schedule": schedule, "mode": mode}
+
+    return {"vigilance": vigilance, "schedule": schedule, "mode": mode, "result_note": result_note}
 
 
 def _load_current_vigilance_normal(user_id, camera_id):
@@ -784,7 +825,7 @@ def _config_summary_text(session, first):
     ]
     if attention_phrases:
         lines.append(f"")
-        lines.append(f"🔍 Frases de atención ({len(ph_attention_phrases)}):")
+        lines.append(f"🔍 Frases de atención ({len(attention_phrases)}):")
         for p in attention_phrases[:5]:
             lines.append(f"  • {p}")
     if owner_notes:
@@ -960,6 +1001,74 @@ async def _resume_pending_setup(pending, user_id, session_id, message, storage_r
     return await _handle_setup(pending, user_id, message, sid, pending.get("camera_id", ""), storage_root, False)
 
 
+def _render_summary_lines(result, period_label):
+    """Arma las líneas del resumen diario en ES desde el resultado de
+    tool_get_activity_summary. Reutilizable para hoy/ayér/rango."""
+    total = result.get("total_events", 0)
+    attention_events = result.get("attention_events", 0)
+    persons_total = result.get("persons_total", 0)
+    tracking_max = result.get("tracking_unique_max", 0)
+    peak_hour = result.get("peak_hour")
+    tag_counts = result.get("tag_counts", {}) or {}
+    top_phrases = result.get("top_attention_phrases", []) or []
+    last_summary = result.get("last_summary", "")
+    details = result.get("details", {}) or {}
+    last_yolo = result.get("last_yolo", {}) or {}
+    counts_total = result.get("counts_total", {}) or {}
+
+    lines = []
+    label = period_label or "Hoy"
+    lines.append(f"Resumen: {label} se realizaron {total} análisis de seguridad.")
+    lines.append("")
+
+    if attention_events > 0:
+        lines.append(f"🔍 {attention_events} análisis coincidieron con lo que me pediste vigilar.")
+        for p in top_phrases[:3]:
+            lines.append(f"   • “{p.get('frase','')}” ({p.get('count',0)}x)")
+    else:
+        lines.append("✅ No se detectaron coincidencias con lo que me pediste vigilar.")
+
+    if tracking_max > 0:
+        lines.append(f"👥 Personas distintas vistas: hasta {tracking_max} a la vez (según tracker).")
+    elif persons_total > 0:
+        lines.append(f"👥 Personas en la escena: hasta {persons_total} a la vez (según tracker).")
+
+    if peak_hour is not None:
+        lines.append(f"📈 Hora más activa: {peak_hour:02d}:00.")
+
+    if tag_counts:
+        top_tags = sorted(tag_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        lines.append("🏷️ Objetos frecuentes: " + ", ".join(f"{t} ({c})" for t, c in top_tags) + ".")
+
+    platos = counts_total.get("platos", 0)
+    bebidas = counts_total.get("bebidas", 0)
+    fundas = counts_total.get("fundas", 0)
+    clientes = counts_total.get("clientes_estimado", 0)
+    if platos > 0:
+        lines.append(f"🍽️ Platos visibles: ~{platos}.")
+    if bebidas > 0:
+        lines.append(f"🥤 Bebidas visibles: ~{bebidas}.")
+    if fundas > 0:
+        lines.append(f"🛍️ Fundas utilizadas: ~{fundas}.")
+    if clientes > 0:
+        lines.append(f"🧑‍🤝‍🧑 Clientes observados: ~{clientes}.")
+
+    lines.append(f"⚙️ Objetos en último análisis: {last_yolo.get('count', 0)}.")
+    classes = last_yolo.get("classes", [])
+    if classes:
+        lines.append(f"   Tipos: {', '.join(classes[:5])}.")
+
+    if last_summary:
+        lines.append("")
+        lines.append(f"📝 Último análisis: {last_summary[:200]}")
+
+    scene = details.get("scene_context", "")
+    if scene:
+        lines.append("")
+        lines.append(f"🏪 Contexto: {scene}")
+    return lines
+
+
 async def _handle_daily_summary(session, user_id, message, session_id):
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
     ud = _load_user_data(user_id)
@@ -970,11 +1079,7 @@ async def _handle_daily_summary(session, user_id, message, session_id):
     result = await tool_get_activity_summary(user_id, "today")
     total = result.get("total_events", 0)
     attention_events = result.get("attention_events", 0)
-    persons_total = result.get("persons_total", 0)
-    last_summary = result.get("last_summary", "")
-    details = result.get("details", {})
-    last_yolo = result.get("last_yolo", {})
-    counts_total = result.get("counts_total", {})
+    top_phrases = result.get("top_attention_phrases", []) or []
 
     if total == 0:
         text = f"Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta a cualquier actividad."
@@ -982,46 +1087,12 @@ async def _handle_daily_summary(session, user_id, message, session_id):
         _sessions[session_id] = session
         return _mk_resp(session, text, suggestions=suggestions)
 
-    lines = []
-    lines.append(f"Resumen del día: Hoy se realizaron {total} análisis de seguridad.")
-    lines.append("")
-
-    if attention_events > 0:
-        lines.append(f"🔍 {attention_events} evento(s) coincidieron con lo que me pediste vigilar.")
-    else:
-        lines.append("✅ No se detectaron coincidencias con lo que me pediste vigilar.")
-
-    if persons_total > 0:
-        lines.append(f"👥 Personas en la escena: hasta {persons_total} a la vez (según tracker).")
-
-    platos = counts_total.get("platos", 0)
-    bebidas = counts_total.get("bebidas", 0)
-    fundas = counts_total.get("fundas", 0)
-    clientes = counts_total.get("clientes_estimado", 0)
-
-    if platos > 0:
-        lines.append(f"🍽️ Platos visibles en total: ~{platos}.")
-    if bebidas > 0:
-        lines.append(f"🥤 Bebidas visibles: ~{bebidas}.")
-    if fundas > 0:
-        lines.append(f"🛍️ Fundas utilizadas: ~{fundas}.")
-    if clientes > 0:
-        lines.append(f"🧑‍🤝‍🧑 Clientes observados: ~{clientes}.")
-
-    lines.append(f"📊 Objetos detectados en último análisis: {last_yolo.get('count', 0)}.")
-    classes = last_yolo.get("classes", [])
-    if classes:
-        lines.append(f"   Tipos: {', '.join(classes[:5])}.")
-
-    if last_summary:
-        lines.append(f"")
-        lines.append(f"📝 Último análisis: {last_summary[:200]}")
-
-    scene = details.get("scene_context", "")
-    if scene:
-        lines.append(f"")
-        lines.append(f"🏪 Contexto: {scene}")
-
+    lines = _render_summary_lines(result, "Hoy")
+    if top_phrases and attention_events > 0:
+        lines.append("")
+        lines.append("¿Quieres que ajuste lo que vigilo o que marque alguna de esas observaciones como falsa alarma?")
+    # Encabezado en estilo de tarjeta conservado
+    lines[0] = f"Resumen del día: Hoy se realizaron {total} análisis de seguridad."
     text = "\n".join(lines)
 
     notable_events = result.get("notable_events", [])
@@ -1164,10 +1235,14 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
         from eva.tools import tool_get_activity_summary
         result = await tool_get_activity_summary(user_id, "today")
         total = result.get("total_events", 0)
+        tracking_max = result.get("tracking_unique_max", 0)
         persons = result.get("persons_total", 0)
+        peak_hour = result.get("peak_hour")
         if total == 0:
             return {"text": f"Hoy no se han registrado personas todavía. La cámara está activa y Eva está atenta."}
-        return {"text": f"Hoy se detectaron {persons} persona(s) en {total} análisis. Último análisis: {result.get('last_summary', '')[:150]}"}
+        shown = tracking_max if tracking_max > 0 else persons
+        extra = f" Hora más activa: {peak_hour:02d}:00." if peak_hour is not None else ""
+        return {"text": f"Hoy se detectaron hasta {shown} persona(s) a la vez en {total} análisis.{extra} Último análisis: {result.get('last_summary', '')[:150]}"}
 
     if any(p in msg_norm for p in ["cuantos clientes", "cuántos clientes", "cuantas clientes", "cuántas clientes", "cliente hoy"]):
         from eva.tools import tool_search_events
@@ -1337,11 +1412,10 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
         from eva.tools import tool_get_activity_summary
         result = await tool_get_activity_summary(user_id, "yesterday")
         total = result.get("total_events", 0)
-        persons = result.get("persons_total", 0)
         if total == 0:
-            return {"text": f"Ayer no se registraron análisis. La cámara pudo estar inactiva o sin movimiento detectado."}
-        last_summary = (result.get("last_summary", "") or "")[:200]
-        return {"text": f"Ayer se realizaron {total} análisis con {persons} persona(s) única(s). {last_summary}", "events": []}
+            return {"text": "Ayer no se registraron análisis. La cámara pudo estar inactiva o sin movimiento detectado."}
+        lines = _render_summary_lines(result, "Ayer")
+        return {"text": "\n".join(lines), "events": []}
 
     # Resumen de hoy / "y hoy que tal"
     if (any(w in msg_norm for w in ("hoy", "este dia", "este día")) and is_summary_intent
@@ -1349,11 +1423,10 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
         from eva.tools import tool_get_activity_summary
         result = await tool_get_activity_summary(user_id, "today")
         total = result.get("total_events", 0)
-        persons = result.get("persons_total", 0)
         if total == 0:
-            return {"text": f"Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta."}
-        last_summary = (result.get("last_summary", "") or "")[:200]
-        return {"text": f"Hoy llevamos {total} análisis con {persons} persona(s) única(s). {last_summary}", "events": []}
+            return {"text": "Hoy no se han registrado análisis todavía. La cámara está activa y Eva está atenta."}
+        lines = _render_summary_lines(result, "Hoy")
+        return {"text": "\n".join(lines), "events": []}
 
     # Donde se acumula la gente / heatmap / zonas mas transitadas / mapa de calor
     if any(p in msg_norm for p in ["donde se acumula", "dónde se acumula", "mapa de calor", "heatmap", "heat map",
@@ -1903,6 +1976,60 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
             _sessions[session_id] = session
             return _mk_resp(session, error_text, suggestions=suggestions, events_found=[])
 
+    # ── Falsa alarma / confirmación de evento (Decision 2, vía chat) ──
+    false_alert_kw = ("fue falsa alarma", "falsa alarma", "fue falsa", "no avises por eso",
+                      "no alertes por eso", "eso fue normal", "eso no es nada",
+                      "es confirmado", "si paso", "sí pasó", "eso si es real", "eso sí es real")
+    if any(k in msg_lower for k in false_alert_kw):
+        eid = session.get("last_event_id")
+        user_uid = session.get("user_id") or user_id
+        if not eid:
+            text = f"{first}, no tengo ninguna alerta reciente en este chat para marcar. Abre una alerta y dime «fue falsa alarma» justo después, o dime el evento por su hora."
+            session["msgs"].append({"role": "assistant", "content": text})
+            _sessions[session_id] = session
+            return _mk_resp(session, text, suggestions=suggestions, events_found=[])
+        is_false = any(k in msg_lower for k in ("fue falsa alarma", "falsa alarma", "fue falsa",
+                                                "no avises por eso", "no alertes por eso",
+                                                "eso fue normal", "eso no es nada"))
+        from eva.tools import tool_learn_from_feedback
+        fb = await tool_learn_from_feedback(event_id=eid, is_real=not is_false,
+                                            notes=(message if is_false else None), user_id=user_uid)
+        if fb.get("success"):
+            if is_false:
+                text = f"{first}, anoté la alerta como falsa alarma. La voy a dejar de vigilar cuando pase algo parecido, y registro la nota para que el centinela afine. ✅"
+            else:
+                text = f"{first}, confirmé la alerta como real. Voy a seguir atento a casos parecidos. 👁️"
+            # Limpio la marca para no releerla en cada turno
+            session["last_event_id"] = None
+            session["msgs"].append({"role": "assistant", "content": text})
+            _sessions[session_id] = session
+            return _mk_resp(session, text, suggestions=suggestions, events_found=[])
+        logger.warning(f"[EVA false-alarm] feedback failed for {eid}: {fb.get('error')}")
+
+    # ── Routing de frases de vigilancia (Decision 2) ──
+    add_kw = ("vigila que", "vigilar que", "avisame si", "avísame si", "alerta si",
+              "alertar si", "alertame si", "notifícame cuando", "notificame cuando",
+              "vigila cuando", "afínate de", "afínate cuando", "ojo con",
+              "ponme alerta si", "pónme alerta si")
+    remove_kw = ("quita la regla de", "quitar la regla de", "quita la frase de", "quitar la frase de",
+                 "deja de vigilar", "dejar de vigilar", "elimina la regla de", "eliminar la regla de",
+                 "borra la regla de", "borrar la regla de", "no alertes por", "no alertar por")
+    list_kw = ("que estas vigilando", "qué estás vigilando", "muestrame las reglas", "muéstrame las reglas",
+               "que vigilas", "qué vigilas", "lista de reglas", "dime que vigilas", "dime qué vigilas",
+               "que estas observando", "qué estás observando")
+    if any(k in msg_lower for k in list_kw):
+        best_cam = await _pick_best_camera_id(user_id) or ""
+        tool_result = await _execute_os_tool_v2(user_id, "get_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
+        session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
+        _sessions[session_id] = session
+        return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
+    if any(k in msg_lower for k in add_kw) or any(k in msg_lower for k in remove_kw):
+        best_cam = await _pick_best_camera_id(user_id) or ""
+        tool_result = await _execute_os_tool_v2(user_id, "update_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
+        session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
+        _sessions[session_id] = session
+        return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
+
     if any(k in msg_lower for k in ("__adjust_protection__", "ajustar proteccion", "ajustar protección", "cambiar proteccion", "cambiar protección", "configurar proteccion")):
         best_cam = await _pick_best_camera_id(user_id) or ""
         tool_result = await _execute_os_tool_v2(user_id, "get_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
@@ -2083,17 +2210,25 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         v = data.get("vigilance", {})
         normal = v.get("normal_mode", {}) if isinstance(v.get("normal_mode"), dict) else {}
         sentinel = v.get("sentinel_mode", {}) if isinstance(v.get("sentinel_mode"), dict) else {}
+        phrases = data.get("attention_phrases", []) or []
+        mode_txt = 'centinela (noche)' if data.get('mode') == 'sentinel' else 'estándar (dentro de horario)'
         text = (
-            f"{first}, configuración de observación de {data.get('camera_id') or 'la cámara'}:\n"
-            f"Modo: {'centinela' if data.get('mode') == 'sentinel' else 'estándar'}.\n"
-            f"Frases de atención ({len(data.get('attention_phrases', []))}):\n"
+            f"{first}, esto es lo que vigilo en {data.get('camera_id') or 'la cámara'}:\n"
+            f"Modo ahora: {mode_txt}.\n"
         )
-        for p in data.get("attention_phrases", [])[:5]:
-            text += f"  • {p}\n"
+        if phrases:
+            text += f"Frases de vigilancia ({len(phrases)}):\n"
+            for p in phrases[:8]:
+                text += f"  • {p}\n"
+            if len(phrases) > 8:
+                text += f"  … y {len(phrases)-8} más.\n"
+        else:
+            text += "No tienes frases de vigilancia configuradas. Dime “vigila que…” para agregar una.\n"
         if data.get("owner_notes"):
-            text += f"Notas del dueño:\n"
+            text += f"Notas del dueño ({len(data.get('owner_notes', []))}):\n"
             for n in data.get("owner_notes", [])[:3]:
                 text += f"  • {n}\n"
+        text += "\nPara cambiarlas: “vigila que nadie se lleve platos sin pasar por caja” o “quita la regla de …”."
         return {"text": text, "events": []}
 
     if tool_name == "update_vigilance_config":
@@ -2125,11 +2260,22 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         })
         if not data.get("success"):
             return {"text": f"No pude actualizar: {data.get('error', 'error')}", "events": []}
-        v = data.get("vigilance", {})
-        normal = v.get("normal_mode", {}) if isinstance(v.get("normal_mode"), dict) else {}
-        sentinel = v.get("sentinel_mode", {}) if isinstance(v.get("sentinel_mode"), dict) else {}
-        mode_text = 'modo centinela' if data.get('mode') == 'sentinel' else 'modo estándar'
-        return {"text": f"{first}, protección actualizada: {mode_text}. Sensibilidad: {normal.get('sensitivity', '—')}. Centinela: {'activo' if sentinel.get('enabled', False) else 'inactivo'}.", "events": []}
+        result_note = inferred.get("result_note", "")
+        # Si el parser generó una nota específica (agregué/quité frase), la usamos;
+        # si no, armamos el texto genérico de modo/sensibilidad.
+        if result_note:
+            text = f"{first}, {result_note}"
+        else:
+            v = data.get("vigilance", {})
+            normal = v.get("normal_mode", {}) if isinstance(v.get("normal_mode"), dict) else {}
+            sentinel = v.get("sentinel_mode", {}) if isinstance(v.get("sentinel_mode"), dict) else {}
+            mode_text = 'modo centinela' if data.get('mode') == 'sentinel' else 'modo estándar'
+            text = f"{first}, protección actualizada: {mode_text}. Sensibilidad: {normal.get('sensitivity', '—')}. Centinela: {'activo' if sentinel.get('enabled', False) else 'inactivo'}."
+        # Si es modo normal y no hay frases, sugerimos agregar
+        phrases = data.get("attention_phrases", []) or []
+        if data.get('mode') != 'sentinel' and not phrases:
+            text += "\nNo tienes frases de vigilancia todavía. Dime “vigila que…” para agregar una."
+        return {"text": text, "events": []}
 
     if tool_name == "get_latest_frame":
         params = {**params}
@@ -2547,6 +2693,14 @@ def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=Fal
                 tmp.write_bytes(small)
                 img_url = f"/eva-image/{tmp.name}"
         except Exception: img_url = ""
+    # Persistir el último event_id visto para que frases como "esa alerta fue
+    # falsa alarma" puedan resolver "esa" en el siguiente turno.
+    if isinstance(events_found, list) and events_found:
+        for ev in events_found:
+            if isinstance(ev, dict) and ev.get("event_id") and not ev["event_id"].startswith("vigilance_"):
+                session["last_event_id"] = ev["event_id"]
+                session["last_event_camera_id"] = ev.get("camera_id") or session.get("camera_id", "")
+                break
     return {
         "success": True, "response": text, "image_url": img_url,
         "session_id": session["session_id"], "phase": session["phase"],

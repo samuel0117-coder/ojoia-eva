@@ -134,6 +134,8 @@ async def tool_get_vigilance_config(user_id: str, camera_id: str = "") -> dict:
             "system_prompt": config.get("system_prompt", ""),
             "vigilance": config.get("vigilance", {}),
             "schedule": config.get("schedule", {}),
+            "attention_phrases": config.get("attention_phrases", []) or [],
+            "owner_notes": config.get("owner_notes", []) or [],
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -153,10 +155,24 @@ async def tool_update_vigilance_config(user_id: str, camera_id: str, vigilance: 
         if schedule:
             config["schedule"] = _merge_config(config.get("schedule", {}), schedule)
         if vigilance:
-            config["vigilance"] = _merge_config(config.get("vigilance", {}), vigilance)
+            vig = dict(vigilance)
+            # Dedup + limit las frases de atención y notas del dueño
+            for key in ("attention_phrases", "owner_notes"):
+                vals = vig.get(key)
+                if isinstance(vals, list):
+                    seen = []
+                    for v in vals:
+                        s = str(v).strip()
+                        if s and s not in seen:
+                            seen.append(s)
+                    vig[key] = seen[-20:]
+            config["vigilance"] = _merge_config(config.get("vigilance", {}), vig)
         current_mode = mode or ("sentinel" if _is_vigilance_mode(config.get("schedule", {}), config.get("vigilance", {})) else "normal")
-        config["system_prompt"] = system_prompt if system_prompt else build_vigilance_prompt(config, current_mode)
+        config["system_prompt"] = system_prompt if system_prompt else build_vigilance_prompt(config)
         _save_camera_config(user_id, camera_id, config)
+        # Re-normalizar para que el return refleje el estado consistente
+        # (top-level attention_phrases/owner_notes sincronizados con vigilance)
+        config = normalize_camera_vigilance_config(config)
         return {
             "success": True,
             "camera_id": camera_id,
@@ -164,6 +180,8 @@ async def tool_update_vigilance_config(user_id: str, camera_id: str, vigilance: 
             "system_prompt": config.get("system_prompt", ""),
             "vigilance": config.get("vigilance", {}),
             "schedule": config.get("schedule", {}),
+            "attention_phrases": config.get("attention_phrases", []) or [],
+            "owner_notes": config.get("owner_notes", []) or [],
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -549,6 +567,54 @@ def _event_is_alert(evt: dict) -> bool:
     return evt.get("event_type") in ("violation", "vigilance_alert", "night_alert") or bool(qjson.get("violation")) or importancia in ("alta", "critica") or high_severity
 
 
+# Substring que delata un hit corrupto: el modelo devolvio el texto descriptivo
+# del schema del prompt ("flag": null | "<frase exacta de attention_phrases ... o null>")
+# en vez de null o de una frase real. Filtramos por lectura (eventos viejos) y
+# por origen (orchestrator) para no inflar los conteos.
+_PLACEHOLDER_HIT_MARKERS = (
+    "frase exacta de attention_phrases",
+    "o null",
+    "detectaste cumplirse",
+    "detectaste cumplir",
+)
+
+
+def _is_placeholder_hit(text: str) -> bool:
+    """True si el texto de un hit es el placeholder del prompt, no una frase real."""
+    if not text or not isinstance(text, str):
+        return True
+    t = text.strip().lower()
+    if not t or t == "null" or t == "ninguna" or t == "ninguno":
+        return True
+    return any(m in t for m in _PLACEHOLDER_HIT_MARKERS)
+
+
+def _event_attention_hits(evt: dict) -> list:
+    """Lee la lista de attention_hits de un evento, tolerante al lugar donde se
+    persiste (top-level legacy o dentro de qwen_json). Filtra el placeholder.
+
+    Top-level fue el formato viejo; actualmente se guarda dentro de qwen_json.
+    """
+    hits = evt.get("attention_hits")
+    if hits is None or not isinstance(hits, list):
+        qjson = _event_qwen(evt)
+        hits = qjson.get("attention_hits")
+        if hits is None or not isinstance(hits, list):
+            hits = []
+    # Normalizar: cada item puede ser str o {"frase": ...}
+    result = []
+    for h in hits:
+        if isinstance(h, dict):
+            frase = h.get("frase") or h.get("text") or ""
+        elif isinstance(h, str):
+            frase = h
+        else:
+            continue
+        if not _is_placeholder_hit(frase):
+            result.append(frase.strip())
+    return result
+
+
 def _attach_event_package(evt: dict, user_id: str, camera_id: str):
     folder = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / evt.get("event_id", "")
     mp4 = folder / f"{evt.get('event_id', '')}.mp4"
@@ -912,8 +978,30 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
     latest_yolo = _event_yolo(last)
     latest_qjson = _event_qwen(last)
 
-    attention_events = [e for e in events if e.get("attention_hits")]
-    normal_events = [e for e in events if not e.get("attention_hits")]
+    attention_events = [e for e in events if _event_attention_hits(e)]
+    normal_events = [e for e in events if not _event_attention_hits(e)]
+
+    # ── search_tags agregados (objetos frecuentes: datáfono, bolsas, etc.) ──
+    tag_counts = {}
+    for e in events:
+        qwen = e.get("qwen_json", {}) if isinstance(e.get("qwen_json"), dict) else {}
+        for tag in (qwen.get("search_tags") or []):
+            if not tag or _is_placeholder_hit(tag):
+                continue
+            t = str(tag).strip()
+            if t and t.lower() != "attention_hit":
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+
+    # ── Personas únicas reales (tracker) por evento, máx/suma diaria ──
+    tracking_persons = []
+    for e in events:
+        md = e.get("metadata", {}) if isinstance(e.get("metadata"), dict) else {}
+        pt = md.get("person_tracking", {}) if isinstance(md.get("person_tracking"), dict) else {}
+        up = pt.get("unique_persons") or 0
+        if up:
+            tracking_persons.append(int(up))
+    tracking_unique_max = max(tracking_persons) if tracking_persons else 0
+    tracking_unique_sum = sum(tracking_persons) if tracking_persons else 0
 
     total_platos = 0
     total_bebidas = 0
@@ -942,8 +1030,14 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
         summary_parts.append(f"🥤 Bebidas visibles: ~{total_bebidas}.")
     if total_fundas > 0:
         summary_parts.append(f"🛍️ Fundas utilizadas: ~{total_fundas}.")
+    if tracking_unique_max > 0:
+        summary_parts.append(f"👥 Personas distintas vistas: hasta {tracking_unique_max} a la vez (tracker).")
+    if tag_counts:
+        top_tags = sorted(tag_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        tags_str = ", ".join(f"{t} ({c})" for t, c in top_tags)
+        summary_parts.append(f"📊 Objetos frecuentes: {tags_str}.")
     if attention_events:
-        summary_parts.append(f"🔍 {len(attention_events)} evento(s) coincidieron con lo que me pediste vigilar.")
+        summary_parts.append(f"🔍 {len(attention_events)} análisis coincidieron con lo que me pediste vigilar.")
 
     last_summary = latest_qjson.get("summary") or last.get("summary", "Sin datos")
     summary_parts.append(f"📝 Último análisis: {last_summary[:150]}")
@@ -960,7 +1054,7 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
             "description": e.get("description", "") or e.get("summary", ""),
             "summary": e.get("summary", "") or e.get("description", ""),
             "event_type": e.get("event_type", ""),
-            "attention_hits": e.get("attention_hits", []),
+            "attention_hits": _event_attention_hits(e),
             "qwen_analysis": e.get("qwen_analysis", {}),
             "qwen": qwen,
             "thumb_url": e.get("thumb_url", "") or (f"/api/event-thumb/{e['event_id']}?user_id={user_id}" if e.get("event_id") else ""),
@@ -980,7 +1074,7 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
                 "description": e.get("description", "") or e.get("summary", ""),
                 "summary": e.get("summary", "") or e.get("description", ""),
                 "event_type": e.get("event_type", ""),
-                "attention_hits": e.get("attention_hits", []),
+                "attention_hits": _event_attention_hits(e),
                 "qwen_analysis": e.get("qwen_analysis", {}),
                 "qwen": qwen,
                 "thumb_url": e.get("thumb_url", "") or (f"/api/event-thumb/{e['event_id']}?user_id={user_id}" if e.get("event_id") else ""),
@@ -989,12 +1083,40 @@ async def tool_get_activity_summary(user_id: str, date: str = None, camera_id: s
                 "persons": e.get("persons", 0),
             })
 
+    # Pico horario del día (hora con más análisis) y horas silenciosas
+    from datetime import datetime
+    hourly = {}
+    for e in events:
+        ts = e.get("timestamp", 0) or 0
+        if not ts:
+            continue
+        try:
+            h = datetime.fromtimestamp(int(ts)).hour
+        except Exception:
+            continue
+        hourly[h] = hourly.get(h, 0) + 1
+    peak_hour = max(hourly, key=lambda k: hourly[k]) if hourly else None
+    active_hours = set(hourly.keys())
+
+    # Desglose de frases de atención reales (top) para el resumen
+    attention_phrase_counts = {}
+    for e in attention_events:
+        for frase in _event_attention_hits(e):
+            attention_phrase_counts[frase] = attention_phrase_counts.get(frase, 0) + 1
+    top_attention_phrases = sorted(attention_phrase_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
     return {
         "period": date or "today",
         "total_events": total,
         "attention_events": len(attention_events),
         "persons_total": unique_persons_day,
         "persons_analyses": len(persons_values),
+        "tracking_unique_max": tracking_unique_max,
+        "tracking_unique_sum": tracking_unique_sum,
+        "peak_hour": peak_hour,
+        "active_hours": sorted(active_hours),
+        "tag_counts": tag_counts,
+        "top_attention_phrases": [{"frase": f, "count": c} for f, c in top_attention_phrases],
         "counts_total": {
             "platos": total_platos,
             "bebidas": total_bebidas,
@@ -1018,7 +1140,7 @@ async def tool_find_anomalies(user_id: str, min_severity: str = "media",
     min_level = severity_order.get(min_severity, 1)
     results = []
     for evt, cam_name in _iter_events(user_id, camera_id, date):
-        attention_hits = evt.get("attention_hits", []) if isinstance(evt, dict) else []
+        attention_hits = _event_attention_hits(evt)
         is_vig = isinstance(evt, dict) and evt.get("event_id", "").startswith("vigilance_")
         evt_dt = evt.get("datetime", "") if isinstance(evt, dict) else ""
         if not evt_dt and isinstance(evt, dict) and evt.get("timestamp"):
@@ -1080,6 +1202,7 @@ async def tool_latest_events(user_id: str, limit: int = 5,
         if not evt_dt and evt.get("timestamp"):
             from datetime import datetime as _dt
             evt_dt = _dt.fromtimestamp(int(evt["timestamp"])).strftime("%Y-%m-%d %H:%M:%S")
+        search_tags = [t for t in (qjson.get("search_tags") or []) if t and not _is_placeholder_hit(t)]
         events.append({
             "event_id": eid,
             "datetime": evt_dt,
@@ -1090,6 +1213,8 @@ async def tool_latest_events(user_id: str, limit: int = 5,
             "summary": qjson.get("summary", _event_description(evt)),
             "importancia": qjson.get("importancia", "baja"),
             "anomaly": _event_is_alert(evt),
+            "attention_hits": _event_attention_hits(evt),
+            "search_tags": search_tags,
             "persons": _event_persons(evt),
             "yolo": _event_yolo(evt),
             "frame_url": f"/api/event-frame/{eid}?user_id={user_id}",
