@@ -763,35 +763,131 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
         current_zones_map = {}
 
     # ── QUITAR una frase de atención ──
-    remove_markers = ("quita la regla de", "quitar la regla de", "quita la frase de", "quitar la frase de",
-                      "deja de vigilar", "dejar de vigilar", "elimina la regla de", "eliminar la regla de",
-                      "borra la regla de", "borrar la regla de", "no alertes por", "no alertar por")
-    for marker in remove_markers:
-        idx = m.find(marker)
-        if idx >= 0:
-            value = _clean_behavior(_extract_behavior_after(message, [marker]))
-            if not value:
-                break
-            v_low = value.lower()
-            removed = [p for p in current_phrases if v_low == p.lower() or v_low in p.lower() or p.lower() in v_low]
-            if removed:
-                for r in removed:
-                    current_phrases = [p for p in current_phrases if p.lower() != r.lower()]
-                    current_zones_map.pop(r, None)
-                vigilance["attention_phrases"] = current_phrases[-20:]
-                if current_zones_map:
-                    vigilance["attention_phrases_zones"] = current_zones_map
-                result_note = f"Listo, quité {len(removed)} frase(s) de vigilancia: “{', '.join(removed)}”. Te quedan {len(current_phrases)} frase(s) activa(s)."
+    # Enfoque tolerante (no determinista): reconocemos VERBOS de intención
+    # de quitar en cualquier forma, y extraemos el resto del mensaje como el
+    # texto objetivo. Si no coincide con ninguna frase, Eva PREGUNTA al usuario
+    # enumerando las frases activas para que confirme cuál quitar, en vez de
+    # fallar en silencio.
+    import re as _re
+    remove_verbs = (r"\b(?:quita|quitar|elimina|eliminar|borra|borrar|saca|sacar|suprime|suprimir)\b",
+                    r"\b(?:deja\s+de|dejar\s+de)\s+vigilar",
+                    r"\b(?:no\s+alertes|no\s+alertar|no\s+me\s+alertes|no\s+me\s+alertar)\b",
+                    r"\b(?:quita|quitar|elimina|eliminar|borra|borrar)\b.*\b(?:regla|frase|vigilancia)\b")
+    is_remove_intent = any(_re.search(p, m) for p in remove_verbs)
+
+    # No treat "no alertes por X" como remoción directa: puede ser "es normal".
+    is_normal_flag = any(w in m for w in ("es normal", "no es falta", "no me hace falta"))
+    is_no_alert_explicit = any(pt in m for pt in ("no alertes por", "no alertar por", "no alertes de", "no alertar de", "no me alertes", "no me alertar"))
+
+    remove_value = None
+    remove_index = None  # selección numérica ("la 3", "quita la 2", "número 1")
+    if is_remove_intent and current_phrases:
+        # Si el usuario respondió a la pregunta de Eva con un número, usarlo.
+        # Patrones: "la 3", "el 2", "número 1", "num 1", "quita la 2", "la frase 3".
+        num_match = _re.search(r"\b(?:n[uú]mero|num)\s*(\d{1,2})\b", m) or \
+                    _re.search(r"\b(?:la|el|los|las)?\s*(\d{1,2})\b", m)
+        if num_match:
+            idx = int(num_match.group(1))
+            if 1 <= idx <= len(current_phrases):
+                remove_index = idx - 1  # 0-based
+
+    if remove_index is not None:
+        r = current_phrases[remove_index]
+        current_phrases = [p for p in current_phrases if p.lower() != r.lower()]
+        current_zones_map.pop(r, None)
+        vigilance["attention_phrases"] = current_phrases[-20:]
+        if not current_zones_map:
+            vigilance.pop("attention_phrases_zones", None)
+        else:
+            vigilance["attention_phrases_zones"] = current_zones_map
+        result_note = f"Listo, quité la frase “{r}”. Te quedan {len(current_phrases)} frase(s) activa(s)."
+    elif is_remove_intent or (is_no_alert_explicit and not is_normal_flag):
+        # Extraer el texto objetivo: quitamos el segmento que contiene el verbo
+        # de intención y la palabra puente (regla/frase/de/vigilar/por/de).
+        cleaned = m
+        for pattern in remove_verbs + (r"\b(?:regla|frase|vigilancia|para|por|de|la|el|los|las|que)\b",):
+            cleaned = _re.sub(pattern, " ", cleaned)
+        cleaned = _re.sub(r"\s+", " ", cleaned).strip(" .,-;:¿?¡!")
+        # El resto SI contiene palabras significativas es el objetivo.
+        if len(cleaned.split()) >= 1:
+            remove_value = _normalize_text(message).strip()  # fallback: usar mensaje limpio
+            # Mejor: tomar words que sobran tras quitar verbo+puente del original.
+            # Reconstruir extraído sobre mensaje original manteniendo acentos.
+            orig = message
+            for pat in remove_verbs:
+                orig = _re.sub(pat, " ", orig, flags=_re.IGNORECASE)
+            orig = _re.sub(r"\b(?:la|el|los|las|regla|frase|vigilancia|de\s+la\s+regla|de\s+la\s+frase|regla\s+de|frase\s+de|de|por|para|que|vigilar)\b", " ", orig, flags=_re.IGNORECASE)
+            orig = _re.sub(r"\s+", " ", orig).strip(" .,-;:¿?¡!,")
+            # Conservar palabras con acento del mensaje original (no normalizado).
+            target_words = [w for w in orig.split() if len(w) >= 3]
+            if target_words:
+                remove_value = " ".join(target_words)
             else:
-                if marker in ("no alertes por", "no alertar por") or any(w in m for w in ("es normal", "no es falta")):
-                    note = f"Nota del dueño: cuando pasa “{value}”, es normal, no lo menciones."
-                    if note not in current_notes:
-                        current_notes.append(note)
-                    vigilance["owner_notes"] = current_notes[-20:]
-                    result_note = f"Anotado: cuando pasa “{value}” lo considero normal y no te alerto."
-                else:
-                    result_note = "No tengo ninguna frase de vigilancia que coincida con “" + value + "”. Tus frases actuales son:\n" + "\n".join(f"  • {p}" for p in current_phrases[:5])
-            break
+                remove_value = cleaned if cleaned else None
+            remove_value = remove_value[:180] if remove_value else None
+
+    # Matching fuzzy bidireccional entre remove_value y cada frase activa.
+    def _phrase_matches(phrase, target):
+        if not target:
+            return False
+        p = _normalize_text(phrase).lower()
+        t = _normalize_text(target).lower()
+        if p == t:
+            return True
+        # Coincidencia por palabras significativas (≥4 chars): ≥60% de las
+        # palabras del target están en la frase, o viceversa.
+        pw = [w for w in p.split() if len(w) >= 4]
+        tw = [w for w in t.split() if len(w) >= 4]
+        if not tw:
+            return p in t or t in p
+        in_phrase = sum(1 for w in tw if w in p)
+        if in_phrase / len(tw) >= 0.6:
+            return True
+        in_target = sum(1 for w in pw if w in t)
+        if in_target / len(pw) >= 0.6:
+            return True
+        return False
+
+    if remove_value and current_phrases:
+        value = remove_value
+        removed = [p for p in current_phrases if _phrase_matches(p, value)]
+        if len(removed) == 1:
+            r = removed[0]
+            current_phrases = [p for p in current_phrases if p.lower() != r.lower()]
+            current_zones_map.pop(r, None)
+            vigilance["attention_phrases"] = current_phrases[-20:]
+            if not current_zones_map:
+                vigilance.pop("attention_phrases_zones", None)
+            else:
+                vigilance["attention_phrases_zones"] = current_zones_map
+            result_note = f"Listo, quité la frase “{r}”. Te quedan {len(current_phrases)} frase(s) activa(s)."
+        elif len(removed) > 1:
+            # Varias coinciden: pedir confirmación al usuario enumerándolas.
+            vigilance.pop("attention_phrases", None)  # no modificar todavía
+            opts = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(removed))
+            result_note = f"Varias frases coinciden con “{value}”. ¿Cuál quieres que quite?\n{opts}\nDime el número o el nombre exacto."
+        else:
+            # Ninguna frase coincide con lo que el usuario pidió quitar.
+            if is_normal_flag or is_no_alert_explicit:
+                # "no alertes por X es normal" → anotar como excepción, no quitar.
+                note = f"Nota del dueño: cuando pasa “{value}”, es normal, no lo menciones."
+                if note not in current_notes:
+                    current_notes.append(note)
+                vigilance["owner_notes"] = current_notes[-20:]
+                result_note = f"Anotado: cuando pasa “{value}” lo considero normal y no te alerto."
+            elif current_phrases:
+                # Eva PREGUNTA: no falla en silencio. Enumera las frases activas
+                # para que el usuario confirme cuál quiere quitar por número o nombre.
+                vigilance.pop("attention_phrases", None)  # no modificar todavía
+                active = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(current_phrases[:10]))
+                result_note = (f"No encontré ninguna frase que coincida con “{value}”. "
+                               f"Tienes {len(current_phrases)} frase(s) activa(s):\n{active}\n"
+                               f"Dime el número de la que quieres quitar (o repítela).")
+            else:
+                result_note = "No tienes ninguna frase de vigilancia configurada todavía. Usa “vigila que…” para añadir una."
+
+    elif is_remove_intent and not current_phrases:
+        result_note = "No tienes ninguna frase de vigilancia configurada todavía. Usa “vigila que…” para añadir una."
 
     # ── AGREGAR una frase de atención ──
     add_markers = ("vigila que", "vigilar que", "avísame si", "avisame si", "alerta si", "alertar si",
