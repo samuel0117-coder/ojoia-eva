@@ -1725,19 +1725,21 @@ async def eva_event_feedback(request: dict):
     el chat de Eva. Delega en tool_learn_from_feedback, que:
       - persiste feedback en el JSON del evento
       - si is_real=False: añade nota como owner_note y registra false_alarm
-    Body: {user_id, event_id, is_real, notes?}
+    Body: {user_id, event_id, is_real, notes?, correction_note?}
     """
     try:
         user_id = request.get("user_id", "")
         event_id = request.get("event_id", "")
         is_real = bool(request.get("is_real", True))
         notes = request.get("notes") or ""
+        correction_note = request.get("correction_note") or ""
         if not user_id or not event_id:
             return {"success": False, "error": "user_id and event_id required"}
         from eva.tools import tool_learn_from_feedback
         result = await tool_learn_from_feedback(
             event_id=event_id, is_real=is_real,
             notes=(notes.strip() or None), user_id=user_id,
+            correction_note=(correction_note.strip() or None),
         )
         if not result.get("success"):
             logger.warning(f"[EVA feedback] {result.get('error', 'error')} (event={event_id})")

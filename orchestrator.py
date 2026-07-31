@@ -1358,7 +1358,10 @@ def _apply_rules(vision: dict, cam_cfg: dict, zone: str, is_after_hours: bool, m
     vigilance = cam_cfg.get("vigilance", {}) if isinstance(cam_cfg.get("vigilance"), dict) else {}
     attention_phrases = vigilance.get("attention_phrases", []) or cam_cfg.get("attention_phrases", []) or []
     owner_notes = vigilance.get("owner_notes", []) or cam_cfg.get("owner_notes", []) or []
-    return _detect_attention_hits(vision, attention_phrases, owner_notes, zone, is_after_hours, mode)
+    attention_phrases_zones = vigilance.get("attention_phrases_zones", {}) or {}
+    if not isinstance(attention_phrases_zones, dict):
+        attention_phrases_zones = {}
+    return _detect_attention_hits(vision, attention_phrases, owner_notes, zone, is_after_hours, mode, attention_phrases_zones)
 
 
 def _max_severity(a: str, b: str) -> str:
@@ -1367,14 +1370,19 @@ def _max_severity(a: str, b: str) -> str:
 
 
 def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: list,
-                            zone: str, is_after_hours: bool, mode: str) -> dict:
+                            zone: str, is_after_hours: bool, mode: str,
+                            attention_phrases_zones: dict = None) -> dict:
     """Detecta si el relato de Qwen contiene frases de atención configuradas.
 
     NO juzga, NO decide violaciones. Solo observa si lo que el dueño quería
     vigilar fue visiblemente mencionado en la narrativa de Qwen.
 
+    attention_phrases_zones: dict {frase: zone_name} (Fase 4). Si un hit coincide
+    con una frase mapeada, se añade zone_name al hit para el banner.
+
     Retorna coincidencias observacionales para que el sistema decida si notifica.
     """
+    attention_phrases_zones = attention_phrases_zones or {}
     checks = {}
     anomalias = []
     importance = "normal"
@@ -1382,6 +1390,12 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
     relato_text = json.dumps(vision, ensure_ascii=False).lower()
     resumen = vision.get("resumen", "") if isinstance(vision, dict) else ""
     attention_hits_raw = vision.get("attention_hits", []) if isinstance(vision, dict) else []
+
+    def _zone_for_phrase(phrase):
+        if not phrase or not attention_phrases_zones:
+            return None
+        match = next((k for k in attention_phrases_zones if k.lower() == phrase.lower()), None)
+        return attention_phrases_zones.get(match) if match else None
 
     hits = []
 
@@ -1404,7 +1418,8 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
             hits.append({
                 "frase": flag_text,
                 "momento": "",
-                "source": "qwen_flag"
+                "source": "qwen_flag",
+                "zone_name": _zone_for_phrase(flag_text),
             })
 
     # 1. Verificar si Qwen reportó attention_hits explícitamente
@@ -1421,7 +1436,8 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
                 hits.append({
                     "frase": frase,
                     "momento": hit.get("momento", ""),
-                    "source": "qwen_explicit"
+                    "source": "qwen_explicit",
+                    "zone_name": _zone_for_phrase(frase),
                 })
 
     # 2. Verificar phrases de atención (respaldo por keywords)
@@ -1433,7 +1449,8 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
                     hits.append({
                         "frase": phrase,
                         "momento": "",
-                        "source": "keyword_match"
+                        "source": "keyword_match",
+                        "zone_name": _zone_for_phrase(phrase),
                     })
 
     # 3. Evaluar notas del dueño (contexto) — ¿falso positivo conocido?
@@ -1488,6 +1505,7 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
         "importancia": importance,
         "anomalias": anomalias,
         "attention_hits": [h["frase"] for h in hits],
+        "attention_hits_zones": [h.get("zone_name") or None for h in hits],
         "false_positives_detected": len(false_positive_notes),
         "summary": summary,
         "evidence": [a["descripcion"] for a in anomalias] if anomalias else ["Sin observaciones relevantes"],
@@ -1742,6 +1760,7 @@ class QwenOrchestrator:
          mode: str, is_after_hours: bool, total_yolo: int, yolo_stats: dict,
          cam_cfg: dict, frames: list = None, concern: str = "",
          attention_phrases: list = None, owner_notes: list = None,
+         attention_phrases_zones: dict = None,
          tracking_summary: dict = None, user_id: str = "", camera_id: str = ""
      ) -> dict:
         """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos.
@@ -1750,10 +1769,12 @@ class QwenOrchestrator:
         Eje 2: inyecta conteo YOLO/tracker como dato factual (no se le pide contar).
         Eje 3: dos prompts (preambulo generico + vigilancia con contexto del negocio) + salida JSON.
         Eje 4: inyecta ZONAS CONFIGURADAS por el usuario (áreas de interés dibujadas).
+        Eje 5 (Fase 4): frases de atención vinculadas a zonas (avisame si... en Zona X).
         """
         tracking_summary = tracking_summary or {"unique_persons": 0, "tracks": []}
         attention_phrases = attention_phrases or []
         owner_notes = owner_notes or []
+        attention_phrases_zones = attention_phrases_zones or {}
         n_frames = len(frames) if frames else 0
 
         # ── Eje 4: ZONAS CONFIGURADAS POR EL USUARIO ──
@@ -1820,7 +1841,13 @@ class QwenOrchestrator:
             vigilance_prompt += f"CONTEXTO: \"{zone}\" en {business_name or 'el negocio'} (un {business_description or business_type or 'negocio'}). Foco de observación: {witness_focus}.\n"
 
         if attention_phrases:
-            ap_list = "\n".join(f"- {p}" for p in attention_phrases[:8])
+            # Fase 4: si una frase está vinculada a una zona (attention_phrases_zones),
+            # indicárselo a Qwen para que busque la acción dentro de esa área.
+            ap_lines = []
+            for p in attention_phrases[:8]:
+                zn = attention_phrases_zones.get(p) if isinstance(attention_phrases_zones, dict) else None
+                ap_lines.append(f"- {p}" + (f"  (zona: {zn})" if zn else ""))
+            ap_list = "\n".join(ap_lines)
             vigilance_prompt += f"\nEL PROPIETARIO QUIERE VIGILAR:\n{ap_list}\n"
         if owner_notes:
             on_list = "; ".join(str(n) for n in owner_notes[:5])
@@ -1981,11 +2008,16 @@ class QwenOrchestrator:
             # ── Extraer attention_phrases y owner_notes de cam_cfg ──────────────
             attention_phrases = cam_cfg.get("attention_phrases", []) or []
             owner_notes = cam_cfg.get("owner_notes", []) or []
+            attention_phrases_zones = {}
             if not attention_phrases:
                 vigilance = cam_cfg.get("vigilance", {}) if isinstance(cam_cfg.get("vigilance"), dict) else {}
-                attention_phases = vigilance.get("attention_phrases", []) or []
+                attention_phrases = vigilance.get("attention_phrases", []) or []
                 owner_notes = vigilance.get("owner_notes", []) or []
-    
+            vigilance2 = cam_cfg.get("vigilance", {}) if isinstance(cam_cfg.get("vigilance"), dict) else {}
+            aphz = vigilance2.get("attention_phrases_zones") or {}
+            if isinstance(aphz, dict):
+                attention_phrases_zones = aphz
+
             if use_grid_image and len(frames) > 1:
                 # 4×4 mosaico numerado de TODOS los frames en disco (P1)
                 # para verificacion rapida del usuario desde el listado.
@@ -2000,6 +2032,7 @@ class QwenOrchestrator:
                          _schedule_open, _schedule_close, mode, is_after_hours,
                          total_yolo_objects, yolo_stats, cam_cfg, frames=frames, concern=concern,
                          attention_phrases=attention_phrases, owner_notes=owner_notes,
+                         attention_phrases_zones=attention_phrases_zones,
                          tracking_summary=tracking_summary, user_id=user_id, camera_id=camera_id
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
@@ -2010,15 +2043,16 @@ class QwenOrchestrator:
                     vision_json = {}
             else:
                 logger.info(f"[GRID] Skipping Qwen: use_grid={use_grid_image} frames={len(frames)}")
-    
+
             # ── Etapa 2: Attention Hit Detection (no reglas, solo observación) ──
-            rule_result = _detect_attention_hits(vision_json, attention_phrases, owner_notes, zone, is_after_hours, mode)
+            rule_result = _detect_attention_hits(vision_json, attention_phrases, owner_notes, zone, is_after_hours, mode, attention_phrases_zones)
     
             # ── Armar qwen_json final ─────────────────────────────────────────────
             qwen_json = {
                 "vision": vision_json,
                 "rule_checks": rule_result["checks"],
                 "attention_hits": rule_result.get("attention_hits", []),
+                "attention_hits_zones": rule_result.get("attention_hits_zones", []),
                 "false_positives_detected": rule_result.get("false_positives_detected", 0),
                 "importance": rule_result["importance"],
                 "importancia": rule_result["importance"],
@@ -2114,23 +2148,26 @@ class QwenOrchestrator:
                     "qwen_details": qwen_json.get("details") if isinstance(qwen_json.get("details"), dict) else {},
                     "qwen_search_tags": qwen_json.get("search_tags") if isinstance(qwen_json.get("search_tags"), list) else [],
                     "attention_hits": attention_hits,
+                    "attention_hits_zones": rule_result.get("attention_hits_zones", []),
                     "counts": vision_json.get("counts", {}) if isinstance(vision_json, dict) else {},
                 }
             )
-    
+
             update_camera_metrics(user_id, camera_id, event_type=event_type)
-    
+
             # ── Notificación push (solo attention hits + cooldown) ──────────────
             if attention_detected and cooldown_ok and attention_hits:
                 try:
                     now_str = time.strftime("%H:%M", time.localtime())
                     first_hit = attention_hits[0] if attention_hits else "comportamiento observado"
-                    title = f"📷 Algo que quizás quieras revisar — {zone}"
+                    eye_hits_zones = rule_result.get("attention_hits_zones") or []
+                    hit_zone = eye_hits_zones[0] if eye_hits_zones else ""
+                    title = f"📷 Algo que quizás quieras revisar{(' — ' + hit_zone) if hit_zone else ' — ' + zone}"
                     body = (f"Nuestro sistema detectó algo que coincide con lo que me pediste vigilar:\n\n"
                             f"🔍 {first_hit}\n\n"
                             f"📝 Contexto: {summary[:100]}\n\n"
                             f"🕐 {now_str} | 📍 {business_name or zone}")
-                    event_link = f"https://ojoia.com.do/#eva?alert={event_id}&camera={camera_id}"
+                    event_link = f"https://ojoia.com.do/#cameras?alert={event_id}&camera={camera_id}"
                     _fcm_task = asyncio.create_task(send_fcm_notification(
                         title=title, body=body, user_id=user_id,
                         image_b64=image_to_base64(frames[0]["image_bytes"]) if frames else None,

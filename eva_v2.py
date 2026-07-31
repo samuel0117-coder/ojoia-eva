@@ -685,6 +685,50 @@ def _extract_camera_id_from_message(message):
     return _vigilance_camera_id(message)
 
 
+def _detect_phrase_zone(user_id, camera_id, phrase):
+    """Detecta si una frase de atencion menciona una zona configurada por el dueño.
+    Devuelve el nombre de la zona (str) o None si no hay match.
+    Usa camera_zones.get_camera_zones y empareja por nombre/tipo keywords en la frase.
+    """
+    if not user_id or not camera_id or not phrase:
+        return None
+    try:
+        import camera_zones
+        zones = camera_zones.get_camera_zones(user_id, camera_id) or []
+    except Exception:
+        return None
+    if not zones:
+        return None
+    pl = _normalize_text(phrase)
+    for z in zones:
+        zname = (z.get("name") or "").strip()
+        ztype = (z.get("type") or "").strip()
+        if zname and _normalize_text(zname) in pl:
+            return zname
+    # Emparejar por tipo keyword (cajero->cashier, cocina->kitchen...)
+    type_keywords = {
+        "cashier": ["caja", "cajero", "cobro", "registradora", "punto de venta"],
+        "entrance": ["entrada", "puerta", "acceso", "porton"],
+        "kitchen": ["cocina", "estufa", "fogon"],
+        "dining": ["comedor", "mesa", "cliente"],
+        "inventory": ["inventario", "almacen", "bodega", "estante"],
+        "counter": ["mostrador", "barra", "mostrador"],
+        "restricted": ["restringid", "prohibid"],
+        "office": ["oficina"],
+        "storage": ["bodega", "deposito"],
+        "hallway": ["pasillo"],
+        "production": ["produccion", "fabrica"],
+        "parking": ["parqueo", "estacionamiento"],
+        "hall": ["sala", "hall", "recepcion"],
+    }
+    for z in zones:
+        ztype = _normalize_text(z.get("type") or "")
+        kws = type_keywords.get(ztype, [])
+        if any(kw in pl for kw in kws):
+            return (z.get("name") or "").strip() or ztype
+    return None
+
+
 def _build_vigilance_update_from_message(user_id, camera_id, message):
     from eva.tools import _load_camera_config, normalize_camera_vigilance_config
     m = _normalize_text(message)
@@ -713,6 +757,10 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
     current_cfg = normalize_camera_vigilance_config(_load_camera_config(user_id, camera_id)) if camera_id else {}
     current_phrases = list((current_cfg.get("attention_phrases") or []))
     current_notes = list((current_cfg.get("owner_notes") or []))
+    # attention_phrases_zones: dict {frase_text: zone_name}. Persistido en vigilance.
+    current_zones_map = (current_cfg.get("vigilance", {}) or {}).get("attention_phrases_zones", {}) or {}
+    if not isinstance(current_zones_map, dict):
+        current_zones_map = {}
 
     # ── QUITAR una frase de atención ──
     remove_markers = ("quita la regla de", "quitar la regla de", "quita la frase de", "quitar la frase de",
@@ -729,7 +777,10 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
             if removed:
                 for r in removed:
                     current_phrases = [p for p in current_phrases if p.lower() != r.lower()]
+                    current_zones_map.pop(r, None)
                 vigilance["attention_phrases"] = current_phrases[-20:]
+                if current_zones_map:
+                    vigilance["attention_phrases_zones"] = current_zones_map
                 result_note = f"Listo, quité {len(removed)} frase(s) de vigilancia: “{', '.join(removed)}”. Te quedan {len(current_phrases)} frase(s) activa(s)."
             else:
                 if marker in ("no alertes por", "no alertar por") or any(w in m for w in ("es normal", "no es falta")):
@@ -752,7 +803,14 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
         if value and value.lower() not in [p.lower() for p in current_phrases]:
             current_phrases.append(value)
             vigilance["attention_phrases"] = current_phrases[-20:]
-            result_note = f"Agregué la frase de vigilancia: “{value}”. Ahora vigilo {len(current_phrases)} frase(s)."
+            # Fase 4: detectar si la frase menciona una zona configurada.
+            zone_name = _detect_phrase_zone(user_id, camera_id, value)
+            if zone_name:
+                current_zones_map[value] = zone_name
+                vigilance["attention_phrases_zones"] = current_zones_map
+                result_note = f"Agregué la frase de vigilancia: “{value}” (zona: {zone_name}). Ahora vigilo {len(current_phrases)} frase(s)."
+            else:
+                result_note = f"Agregué la frase de vigilancia: “{value}”. Ahora vigilo {len(current_phrases)} frase(s)."
         elif value:
             result_note = f"Esa frase “{value}” ya la estaba vigilando."
     else:
@@ -761,7 +819,11 @@ def _build_vigilance_update_from_message(user_id, camera_id, message):
             if behavior and behavior not in current_phrases:
                 current_phrases.append(behavior)
                 vigilance["attention_phrases"] = current_phrases[-20:]
-                result_note = f"Agregué la frase de vigilancia: “{behavior}”. Ahora vigilo {len(current_phrases)} frase(s)."
+                zone_name = _detect_phrase_zone(user_id, camera_id, behavior)
+                if zone_name:
+                    current_zones_map[behavior] = zone_name
+                    vigilance["attention_phrases_zones"] = current_zones_map
+                result_note = f"Agregué la frase de vigilancia: “{behavior}”{(' (zona: ' + zone_name + ')') if zone_name else ''}. Ahora vigilo {len(current_phrases)} frase(s)."
                 break
 
     # ── Horario ──
@@ -2185,6 +2247,9 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         normal = v.get("normal_mode", {}) if isinstance(v.get("normal_mode"), dict) else {}
         sentinel = v.get("sentinel_mode", {}) if isinstance(v.get("sentinel_mode"), dict) else {}
         phrases = data.get("attention_phrases", []) or []
+        zones_map = v.get("attention_phrases_zones", {}) or {}
+        if not isinstance(zones_map, dict):
+            zones_map = {}
         mode_txt = 'centinela (noche)' if data.get('mode') == 'sentinel' else 'estándar (dentro de horario)'
         text = (
             f"{first}, esto es lo que vigilo en {data.get('camera_id') or 'la cámara'}:\n"
@@ -2193,7 +2258,8 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         if phrases:
             text += f"Frases de vigilancia ({len(phrases)}):\n"
             for p in phrases[:8]:
-                text += f"  • {p}\n"
+                zn = zones_map.get(p)
+                text += f"  • {p}{('  (zona: ' + zn + ')') if zn else ''}\n"
             if len(phrases) > 8:
                 text += f"  … y {len(phrases)-8} más.\n"
         else:

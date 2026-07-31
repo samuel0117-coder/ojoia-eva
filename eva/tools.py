@@ -1320,12 +1320,16 @@ async def tool_respond_directly(user_id: str, message: str = "") -> dict:
 
 
 
-async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = None, user_id: str = None) -> dict:
+async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = None, user_id: str = None,
+                                    correction_note: str = None) -> dict:
     """Procesa feedback del usuario sobre un evento.
 
     - Si es falsa alarma: registra el false_alarm y guarda notas como contexto
     - Si es amenaza real: fortalece la atención en esa zona
     - Las notas del usuario se convierten en owner_notes para futuros análisis
+    - correction_note: lo que el usuario cree que pasó realmente (difiere de lo que
+      el sistema creyó que disparó la alerta). Se guarda en vigilance.attention_corrections
+      para el ajuste iterativo de frases desde el chat.
     """
     try:
         import os, json
@@ -1351,8 +1355,16 @@ async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = No
         event_data["feedback"]["timestamp"] = int(time.time())
         if notes:
             event_data["feedback"]["notes"] = notes
+        # correction_note: lo que el usuario cree que pasó realmente
+        if correction_note:
+            event_data["feedback"]["correction_note"] = correction_note
 
         camera_id = event_data.get("camera_id", "")
+        # Hit original que disparó la alerta (para comparar con correction_note)
+        original_hit = ""
+        att_hits = event_data.get("attention_hits") or (event_data.get("qwen_json", {}) or {}).get("attention_hits") or []
+        if isinstance(att_hits, list) and att_hits:
+            original_hit = str(att_hits[0]) if att_hits else ""
 
         # ═══════════════════════════════════════════════════════════════════
         # FEEDBACK LOOP: Convertir notas del dueño en owner_notes
@@ -1384,6 +1396,35 @@ async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = No
                     logger.info(f"Owner note added for {camera_id}: {note_clean[:50]}")
             except Exception as e:
                 logger.warning(f"Could not save owner_note: {e}")
+
+        # ── Attention corrections (Fase 4): historial de qué creyó el sistema
+        #    vs. qué cree el dueño que pasó realmente. Lo usa el ajuste iterativo
+        #    de frases desde el chat.
+        if not is_real and camera_id and correction_note and correction_note.strip():
+            try:
+                cam_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
+                if os.path.exists(cam_file):
+                    with open(cam_file) as f:
+                        cam_cfg = json.load(f)
+                    vigilance = cam_cfg.get("vigilance", {})
+                    if not isinstance(vigilance, dict):
+                        vigilance = {}
+                    corrs = vigilance.get("attention_corrections") or []
+                    if not isinstance(corrs, list):
+                        corrs = []
+                    corrs.append({
+                        "event_id": event_id,
+                        "original_hit": original_hit or "",
+                        "correction_note": correction_note.strip(),
+                        "ts": int(time.time()),
+                    })
+                    vigilance["attention_corrections"] = corrs[-50:]
+                    cam_cfg["vigilance"] = vigilance
+                    with open(cam_file, "w") as f:
+                        json.dump(cam_cfg, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Attention correction recorded for {camera_id}: original='{original_hit[:40]}' -> corretta='{correction_note[:40]}'")
+            except Exception as e:
+                logger.warning(f"Could not save attention_correction: {e}")
 
         with open(event_file, "w") as f:
             json.dump(event_data, f, indent=2, ensure_ascii=False)
