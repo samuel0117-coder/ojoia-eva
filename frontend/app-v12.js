@@ -599,20 +599,22 @@ const App = {
      * pageName: 'eva' | 'cameras' | 'events' | 'live'
      */
     _handleEventDeepLink(pageName, eventId, cameraId) {
-        if (eventId && pageName === 'eva') {
-            this._pendingNotificationEventId = eventId;
-            this._pendingNotificationCameraId = cameraId || '';
-            this.go('eva');
-            return;
-        }
-        if (eventId && pageName === 'cameras') {
-            // Push (centinela/night): abrir cameras tab con el modal del evento encima.
+        // Push (Fase 0): tanto centinela como modo normal abren la tab cámara
+        // con el modal del evento encima. pageName==='eva' cae aquí por
+        // deep-links legacy (#eva?alert=...). Redirigimos a cameras en ambos.
+        if (eventId && (pageName === 'cameras' || pageName === 'eva')) {
             this.go('cameras');
-            window.location.hash = '#cameras';
+            if (window.location.hash !== '#cameras') window.location.hash = '#cameras';
             const evtId = eventId;
+            const camId = cameraId || '';
+            // Guardar referencia para que el banner (_activeAlertEvent) refleje esta alerta.
+            this._activeAlertEvent = this._activeAlertEvent || {};
+            this._activeAlertEvent.eventId = evtId;
+            this._activeAlertEvent.cameraId = camId;
+            this._activeAlertEvent.ts = Date.now();
             setTimeout(() => {
                 try { this._openEvent(evtId); } catch(e) { console.error('open event from push:', e); }
-            }, 600);
+            }, 700);
             return;
         }
         if (eventId && pageName === 'events') {
@@ -766,7 +768,7 @@ const App = {
         try {
             const [camsSettled, evtsSettled, profileSettled] = await Promise.allSettled([
                 apiFetch(`${this.API}/api/cameras?user_id=${this.userId || 'default'}`),
-                apiFetch(`${this.API}/api/user/events?user_id=${this.userId || 'default'}&limit=1`),
+                apiFetch(`${this.API}/api/user/events?user_id=${this.userId || 'default'}&limit=20`),
                 apiFetch(`${this.API}/api/user/profile?user_id=${this.userId || 'default'}`)
             ]);
             // Si el endpoint crítico (cámaras) falla, sí mostrar "Sin conexión".
@@ -784,37 +786,80 @@ const App = {
             this._homeViewCount = [1, 2, 4, 8, 16].includes(this._homeViewCount) ? this._homeViewCount : 1;
 
             const on = cams.filter(x => x.active).length;
-            const lastEvt = evts[0];
-            const heroText = on > 0 
-                ? `✅ ${on} de ${cams.length} cámaras activas` 
-                : cams.length > 0 
-                    ? `⚠️ ${cams.length} cámaras sin conexión` 
-                    : '📹 Sin cámaras';
+            // Banner de alerta: REUSA .last-alert.
+            // El evento que se muestra es el ÚLTIMO evento que generó una alerta
+            // (attention/violation/sentinel/vigilance_alert O con attention_hits),
+            // no "el último evento que vio la cámara". Se prioriza _activeAlertEvent
+            // (fijado por un push reciente) sobre el más reciente del poll.
+            const isAlertEvt = (e) => {
+                if (!e) return false;
+                const t = (e.event_type || '').toLowerCase();
+                if (['attention','violation','sentinel','vigilance_alert'].includes(t)) return true;
+                if (e.qwen && e.qwen.violation) return true;
+                if (Array.isArray(e.attention_hits) && e.attention_hits.length > 0) return true;
+                if (e.qwen_json && e.qwen_json.after_hours && e.qwen_json.importancia === 'alta') return true;
+                return false;
+            };
+            let alertEvt = null;
+            // 1) Si llego un push reciente (_activeAlertEvent), buscar ese evento en evts
+            //    para tener todos sus datos. Si no está en la página, sigue la 2.
+            if (this._activeAlertEvent && this._activeAlertEvent.eventId) {
+                alertEvt = evts.find(e => e.event_id === this._activeAlertEvent.eventId) || null;
+                if (!alertEvt) {
+                    // No estaba en los 20 más recientes: fetch directo.
+                    try {
+                        const r = await apiFetch(`${this.API}/api/events/${this._activeAlertEvent.eventId}?user_id=${this.userId || 'default'}`);
+                        if (r.ok) alertEvt = await r.json();
+                    } catch(e) {}
+                }
+            }
+            // 2) Sino, primer evento de alerta del poll (filtrado).
+            if (!alertEvt) {
+                alertEvt = evts.find(isAlertEvt) || null;
+            }
+            // Saldud del banner: si refrescó Home tras descartar, _activeAlertEvent
+            // queda null y no se repinta.
             const heroClass = on > 0 ? 'ok' : 'off';
 
             let lastAlertHTML = '';
-            if (lastEvt) {
+            if (alertEvt && isAlertEvt(alertEvt)) {
+                const lastEvt = alertEvt;
+                // Guardar como alerta activa para el resto de la sesión.
+                this._activeAlertEvent = this._activeAlertEvent || {};
+                this._activeAlertEvent.eventId = lastEvt.event_id;
+                this._activeAlertEvent.cameraId = lastEvt.camera_id || '';
+                this._activeAlertEvent.ts = Date.now();
+
                 const isViolation = lastEvt.qwen?.violation || lastEvt.event_type === 'violation';
                 const isAttention = (lastEvt.attention_hits && lastEvt.attention_hits.length > 0) || lastEvt.event_type === 'attention';
-                const isSentinel = lastEvt.event_type === 'sentinel' || (lastEvt.qwen_json?.after_hours && lastEvt.qwen_json?.importancia === 'alta');
-                if (isViolation || isAttention || isSentinel) {
-                    const ts = lastEvt.timestamp ? new Date(lastEvt.timestamp * 1000).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit', hour12:true}) : '--';
-                    const evtDesc = lastEvt.description || lastEvt.summary || (lastEvt.qwen_json?.summary || '');
-                    const evtHits = lastEvt.attention_hits || [];
-                    const alertColor = isSentinel ? 'var(--warning, #f5a623)' : 'var(--danger)';
-                    const alertIcon = isSentinel ? '🛡️' : '📷';
-                    const alertTitle = isSentinel ? 'FUERA DE HORARIO — Se detectó presencia' : (isAttention ? '🔍 Observación relevante' : '🚨 Alerta');
-                    lastAlertHTML = `<div class="last-alert" onclick="App._openEvent('${lastEvt.event_id}')" style="background:${isSentinel ? 'rgba(245,166,35,0.08)' : 'rgba(255,59,48,0.06)'};border:1px solid ${alertColor};padding:14px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer">
-                        <div style="font-size:.78rem;color:${alertColor};font-weight:700;margin-bottom:6px">${alertIcon} ${alertTitle} — ${ts}</div>
-                        <div style="font-size:.92rem;line-height:1.4;margin-bottom:6px">${evtDesc.substring(0, 180) || 'Se detectó actividad en la zona'}</div>
-                        ${evtHits.length ? `<div style="font-size:.78rem;color:var(--text-secondary);margin-bottom:6px">🔍 ${evtHits.slice(0, 2).join(', ')}</div>` : ''}
-                        <div style="display:flex;gap:8px;margin-top:8px">
-                            <button class="btn btn-sm" onclick="event.stopPropagation();App._openEvent('${lastEvt.event_id}')" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:8px;font-size:.82rem">Ver detalle</button>
-                            <button class="btn btn-sm" onclick="event.stopPropagation();App._dismissEvent('${lastEvt.event_id}');App.go('home')" style="background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-size:.82rem">✓ Falsa alarma</button>
-                        </div>
-                    </div>`;
-                }
+                const isSentinel = lastEvt.event_type === 'sentinel' || lastEvt.event_type === 'vigilance_alert' || (lastEvt.qwen_json?.after_hours && lastEvt.qwen_json?.importancia === 'alta');
+                const ts = lastEvt.timestamp ? new Date(lastEvt.timestamp * 1000).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit', hour12:true}) : '--';
+                const evtDesc = lastEvt.description || lastEvt.summary || (lastEvt.qwen_json?.summary || '');
+                const evtHits = lastEvt.attention_hits || [];
+                const zoneName = (Array.isArray(lastEvt.attention_hits_zones) && lastEvt.attention_hits_zones.length && lastEvt.attention_hits_zones[0])
+                    || lastEvt.camera_zone || (lastEvt.qwen_json && lastEvt.qwen_json.zone) || '';
+                const alertColor = isSentinel ? 'var(--warning, #f5a623)' : 'var(--danger)';
+                const alertIcon = isSentinel ? '🛡️' : (isAttention ? '🔍' : '🚨');
+                const alertTitle = isSentinel ? 'FUERA DE HORARIO — Se detectó presencia' : (isAttention ? 'Observación relevante' : 'Alerta');
+                const blinkClass = isSentinel ? '' : ' alert-blink';
+                lastAlertHTML = `<div class="last-alert${blinkClass}" onclick="App._openEvent('${lastEvt.event_id}')" style="background:${isSentinel ? 'rgba(245,166,35,0.08)' : 'rgba(255,59,48,0.06)'};border:2px solid ${alertColor};padding:14px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer">
+                    <div style="font-size:.78rem;color:${alertColor};font-weight:700;margin-bottom:6px">${alertIcon} ${alertTitle}${zoneName ? ' · ' + escHtml(zoneName) : ''} — ${ts}</div>
+                    <div style="font-size:.92rem;line-height:1.4;margin-bottom:6px">${escHtml((evtDesc || 'Se detectó actividad en la zona').substring(0,220))}</div>
+                    ${evtHits.length ? `<div style="font-size:.78rem;color:var(--text-secondary);margin-bottom:6px">🔍 ${evtHits.slice(0, 2).map(escHtml).join(', ')}</div>` : ''}
+                    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+                        <button class="btn btn-sm" onclick="event.stopPropagation();App._openEvent('${lastEvt.event_id}')" style="background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:.82rem">Ver detalle</button>
+                        <button class="btn btn-sm" onclick="event.stopPropagation();App._dismissEvent('${lastEvt.event_id}')" style="background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border);padding:8px 16px;border-radius:8px;font-size:.82rem">✓ Falsa alarma</button>
+                    </div>
+                </div>`;
+            } else {
+                this._activeAlertEvent = null;
             }
+
+            const heroText = on > 0 
+                ? `${on} de ${cams.length} cámaras activas` 
+                : cams.length > 0 
+                    ? `${cams.length} cámaras sin conexión` 
+                    : 'Sin cámaras';
 
             const defaultCam = cams.find(c => c.active) || cams[0] || null;
             const defaultCamId = defaultCam ? defaultCam.camera_id : '';
@@ -991,6 +1036,7 @@ const App = {
 
     _homeCams: [],
     _homeActiveCamId: null,
+    _activeAlertEvent: null,
     _homeViewCount: Number(localStorage.getItem('ojoia_home_view_count') || 1),
     _homeFrameInFlight: {},
     _homeLastDetectionsByCam: {},
@@ -1945,7 +1991,8 @@ const App = {
                                 <div class="section-title">📍 Dibuja las áreas importantes</div>
                             </div>
                         </div>
-                        <p class="meta" style="margin-bottom:12px;">Dibuja rectángulos sobre la imagen para marcar zonas como "Caja", "Entrada", "Cocina", etc. Eva vigilará estas áreas de forma prioritaria.</p>
+                        <p class="meta" style="margin-bottom:12px;">Pulsa "➕ Nueva zona", ponle nombre y describe qué pasa ahí. Luego dibuja el rectángulo sobre la imagen. Eva vigilará esas áreas de forma prioritaria.</p>
+                        <div id="zone-form" style="margin-bottom:12px"></div>
                         <div id="zone-canvas-container" style="position:relative;width:100%;max-width:640px;margin:0 auto;background:#000;border-radius:12px;overflow:hidden">
                             <img id="zone-canvas-bg" src="" style="width:100%;display:block;opacity:0.5">
                             <canvas id="zone-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair"></canvas>
@@ -2095,16 +2142,63 @@ async _applyCamDefaults(camId, cam) {
     _zoneDrawing: false,
     _zoneStartPos: null,
     _zoneCurrentRect: null,
-    _zoneList: [],  // [{id, name, type, coords: {x,y,w,h}, color}]
+    _zoneList: [],  // [{id, name, type, coords: {x,y,w,h}, color, description}]
+    // Zona en preparación (nombre+tipo+descripción ya definidos, esperando dibujo)
+    _zonePending: null,  // {name, type, description} | null
+    _zoneTypesCache: null,  // cache de /api/zone-types
+
+    async _openZonesFromSettings() {
+        // Entrada desde Ajustes > Detección > Zonas de interés.
+        // Si hay una sola cámara, abre su config y el editor de zonas.
+        // Si hay varias, primero pide seleccionar la cámara.
+        let cams = this._homeCams || [];
+        if (!cams.length) {
+            try {
+                const r = await apiFetch(`${this.API}/api/cameras?user_id=${this.userId}`);
+                cams = (await r.json()).cameras || [];
+            } catch(e) {}
+        }
+        if (!cams.length) {
+            this._toast('', 'Primero instala una cámara', 'danger');
+            return;
+        }
+        const camId = cams[0].camera_id;
+        // Abrir la config de la cámara y, tras render, abrir el editor de zonas.
+        await this._openCameraConfig(camId);
+        // _openCameraConfig renderiza #zone-editor-section en display:none.
+        // Lo abrimos automáticamente y precargamos el editor.
+        setTimeout(() => {
+            try { this._openZoneEditor(camId); } catch(e) { console.warn('openZoneEditor auto:', e); }
+            // auto-guardar: tras abrir el editor, la sección ya está visible.
+            const section = document.getElementById('zone-editor-section');
+            if (section) section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 400);
+    },
 
     async _openZoneEditor(camId) {
         this._zoneEditorCamId = camId;
         this._zoneDrawing = false;
         this._zoneStartPos = null;
         this._zoneCurrentRect = null;
+        this._zonePending = null;
         const section = document.getElementById('zone-editor-section');
         if (!section) return;
         section.style.display = 'block';
+
+        // Cargar tipos de zona (cache) desde el backend (15 tipos) una sola vez.
+        if (!this._zoneTypesCache) {
+            try {
+                const tr = await fetch(`${this.API}/api/zone-types`);
+                const td = await tr.json();
+                this._zoneTypesCache = (td.zone_types || []);
+            } catch(e) {
+                this._zoneTypesCache = [
+                    {id:'cashier',name:'Caja',icon:'💰'},{id:'entrance',name:'Entrada',icon:'🚪'},
+                    {id:'kitchen',name:'Cocina',icon:'🍳'},{id:'dining',name:'Comedor',icon:'🍽️'},
+                    {id:'other',name:'Otra',icon:'📍'}
+                ];
+            }
+        }
 
         // Cargar zonas existentes
         try {
@@ -2126,6 +2220,7 @@ async _applyCamDefaults(camId, cam) {
             if (bgImg.complete && bgImg.naturalWidth) setupCanvas();
             else bgImg.onload = setupCanvas;
         }
+        this._renderZoneForm();
         this._renderZoneList();
     },
 
@@ -2187,31 +2282,112 @@ async _applyCamDefaults(camId, cam) {
         this._drawZonesOnCanvas(canvas);
     },
 
+    _zoneTypeLabel(typeId) {
+        const t = (this._zoneTypesCache || []).find(x => x.id === typeId);
+        return t ? t.name : typeId;
+    },
+    _zoneTypeIcon(typeId) {
+        const t = (this._zoneTypesCache || []).find(x => x.id === typeId);
+        return t ? (t.icon || '📍') : '📍';
+    },
+
+    // Renderiza el formulario inline "+ Nueva zona" (nombre + tipo + descripción).
+    // Sustituye a los prompt() nativos. La zona se confirma al "dibujar el área".
+    _renderZoneForm() {
+        const container = document.getElementById('zone-form');
+        if (!container) return;
+        const p = this._zonePending;
+        if (!p) {
+            container.innerHTML = `<button class="btn" style="width:100%" onclick="App._startNewZone()">➕ Nueva zona</button>`;
+            return;
+        }
+        const types = this._zoneTypesCache || [];
+        container.innerHTML = `
+            <div class="zone-form-card">
+                <div class="zone-form-title">Nueva zona</div>
+                <div class="zone-field">
+                    <input id="zone-input-name" class="zone-input" type="text" placeholder="Nombre (ej: Caja, Entrada…)" value="${(p.name||'').replace(/"/g,'"')}" oninput="App._zonePending.name=this.value">
+                </div>
+                <div class="zone-field">
+                    <select id="zone-input-type" class="zone-select" onchange="App._zonePending.type=this.value">
+                        ${types.map(t => `<option value="${t.id}" ${t.id===p.type?'selected':''}>${t.icon||''} ${t.name}</option`).join('')}
+                    </select>
+                </div>
+                <div class="zone-field">
+                    <textarea id="zone-input-desc" class="zone-input" rows="2" placeholder="¿Qué pasa en esta zona? (ej: aquí el cajero cobra y guarda dinero)" oninput="App._zonePending.description=this.value">${(p.description||'').replace(/</g,'<')}</textarea>
+                </div>
+                <div class="zone-form-hint">👇 Ahora dibuja el rectángulo sobre la imagen para definir el área.</div>
+                <div style="display:flex;gap:8px">
+                    <button class="btn" onclick="App._zonePreviewManual()">✅ Dibujé el área</button>
+                    <button class="btn btn-outline" onclick="App._cancelZonePending()">Cancelar</button>
+                </div>
+            </div>`;
+        // focus nombre
+        setTimeout(() => { const el = document.getElementById('zone-input-name'); if (el && !p.name) el.focus(); }, 50);
+    },
+
+    _startNewZone() {
+        // Inicia el flujo crear-zona: pide nombre/tipo/descripción primero.
+        this._zonePending = { name: '', type: 'cashier', description: '' };
+        this._renderZoneForm();
+    },
+
+    _cancelZonePending() {
+        this._zonePending = null;
+        this._renderZoneForm();
+        const canvas = document.getElementById('zone-canvas');
+        if (canvas) this._drawZonesOnCanvas(canvas);
+    },
+
+    _zonePreviewManual() {
+        // Si el usuario ya dibujó un rectángulo en el canvas (modo legacy: dibujo
+        // antes de rellenar el form), lo finaliza ahora.
+        if (this._zoneCurrentRect && Math.abs(this._zoneCurrentRect.w) > 20) {
+            const canvas = document.getElementById('zone-canvas');
+            this._finalizeZoneDraw(canvas || document.getElementById('zone-canvas'));
+            return;
+        }
+        // Si no, entra en modo "esperando dibujo": el siguiente drag sobre el
+        // canvas creará la zona con los datos del formulario.
+        this._toast('', 'arrastra el rectángulo sobre la imagen', 'info');
+    },
+
     _finalizeZoneDraw(canvas) {
         const r = this._zoneCurrentRect;
-        if (!r || Math.abs(r.w) < 20 || Math.abs(r.h) < 20) { this._drawZonesOnCanvas(canvas); return; }
+        if (!r || Math.abs(r.w) < 20 || Math.abs(r.h) < 20) {
+            // Dibujo muy chico: si hay pending, avisar que dibuje más grande.
+            if (this._zonePending) {
+                this._toast('', 'dibuja un rectángulo más grande', 'info');
+            }
+            this._drawZonesOnCanvas(canvas);
+            return;
+        }
         // Normalizar coords (0-1) relativas al canvas
         const cw = canvas.width, ch = canvas.height;
         const normX = r.x / cw, normY = r.y / ch, normW = r.w / cw, normH = r.h / ch;
-        const name = prompt('Nombre de la zona (ej: Caja, Entrada, Cocina):', 'Zona ' + (this._zoneList.length + 1));
-        if (!name) { this._drawZonesOnCanvas(canvas); return; }
-        const types = [
-            {id: 'cashier', name: 'Caja'}, {id: 'entrance', name: 'Entrada'},
-            {id: 'kitchen', name: 'Cocina'}, {id: 'dining', name: 'Comedor'},
-            {id: 'inventory', name: 'Inventario'}, {id: 'counter', name: 'Mostrador'},
-            {id: 'restricted', name: 'Restringida'}, {id: 'other', name: 'Otra'}
-        ];
-        const typePrompt = 'Tipo de zona:\n' + types.map((t, i) => `${i+1}. ${t.name}`).join('\n') + '\n\nEscribe el número:';
-        const typeIdx = parseInt(prompt(typePrompt, '1')) - 1;
-        const zoneType = types[typeIdx]?.id || 'other';
+
+        // Datos: si hay _zonePending (flujo nuevo), usarlos; si no (wizard legacy),
+        // crear zona por defecto con nombre "Zona N".
+        let name, zoneType, description;
+        if (this._zonePending) {
+            name = (this._zonePending.name || '').trim() || `Zona ${this._zoneList.length + 1}`;
+            zoneType = this._zonePending.type || 'other';
+            description = (this._zonePending.description || '').trim();
+            this._zonePending = null;
+        } else {
+            name = `Zona ${this._zoneList.length + 1}`;
+            zoneType = 'other';
+            description = '';
+        }
         const colors = ['rgba(255,0,0,0.3)', 'rgba(0,255,0,0.3)', 'rgba(0,0,255,0.3)', 'rgba(255,255,0,0.3)', 'rgba(255,0,255,0.3)'];
         const color = colors[this._zoneList.length % colors.length];
         this._zoneList.push({
             id: 'zone_' + Date.now(), name: name, type: zoneType,
             coords: { x: normX, y: normY, w: normW, h: normH },
-            description: '', color: color
+            description: description, color: color
         });
         this._renderZoneList();
+        this._renderZoneForm();
         this._drawZonesOnCanvas(canvas);
     },
 
@@ -2232,23 +2408,48 @@ async _applyCamDefaults(camId, cam) {
             ctx.lineWidth = 2;
             ctx.strokeRect(x, y, w, h);
             
+            // Etiqueta de nombre(más legible que solo texto)
+            const label = `${idx+1}. ${zone.name}`;
+            ctx.font = 'bold 13px sans-serif';
+            const tw = ctx.measureText(label).width + 10;
+            ctx.fillStyle = 'rgba(0,0,0,0.65)';
+            ctx.fillRect(x + 2, y + 2, tw, 20);
             ctx.fillStyle = '#fff';
-            ctx.font = 'bold 14px sans-serif';
-            ctx.fillText(`${idx+1}. ${zone.name}`, x + 4, y + 18);
+            ctx.fillText(label, x + 7, y + 16);
         });
         
-        // Dibujar rectángulo actual (si se está dibujando)
+        // Dibujar rectángulo actual (si se está dibujando) + preview del nombre
         if (this._zoneDrawing && this._zoneCurrentRect) {
             const x = this._zoneCurrentRect.x;
             const y = this._zoneCurrentRect.y;
             const w = this._zoneCurrentRect.w;
             const h = this._zoneCurrentRect.h;
             
-            ctx.fillStyle = 'rgba(0,168,255,0.2)';
+            ctx.fillStyle = 'rgba(10,132,255,0.2)';
             ctx.fillRect(x, y, w, h);
             ctx.strokeStyle = '#0a84ff';
             ctx.lineWidth = 2;
             ctx.strokeRect(x, y, w, h);
+
+            // Preview del nombre en tiempo real (si hay pending)
+            const previewName = (this._zonePending && this._zonePending.name)
+                ? this._zonePending.name
+                : (this._zonePending ? `Zona ${this._zoneList.length + 1}` : null);
+            if (previewName && Math.abs(w) > 30) {
+                ctx.font = 'bold 13px sans-serif';
+                const tw = ctx.measureText(previewName).width + 10;
+                ctx.fillStyle = 'rgba(10,132,255,0.85)';
+                ctx.fillRect(x + 2, y + 2, tw, 20);
+                ctx.fillStyle = '#fff';
+                ctx.fillText(previewName, x + 7, y + 16);
+            }
+            // Tooltip área
+            if (Math.abs(w) > 40 && Math.abs(h) > 30) {
+                const pct = (Math.abs(w) * Math.abs(h) / (canvas.width * canvas.height) * 100);
+                ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                ctx.font = '11px sans-serif';
+                ctx.fillText(`${pct.toFixed(1)}%`, x + 4, y + Math.max(22, h - 6));
+            }
         }
     },
 
@@ -2257,21 +2458,68 @@ async _applyCamDefaults(camId, cam) {
         if (!container) return;
         
         if (this._zoneList.length === 0) {
-            container.innerHTML = '<div class="meta" style="text-align:center;padding:20px">No hay zonas configuradas. Dibuja un rectángulo sobre la imagen para crear una.</div>';
+            container.innerHTML = '<div class="meta" style="text-align:center;padding:20px">No hay zonas configuradas. Pulsa "➕ Nueva zona" para crear una.</div>';
             return;
         }
         
         container.innerHTML = '<div style="margin-bottom:12px;font-weight:600">Zonas creadas:</div>' + 
             this._zoneList.map((z, idx) => `
-                <div style="display:flex;align-items:center;gap:12px;padding:10px;background:var(--bg-tertiary);border-radius:8px;margin-bottom:8px">
-                    <div style="width:20px;height:20px;border-radius:4px;background:${z.color};border:2px solid #0a84ff"></div>
-                    <div style="flex:1">
-                        <div style="font-weight:600">${idx+1}. ${z.name}</div>
-                        <div class="meta">${z.type} — (${(z.coords.x*100).toFixed(0)}%, ${(z.coords.y*100).toFixed(0)}%) → (${((z.coords.x+z.coords.w)*100).toFixed(0)}%, ${((z.coords.y+z.coords.h)*100).toFixed(0)}%)</div>
+                <div class="zone-row" data-zone-idx="${idx}">
+                    <div class="zone-chip" style="background:${z.color};border:2px solid #0a84ff">${this._zoneTypeIcon(z.type)}</div>
+                    <div style="flex:1;min-width:0">
+                        <div style="font-weight:600">${idx+1}. ${escHtml(z.name)}</div>
+                        <div class="meta">${this._zoneTypeLabel(z.type)} — (${(z.coords.x*100).toFixed(0)}%, ${(z.coords.y*100).toFixed(0)}) → (${((z.coords.x+z.coords.w)*100).toFixed(0)}%, ${((z.coords.y+z.coords.h)*100).toFixed(0)}%)</div>
+                        ${z.description ? `<div class="meta" style="margin-top:4px;color:var(--text-secondary)">📝 ${escHtml(z.description)}</div>` : ''}
                     </div>
-                    <button class="btn btn-sm btn-danger" onclick="App._deleteZone(${idx})">Eliminar</button>
+                    <button class="btn btn-sm btn-outline" onclick="App._editZone(${idx})">Editar</button>
+                    <button class="btn btn-sm btn-danger" onclick="App._deleteZone(${idx})">✕</button>
                 </div>
             `).join('');
+    },
+
+    _editZone(idx) {
+        // Abre un sheet inline para editar nombre/tipo/descripción de una zona existente.
+        const z = this._zoneList[idx];
+        if (!z) return;
+        const types = this._zoneTypesCache || [];
+        const container = document.getElementById('zone-list');
+        // Reemplazar la fila por el formulario de edición
+        const rows = container.querySelectorAll('.zone-row');
+        const row = rows[idx];
+        if (!row) return;
+        row.innerHTML = `
+            <div class="zone-form-card" style="flex:1 1 100%;border:1px solid var(--accent)">
+                <div class="zone-form-title">Editar ${escHtml(z.name)}</div>
+                <div class="zone-field">
+                    <input id="zone-edit-name" class="zone-input" type="text" value="${(z.name||'').replace(/"/g,'"')}">
+                </div>
+                <div class="zone-field">
+                    <select id="zone-edit-type" class="zone-select">
+                        ${types.map(t => `<option value="${t.id}" ${t.id===z.type?'selected':''}>${t.icon||''} ${t.name}</option`).join('')}
+                    </select>
+                </div>
+                <div class="zone-field">
+                    <textarea id="zone-edit-desc" class="zone-input" rows="2" placeholder="¿Qué pasa en esta zona?">${(z.description||'').replace(/</g,'<')}</textarea>
+                </div>
+                <div style="display:flex;gap:8px">
+                    <button class="btn" onclick="App._saveZoneEdit(${idx})">Guardar</button>
+                    <button class="btn btn-outline" onclick="App._renderZoneList()">Cancelar</button>
+                </div>
+            </div>`;
+    },
+
+    _saveZoneEdit(idx) {
+        const z = this._zoneList[idx];
+        if (!z) return;
+        const name = (document.getElementById('zone-edit-name')?.value || '').trim();
+        if (name) z.name = name;
+        const typeEl = document.getElementById('zone-edit-type');
+        if (typeEl) z.type = typeEl.value;
+        const desc = (document.getElementById('zone-edit-desc')?.value || '').trim();
+        z.description = desc;
+        this._renderZoneList();
+        const canvas = document.getElementById('zone-canvas');
+        if (canvas) this._drawZonesOnCanvas(canvas);
     },
 
     _deleteZone(idx) {
@@ -3542,20 +3790,106 @@ async _saveCooldown(camId, btn) {
         }
     },
 
+    // Fase 2: feedback editable + entrenamiento.
+    // Abre un sheet (no prompt) para marcar "Falsa alarma" con opción de editar
+    // qué creyó el sistema que pasó. Se envía a /api/chat/eva/feedback que
+    // persiste feedback + registra false_alarm + attention_corrections.
     async _dismissEvent(id) {
+        if (!id) return;
+        const uid = this.userId || 'default';
+        // Cargar el evento para pre-cargar el campo editable con el hit original.
+        let originalHit = '';
+        let evtDesc = '';
         try {
-            const uid = this.userId || 'default';
-            await apiFetch(`${this.API}/api/event/${id}/dismiss`, { method: 'POST', body: JSON.stringify({ user_id: uid }) });
-            this._toast('', 'Evento marcado como falsa alarma', 'success');
+            const r = await apiFetch(`${this.API}/api/events/${id}?user_id=${uid}`);
+            if (r.ok) {
+                const d = await r.json();
+                originalHit = (Array.isArray(d.attention_hits) && d.attention_hits.length) ? d.attention_hits[0] : '';
+                evtDesc = (d.qwen_json && d.qwen_json.summary) || d.summary || d.description || '';
+            }
         } catch(e) {}
+        this._openFeedbackSheet(id, false, originalHit || evtDesc || 'Actividad observada');
     },
 
     async _confirmThreat(id) {
-        try {
-            const uid = this.userId || 'default';
-            await apiFetch(`${this.API}/api/event/${id}/confirm`, { method: 'POST', body: JSON.stringify({ user_id: uid }) });
-            this._toast('', '¡Alerta confirmada! Gracias por la confirmación', 'danger');
-        } catch(e) {}
+        if (!id) return;
+        const uid = this.userId || 'default';
+        this._openFeedbackSheet(id, true, '');
+    },
+
+    // Sheet inline para feedback: precarga, editable, envía a /api/chat/eva/feedback.
+    _openFeedbackSheet(eventId, isReal, presetText) {
+        // Evitar duplicar si ya hay uno abierto.
+        const existing = document.getElementById('feedback-sheet');
+        if (existing) existing.remove();
+        const overlay = document.createElement('div');
+        overlay.id = 'feedback-sheet';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:600;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);display:flex;align-items:flex-end;justify-content:center;padding:0;animation:fadeIn 0.2s ease';
+        const sheet = document.createElement('div');
+        sheet.style.cssText = 'width:100%;max-width:560px;background:var(--bg-secondary);border-radius:18px 18px 0 0;padding:20px 20px calc(20px + env(safe-area-inset-bottom));animation:slideUp 0.25s cubic-bezier(0.4,0,0.2,1)';
+        const title = isReal ? '✅ Vio bien' : '✓ Falsa alarma';
+        const titleColor = isReal ? 'var(--success)' : 'var(--danger)';
+        const subtitle = isReal
+            ? 'Confirma que Eva detectó bien. Esto refuerza la vigilancia.'
+            : '¿Qué pasó realmente? Esto ayuda a Eva a ajustar sus reglas.';
+        sheet.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                <div style="font-size:1.1rem;font-weight:700;color:${titleColor}">${title}</div>
+                <button class="btn-icon" data-fb-close style="background:none;border:none;color:var(--text-secondary);font-size:1.4rem;padding:4px">✕</button>
+            </div>
+            <div style="font-size:.85rem;color:var(--text-secondary);margin-bottom:12px">${subtitle}</div>
+            <label style="display:block;font-size:.8rem;font-weight:600;margin-bottom:6px">${isReal ? 'Nota (opcional)' : 'Lo que crees que pasó'}</label>
+            <textarea id="fb-correction" rows="3" style="width:100%;box-sizing:border-box;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:10px;padding:12px;color:var(--text-primary);font-size:1rem;font-family:inherit;resize:vertical" placeholder="${isReal ? 'Ej: el cajero sí se llevó la mano al bolsillo' : 'Ej: solo estaba acomodando la camiseta, no metió la mano'}">${(presetText||'').replace(/</g,'<')}</textarea>
+            <div style="display:flex;gap:10px;margin-top:14px">
+                <button class="btn" data-fb-cancel style="flex:1;background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border)">Cancelar</button>
+                <button class="btn" data-fb-send style="flex:2;background:${isReal ? 'var(--success)' : 'var(--accent)'};color:#fff;border:none;font-weight:600">${isReal ? '✅ Confirmar' : 'Marcar falsa alarma'}</button>
+            </div>`;
+        overlay.appendChild(sheet);
+        document.body.appendChild(overlay);
+
+        const close = () => overlay.remove();
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+        sheet.querySelector('[data-fb-close]').onclick = close;
+        sheet.querySelector('[data-fb-cancel]').onclick = close;
+        sheet.querySelector('[data-fb-send]').onclick = async (e) => {
+            const btn = e.currentTarget;
+            const text = (sheet.querySelector('#fb-correction').value || '').trim();
+            btn.disabled = true; btn.textContent = 'Enviando…';
+            try {
+                const r = await apiFetch(`${this.API}/api/chat/eva/feedback`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        user_id: this.userId || 'default',
+                        event_id: eventId,
+                        is_real: isReal,
+                        correction_note: isReal ? '' : text,
+                        notes: isReal ? text : '',
+                    }),
+                });
+                const d = await r.json();
+                if (d.success) {
+                    close();
+                    // Si era falsa alarma y la corregiste, el banner activo se descarta.
+                    if (!isReal && this._activeAlertEvent && this._activeAlertEvent.eventId === eventId) {
+                        this._activeAlertEvent = null;
+                    }
+                    this._toast('', isReal ? '¡Gracias! Eva recordará que vio bien' : 'Marcado como falsa alarma. Eva lo aprenderá', isReal ? 'success' : 'info');
+                    // Si estamos en Home/Cameras, refrescar para quitar el banner.
+                    if (this.page === 'home' || this.page === 'cameras') {
+                        setTimeout(() => this._pageHome(document.getElementById('app-content')), 400);
+                    }
+                } else {
+                    btn.disabled = false; btn.textContent = isReal ? '✅ Confirmar' : 'Marcar falsa alarma';
+                    this._toast('', 'No se pudo enviar: ' + (d.error || ''), 'danger');
+                }
+            } catch(err) {
+                btn.disabled = false; btn.textContent = isReal ? '✅ Confirmar' : 'Marcar falsa alarma';
+                this._toast('', 'Error de conexión: ' + err.message, 'danger');
+            }
+        };
+        // Re-enable textareas (fallback if markdown rendering: textarea content is raw text)
+        const correctionTa = sheet.querySelector('#fb-correction');
+        if (correctionTa && presetText) { /* el value ya está seteado en el markup */ }
     },
 
     // ── SETTINGS ─────────────────────────────────────────────
@@ -3700,6 +4034,14 @@ async _saveCooldown(camId, btn) {
                     </div>
                     <div class="ios-group-body">
                         <div class="ios-group-body-inner">
+                        <button class="ios-row" onclick="App._openZonesFromSettings()">
+                            <span class="ios-icon">📍</span>
+                            <div class="ios-row-main">
+                                <div class="ios-row-title">Zonas de interés</div>
+                                <div class="ios-row-sub">Caja, Entrada, Cocina… dibuja y nombra cada área</div>
+                            </div>
+                            <span class="ios-chevron">›</span>
+                        </button>
                         <button class="ios-row" onclick="App._openGridSettings()">
                             <span class="ios-icon">🔲</span>
                             <div class="ios-row-main">
