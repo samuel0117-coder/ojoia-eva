@@ -2104,6 +2104,69 @@ async def get_zone_types_endpoint():
     return {"success": True, "zone_types": camera_zones.get_zone_types()}
 
 
+@app.delete("/api/cameras/{camera_id}")
+async def delete_camera_endpoint(camera_id: str, user_id: str = ""):
+    """Elimina una cámara del usuario.
+
+    Qué hace (eliminación segura, no destructiva en FS):
+    1. Quita la entrada de user.json (cameras[]).
+    2. Quita vigilance_context si apuntaba a esa cámara.
+    3. Renombra el directorio de la cámara a .deleted_<ts> para conservar
+       events/frames por si el usuario se equivoca. (No borra nada del FS.)
+    4. Si purge=true, elimina físicamente el directorio tras renombrar.
+
+    El frontend llama DELETE /api/cameras/{id}?user_id=UID y espera {success}.
+    """
+    if not user_id:
+        return {"success": False, "error": "user_id required"}
+    if not camera_id:
+        return {"success": False, "error": "camera_id required"}
+    try:
+        uf = find_user_json(user_id)
+        if not uf or not uf.exists():
+            return {"success": False, "error": "usuario no encontrado"}
+        with open(uf) as f:
+            ud = json.load(f)
+        cams = ud.get("cameras", [])
+        if not isinstance(cams, list):
+            cams = list(cams.values()) if isinstance(cams, dict) else []
+        if not any(c.get("camera_id") == camera_id for c in cams):
+            return {"success": False, "error": "cámara no encontrada para este usuario"}
+        new_cams = [c for c in cams if c.get("camera_id") != camera_id]
+        ud["cameras"] = new_cams
+        # Limpiar vigilance_context si apuntaba a esa cámara
+        vc = ud.get("vigilance_context")
+        if isinstance(vc, dict) and (
+            vc.get("camera_id") == camera_id or len(new_cams) == 0
+        ):
+            ud["vigilance_context"] = {k: v for k, v in vc.items() if k != "camera_id"}
+        with open(uf, "w") as f:
+            json.dump(ud, f, indent=2, ensure_ascii=False)
+        # Renombrar el directorio de la cámara a .deleted_<ts> (no borrar).
+        cam_root = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        moved_to = None
+        if cam_root.exists():
+            ts = int(time.time())
+            dest = cam_root.parent / f"{camera_id}.deleted_{ts}"
+            try:
+                import shutil
+                shutil.move(str(cam_root), str(dest))
+                moved_to = str(dest)
+            except Exception as me:
+                logger.warning(f"[delete_camera] no pude mover {cam_root}: {me}")
+        logger.info(f"[delete_camera] {user_id}/{camera_id} removed from user.json; dir moved={bool(moved_to)}")
+        return {
+            "success": True,
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "remaining_cameras": [c.get("camera_id") for c in new_cams],
+            "archived_dir": moved_to,
+        }
+    except Exception as e:
+        logger.exception(f"[delete_camera] error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/user/profile")
 async def get_user_profile(user_id: str):
     user_file = find_user_json(user_id)
