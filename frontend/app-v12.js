@@ -2106,6 +2106,7 @@ const App = {
                         <button class="btn" onclick="App._sendCamCmd('${camId}','snapshot',0,this)">📸 Snapshot</button>
                         <button class="btn btn-outline" onclick="App._exportVideo('${camId}', 45, this)">🎬 Guardar video (45 min)</button>
                         <button class="btn btn-outline" onclick="App._openVigilanceSettings('${camId}')">🛡️ Ajustar protección</button>
+                        <button class="btn btn-outline" style="color:var(--danger);border-color:var(--danger)" onclick="App._confirmDeleteCamera('${camId}')">🗑️ Eliminar cámara</button>
                     </section>
 
                     <button class="btn btn-ghost" onclick="App.go('${returnPage}')">← Volver</button>
@@ -4924,15 +4925,80 @@ async _saveCooldown(camId, btn) {
         } catch(e) {}
     },
 
+    async _confirmDeleteCamera(camId) {
+        const user = firebase.auth().currentUser;
+        if (!user || !user.email) {
+            alert('Debes iniciar sesión para eliminar una cámara.');
+            return;
+        }
+        const camName = this._cameras?.find(c => c.camera_id === camId)?.name || camId;
+        const ov = document.createElement('div');
+        ov.id = 'delete-cam-modal';
+        ov.className = 'modal-overlay';
+        ov.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)';
+        ov.innerHTML = `
+            <div class="modal-content" style="background:var(--bg-primary);border-radius:16px;padding:24px;max-width:380px;width:90%;text-align:center">
+                <div style="font-size:2.5rem;margin-bottom:12px">🗑️</div>
+                <div style="font-weight:700;font-size:1.1rem;margin-bottom:4px">Eliminar "${camName}"</div>
+                <p class="meta" style="margin-bottom:16px">Esta acción no se puede deshacer. Ingresa tu clave para confirmar.</p>
+                <input id="delete-cam-pw" type="password" placeholder="Clave de tu cuenta" style="width:100%;padding:12px;border-radius:10px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:1rem;outline:none;margin-bottom:12px;box-sizing:border-box">
+                <div id="delete-cam-err" style="color:var(--danger);font-size:0.85rem;margin-bottom:12px;display:none"></div>
+                <div style="display:flex;gap:8px">
+                    <button class="btn" style="flex:1;background:var(--danger);color:#fff" onclick="App._execDeleteCamera('${camId}')">Eliminar</button>
+                    <button class="btn btn-outline" style="flex:1" onclick="App._closeDeleteCamModal()">Cancelar</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(ov);
+        document.getElementById('delete-cam-pw').focus();
+        document.getElementById('delete-cam-pw').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') App._execDeleteCamera(camId);
+        });
+    },
+    _closeDeleteCamModal() {
+        const el = document.getElementById('delete-cam-modal');
+        if (el) el.remove();
+    },
+    async _execDeleteCamera(camId) {
+        const pw = document.getElementById('delete-cam-pw').value.trim();
+        const errEl = document.getElementById('delete-cam-err');
+        if (!pw) { errEl.textContent = 'Ingresa tu clave.'; errEl.style.display = 'block'; return; }
+        errEl.style.display = 'none';
+        const user = firebase.auth().currentUser;
+        if (!user || !user.email) { alert('Sesión perdida. Recarga la página.'); this._closeDeleteCamModal(); return; }
+        const btn = document.querySelector('#delete-cam-modal .btn-danger, #delete-cam-modal .btn');
+        if (btn) btn.disabled = true;
+        try {
+            const cred = firebase.auth.EmailAuthProvider.credential(user.email, pw);
+            await user.reauthenticateWithCredential(cred);
+            this._closeDeleteCamModal();
+            await this.deleteCamera(camId);
+        } catch (e) {
+            const code = e.code || '';
+            if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+                errEl.textContent = 'Clave incorrecta. Intenta de nuevo.';
+                errEl.style.display = 'block';
+            } else if (code === 'auth/too-many-requests') {
+                errEl.textContent = 'Demasiados intentos. Espera un momento.';
+                errEl.style.display = 'block';
+            } else {
+                errEl.textContent = 'Error de autenticación: ' + (e.message || 'desconocido');
+                errEl.style.display = 'block';
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    },
+
     async deleteCamera(camId, camName) {
-        if (!confirm(`¿Eliminar "${camName}"? Esta acción no se puede deshacer.`)) return;
         try {
             const r = await apiFetch(`${this.API}/api/cameras/${camId}?user_id=${this.userId}`, { method: 'DELETE' });
             const d = await r.json();
             if (d.success) {
-                this.go('cameras');
+                if (this.page !== 'cameras') { this.go('cameras'); }
+                else { this._pageCameras(document.getElementById('app-content')); }
             } else {
-                alert('Error: ' + (d.detail || 'No se pudo eliminar'));
+                alert('Error: ' + (d.detail || d.error || 'No se pudo eliminar'));
             }
         } catch(e) {
             alert('Error de conexión');
