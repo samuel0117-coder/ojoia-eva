@@ -1052,6 +1052,13 @@ def _is_os_intent(text: str) -> bool:
         "ingresos", "incendio", "humo", "fuego", "riesgo", "diario", "eventos",
         "ultimos analisis", "que ha pasado hoy", "que ha pasado ayer", "historial",
         "ultimo evento", "ultimos eventos", "hubo algo", "paso algo",
+        "regla de", "frase de", "frases de", "reglas de",
+        "quita la", "quitar la", "quita de la", "quitar de la",
+        "elimina la", "eliminar la", "elimina de la", "eliminar de la",
+        "borra la", "borrar la", "borra de la", "borrar de la",
+        "saca la", "sacar la",
+        "no alertes", "no alertar", "deja de vigilar", "dejar de vigilar",
+        "vigila que", "vigilar que", "avisame si", "avísame si", "alerta de",
     ))
 
 
@@ -1068,6 +1075,8 @@ async def handle_eva_v2(user_id, message, session_id, cam_id=None, include_frame
         if not session or session.get("user_id") != user_id or session.get("phase") not in (SetupPhase.DONE.value, "os"):
             session = _make_os_session(user_id, sid)
             _sessions[sid] = session
+        if cam_id:
+            session["camera_id"] = cam_id
         return await _handle_os_mode(session, user_id, message, sid)
     if _is_new_camera_intent(msg_norm):
         pending = _pending_session_for_user(user_id)
@@ -2138,25 +2147,44 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
             return _mk_resp(session, text, suggestions=suggestions, events_found=[])
         logger.warning(f"[EVA false-alarm] feedback failed for {eid}: {fb.get('error')}")
 
-    # ── Routing de frases de vigilancia (Decision 2) ──
-    add_kw = ("vigila que", "vigilar que", "avisame si", "avísame si", "alerta si",
-              "alertar si", "alertame si", "notifícame cuando", "notificame cuando",
-              "vigila cuando", "afínate de", "afínate cuando", "ojo con",
-              "ponme alerta si", "pónme alerta si")
-    remove_kw = ("quita la regla de", "quitar la regla de", "quita la frase de", "quitar la frase de",
-                 "deja de vigilar", "dejar de vigilar", "elimina la regla de", "eliminar la regla de",
-                 "borra la regla de", "borrar la regla de", "no alertes por", "no alertar por")
+    # ── Routing de frases de vigilancia ──
+    # Detectamos INTENCIÓN de agregar/quitar frases de vigilancia por verbos
+    # (no marcadores literales exactos — son frágiles). El router Qwen NO tiene
+    # update_vigilance_config en su lista de tools (es OS-only), por lo que este
+    # atajo es el único camino hacia _build_vigilance_update_from_message (que
+    # hace matching fuzzy + desambiguación conversacional).
     list_kw = ("que estas vigilando", "qué estás vigilando", "muestrame las reglas", "muéstrame las reglas",
-               "que vigilas", "qué vigilas", "lista de reglas", "dime que vigilas", "dime qué vigilas",
-               "que estas observando", "qué estás observando")
+               "muestrame las frases", "muéstrame las frases", "muestrame que vigilas", "muéstrame qué vigilas",
+               "muestra que vigilas", "muestra qué vigilas", "mostrame que vigilas", "selas frases", "selas reglas",
+               "selas frases de", "como estan las frases", "cómo están las frases",
+               "que vigilas", "qué vigilas", "lista de reglas", "lista de frases",
+               "dime que vigilas", "dime qué vigilas", "dime las frases", "dime las reglas",
+               "que estas observando", "qué estás observando", "como quedo la vigilancia", "cómo quedó la vigilancia")
     if any(k in msg_lower for k in list_kw):
         best_cam = await _pick_best_camera_id(user_id) or ""
         tool_result = await _execute_os_tool_v2(user_id, "get_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
         _sessions[session_id] = session
         return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
-    if any(k in msg_lower for k in add_kw) or any(k in msg_lower for k in remove_kw):
-        best_cam = await _pick_best_camera_id(user_id) or ""
+
+    # Intención de AGREGAR frase (verbos de vigilar/alertar).
+    import re as _re_intent
+    add_intent = any(_re_intent.search(p, msg_lower) for p in (
+        r"\b(?:vigila|vigilar|avisa|avisame|avísame|alerta|alertame|notifícame|notificame|ojo con|alertame)\b.*\b(?:que|si|cuando|con|de|por)\b",
+        r"\b(?:ponme|pónme)\s+alerta\b",
+        r"\b(?:afínate|afinate)\b",
+    ))
+    # Intención de QUITAR frase (verbos de eliminar + mención de regla/frase, o
+    # "no alertes"/"deja de vigilar"). Tolerante: acepta "quita de la regla de",
+    # "elimina regla de", "borra la frase", "saca la vigilancia", etc.
+    remove_intent = any(_re_intent.search(p, msg_lower) for p in (
+        r"\b(?:quita|quitar|elimina|eliminar|borra|borrar|saca|sacar|suprime|suprimir)\b.*\b(?:regla|frase|vigilancia|vigilar|de|la|el)\b",
+        r"\b(?:deja\s+de|dejar\s+de)\s+vigilar\b",
+        r"\b(?:no\s+alertes|no\s+alertar|no\s+me\s+alertes|no\s+me\s+alertar)\b",
+        r"\b(?:quita|quitar|elimina|eliminar|borra|borrar|saca|sacar)\b\s+(?:la|el|los|las|de\s+la|de\s+el)\s",
+    ))
+    if add_intent or remove_intent:
+        best_cam = session.get("camera_id") or await _pick_best_camera_id(user_id) or ""
         tool_result = await _execute_os_tool_v2(user_id, "update_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
         _sessions[session_id] = session
@@ -2296,19 +2324,21 @@ async def _route_os_message(user_id, session, message, recent, cam_count, ud=Non
          "\nReglas:\n"
          "- Si el usuario pregunta qué es Eva, quién eres o se queja de que Eva sigue instalando/configurando, usa tool='none' y explica en reason.\n"
          "- Si pide ajustar, activar, desactivar o cambiar protección, usa update_vigilance_config o get_vigilance_config.\n"
+         "- Si pide AGREGAR o QUITAR frases/reglas de vigilancia (vigila que..., avisame si..., quita la regla de..., elimina/borra la frase de..., deja de vigilar..., no alertes por...), SIEMPRE usa update_vigilance_config (NO respondas conversacionalmente; el parser detecta y aplica el cambio).\n"
+         "- Si pregunta por las frases/reglas actuales ('que vigilas', 'muestrame las frases', 'como quedo la vigilancia'), usa get_vigilance_config.\n"
          "- Si pregunta por alertas, sospechas, anomalías, riesgos, incendio, humo, actividad actual o última actividad, elige la herramienta de diario que corresponda.\n"
          "- Si pregunta por personas, conteo, cuántas personas vinieron, afluencia o tráfico de clientes, usa count_people.\n"
          "- Si pregunta por empleados o quién está en cámara, usa identify_face/list_employees según corresponda.\n"
          "- Si pregunta por horario de apertura, si está abierto o cerrado, usa is_open_hours.\n"
          "- Si no hay intención clara o es conversación general, usa tool='none'.\n"
          "- params debe contener solo los campos necesarios y valores concretos.\n"
-         "Contexto del negocio:\n"
-         f"Dueño: {session.get('owner_name','el dueño')}\n"
-         f"Negocio: {ud.get('business_name','')} ({ud.get('business_type','')})\n"
-         f"Cámaras activas: {cam_count}\n"
-         f"Resumen reciente:\n{recent}\n"
-         "Mensaje del usuario:\n"
-         f"{message}"
+        "Contexto del negocio:\n"
+        f"Dueño: {session.get('owner_name','el dueño')}\n"
+        f"Negocio: {ud.get('business_name','')} ({ud.get('business_type','')})\n"
+        f"Cámaras activas: {cam_count}\n"
+        f"Resumen reciente:\n{recent}\n"
+        "Mensaje del usuario:\n"
+        f"{message}"
      )
      msgs = [{"role":"system","content":sys_p}, {"role":"user","content":message}]
      result = await _call_qwen(msgs, 180)
@@ -2374,9 +2404,21 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
         inferred = _build_vigilance_update_from_message(user_id, params.get("camera_id", ""), message)
         if inferred.get("needs_clarification"):
             return {"text": inferred.get("text", "Necesito más datos."), "events": []}
-        vigilance = params.get("vigilance") or inferred.get("vigilance") or {}
-        schedule = params.get("schedule") or inferred.get("schedule")
-        mode = params.get("mode") or inferred.get("mode")
+        # IMPORTANTE: si el parser (inferred) detectó una ACCIÓN CONCRETA de
+        # agregar/quitar frase (result_note presente), su vigilance tiene prioridad
+        # sobre lo que alucinó Qwen en params (p.ej. mode=sentinel). Esto evita que
+        # Qwen sobrescriba el cambio de frases con un cambio de modo irrelevante.
+        inferred_has_phrase_action = bool(inferred.get("result_note")) and bool(
+            (inferred.get("vigilance") or {}).get("attention_phrases") is not None
+            or "owner_notes" in (inferred.get("vigilance") or {}))
+        if inferred_has_phrase_action:
+            vigilance = inferred.get("vigilance") or {}
+            schedule = inferred.get("schedule")
+            mode = None  # no cambiar modo si la acción es de frases
+        else:
+            vigilance = params.get("vigilance") or inferred.get("vigilance") or {}
+            schedule = params.get("schedule") or inferred.get("schedule")
+            mode = params.get("mode") or inferred.get("mode")
         if not vigilance and mode:
             if mode == "sentinel":
                 vigilance = {"sentinel_mode": {"enabled": True}, "enabled": True}
@@ -2384,9 +2426,9 @@ async def _execute_os_tool_v2(user_id, tool_name, params, message, first, recent
                 vigilance = {"normal_mode": {"enabled": True}, "enabled": True}
         if "sensitivity" in params:
             vigilance.setdefault("normal_mode", {})["sensitivity"] = params["sensitivity"]
-        if "attention_phrases" in params:
+        if not inferred_has_phrase_action and "attention_phrases" in params:
             vigilance["attention_phrases"] = params["attention_phrases"]
-        if "owner_notes" in params:
+        if not inferred_has_phrase_action and "owner_notes" in params:
             vigilance["owner_notes"] = params["owner_notes"]
         data = await _tool_call("update_vigilance_config", user_id, {
             "camera_id": params.get("camera_id", ""),
