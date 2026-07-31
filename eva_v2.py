@@ -528,8 +528,13 @@ _YES = {"si","sí","dale","perfecto","exacto","correcto","bueno","bien",
 _NO = {"no","otra","cambiar","diferente","no me gusta","no sirve",
        "paso","otra opción","no esta bien","no quiero"}
 
-async def _is_intent_confirmed(message: str, context: str, model_func) -> bool:
-    """Usa Qwen para entender si el usuario confirmó la intención."""
+async def _is_intent_confirmed(message: str, context: str, model_func=None) -> bool:
+    """Usa Qwen para entender si el usuario confirmó la intención.
+
+    model_func es opcional: si es None o falla, usamos _call_qwen (que siempre
+    existe en este módulo). Esto quita la dependencia de un nombre `_qwen` que
+    nunca se definió y causaba NameError en HARDWARE/WAIT_IMAGE.
+    """
     try:
         prompt = (
             f"Analiza si el usuario confirmó una acción. Responde SOLO con: 'si' (confirmado), 'no' (no confirmado), 'maybe' (incógnita).\n\n"
@@ -537,7 +542,18 @@ async def _is_intent_confirmed(message: str, context: str, model_func) -> bool:
             f"Mensaje del usuario: '{message}'\n\n"
             f"¿El usuario confirmó la acción del sistema? Responde con 'si', 'no' o 'maybe'."
         )
-        response = await model_func([{"role": "user", "content": prompt}])
+        msgs = [{"role": "user", "content": prompt}]
+        response = ""
+        if model_func is not None:
+            raw = await model_func(msgs)
+            # Soporta ambas formas: function que devuelve str o dict con 'content'.
+            if isinstance(raw, dict):
+                response = str(raw.get("content", ""))
+            else:
+                response = str(raw or "")
+        else:
+            r = await _call_qwen(msgs, max_tokens=10, temperature=0.0)
+            response = str(r.get("content", ""))
         clean_response = response.strip().lower()
         return clean_response in ("si", "sí", "true", "yes")
     except Exception:
@@ -1070,6 +1086,12 @@ async def handle_eva_v2(user_id, message, session_id, cam_id=None, include_frame
     if pending_setup and pending_setup.get("phase") not in (SetupPhase.DONE.value, "os") and not _is_os_intent(msg_norm) and cam_count == 0:
         return await _resume_pending_setup(pending_setup, user_id, session_id, message, storage_root)
     if _is_os_intent(msg_norm) and not _is_new_camera_intent(msg_norm):
+        # Si hay un setup en progreso (pending), RESPECTARLO: el msg de OS intent
+        # ("vigila que...") debe procesarse dentro del wizard del setup, no
+        # pisarlo con una nueva OS session. Solo vamos a OS mode si no hay
+        # pending (o ya terminó) o si el user NO tiene cameras y quiere setup.
+        if pending_setup and pending_setup.get("phase") not in (SetupPhase.DONE.value, "os") and cam_count == 0:
+            return await _resume_pending_setup(pending_setup, user_id, session_id, message, storage_root)
         sid = session_id or f"chat_{user_id}_{int(time.time())}"
         session = _load_session(sid)
         if not session or session.get("user_id") != user_id or session.get("phase") not in (SetupPhase.DONE.value, "os"):
@@ -1730,7 +1752,7 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
     if phase == SetupPhase.HARDWARE.value:
         session["msgs"].append({"role":"user","content":message})
         # Usar el modelo para entender la intención del usuario
-        if await _is_intent_confirmed(message, "Usuario completando pasos de conexión", _qwen):
+        if await _is_intent_confirmed(message, "Usuario completando pasos de conexión"):
             session["phase"] = SetupPhase.WAIT_IMAGE.value
             _sessions[session_id] = session
             return await _handle_wait_image(session, session_id, user_id, first, message, storage_root, include_frame)
@@ -1787,7 +1809,7 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
         return await _handle_analyze(session, session_id, first)
 
     attempts = session.get("wait_attempts", 0)
-    if await _is_intent_confirmed(message, f"Esperando imagen. Usuario dice: {message}", _qwen) and not frame:
+    if await _is_intent_confirmed(message, f"Esperando imagen. Usuario dice: {message}") and not frame:
         session["phase"] = SetupPhase.CONTEXT.value
         session["manual_image_confirmed"] = True
         session["position_confirmed"] = True
@@ -2153,6 +2175,12 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     # update_vigilance_config en su lista de tools (es OS-only), por lo que este
     # atajo es el único camino hacia _build_vigilance_update_from_message (que
     # hace matching fuzzy + desambiguación conversacional).
+    #
+    # GUARD: solo en modo operativo (phase DONE). Si el usuario está en setup
+    # (GREET/ZONE/.../CONFIRM), NO interceptamos "vigila que..." aquí porque eso
+    # rompería el context_step de attention_phrases del wizard de registro. En
+    # setup esas frases las procesa _handle_context normalmente.
+    is_done = session.get("phase") == SetupPhase.DONE.value or session.get("phase") == "os"
     list_kw = ("que estas vigilando", "qué estás vigilando", "muestrame las reglas", "muéstrame las reglas",
                "muestrame las frases", "muéstrame las frases", "muestrame que vigilas", "muéstrame qué vigilas",
                "muestra que vigilas", "muestra qué vigilas", "mostrame que vigilas", "selas frases", "selas reglas",
@@ -2160,8 +2188,8 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
                "que vigilas", "qué vigilas", "lista de reglas", "lista de frases",
                "dime que vigilas", "dime qué vigilas", "dime las frases", "dime las reglas",
                "que estas observando", "qué estás observando", "como quedo la vigilancia", "cómo quedó la vigilancia")
-    if any(k in msg_lower for k in list_kw):
-        best_cam = await _pick_best_camera_id(user_id) or ""
+    if is_done and any(k in msg_lower for k in list_kw):
+        best_cam = session.get("camera_id") or await _pick_best_camera_id(user_id) or ""
         tool_result = await _execute_os_tool_v2(user_id, "get_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
         _sessions[session_id] = session
@@ -2183,7 +2211,7 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         r"\b(?:no\s+alertes|no\s+alertar|no\s+me\s+alertes|no\s+me\s+alertar)\b",
         r"\b(?:quita|quitar|elimina|eliminar|borra|borrar|saca|sacar)\b\s+(?:la|el|los|las|de\s+la|de\s+el)\s",
     ))
-    if add_intent or remove_intent:
+    if is_done and (add_intent or remove_intent):
         best_cam = session.get("camera_id") or await _pick_best_camera_id(user_id) or ""
         tool_result = await _execute_os_tool_v2(user_id, "update_vigilance_config", {"camera_id": best_cam}, message, first, recent, cam_count, session)
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
