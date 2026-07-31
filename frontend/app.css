@@ -1131,6 +1131,15 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
 }
 
 /* ========== Zone editor (Fase 3) ========== */
+/* Punto #2: al editar zonas, ocultar las demás secciones de config para evitar
+   que el usuario toque botones irrelevantes (brillo, sensibilidad) mientras dibuja. */
+.camera-config-page.zone-editing-active > .config-section:not(#zone-editor-section) {
+    display: none !important;
+}
+.camera-config-page.zone-editing-active > .config-actions {
+    display: none !important;
+}
+
 .zone-form-card {
     background: var(--bg-tertiary);
     border: 1px solid var(--border);

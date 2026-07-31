@@ -2185,6 +2185,14 @@ async _applyCamDefaults(camId, cam) {
         if (!section) return;
         section.style.display = 'block';
 
+        // Punto #2: al abrir el editor de zonas, ocultar las demás secciones de
+        // config (brillo, sensibilidad, etc.) para que el usuario NO se confunda
+        // tocando botones irrelevantes mientras dibuja. Aplicamos una clase
+        // '.zone-editing-active' al contenedor .camera-config-page que oculta vía
+        // CSS todas las .config-section excepto #zone-editor-section y el hero.
+        const page = document.querySelector('.camera-config-page');
+        if (page) page.classList.add('zone-editing-active');
+
         // Cargar tipos de zona (cache) desde el backend (15 tipos) una sola vez.
         if (!this._zoneTypesCache) {
             try {
@@ -2570,6 +2578,9 @@ async _applyCamDefaults(camId, cam) {
     _closeZoneEditor() {
         const section = document.getElementById('zone-editor-section');
         if (section) section.style.display = 'none';
+        // Restaurar las demás secciones de config que ocultamos al abrir el editor.
+        const page = document.querySelector('.camera-config-page');
+        if (page) page.classList.remove('zone-editing-active');
         this._zoneEditorCamId = null;
         this._zoneList = [];
     },

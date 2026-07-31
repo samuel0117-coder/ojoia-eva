@@ -925,14 +925,17 @@ const EvaChat = {
                     this._remoteHistoryTs = parseInt(data.ts || 0, 10) || 0;
                     // MERGE: si tenemos local state, mezclar; sino usar el remoto
                     if (this.history.length > 0 && Array.isArray(data.history) && data.history.length) {
-                        // Firma local (sin extras) para detectar duplicados
+                        // Firma local (sin timestamp: solo role+content). El timestamp
+                        // cliente/servidor puede diferir en milisegundos y causar duplicados
+                        // al merge. Toleramos re-procesar el mismo content (raro) antes que
+                        // duplicar un mensaje real.
                         const localKeys = new Set();
                         for (const m of this.history) {
-                            localKeys.add(`${m.role}|${m.content}|${m.timestamp || 0}`);
+                            localKeys.add(`${m.role}|${m.content}`);
                         }
                         let appended = 0;
                         for (const rm of data.history) {
-                            const k = `${rm.role}|${rm.content}|${rm.timestamp || 0}`;
+                            const k = `${rm.role}|${rm.content}`;
                             if (!localKeys.has(k)) {
                                 this.history.push(rm);
                                 appended++;
