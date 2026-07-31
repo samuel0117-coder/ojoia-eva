@@ -2520,7 +2520,7 @@ async def get_cameras(user_id: str):
         known_ids = {c.get("camera_id") for c in cams if c.get("camera_id")}
         if cams_dir.exists():
             for d in cams_dir.iterdir():
-                if not d.is_dir() or d.name in known_ids:
+                if not d.is_dir() or d.name in known_ids or ".deleted_" in d.name or ".orphan_" in d.name:
                     continue
                 cj = d / "camera.json"
                 if not cj.exists():
