@@ -122,6 +122,18 @@ const App = {
     _apiBackoffReset(key) {
         if (this._apiBackoff[key]) delete this._apiBackoff[key];
     },
+    // v13 Track B Cambio D: dedup de peticiones en vuelo.
+    // Set de keys 'camId:endpoint' con un fetch activo. Evita que el
+    // setInterval dispare un nuevo fetch si el anterior aun esta pendiente.
+    _apiInflight: {},
+    _apiInflightStart(key) {
+        if (this._apiInflight[key]) return false;
+        this._apiInflight[key] = true;
+        return true;
+    },
+    _apiInflightEnd(key) {
+        delete this._apiInflight[key];
+    },
 
     init() {
         document.addEventListener('visibilitychange', () => this._onVisibilityChange());
@@ -1444,11 +1456,11 @@ const App = {
     },
 
     _fetchYoloMetadata(camId, el, nowText, camIdShort, zone, targetId = 'live-wrap') {
-        // v13 Track B Cambio B: backoff exponencial para no bombardear
-        // /frames/latest cuando el tunnel esta cascadeando (502/530).
+        // v13 Track B Cambio B/Cambio D: backoff exponencial + dedup en vuelo.
         const bkKey = `${camId}:yolo`;
         const remain = this._apiBackoffMs(bkKey);
         if (remain > 0) return; // aun en cooldown
+        if (!this._apiInflightStart(bkKey)) return; // ya hay un fetch en vuelo
         apiFetch(`${this.API}/frames/latest?camera_id=${camId}&user_id=${this.userId || 'default'}`)
             .then(r => {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1479,7 +1491,8 @@ const App = {
             .catch(() => {
                 const fails = this._apiBackoffBump(bkKey);
                 if (fails === 1) console.warn(`[yolo] ${camId} fallo 1x — backoff 2s`);
-            });
+            })
+            .finally(() => this._apiInflightEnd(bkKey));
     },
 
     async _fetchFrameForCam(camId, targetId = 'live-wrap') {
@@ -1876,10 +1889,11 @@ const App = {
     },
 
     async _loadThumb(camId) {
-        // v13 Track B Cambio B: backoff exponencial por camara.
+        // v13 Track B Cambio B/Cambio D: backoff exponencial + dedup por camara.
         const bkKey = `${camId}:thumb`;
         const remain = this._apiBackoffMs(bkKey);
         if (remain > 0) return; // aun en cooldown
+        if (!this._apiInflightStart(bkKey)) return; // fetch ya en vuelo
         try {
                 const r = await apiFetch(`${this.API}/frames/latest?camera_id=${camId}&user_id=${this.userId}`);
             if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1892,7 +1906,7 @@ const App = {
         } catch(e) {
             const fails = this._apiBackoffBump(bkKey);
             if (fails === 1) console.warn(`[thumb] ${camId} fallo 1x — backoff 2s`);
-        }
+        } finally { this._apiInflightEnd(bkKey); }
     },
 
     async _openCameraTimeline(camId) {
@@ -4974,10 +4988,11 @@ async _saveCooldown(camId, btn) {
 
     async _fetchViewerGrid() {
         if (!this._viewerCamId) return;
-        // v13 Track B Cambio B: backoff exponencial por camara viewer.
+        // v13 Track B Cambio B/Cambio D: backoff exponencial + dedup por camara viewer.
         const bkKey = `${this._viewerCamId}:grid`;
         const remain = this._apiBackoffMs(bkKey);
         if (remain > 0) return; // aun en cooldown
+        if (!this._apiInflightStart(bkKey)) return; // fetch ya en vuelo
         try {
             const r = await apiFetch(`${this.API}/api/cameras/${this._viewerCamId}/grid`);
             if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -4994,7 +5009,7 @@ async _saveCooldown(camId, btn) {
         } catch(e) {
             const fails = this._apiBackoffBump(bkKey);
             if (fails === 1) console.warn(`[grid] ${this._viewerCamId} fallo 1x — backoff 2s`);
-        }
+        } finally { this._apiInflightEnd(bkKey); }
     },
 
     async _confirmDeleteCamera(camId) {
