@@ -27,6 +27,10 @@ const EvaChat = {
     _visibleLimit: 10,
     _loadingOlder: false,
     _hasRecentAlerts: false,
+    // v13: scroll inteligente. Si el usuario subio manualmente, NO forzar
+    // auto-scroll en siguientes render() hasta que vuelva al fondo.
+    _userAtBottom: true,
+    _unreadCount: 0,
     _briefEvent: null,
     _frameTimer: null,
 
@@ -294,14 +298,23 @@ const EvaChat = {
         const messages = document.getElementById('eva-messages');
         if (messages) messages.onscroll = () => {
             if (messages.scrollTop < 80 && hasOlder && !this._loadingOlder) this.loadOlderMessages();
+            // v13: tracking de si el usuario está al fondo.
+            const wasAtBottom = this._userAtBottom;
+            this._userAtBottom = this._checkUserAtBottom();
+            if (this._userAtBottom && !wasAtBottom) {
+                // el usuario volvió al fondo: limpiar badge de unread
+                this._unreadCount = 0;
+                const badge = document.getElementById('eva-unread-badge');
+                if (badge) badge.style.display = 'none';
+            }
         };
         setTimeout(() => {
             const input = document.getElementById('eva-input');
             if (input) input.focus();
             this._drawPendingHeatmaps();
-            this.scrollToBottom(true);
+            // Solo forzar scroll al fondo en render completo (cambio de página,
+            // inicialización, etc). NO hacer auto-scroll en poll remoto.
         }, 300);
-        this.scrollToBottom(true);
     },
 
     _isInstallCameraIntent(msg) {
@@ -907,22 +920,54 @@ const EvaChat = {
 
     escapeHtml(text) { const d = document.createElement('div'); d.textContent = text; return d.innerHTML; },
 
-    scrollToBottom(force = false) {
+    // v13: detectar si el usuario está en el fondo del chat.
+    // Si NO está (subió manualmente), no forzar auto-scroll en próximos renders.
+    _checkUserAtBottom() {
+        const c = document.getElementById('eva-messages');
+        if (!c) return true;
+        // 60px de tolerancia hacia el fondo (cargar viejos, etc.)
+        return (c.scrollHeight - c.scrollTop - c.clientHeight) < 60;
+    },
+
+    _markUnread(n = 1) {
+        this._unreadCount = Math.max(this._unreadCount, 0) + n;
+        let badge = document.getElementById('eva-unread-badge');
         const c = document.getElementById('eva-messages');
         if (!c) return;
+        if (this._unreadCount > 0 && !this._userAtBottom) {
+            if (!badge) {
+                badge = document.createElement('div');
+                badge.id = 'eva-unread-badge';
+                badge.style.cssText = 'position:absolute;bottom:120px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:6px 14px;border-radius:999px;font-size:0.8rem;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,0.4);cursor:pointer;z-index:100;transition:opacity .2s';
+                badge.onclick = () => { this._unreadCount = 0; this._userAtBottom = true; badge.remove(); this.scrollToBottom(true); };
+                const parent = c.parentElement;
+                if (parent) parent.appendChild(badge);
+            }
+            badge.textContent = `↓ ${this._unreadCount} nuevo${this._unreadCount>1?'s':''}`;
+            badge.style.display = 'block';
+        } else if (badge) {
+            badge.style.display = 'none';
+        }
+    },
+
+    scrollToBottom(force = false) {
+        if (!force && !this._userAtBottom) return; // respetar scroll del usuario
+        const c = document.getElementById('eva-messages');
+        if (!c) return;
+        this._unreadCount = 0;
+        const badge = document.getElementById('eva-unread-badge');
+        if (badge) badge.style.display = 'none';
         const doScroll = () => { c.scrollTop = c.scrollHeight; };
         doScroll();
         requestAnimationFrame(() => {
             doScroll();
             setTimeout(doScroll, 100);
-            setTimeout(doScroll, 300);
-            if (force) setTimeout(doScroll, 650);
+            if (force) {
+                setTimeout(doScroll, 300);
+                setTimeout(doScroll, 650);
+            }
         });
-        if (window._evaScroll) {
-            window._evaScroll = false;
-            setTimeout(doScroll, 500);
-            setTimeout(doScroll, 1000);
-        }
+        this._userAtBottom = true;
     },
 
     async _loadSavedConversation() {
@@ -1053,8 +1098,15 @@ const EvaChat = {
                         // el chat se renderizaria encima de Otra pagina (Settings, Eventos, etc.)
                         const onEva = (typeof App !== 'undefined' && App.page === 'eva') || document.getElementById('eva-chat-container');
                         if (onEva) {
+                            const newMsgs = this.history.length - prevLen;
                             this.render();
-                            this.scrollToBottom();
+                            // v13: si llegaron mensajes remotos y el usuario NO está al fondo,
+                            // marcar como unread en vez de forzar scroll.
+                            if (newMsgs > 0 && !this._userAtBottom) {
+                                this._markUnread(newMsgs);
+                            } else {
+                                this.scrollToBottom();
+                            }
                         }
                     }
                 }
