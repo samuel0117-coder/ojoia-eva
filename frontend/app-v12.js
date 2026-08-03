@@ -51,6 +51,17 @@ function apiFetch(url, opts = {}) {
         (url.indexOf('ojoia.com.do') !== -1 || url.indexOf('10.0.0.44') !== -1)) {
         headers['Authorization'] = 'Bearer ' + token;
     }
+    // v13: timeout por defecto 8s. Si el caller trae su propio opts.signal,
+    // respetamos; si no, creamos AbortSignal.timeout() para que un 502/530
+    // colgado de cloudflared (edge-timeout 30s) no zombiee el socket del
+    // navegador durante 30s, alimentando el retry-storm sobre el tunnel.
+    // El caller puede pasar opts.timeoutMs=0 para deshabilitar, o un número
+    // mayor si la peticion necesita mas (ej. upload de PDF grande).
+    const timeoutMs = (typeof opts.timeoutMs === 'number') ? opts.timeoutMs : 8000;
+    const signal = opts.signal;
+    if (timeoutMs > 0 && !signal && typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        return fetch(url, { mode: 'cors', headers, ...opts, signal: AbortSignal.timeout(timeoutMs) });
+    }
     return fetch(url, { mode: 'cors', headers, ...opts });
 }
 
@@ -1226,6 +1237,13 @@ const App = {
         } else {
             imgEl.onload = onImgLoad;
             imgEl.onerror = onImgError;
+            // Si el src actual corresponde a OTRA cámara (cambio de cámara en viewer),
+            // forzar la reasignación del src al stream de la cámara nueva.
+            // Sin esto, el <img> sigue consumiendo el stream MJPEG de la cámara anterior
+            // y la cámara nueva nunca se muestra (viewer "congelado" en la imagen vieja).
+            if (imgEl.dataset.camId && imgEl.dataset.camId !== camId) {
+                imgEl.src = rawUrl;
+            }
         }
         return { el, imgEl, canvasEl };
     },
