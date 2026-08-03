@@ -1038,21 +1038,25 @@ const EvaChat = {
         if (this._remoteSyncStarted) return;
         this._remoteSyncStarted = true;
         const mergeRemote = (remoteHistory, remoteSummary) => {
-            // MERGE: conservar mensajes locales con ts > remoteTs (escritos hace poco,
-            // todavia no flushed al backend por debounce de 800ms), y agregar remotos
-            // nuevos con ts > remoteTs actual que no tengamos.
+            // v13: dedup por role|contentNormalizado (NO timestamp).
+            // Antes usabamos role|content|timestamp, pero el user msg tomaba
+            // Date.now()/1000 en el frontend optimista y el backend le asignaba
+            // su propio ts al guardar — desincronia de 1-3s => NO dedup => duplicado.
+            // Ahora normalizamos content (trim + colapsar whitespace) para que
+            // msgs iguales飘nmatchen sin importar minor formatting.
             if (!Array.isArray(remoteHistory) || !remoteHistory.length) return false;
-            const localByTs = new Map();
+            const norm = (s) => (String(s || '')).trim().replace(/\s+/g, ' ');
+            const localKeys = new Set();
             for (const m of (this.history || [])) {
-                const k = `${m.role}|${m.content}|${m.timestamp || 0}`;
-                localByTs.set(k, true);
+                localKeys.add(`${m.role}|${norm(m.content)}`);
             }
             let appended = 0;
             for (const r of remoteHistory) {
-                const k = `${r.role}|${r.content}|${r.timestamp || 0}`;
-                if (localByTs.has(k)) continue;
+                const k = `${r.role}|${norm(r.content)}`;
+                if (localKeys.has(k)) continue;
                 // Es remoto nuevo (de otro dispositivo) que no tenemos localmente
                 this.history.push(r);
+                localKeys.add(k);
                 appended++;
             }
             // Recortar a ultimos 200
