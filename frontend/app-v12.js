@@ -99,6 +99,30 @@ const App = {
     _streamLastOnloadTs: {},
     _streamWatchdogTimers: {},
 
+    // --- Backoff exponencial para polling HTTP (Track B Cambio B) ---
+    // Map { 'camId:endpoint': { fails: N, nextAt: ms } }
+    // Backoff delays por fallo consecutivo (capped en 16s).
+    _apiBackoffDelays: [0, 2000, 4000, 8000, 16000, 16000],
+    _apiBackoff: {},
+    // Devuelve ms restante de espera para el backoff, o 0 si libre.
+    _apiBackoffMs(key) {
+        const s = this._apiBackoff[key];
+        if (!s) return 0;
+        const remain = Math.max(0, (s.nextAt || 0) - Date.now());
+        return remain;
+    },
+    _apiBackoffBump(key) {
+        const s = this._apiBackoff[key] || { fails: 0, nextAt: 0 };
+        s.fails = Math.min(s.fails + 1, this._apiBackoffDelays.length - 1);
+        const delay = this._apiBackoffDelays[s.fails] || 16000;
+        s.nextAt = Date.now() + delay;
+        this._apiBackoff[key] = s;
+        return s.fails;
+    },
+    _apiBackoffReset(key) {
+        if (this._apiBackoff[key]) delete this._apiBackoff[key];
+    },
+
     init() {
         document.addEventListener('visibilitychange', () => this._onVisibilityChange());
         const h = window.location.hostname;
@@ -1420,9 +1444,18 @@ const App = {
     },
 
     _fetchYoloMetadata(camId, el, nowText, camIdShort, zone, targetId = 'live-wrap') {
+        // v13 Track B Cambio B: backoff exponencial para no bombardear
+        // /frames/latest cuando el tunnel esta cascadeando (502/530).
+        const bkKey = `${camId}:yolo`;
+        const remain = this._apiBackoffMs(bkKey);
+        if (remain > 0) return; // aun en cooldown
         apiFetch(`${this.API}/frames/latest?camera_id=${camId}&user_id=${this.userId || 'default'}`)
-            .then(r => r.json())
+            .then(r => {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
             .then(d => {
+                this._apiBackoffReset(bkKey);
                 const yolo = d.yolo || {};
                 const detections = Array.isArray(yolo.detections) ? yolo.detections : [];
                 this._homeLastDetectionsByCam[camId] = detections;
@@ -1443,7 +1476,10 @@ const App = {
                 this._homeWatermarkTextByCam[camId] = watermark;
                 this._drawYoloBoxes(camId, detections, watermark, targetId);
             })
-            .catch(() => {});
+            .catch(() => {
+                const fails = this._apiBackoffBump(bkKey);
+                if (fails === 1) console.warn(`[yolo] ${camId} fallo 1x — backoff 2s`);
+            });
     },
 
     async _fetchFrameForCam(camId, targetId = 'live-wrap') {
@@ -1840,14 +1876,23 @@ const App = {
     },
 
     async _loadThumb(camId) {
+        // v13 Track B Cambio B: backoff exponencial por camara.
+        const bkKey = `${camId}:thumb`;
+        const remain = this._apiBackoffMs(bkKey);
+        if (remain > 0) return; // aun en cooldown
         try {
                 const r = await apiFetch(`${this.API}/frames/latest?camera_id=${camId}&user_id=${this.userId}`);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
             const d = await r.json();
+            this._apiBackoffReset(bkKey);
             const el = document.getElementById(`thumb-${camId}`);
             if (el && d.success && d.image_b64) {
                 el.innerHTML = `<img src="data:image/jpeg;base64,${d.image_b64}" style="width:100%;height:100%;object-fit:cover;border-radius:8px">`;
             }
-        } catch(e) {}
+        } catch(e) {
+            const fails = this._apiBackoffBump(bkKey);
+            if (fails === 1) console.warn(`[thumb] ${camId} fallo 1x — backoff 2s`);
+        }
     },
 
     async _openCameraTimeline(camId) {
@@ -4929,9 +4974,15 @@ async _saveCooldown(camId, btn) {
 
     async _fetchViewerGrid() {
         if (!this._viewerCamId) return;
+        // v13 Track B Cambio B: backoff exponencial por camara viewer.
+        const bkKey = `${this._viewerCamId}:grid`;
+        const remain = this._apiBackoffMs(bkKey);
+        if (remain > 0) return; // aun en cooldown
         try {
             const r = await apiFetch(`${this.API}/api/cameras/${this._viewerCamId}/grid`);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
             const d = await r.json();
+            this._apiBackoffReset(bkKey);
             let gc = document.getElementById('viewer-grid');
             if (!gc) { gc = document.createElement('div'); gc.id = 'viewer-grid'; const vb = document.getElementById('viewer-body'); if (vb) vb.appendChild(gc); }
             if (d.active && d.grid_b64) {
@@ -4940,7 +4991,10 @@ async _saveCooldown(camId, btn) {
                     <div class="prog-bar"><div class="prog-fill" style="width:${Math.round(f/16*100)}%"></div></div>
                     <img src="data:image/jpeg;base64,${d.grid_b64}" style="width:100%;border-radius:8px;display:block;margin-top:8px"></div>`;
             }
-        } catch(e) {}
+        } catch(e) {
+            const fails = this._apiBackoffBump(bkKey);
+            if (fails === 1) console.warn(`[grid] ${this._viewerCamId} fallo 1x — backoff 2s`);
+        }
     },
 
     async _confirmDeleteCamera(camId) {
