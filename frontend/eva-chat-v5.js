@@ -49,8 +49,15 @@ const EvaChat = {
         this.userId = userId;
         this.userName = userName || '';
         this._sessionKey = `eva_session_${userId}`;
+        // UN SOLO CHAT por usuario: session_id estable "chat_<uid>". Persistido en
+        // localStorage para que todas las tabs/devices del mismo user usen el mismo.
+        // Antes se usaba "eva_<uid>_single" / "os_<uid>" / "chat_<uid>_<ts>",
+        // lo que bifurcaba el historial en varias sesiones y el backend mezclaba
+        // todo en el GET. Ahora siempre es "chat_<uid>".
+        const UNIFIED_SID = `chat_${userId}`;
         const savedSessionId = localStorage.getItem(this._sessionKey);
-        this.sessionId = savedSessionId || `eva_${userId}_single`;
+        // Normalizar sessionId legacy → unificado
+        this.sessionId = UNIFIED_SID;
         localStorage.setItem(this._sessionKey, this.sessionId);
         this._historyKey = `eva_history_${userId}`;
         this._historyTsKey = `eva_history_ts_${userId}`;
@@ -418,9 +425,11 @@ const EvaChat = {
             return;
         }
         try {
-            const chatSessionId = this._isOsIntentText(intentText) && !this._isInstallCameraIntent(intentText)
-                ? `os_${this.userId}`
-                : this.sessionId;
+            // UN SOLO CHAT: SIEMPRE usar el mismo session_id estable del usuario
+            // ("chat_<uid>"), sin importar si el mensaje es OS, setup, install, etc.
+            // Antes se bifurcaba a "os_<uid>" para OS intents, lo que partía el
+            // historial en dos sesiones y duplicaba mensajes al recargar.
+            const chatSessionId = this.sessionId;
             let r = null, lastErr = null;
             // Reintentar 2 veces con backoff para resistir microcortes de red móvil.
             for (let attempt = 0; attempt < 3; attempt++) {
@@ -446,9 +455,19 @@ const EvaChat = {
             if (!r || !r.ok) throw lastErr || new Error('fetch-failed');
             const data = await r.json();
             if (data.success) {
-                this.sessionId = data.sessionId || this.sessionId;
+                // UN SOLO CHAT: NO sobrescribir this.sessionId con el que devuelva
+                // el backend. Antes se hacía `this.sessionId = data.sessionId || this.sessionId`,
+                // lo que permitía al backend imponer "chat_<uid>_<ts>" y bifurcar el
+                // historial. Ahora el backend debe respetar el session_id que el
+                // frontend le envía. Solo actualizamos por consistencia si coincide.
+                if (data.sessionId && data.sessionId === this.sessionId) {
+                    // ok, mismo id (no-op)
+                } else if (data.sessionId) {
+                    // El backend respondió con otro sid: lo ignoramos pero logueamos
+                    // para detectar regresiones. NO tocamos this.sessionId.
+                    console.warn('[EvaChat] backend devolvió sessionId distinto (ignorado):', data.sessionId, 'vs', this.sessionId);
+                }
                 if (this._isOsIntentText(intentText) && !this._isInstallCameraIntent(intentText)) {
-                    this.sessionId = data.sessionId || this.sessionId;
                     this.history = this.history.filter(m => !(m.role === 'assistant' && this._isSetupArtifact(m.content || '')));
                 }
                 localStorage.setItem(this._sessionKey, this.sessionId);
@@ -918,24 +937,26 @@ const EvaChat = {
 
         // 2. GET del remote para sincronizar (merge, no reemplazo)
         try {
-            const r = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}`);
+            // UN SOLO CHAT: enviar session_id al backend para que devuelva SOLO
+            // la sesión del usuario, no la unión de todas (que mezclaba chats).
+            const r = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`);
             if (r.ok) {
                 const data = await r.json();
                 if (data && Array.isArray(data.history)) {
                     this._remoteHistoryTs = parseInt(data.ts || 0, 10) || 0;
                     // MERGE: si tenemos local state, mezclar; sino usar el remoto
                     if (this.history.length > 0 && Array.isArray(data.history) && data.history.length) {
-                        // Firma local (sin timestamp: solo role+content). El timestamp
-                        // cliente/servidor puede diferir en milisegundos y causar duplicados
-                        // al merge. Toleramos re-procesar el mismo content (raro) antes que
-                        // duplicar un mensaje real.
+                        // Firma consistente con _startRemoteSync: role|content|timestamp.
+                        // Antes se usaba "role|content" (sin ts) en loadSaved y
+                        // "role|content|ts" en remoteSync; esa inconsistencia
+                        // duplicaba mensajes con timestamps ligeramente distintos.
                         const localKeys = new Set();
                         for (const m of this.history) {
-                            localKeys.add(`${m.role}|${m.content}`);
+                            localKeys.add(`${m.role}|${m.content}|${m.timestamp || 0}`);
                         }
                         let appended = 0;
                         for (const rm of data.history) {
-                            const k = `${rm.role}|${rm.content}`;
+                            const k = `${rm.role}|${rm.content}|${rm.timestamp || 0}`;
                             if (!localKeys.has(k)) {
                                 this.history.push(rm);
                                 appended++;
@@ -997,14 +1018,22 @@ const EvaChat = {
         };
         const poll = async () => {
             if (document.visibilityState === 'hidden') return;
+            // v13 Track B Cambio C: dedup — no iniciar nuevo poll si el anterior sigue en vuelo.
+            // Antes no habia protection, y un fetch colgado 8-30s sobre un tunnel cascade
+            // permitia al setInterval(10s) disparar OTRO poll encima. Dos poll en paralelo
+            // hacia fetch duplicados y saturaba cloudflared todavia mas.
+            if (this._historyPollInFlight) return;
+            this._historyPollInFlight = true;
             try {
-                const r = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&limit=1`);
+                const r = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}&limit=1`,
+                    { signal: AbortSignal.timeout(8000) });
                 if (!r.ok) return;
                 const data = await r.json();
                 const remoteTs = parseInt(data.ts || 0, 10) || 0;
                 if (!remoteTs || remoteTs === this._remoteHistoryTs) return;
                 // Hubo cambios en otro dispositivo -> fetch completo y MERGE
-                const full = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}`);
+                const full = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`,
+                    { signal: AbortSignal.timeout(8000) });
                 if (!full.ok) return;
                 const fullData = await full.json();
                 const prevLen = this.history.length;
@@ -1030,6 +1059,7 @@ const EvaChat = {
                     }
                 }
             } catch (e) { /* silencioso */ }
+            finally { this._historyPollInFlight = false; }
         };
         // Polling cada 10s
         this._remoteSyncInterval = setInterval(poll, 10000);
@@ -1073,7 +1103,9 @@ const EvaChat = {
                 fetch(`${this.API}/api/chat/eva/history`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: this.userId, history: safeHistory, summary: this._summary })
+                    // UN SOLO CHAT: enviar session_id estable del usuario para que
+                    // el backend LO RESPETE (antes el POST lo ignoraba y forzaba "os_<uid>").
+                    body: JSON.stringify({ user_id: this.userId, session_id: this.sessionId, history: safeHistory, summary: this._summary })
                 }).then(r => r.ok ? r.json() : null).then(data => {
                     if (data && data.ts) this._remoteHistoryTs = parseInt(data.ts, 10) || 0;
                 }).catch(() => {});
@@ -1137,8 +1169,11 @@ const EvaChat = {
     clearChat(render = true) {
         this.history = [];
         this._greeted = false;
-        this.sessionId = `chat_${this.userId}_${Date.now()}`;
-        this._suggestions = [];
+        // UN SOLO CHAT: clearChat reinicia la conversación visual/local pero MANTIENE
+        // el session_id estable del usuario, para que el backend no bifurque. Antes
+        // generaba "chat_<uid>_<Date.now()>" y creaba una nueva sesión en cada clear.
+        this.sessionId = `chat_${this.userId}`;
+        localStorage.setItem(this._sessionKey, this.sessionId);
         this._briefEvent = null;
         this._hasRecentAlerts = false;
         this._visibleLimit = 10;
