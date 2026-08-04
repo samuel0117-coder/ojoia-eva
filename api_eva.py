@@ -5104,11 +5104,34 @@ async def admin_stats(authorization: str = Header(None)):
                 except Exception:
                     pass
     storage_used_gb = sum(d.get("used_gb", 0) or 0 for d in cfg.get("disks", []))
+    # [Fix] active_cameras NO debe depender de la grilla en memoria del orquestador:
+    # esa grilla se vacía en cada reinicio del backend y devolvía 0 aunque las
+    # cámaras estuvieran enviando frames. Se calcula desde last_frame/last_announce
+    # de user.json (misma lógica que /admin/cameras: online si < 120s).
     active_cams = 0
     try:
-        active_cams = len(orchestrator._get_grid("", "").get_grid_info().get("camera_ids", []))
-    except Exception:
-        pass
+        _now = time.time()
+        for disk in cfg.get("disks", []):
+            _ub = Path(disk.get("mount", "")) / disk.get("user_folder", "users")
+            if not _ub.is_dir():
+                continue
+            for _uid in _ub.iterdir():
+                _uf = _uid / "user.json"
+                if not _uf.is_file():
+                    continue
+                try:
+                    _ud = json.loads(_uf.read_text())
+                except Exception:
+                    continue
+                for _cam in _ud.get("cameras", []):
+                    _la = _cam.get("last_announce") or 0
+                    _lf = _cam.get("last_frame") or 0
+                    _aa = (_now - _la) if _la else None
+                    _fa = (_now - _lf) if _lf else None
+                    if (_aa is not None and _aa < 120) or (_fa is not None and _fa < 120):
+                        active_cams += 1
+    except Exception as _e:
+        logger.error(f"[admin_stats] active_cams calc error: {_e}")
     return {
         "total_users": total_users, "total_cameras": len(total_cameras),
         "active_cameras": active_cams, "storage_used_gb": round(storage_used_gb, 2),
