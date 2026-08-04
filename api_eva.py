@@ -3055,6 +3055,7 @@ async def get_esp32_config(camera_id: str):
                 "framesize": c.get("framesize", 10),
                 "led_auto": c.get("led_auto", True),
                 "led_bright": c.get("led_bright", 128),
+                "led_on": c.get("led_on", False),
                 "h_mirror": c.get("h_mirror", False),
                 "v_flip": c.get("v_flip", False),
                 "brightness": c.get("brightness", 0),
