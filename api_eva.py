@@ -858,7 +858,12 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin", "User-Agent", "DNT", "Cache-Control", "Keep-Alive", "X-Api-Key", "Pragma"],
+    # [Fix CORS] El SPA admin envia SIEMPRE el header 'ngrok-skip-browser-warning'
+    # (desde HDRS) en cada request. El navegador lo incluye en
+    # Access-Control-Request-Headers del preflight; al no estar en esta lista el
+    # backend responde 400 y el navegador bloquea TODAS las llamadas (dashboard
+    # "Offline"). Se agrega para que el preflight sea 200.
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept", "Origin", "User-Agent", "DNT", "Cache-Control", "Keep-Alive", "X-Api-Key", "Pragma", "ngrok-skip-browser-warning", "Accept-Language"],
     expose_headers=["*"],
     max_age=86400,
 )
