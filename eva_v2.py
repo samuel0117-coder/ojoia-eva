@@ -190,22 +190,41 @@ def _get_unconfigured_frame(user_id: str):
     ids = _configured_camera_ids(user_id)
     best = (None, "", 0.0)
     now = time.time()
+    # 1) Buffer en RAM (alimentado por ingest_frame_for_eva desde /ingest/frame).
+    # Es la vía preferida: el frame llega incluso si la cámara physical no está
+    # asociada al user_id del wizard (puede caer en users/default mientras otra
+    # cuenta levanta la cámara).
     for cid, frame in _latest_frame.items():
         if cid in ids:
             continue
         ts = _latest_frame_time.get(cid, 0.0)
         if now - ts < 120 and ts > best[2]:
             best = (frame, cid, ts)
+    # 2) FS search EXPANDIDO a TODOS los user-dirs (no solo el del user_id del
+    # wizard). La cámara física nueva puede estar postando a users/default
+    # (porque resolve_user_id la asoció a "default" al no tener user_id explícito)
+    # mientras el wizard lo levanta para otro user. Antes, el FS search estaba
+    # restringido a STORAGE_ROOT/users/<user_id>/cameras/ y por eso el wizard
+    # nunca encontraba el frame.
     try:
-        cam_root = STORAGE_ROOT / "users" / user_id / "cameras"
-        if cam_root.exists():
-            for latest in cam_root.glob("*/frames/latest_raw.jpg"):
-                cid = latest.parent.parent.name
+        users_root = STORAGE_ROOT / "users"
+        if users_root.exists():
+            for latest in users_root.glob("*/cameras/*/frames/latest_raw.jpg"):
+                try:
+                    cid = latest.parent.parent.name
+                except Exception:
+                    continue
                 if cid in ids:
                     continue
-                mtime = latest.stat().st_mtime
+                try:
+                    mtime = latest.stat().st_mtime
+                except Exception:
+                    continue
                 if now - mtime < 300 and mtime > best[2]:
-                    best = (latest.read_bytes(), cid, mtime)
+                    try:
+                        best = (latest.read_bytes(), cid, mtime)
+                    except Exception:
+                        pass
     except Exception:
         pass
     return best[0], best[1]
@@ -278,9 +297,29 @@ def _load_session(session_id: str) -> Optional[Dict]:
                 except Exception: pass
     return None
 
+# ── Ranking de avance de fase del wizard ─────────────────────────────────────
+# Sirve para que _pending_session_for_user ELIJA la sesión MÁS AVANZADA (no la
+# más nueva). Antes solo comparaba por created_at, lo que permitía a una sesión
+# nueva en fase "zone" pisar una existente en "context" (wizard reiniciado).
+_PHASE_RANK = {
+    "greet": 1, "zone": 2, "hardware": 3, "wait_image": 4,
+    "analyze": 5, "context": 6, "prompt_build": 7, "confirm": 8,
+}
+
+def _phase_rank(phase: str) -> int:
+    return _PHASE_RANK.get((phase or "").lower(), 0)
+
+
 def _pending_session_for_user(user_id: str) -> Optional[Dict]:
+    """Devuelve la sesión de SETUP pendiente más avanzada para el usuario.
+    
+    UN SOLO CHAT: ahora todas las sesiones usan el mismo sid "chat_<uid>", así
+    que normalmente solo hay UNA entrada en _sessions. Pero por compatibilidad
+    con datos legacy/sessiones guardadas en disco, este helper elige la sesión
+    MÁS AVANZADA en el wizard (no la más nueva), para no regresar el flujo.
+    """
     best = None
-    best_time = 0.0
+    best_score = (0, 0.0)  # (phase_rank, created_at)
     for s in _sessions.values():
         if s.get("user_id") != user_id:
             continue
@@ -288,9 +327,9 @@ def _pending_session_for_user(user_id: str) -> Optional[Dict]:
             continue
         if s.get("phase") not in ("hardware", "wait_image", "analyze", "context", "prompt_build", "confirm"):
             continue
-        t = float(s.get("created_at", 0) or 0)
-        if t >= best_time:
-            best_time = t
+        score = (_phase_rank(s.get("phase")), float(s.get("created_at", 0) or 0))
+        if score > best_score:
+            best_score = score
             best = s
     for user_dir in STORAGE_ROOT.glob("users/*"):
         for cam_dir in user_dir.glob("cameras/*"):
@@ -307,13 +346,21 @@ def _pending_session_for_user(user_id: str) -> Optional[Dict]:
                 continue
             if d.get("phase") not in ("hardware", "wait_image", "analyze", "context", "prompt_build", "confirm"):
                 continue
-            t = float(d.get("created_at", 0) or sf.stat().st_mtime or 0)
-            if t >= best_time:
-                best_time = t
+            score = (_phase_rank(d.get("phase")), float(d.get("created_at", 0) or sf.stat().st_mtime or 0))
+            if score > best_score:
+                best_score = score
                 best = d
     if best:
         best.setdefault("msgs", [])
-        _sessions[best.get("session_id", f"pending_{user_id}")] = best
+        # Solo indexar si no hay ya una sesión MÁS AVANZADA para el MISMO sid en
+        # memoria (para no pisar una sesión en progreso con una del disco menos
+        # avanzada). Si el sid del best es distinto a _sessions en memoria, OK.
+        best_sid = best.get("session_id") or f"pending_{user_id}"
+        existing = _sessions.get(best_sid)
+        if existing and existing.get("user_id") == user_id and _phase_rank(existing.get("phase")) > _phase_rank(best.get("phase")):
+            # La sesión en memoria está más avanzada: devolver esa en vez del disco.
+            return existing
+        _sessions[best_sid] = best
     return best
 
 def _save_session_to_disk(session: Dict):
@@ -363,7 +410,7 @@ def _get_concern_examples(biz_type: str, zone: str) -> str:
 # LLM HELPERS
 # =============================================================================
 
-async def _call_qwen(messages: list, max_tokens: int = 600, tools: list = None, temperature: float = 0.3) -> dict:
+async def _call_qwen(messages: list, max_tokens: int = 600, tools: list = None, temperature: float = 0.3, tool_choice = None) -> dict:
     try:
         payload = {
             "model": "qwen",
@@ -373,6 +420,10 @@ async def _call_qwen(messages: list, max_tokens: int = 600, tools: list = None, 
         }
         if tools:
             payload["tools"] = tools
+            # [Fix D] En fallback retry con tool_choice="required" forzamos
+            # al modelo a emitir un tool_call en vez de narrar la respuesta.
+            if tool_choice:
+                payload["tool_choice"] = tool_choice
         async with httpx.AsyncClient(timeout=QWEN_TIMEOUT) as cl:
             r = await cl.post(QWEN_URL, json=payload)
             if r.status_code == 200:
@@ -601,14 +652,22 @@ def _clean_context_answer(m, default):
 def _parse_attention_phrases(text):
     """Parsea frases de atención desde texto libre del usuario.
     Separa por comas, 'y', 'que', punto y coma.
+    Las palabras cortas ('no', 'ok', 'si', 'sí', 'listo') NO son frases de
+    atención válidas y se ignoran (el usuario dijo 'no' para pasar al paso
+    siguiente, no para agregar una frase de atención literal).
     """
     if not text:
         return []
     text = text.replace(";", ",").replace("\n", ",")
+    # Palabras cortas de confirmación/negación — no son frases de vigilancia.
+    _CANCEL_WORDS = {"no","sí","si","listo","ok","dale","vale","hecho","ya","na","nada","ninguna","ninguno"}
     parts = re.split(r",\s*|\s+y\s+|\s+que\s+", text)
     phrases = []
     for p in parts:
         p = p.strip().strip(".").strip()
+        if len(p) < 3 or p.lower() in _CANCEL_WORDS:
+            # El usuario no está agregando una frase de atención real
+            continue
         if len(p) > 3 and len(p) < 200:
             phrases.append(p)
     return phrases[:10]
@@ -1292,19 +1351,45 @@ async def _handle_daily_summary(session, user_id, message, session_id):
 
 
 def _parse_hermes_tool_call(content):
-    """Parsea respuestas de hermes-style tool calls del modelo Qwen."""
+    """Parsea respuestas de hermes-style tool calls del modelo Qwen.
+
+    Detecta varios formatos que Qwen usa empiricamente:
+    - <tool>{...}</tool>     (Hermes-classic)
+    - ```json\n{...}\n```   (markdown code block)
+    - ```tool_call\n{...}\n``` (Hermes v3)
+    - {...} suelto (al inicio o final del content)
+    - {"tool": "...", "params": ...} (route style)
+    """
     if not content:
         return None
     import re
-    pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
-    match = re.search(pattern, content, re.DOTALL)
+
+    # 1) <tool>...</tool>
+    match = re.search(r'<tool>\s*(\{.*?\})\s*</tool>', content, re.DOTALL)
     if match:
         try:
             data = json.loads(match.group(1))
             if "name" in data:
                 return data
+            if "tool" in data:
+                return {"name": data.pop("tool"), "arguments": data.get("params", data.get("arguments", {}))}
         except json.JSONDecodeError:
             pass
+
+    # 2) ```json ... ``` o ```tool_call ... ``` con JSON dentro
+    for fence_pat in [r'```json\s*(\{.*?\})\s*```', r'```tool_call\s*(\{.*?\})\s*```', r'```\s*(\{.*?\})\s*```']:
+        m = re.search(fence_pat, content, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                if "name" in data:
+                    return data
+                if "tool" in data:
+                    return {"name": data.pop("tool"), "arguments": data.get("params", data.get("arguments", {}))}
+            except json.JSONDecodeError:
+                pass
+
+    # 3) stripped completo
     stripped = content.strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
@@ -1315,16 +1400,23 @@ def _parse_hermes_tool_call(content):
                 return {"name": data.pop("tool"), "arguments": data.get("params", data.get("arguments", {}))}
         except (json.JSONDecodeError, TypeError):
             pass
-    json_match = re.search(r'\{[^{}]*"name"[^{}]*\}', content)
-    if json_match:
+
+    # 4) cualquier objeto JSON en el content que contenga "name" o "tool"
+    for json_match in re.finditer(r'\{[^{]*"name"[^}]*\}', content, re.DOTALL):
         try:
             data = json.loads(json_match.group())
             if "name" in data:
                 return data
         except json.JSONDecodeError:
             pass
+    for json_match in re.finditer(r'\{[^{]*"tool"[^}]*\}', content, re.DOTALL):
+        try:
+            data = json.loads(json_match.group())
+            if "tool" in data:
+                return {"name": data.pop("tool"), "arguments": data.get("params", data.get("arguments", {}))}
+        except json.JSONDecodeError:
+            pass
     return None
-
 
 async def _detect_intent_and_route(user_id, message, first, recent, cam_count, session):
     """Detecta intenciones comunes y las responde directamente sin pasar por el LLM."""
@@ -1928,14 +2020,34 @@ async def _handle_context(session, session_id, user_id, message, first):
 
     if step in _CONTEXT_STEPS:
         if _is_yes(msg) and not session.get(step):
+            # Si el usuario dice "sí" pero el campo no tiene valor aún, interpretar
+            # como "paso al siguiente paso con valor default", NO "Dímelo concreto".
+            # Esto evita que el wizard se quede trabado en owner_notes cuando el
+            # usuario dijo "sí" para confirmar pero el campo quedó vacío.
+            default = _context_default(step, zone)
+            session[step] = default
+            next_step = _next_context_step(session)
+            session["context_step"] = next_step
             _sessions[session_id] = session
             _save_session_to_disk(session)
-            return _mk_resp(session, f"Dímelo concreto, {first}.\n\n{_context_question(session, step, first)}")
+            if next_step == "prompt_build":
+                session["phase"] = SetupPhase.PROMPT_BUILD.value
+                _sessions[session_id] = session
+                _save_session_to_disk(session)
+                return _mk_resp(session, f"Gracias {first}. Ya tengo todo el contexto. Voy a crear el sistema de observación para tu {zone}...")
+            return _mk_resp(session, _context_question(session, next_step, first))
         default = _context_default(step, zone)
         if step == "attention_phrases":
             answer = _parse_attention_phrases(msg)
             if not answer:
                 answer = default
+        elif step == "owner_notes":
+            # "no", "ninguno", "nada" son respuestas válidas: el usuario NO quiere
+            # agregar notas ni excepciones. Avanzamos con valor vacío.
+            if _is_no(msg) or _is_skippable_answer(msg):
+                answer = default
+            else:
+                answer = _clean_context_answer(msg, default)
         else:
             answer = _clean_context_answer(msg, default)
         session[step] = answer
@@ -2239,40 +2351,195 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
         )
 
     sys_p = (
-        f"Eres Eva, asistente de seguridad de OjoIA en República Dominicana.\n"
-        f"Dueño: {session.get('owner_name','el dueño')}\n"
-        f"Negocio: {ud.get('business_name','')} ({ud.get('business_type','')})\n"
-        f"Cámaras activas: {cam_count}\n\n"
-        f"=== RESUMEN RECIENTE DEL DIARIO ===\n{recent}\n\n"
-        f"=== HERRAMIENTAS DISPONIBLES ===\n"
-        f"- get_activity_summary: Resume actividad diaria (total análisis, personas, alertas)\n" +
-        f"- search_events: Busca eventos con filtros semánticos. Filtros opcionales: person_class (hombre|mujer|nino|anciano), clothing (ej 'camisa blanca'), min_persons, max_persons, activity (trabajando|hablando|entrando), importance (baja|media|alta|critica), date (today|yesterday|YYYY-MM-DD), camera_id, query\n" +
-        f"- event_book: Indice cronologico agrupable. 'Que paso entre 2 y 4 pm?' Parametros: date, group_by (hour|camera|ten_minute), only_importance, camera_id\n" +
-        f"- find_anomalies: Eventos relevantes segun gravedad (media/alta)\n" +
-        f"- latest_events: Lista ultimos análisis cronologicos\n" +
-        f"- count_people: Conteo de personas unicas hoy/ayer\n" +
-        f"- traffic_flow: Flujo entrada/salida con zonas entrance. 'cuantos entraron hoy', 'cuanta gente hay ahora'\n" +
-        f"- peak_hours: Top horas por trafico. 'cuales son las horas pico', 'cuando hay mas gente'\n" +
-        f"- heatmap_data: Datos de densidad por celda. 'donde se acumula mas gente', 'mapa de calor'\n" +
-        f"- zone_dwell: Permanencia por zona. 'cuanto tiempo en caja', 'quien estuvo mas de 30 min'\n" +
-        f"- is_open_hours: Horario negocio abierto/cerrado\n" +
-        f"- list_employees: Empleados registrados con face_id, rol y horario\n\n"
-        f"Para usar una herramienta, responde SOLO con:\n<tool_call>\n{{\"name\": \"nombre_herramienta\", \"arguments\": {{\"param\": \"valor\"}}}}\n</tool_call>\n\n"
-        f"Si no necesitas herramientas, responde directamente al usuario.\n\n"
-        f"Responde en español, natural y dominicano. NO inventes datos."
+        f"Eres Eva, asistente de seguridad inteligente de OjoIA en República Dominicana.\n"
+        f"Trabajas para {session.get('owner_name','el dueño')} en su negocio "
+        f"\"{ud.get('business_name','su negocio')}\" (giro: {ud.get('business_type','')}).\n"
+        f"Tienes {cam_count} cámara(s) activa(s) observando el lugar.\n\n"
+        f"=== ANTECEDENTES — actividad reciente del diario ===\n{recent}\n\n"
+        f"=== TU PERSONALIDAD ===\n"
+        f"- Hablas español dominicano, natural y friendly (pero profesional cuando importa).\n"
+        f"- Llamas al usuario por su nombre cuando es posible ({first}).\n"
+        f"- Eres proactiva: usas las herramientas para buscar respuestas REALES, no inventas.\n"
+        f"- Si no sabes algo exacto, lo dices honestamente y propones qué SÍ puedes investigar.\n\n"
+        f"=== TUS HERRAMIENTAS (usa una SOLO cuando necesites datos concretos) ===\n"
+        "- get_activity_summary(date today|yesterday, camera_id?): Resume el día — total análisis, conteos de personas, alertas, tags de objetos detectados (platos, dinero, fundas, etc.).\n"
+        "- search_events(query?, date today|yesterday|YYYY-MM-DD, camera_id?, person_class hombre|mujer|nino|anciano?, clothing?, min_persons?, max_persons?, activity trabajando|hablando|entrando?, importance baja|media|alta|critica?, limit 1-10): Busca eventos puntuales. El `query` permite texto natural como 'refresco', 'plato', 'dinero entra a la caja', 'empleado'. IMPORTANTE: YOLO detecta objetos como (platos, vasos, refrescos, fundas, dinero, datáfono, sillas, mesas, comida, bebidas...) y los busca aqui.\n"
+        "- event_book(date today|yesterday|YYYY-MM-DD, group_by hour|camera|ten_minute, only_importance?, camera_id?): Indice cronologico agrupable. Ideal para 'que paso entre 2 y 4 pm', 'dame el diario de hoy', 'como estuvo la última hora'.\n"
+        "- find_anomalies(min_severity baja|media|alta|critica, date, camera_id?, limit): Eventos con coincidencias de frases de vigilancia (realmente anormales).\n"
+        "- latest_events(limit 1-10, date?, camera_id?): Lista los últimos análisis cronológicos. Útil para 'que esta pasando ahora', 'muéstrame lo último'.\n"
+        "- count_people(date today|yesterday, camera_id?): Conteo de personas únicas, pico y total detectado. NO confundir con 'platos vendidos'.\n"
+        "- traffic_flow(date, camera_id?): Cuántos entraron/salieron por la zona 'entrance'.\n"
+        "- peak_hours(date, top_n 3?): Top horas con más gente.\n"
+        "- heatmap_data(date, grid_size): Datos de densidad por celda — 'donde se acumula la gente'.\n"
+        "- zone_dwell(date, anomaly_min_minutes?, zone_id, camera_id?): Permanencia por zona — 'cuánto en la caja', 'quién estuvo más de 30 min'.\n"
+        "- is_open_hours(): Horario del negocio abierto/cerrado.\n"
+        "- list_employees(): Empleados registrados con face_id, rol y horario.\n"
+        "- identify_face(camera_id): Quién aparece ahora en la cámara.\n"
+        "- get_latest_frame(camera_id?): Imagen reciente para que la observes.\n"
+        "- analyze_frame(camera_id, prompt): Analizas un frame con questiones visuales.\n"
+        "- save_event(camera_id, summary, importance): Registras un evento manualmente.\n"
+        "- update_vigilance_config(camera_id, mode, schedule, attention_phrases, owner_notes): Cambias qué vigilar ('vigila que...', 'quita la regla de...').\n"
+        "- get_vigilance_config(camera_id?): Lees qué frases estás vigilando actualmente.\n\n"
+        "=== CÓMO USAR HERRAMIENTAS ===\n"
+        "Si necesitas una herramienta, responde SOLO con JSON:\n"
+        "```json\n{\"name\": \"nombre_herramienta\", \"arguments\": {\"param\": \"valor\"}}\n```\n"
+        "Si no necesitas herramientas (charla general, saludo, aclaracion), responde directamente al usuario.\n\n"
+        "=== INTENCIÓN → TOOL — ejemplos ===\n"
+        "- 'cuántos platos se vendieron hoy' → search_events con query='plato' (NO digas 'no tengo acceso a ventas': busca los platos detectados por YOLO)\n"
+        "- 'cuántos refrescos vendí' → search_events con query='refresco' (igual: YOLO detecta refrescos)\n"
+        "- 'mande alguien al banco' → traffic_flow o count_people\n"
+        "- 'hubo anomalías hoy' → find_anomalies min_severity='media'\n"
+        "- 'qué pasó entre 3pm y 5pm' → event_book group_by='hour'\n"
+        "- 'cuántos clientes vinieron' → count_people\n"
+        "- 'cuánto tiempo estuvo alguien en la caja' → zone_dwell\n"
+        "- 'dime las reglas que vigilas' → get_vigilance_config (NO hardcoded responses)\n\n"
+        "Reglas IMPORTANTES:\n"
+        f"- NO inventes datos. Si una herramienta devuelve 0 o vacío, dilo claramente.\n"
+        f"- Si el usuario pregunta por algo que SÍ puede inferirse de los eventos YOLO (ventas ≈ detecciones de platos/dinero/coca-cola), USA la herramienta.\n"
+        f"- NO te limites a 'asistente de seguridad' si la información es observable (ventas, clientes, movimiento).\n"
+        f"- Responde en español dominicano. Máx 4-6 frases.\n"
     )
     msgs = [{"role":"system","content":sys_p}]
     tool_ctx = _format_prior_tool_context(session)
     if tool_ctx:
         msgs.insert(0, {"role":"system","content":tool_ctx})
-    for h in session.get("msgs",[])[-3:]:
-        if isinstance(h,dict) and "role" in h and h.get("role") in ("user","assistant"):
-            msgs.append({"role":h["role"],"content":h.get("content","")[:1200]})
-    msgs.append({"role":"user","content":message})
-    response = await _call_qwen(msgs, max_tokens=500)
-    content = response.get("content", "").strip()
+    # v13: pasar historial COMPLETO (últimos 12 msgs) en vez de solo 3 truncados.
+    # Antes h.content[:1200] cortaba respuestas largas con eventos+resumen; Eva
+    # perdía el contexto de que el usuario ya había preguntado algo similar.
+    # Ahora: más contexto (12 msgs), truncado por TOKENS aprox (4500 chars), no por msg.
+    history_msgs = []
+    total_chars = 0
+    CHAR_BUDGET = 4500
+    # [Fix B] Lista de frases que indican que Eva se rindió sin usar tools.
+    # Si las dejamos en el historial, Qwen replica el patrón y vuelve a decir
+    # "no tengo información" en vez de emitir un tool_call. Las omitimos para
+    # que el modelo vea solo la pregunta del usuario (que es la señal útil).
+    NEGATIVE_PATTERNS = (
+        "no tengo información", "no tengo acceso", "no tengo datos",
+        "no tengo acceso a ventas", "no puedo acceder a", "no puedo ver",
+        "no tengo acceso a la información", "no tengo forma de saber",
+        "no estoy conectada a", "no tengo manera de",
+        # [Fix C] Patrones elusivos: Eva menciona una tool sin ejecutarla.
+        "no tengo acceso directo", "no tengo acceso a los datos",
+        "no puedo dar", "no tengo forma de",
+        "sin embargo, puedo buscar", "puedo buscar eventos relacionados",
+        "puedo usar la herramienta", "puedo usar las herramienta",
+        "no puedo proporcionar datos específicos",
+        "no tengo acceso a los registros", "no tengo registros de ventas",
+    )
+    def _is_negative_assistant(c: str) -> bool:
+        cl = (c or "").lower()
+        if not cl:
+            return True
+        return any(p in cl for p in NEGATIVE_PATTERNS)
 
-    tool_call = _parse_hermes_tool_call(content)
+    for h in session.get("msgs",[])[-12:]:
+        if not isinstance(h,dict) or h.get("role") not in ("user","assistant"):
+            continue
+        c = h.get("content","")
+        # [Fix B] Saltar respuestas negativas del assistant que ensenan a Qwen
+        # a rendirse en vez de emitir tool_calls. Conservamos el mensaje del
+        # usuario previo para mantener contexto conversacional.
+        if h.get("role") == "assistant" and _is_negative_assistant(c):
+            continue
+        # Truncar msg individual solo si es absurdo (>1500 chars).
+        # Recortamos al final (mas reciente) si el total se pasa del budget.
+        if len(c) > 1500:
+            c = c[:1490] + "…"
+        history_msgs.append({"role": h["role"], "content": c})
+        total_chars += len(c)
+    # Si nos pasamos del budget, descartar los más viejos
+    while total_chars > CHAR_BUDGET and history_msgs:
+        removed = history_msgs.pop(0)
+        total_chars -= len(removed["content"])
+    msgs.extend(history_msgs)
+    msgs.append({"role":"user","content":message})
+    # [Fix A] Pasar tools nativas a Qwen para que pueda emitir tool_calls en
+    # formato OpenAI-native (sin esto, el LLM solo ve el prompt textual y
+    # responde en lenguaje natural con "no tengo información...").
+    # El parser textual (_parse_hermes_tool_call) sigue como fallback para
+    # el caso en que Qwen emita JSON suelto dentro del content.
+    os_tools = _os_tools_openai()
+    response = await _call_qwen(msgs, max_tokens=500, tools=os_tools)
+    content = response.get("content", "").strip()
+    native_tool_calls = response.get("tool_calls", []) or []
+    # [DIAG] log para ver qué formato usa Qwen en su 1er reply
+    try:
+        tc_preview = ""
+        if native_tool_calls:
+            tc_preview = " native_tc=" + json.dumps(native_tool_calls, ensure_ascii=False)[:240]
+        logger.info("[EVA_DIAG] 1st_llm_content_len=%d preview=%r%s", len(content), content[:300], tc_preview)
+    except Exception:
+        pass
+
+    # Prioridad 1: tool_calls nativos de OpenAI
+    tool_call = None
+    if native_tool_calls:
+        tc0 = native_tool_calls[0]
+        fn = tc0.get("function", {}) if isinstance(tc0, dict) else {}
+        name = fn.get("name", "")
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if name:
+            tool_call = {"name": name, "arguments": args or {}}
+
+    # Prioridad 2: parser textual Hermes (fallback)
+    if not tool_call:
+        tool_call = _parse_hermes_tool_call(content)
+
+    # [Fix D] Retry con tool_choice="required": si el primer call respondio
+    # en texto natural pero MENCION un tool por nombre (caso clasico: "puedo
+    # usar search_events..."), forzamos un re-intento que SI emita tool_call.
+    # Solo si el mensaje del usuario parece pedir informacion concreta.
+    if not tool_call and content:
+        intro_low = content.lower()
+        info_request_markers = (
+            "cuantos", "cuantas", "cuántos", "cuántas", "dime", "muestra",
+            "muéstrame", "hubo", "cuál", "cual", "que paso", "qué pasó",
+            "resumen", "diario", "alerta", "pico",
+        )
+        user_low = (message or "").lower()
+        is_info_request = any(m in user_low for m in info_request_markers)
+        # Buscar si content menciona nombres de tools reales
+        known_tool_names = set(_OS_TOOL_DEFINITIONS.keys())
+        mentioned_tools = [t for t in known_tool_names if t in intro_low]
+        if is_info_request and mentioned_tools:
+            logger.info("[EVA_DIAG] retry_required: content menciona %s sin emitir tc",
+                        ",".join(mentioned_tools[:3]))
+            try:
+                retry = await _call_qwen(msgs, max_tokens=500, tools=os_tools, tool_choice="required")
+                retry_tcs = retry.get("tool_calls", []) or []
+                retry_content = retry.get("content", "").strip()
+                logger.info("[EVA_DIAG] retry_result: tool_calls=%d content_len=%d",
+                            len(retry_tcs), len(retry_content))
+                if retry_tcs:
+                    tc0 = retry_tcs[0]
+                    fn = tc0.get("function", {}) if isinstance(tc0, dict) else {}
+                    rn = fn.get("name", "")
+                    ra = fn.get("arguments", {})
+                    if isinstance(ra, str):
+                        try: ra = json.loads(ra)
+                        except Exception: ra = {}
+                    if rn:
+                        tool_call = {"name": rn, "arguments": ra or {}}
+                        content = retry_content or content  # mantener content del retry si no es None
+                else:
+                    # intento Hermes parser sobre el retry content tambien
+                    tc_text = _parse_hermes_tool_call(retry_content)
+                    if tc_text:
+                        tool_call = tc_text
+                        content = retry_content
+            except Exception as e:
+                logger.warning("[EVA_DIAG] retry_required fallo: %s", e)
+
+    try:
+        logger.info("[EVA_DIAG] parsed_tool_call=%s", "NONE" if not tool_call else tool_call.get("name"))
+    except Exception:
+        pass
     if tool_call:
         tool_name = tool_call.get("name", "")
         tool_args = tool_call.get("arguments", {})
@@ -2284,20 +2551,52 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
             _store_tool_full(session, tool_name, result)
             biz = ud.get('business_name','')
             biz_type = session.get('business_type','')
+            # [Fix C] Reescrito: Eva es asistente del NEGOCIO (no solo seguridad).
+            # Refuerzo explícito de que el resultado del tool ES la verdad y
+            # "0" es una respuesta válida, NO un error que requiera disculparse.
             final_sys_p = (
-                f"Eres Eva, asistente de seguridad de OjoIA en República Dominicana.\n"
-                f"Dueño: {session.get('owner_name','el dueño')}\n"
-                f"Negocio: {biz} ({biz_type})\n\n"
-                f"=== RESULTADO DE HERRAMIENTA ===\n{tool_result_msg}\n\n"
-                f"Responde al usuario de forma natural con estos datos. Sé específico y útil."
+                f"Eres Eva, asistente del negocio de {session.get('owner_name','el dueño')} "
+                f"({biz} — {biz_type}) en República Dominicana.\n\n"
+                f"=== RESULTADO DE HERRAMIENTA ({tool_name}) ===\n{tool_result_msg}\n\n"
+                f"=== REGLAS DE RESPUESTA ===\n"
+                f"- El resultado de la herramienta ES la verdad. Úsalo literalmente.\n"
+                f"- Si dice found=0, total=0 o events=[]: dilo como 'Detecté 0 ... hoy'. "
+                f"NO digas 'no tengo información' ni te disculpes: 0 es una respuesta válida.\n"
+                f"- NO agregues datos que no estén en el resultado.\n"
+                f"- NO menciones que 'usaste una herramienta': responde al usuario directamente.\n"
+                f"- Responde en español dominicano, máx 4 frases, natural y directo.\n"
+                f"- NO ofrezcas 'buscar eventos' como alternativa: ya buscaste.\n"
             )
             final_msgs = [{"role":"system","content":final_sys_p}]
-            for h in session.get("msgs",[])[-3:]:
-                if isinstance(h,dict) and "role" in h and h.get("role") in ("user","assistant"):
-                    final_msgs.append({"role":h["role"],"content":h.get("content","")[:1200]})
+            # v13: pasar mismos 12 msgs de contexto para que Eva pueda referenciar
+            # la pregunta del usuario sin perder el hilo conversacional.
+            # [Fix B] Saltar respuestas negativas del assistant (mismo filtro de arriba).
+            for h in session.get("msgs",[])[-12:]:
+                if not isinstance(h,dict) or h.get("role") not in ("user","assistant"):
+                    continue
+                c = h.get("content","")
+                if h.get("role") == "assistant" and _is_negative_assistant(c):
+                    continue
+                if len(c) > 1500:
+                    c = c[:1490] + "…"
+                final_msgs.append({"role":h["role"],"content":c})
             final_msgs.append({"role":"user","content":message})
             final = await _call_qwen(final_msgs, max_tokens=400)
-            text = final.get("content", "").strip() or result.get("text", f"No pude procesarlo, {first}.")
+            text = final.get("content", "").strip()
+            # [DIAG] log del 2do LLM call (respuesta final) para depurar
+            try:
+                logger.info("[EVA_DIAG] 2nd_llm_final_text_len=%d preview=%r", len(text), text[:240])
+            except Exception:
+                pass
+            # [Fix C2] Preferir el `text` preformado por el tool si el LLM cayo en
+            # "no tengo info"/"puedo buscar" a pesar del resultado. Si pasa 2 veces,
+            # caemos al texto del tool que SIEMPRE dice "Detecté N ..." (estilo consistente).
+            tool_text = (result.get("text") or "").strip() if isinstance(result, dict) else ""
+            if text and _is_negative_assistant(text):
+                logger.info("[EVA_DIAG] 2nd_llm_negative Detected, falling back to tool_text")
+                text = tool_text or text
+            if not text:
+                text = tool_text or f"No pude procesarlo, {first}."
             session["msgs"].append({"role":"assistant","content":text})
             _sessions[session_id] = session
             return _mk_resp(session, text, suggestions=suggestions, events_found=result.get("events", []))
@@ -2795,6 +3094,57 @@ _OS_TOOL_DEFINITIONS = {
         "parameters": {},
     },
 }
+
+# Cache del formato OpenAI tools generado a partir de _OS_TOOL_DEFINITIONS.
+# Qwen/Hermes-native responde con tool_calls nativos al estilo OpenAI sólo
+# cuando se pasa `tools=` en el payload. Sin esto, el LLM no sabe qué tools
+# existen y responde en lenguaje natural ("no tengo información...").
+_OS_TOOLS_OPENAI_CACHE: list = []
+
+
+def _os_tools_openai() -> list:
+    """Convierte _OS_TOOL_DEFINITIONS al formato OpenAI tools=
+    (lista de {type:'function', function:{name,description,parameters}}).
+    Generado una sola vez y cacheado."""
+    if _OS_TOOLS_OPENAI_CACHE:
+        return _OS_TOOLS_OPENAI_CACHE
+    out = []
+    for name, spec in _OS_TOOL_DEFINITIONS.items():
+        params = spec.get("parameters", {}) or {}
+        properties = {}
+        required = []
+        for k, v in params.items():
+            # v viene como string de tipo o dict; normalizar a OpenAI schema
+            if isinstance(v, dict):
+                properties[k] = v
+                if v.get("required"):
+                    required.append(k)
+            else:
+                t = (v or "string").lower()
+                ot = "string"
+                if t in ("integer", "int", "number"):
+                    ot = "integer"
+                elif t in ("object", "dict"):
+                    ot = "object"
+                elif t in ("array", "list"):
+                    ot = "array"
+                elif t in ("boolean", "bool"):
+                    ot = "boolean"
+                properties[k] = {"type": ot}
+        schema = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec.get("description", ""),
+                "parameters": schema,
+            },
+        })
+    _OS_TOOLS_OPENAI_CACHE.extend(out)
+    return _OS_TOOLS_OPENAI_CACHE
+
 
 def _get_business_suggestions_list(biz_type, cam_count, first):
     base = [f"👥 {first}, ¿cuántas personas hay?","🚨 ¿Viste algo sospechoso?","📊 Últimos análisis del diario","📋 Resumen del día","⚙️ Ajustar protección"]
