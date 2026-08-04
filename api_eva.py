@@ -5241,6 +5241,51 @@ async def admin_disks_add(request: dict, authorization: str = Header(None)):
     return {"success": True}
 
 
+@app.get("/admin/logs")
+async def admin_logs(authorization: str = Header(None), limit: int = 200, tail: int = 120):
+    # [Fix] Endpoint que el SPA admin llama (loadLogs -> /admin/logs?limit=200&tail=120)
+    # pero no existia -> 404 y la pestaña Logs quedaba rota. Devuelve:
+    #   audit_logs: entradas de /home/sam/storage/admin_logs/*.jsonl (ts,action,actor,target,data)
+    #   api_tail:    ultimas N lineas de api_eva.log (archivo grande -> solo la cola)
+    _verify_admin(authorization)
+    audit = []
+    logs_dir = STORAGE_ROOT / "admin_logs"
+    if logs_dir.is_dir():
+        for fp in logs_dir.glob("*.jsonl"):
+            try:
+                with open(fp) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            audit.append(json.loads(line))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    # Mas recientes primero
+    audit.sort(key=lambda x: x.get("ts", ""), reverse=True)
+    n_tail = max(1, tail)
+    audit = audit[:n_tail]
+    if limit and limit < len(audit):
+        audit = audit[:limit]
+    # Cola del log del API (archivo puede ser grande; leer solo el final)
+    api_tail = []
+    api_log = STORAGE_ROOT / "api_eva.log"
+    if api_log.is_file():
+        try:
+            size = api_log.stat().st_size
+            chunk = min(size, 200_000)
+            with open(api_log, "rb") as f:
+                f.seek(max(0, size - chunk))
+                data = f.read().decode("utf-8", errors="ignore")
+            api_tail = data.splitlines()[-n_tail:]
+        except Exception:
+            pass
+    return {"audit_logs": audit, "api_tail": api_tail}
+
+
 @app.post("/admin/disks/remove")
 async def admin_disks_remove(request: dict, authorization: str = Header(None)):
     _verify_admin(authorization)
