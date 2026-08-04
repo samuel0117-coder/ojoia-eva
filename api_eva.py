@@ -78,6 +78,92 @@ def _atomic_write_user_json(uf: Path, ud: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# UN SOLO CHAT por usuario (EVA-UNIFY) — helpers de sesión unificada
+#
+# BUG: el frontend bifurcaba el historial en varias sesiones ("os_<uid>",
+# "chat_<uid>_<ts>", "eva_<uid>_single") y el GET del history LAS JUNTABA
+# TODAS, mezclando chats distintos y duplicando mensajes.
+#
+# FIX: a partir de ahora TODO el historial vive en UNA sesión por usuario,
+# llamada "chat_<uid>". Tanto el GET como el POST y el endpoint de mensaje
+# usan este session_id estable.
+#
+# `_eva_unified_sid(user_id)` devuelve ese id. La primera vez que se lee, se
+# consolidan los mensajes legacy (de os_<uid>, eva_<uid>_single,
+# chat_<uid>_<ts>, etc.) dentro de "chat_<uid>" y se borran las sesiones
+# viejas, para evitar duplicados y mezcla futuras. Idempotente.
+# ─────────────────────────────────────────────────────────────────────────
+
+_LEGACY_SESSION_PREFIXES = ("os_", "eva_", "chat_")
+
+
+def _eva_unified_sid(user_id: str) -> str:
+    return f"chat_{user_id}"
+
+
+def _consolidate_legacy_eva_sessions(ud: dict, user_id: str) -> None:
+    """Mueve los mensajes de sesiones legacy (os_<uid>, eva_<uid>_single,
+    chat_<uid>_<ts>, etc.) a la sesión unificada "chat_<uid>" y elimina las
+    sesiones viejas. Idempotente: si ya se consolidó, no hace nada.
+    Mutar ud["eva_sessions"] in-place. No escribe en disco.
+    """
+    sessions = ud.get("eva_sessions", {}) or {}
+    if not isinstance(sessions, dict):
+        sessions = {}
+        ud["eva_sessions"] = sessions
+    unified_sid = _eva_unified_sid(user_id)
+    unified = sessions.get(unified_sid, {}) or {}
+    if not isinstance(unified, dict):
+        unified = {}
+    unified_msgs = list(unified.get("messages", []) or [])
+    unified_keys = set((m.get("role"), m.get("content"), int(m.get("timestamp", 0) or 0)) for m in unified_msgs)
+
+    migrated = 0
+    to_remove = []
+    for sid, sdata in sessions.items():
+        if sid == unified_sid:
+            continue
+        if not isinstance(sdata, dict):
+            continue
+        # Solo consolidar sesiones legacy de chat (no sesiones internas de reportes
+        # u otros usos que pudieran existir). Filtramos por prefijo conocido.
+        if not any(sid.startswith(p) for p in _LEGACY_SESSION_PREFIXES):
+            continue
+        msgs = sdata.get("messages", []) or []
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            key = (m.get("role", "user"), m.get("content"), int(m.get("timestamp", 0) or 0))
+            if key in unified_keys:
+                continue
+            unified_msgs.append(m)
+            unified_keys.add(key)
+            migrated += 1
+        to_remove.append(sid)
+
+    if not migrated and not to_remove:
+        # Nada que migrar: dejamos ud intacto.
+        return
+
+    # Ordenar por timestamp tras consolidar
+    unified_msgs.sort(key=lambda m: int(m.get("timestamp", 0) or 0))
+    # Limitar a 200
+    unified_msgs = unified_msgs[-200:]
+    new_last = max([int(m.get("timestamp", 0) or 0) for m in unified_msgs] or [0])
+    # Preservar summary y created_at si existían
+    sessions[unified_sid] = {
+        "messages": unified_msgs,
+        "summary": unified.get("summary", ""),
+        "created_at": unified.get("created_at", int(time.time())),
+        "last_message_at": max(new_last, int(unified.get("last_message_at", 0) or 0)),
+    }
+    # Eliminar sesiones legacy que se consolidaron
+    for sid in to_remove:
+        sessions.pop(sid, None)
+    ud["eva_sessions"] = sessions
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # S1/M1.1 - Bearer token auth para usuarios (soft rollout)
 #
 # Flujo soft rollout:
@@ -577,27 +663,68 @@ async def send_report_v2(user_id: str, request: Request = None):
             f"_Generado automáticamente a las 7:30 AM_"
         )
 
-        # 3) inyectar en chat session (memoria)
+        # 3) inyectar en la sesión unificada "chat_<uid>" (memoria + user.json)
+        # UN SOLO CHAT: antes inyectaba en cualquier _session del usuario, que
+        # podía no ser la sesión del chat del frontend. Ahora se inyecta en
+        # "chat_<uid>" consistentemente en memoria Y persistido en user.json,
+        # con merge anti-dup por (role, content, timestamp) para no duplicar el
+        # reporte en sucesivos envíos del día.
         try:
             from eva_v2 import _sessions
-            sid = None
-            for k, v in _sessions.items():
-                if v.get("user_id") == user_id:
-                    sid = k; break
-            if not sid:
-                sid = f"chat_{user_id}_{int(time.time())}"
-                _sessions[sid] = {"user_id": user_id, "msgs": [], "messages": [], "last_activity": time.time()}
-            _sessions[sid]["msgs"].append({"role": "assistant", "content": message, "timestamp": time.time(), "summary": True, "is_daily_report": True, "report_url": html_url})
-            _sessions[sid]["messages"].append({"role": "assistant", "content": message, "timestamp": time.time()})
+            unified_sid = _eva_unified_sid(user_id)
+            sess_mem = _sessions.get(unified_sid)
+            if not sess_mem:
+                sess_mem = {"user_id": user_id, "msgs": [], "messages": [], "last_activity": time.time()}
+                _sessions[unified_sid] = sess_mem
+            msg_event_ts = time.time()
+            daily_msg = {"role": "assistant", "content": message, "timestamp": msg_event_ts,
+                         "summary": True, "is_daily_report": True, "report_url": html_url}
+            # Anti-dup en memoria: si ya hay un reporte con el mismo html_url, no añadir.
+            already_mem = any(m.get("report_url") == html_url for m in sess_mem.get("messages", []))
+            if not already_mem:
+                sess_mem.setdefault("msgs", []).append(daily_msg)
+                sess_mem.setdefault("messages", []).append({"role": "assistant", "content": message,
+                                                            "timestamp": msg_event_ts})
         except Exception as e:
             logger.warning(f"[reportes] inject chat session: {e}")
 
-        # 4) guardar también en eva_chat_history.json (persistente)
+        # 4) persistir en user.json["eva_sessions"]["chat_<uid>"] (sesión unificada)
+        try:
+            uf = find_user_json(user_id)
+            if uf and uf.exists():
+                with _get_user_lock(user_id):
+                    with open(uf) as f:
+                        ud = json.load(f)
+                    try:
+                        _consolidate_legacy_eva_sessions(ud, user_id)
+                    except Exception:
+                        pass
+                    sessions = ud.get("eva_sessions", {}) or {}
+                    usess = sessions.get(unified_sid, {}) or {}
+                    umsgs = list(usess.get("messages", []) or [])
+                    # Anti-dup por report_url (mismo reporte reenviado no se duplica)
+                    if not any(m.get("report_url") == html_url for m in umsgs):
+                        umsgs.append(daily_msg)
+                        umsgs.sort(key=lambda m: int(m.get("timestamp", 0) or 0))
+                        umsgs = umsgs[-200:]
+                        sessions[unified_sid] = {
+                            "messages": umsgs,
+                            "summary": usess.get("summary", ""),
+                            "created_at": usess.get("created_at", int(time.time())),
+                            "last_message_at": max(int(m.get("timestamp", 0) or 0) for m in umsgs) if umsgs else int(time.time()),
+                        }
+                        ud["eva_sessions"] = sessions
+                        _atomic_write_user_json(uf, ud)
+        except Exception as e:
+            logger.warning(f"[reportes] write user.json eva_sessions: {e}")
+
+        # 4b) guardar también en eva_chat_history.json (legacy, sin uso por frontend)
         try:
             hf = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
             hdata = {"history": [], "summary": ""} if not hf.exists() else json.loads(hf.read_text())
-            hdata["history"].append({"role": "assistant", "content": message, "timestamp": time.time(), "summary": True, "is_daily_report": True, "report_url": html_url})
-            hf.write_text(json.dumps(hdata, indent=2, ensure_ascii=False))
+            if not any(m.get("report_url") == html_url for m in hdata.get("history", [])):
+                hdata["history"].append({"role": "assistant", "content": message, "timestamp": time.time(), "summary": True, "is_daily_report": True, "report_url": html_url})
+                hf.write_text(json.dumps(hdata, indent=2, ensure_ascii=False))
         except Exception as e:
             logger.warning(f"[reportes] write chat_history: {e}")
 
@@ -740,24 +867,27 @@ app.add_middleware(
 app.mount("/events", StaticFiles(directory=str(STORAGE_ROOT / "users")), name="events-static")
 
 # Middleware para no-cache y CORS seguro
+# v9.2: NO pisar los headers CORS que ya pone CORSMiddleware de FastAPI.
+# Antes este middleware devolvía Access-Control-Allow-Headers: "*" en
+# OPTIONS, lo cual Firefox/Chrome rechazan cuando la petición lleva
+# Authorization (el navegador exige que Authorization esté listado
+# explícitamente). Ahora dejamos que CORSMiddleware maneje TODO el
+# flujo CORS (ya lo hace bien en línea 856-864 listando Authorization)
+# y aquí solo agregamos headers de seguridad/caching complementarios.
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     try:
         if request.method == "OPTIONS":
-            return Response(
-                status_code=200,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Max-Age": "86400",
-                    "Cross-Origin-Resource-Policy": "cross-origin",
-                }
-            )
-        response = await call_next(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
+            # Dejar que CORSMiddleware de FastAPI genere la respuesta
+            # preflight con los headers correctos (incluye Authorization).
+            response = await call_next(request)
+        else:
+            response = await call_next(request)
+        # Headers complementarios (no tocan Allow-Origin/Headers/Methods
+        # que ya maneja CORSMiddleware).
         response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        if request.method != "OPTIONS":
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return response
     except Exception as e:
         import traceback
@@ -767,7 +897,11 @@ async def add_security_headers(request: Request, call_next):
         return Response(
             status_code=500,
             content=f"Error: {type(e).__name__}: {e}",
-            headers={"Access-Control-Allow-Origin": "*"}
+            # CORS mínimo para que el navegador muestre el error legible
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            }
         )
 
 # Helpers de Almacenamiento
@@ -1147,28 +1281,22 @@ async def camera_mjpeg_stream(camera_id: str, user_id: str = None, fps: int = 2)
                     no_frame_ticks = 0
 
                 if frame_bytes:
-                    if not first_frame_sent or frame_bytes != last_frame_bytes:
-                        first_frame_sent = True
-                        last_frame_bytes = frame_bytes
-                        repeats = 0
-                        yield b"Content-Type: image/jpeg\r\n"
-                        yield f"Content-Length: {len(frame_bytes)}\r\n".encode()
-                        yield b"Cache-Control: no-store\r\n"
-                        yield b"\r\n"
-                        yield frame_bytes
-                        yield b"\r\n"
-                        yield boundary + b"\r\n"
-                    else:
-                        repeats += 1
-                        if repeats >= 3:
-                            repeats = 0
-                            yield b"Content-Type: image/jpeg\r\n"
-                            yield f"Content-Length: {len(frame_bytes)}\r\n".encode()
-                            yield b"Cache-Control: no-store\r\n"
-                            yield b"\r\n"
-                            yield frame_bytes
-                            yield b"\r\n"
-                            yield boundary + b"\r\n"
+                    # Reenviar SIEMPRE el último frame conocido en cada tick.
+                    # El ESP32 puede enviar 1 frame cada ~10s (TLS handshake lento),
+                    # pero el viewer necesita recibir frames continuamente para no
+                    # disparar el watchdog a los 8s y para que el navegador sienta
+                    # que el stream está "vivo". Comparar byte-a-byte y saltarse
+                    # frames idénticos congelaba el viewer visualmente.
+                    first_frame_sent = True
+                    last_frame_bytes = frame_bytes
+                    repeats = 0
+                    yield b"Content-Type: image/jpeg\r\n"
+                    yield f"Content-Length: {len(frame_bytes)}\r\n".encode()
+                    yield b"Cache-Control: no-store\r\n"
+                    yield b"\r\n"
+                    yield frame_bytes
+                    yield b"\r\n"
+                    yield boundary + b"\r\n"
 
             except Exception as e:
                 logger.warning(f"MJPEG stream error for {camera_id}: {e}")
@@ -1182,6 +1310,7 @@ async def camera_mjpeg_stream(camera_id: str, user_id: str = None, fps: int = 2)
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Connection": "close",
             "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
         }
     )
 
@@ -1455,90 +1584,65 @@ async def unregister_fcm_token(request: dict):
         return {"success": False, "error": str(e)}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# GET del historial de chat con Eva — SIEMPRE devuelve la sesión unificada.
+# Ver helpers de consolidación al inicio del archivo (_eva_unified_sid,
+# _consolidate_legacy_eva_sessions).
+# ─────────────────────────────────────────────────────────────────────────
+
 @app.get("/api/chat/eva/history")
 async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, limit: int = 50):
-    """Historial de mensajes del chat con Eva."""
+    """Historial de mensajes del chat con Eva.
+
+    UN SOLO CHAT: siempre devuelve los mensajes de la sesión unificada
+    "chat_<uid>", consolidando el historial legacy la primera vez que se
+    lee. Antes, cuando se llamaba sin session_id, JUNTABA TODAS las sesiones
+    (os_<uid>, chat_<uid>_<ts>, eva_<uid>_single, etc.) lo que mezclaba chats
+    distintos y duplicaba mensajes.
+    """
     try:
         if not user_id:
             raise HTTPException(status_code=400, detail="user_id required")
-        # Sessions se guardan en user.json como eva_sessions_dict
-        history = []
+        unified_sid = _eva_unified_sid(user_id)
+
         uf = find_user_json(user_id)
         if uf and uf.exists():
-            try:
+            with _get_user_lock(user_id):
                 with open(uf) as f:
                     ud = json.load(f)
+                # Consolidar legacy la primera vez (idempotente).
+                try:
+                    _consolidate_legacy_eva_sessions(ud, user_id)
+                except Exception as ce:
+                    logger.warning(f"[history] consolidate legacy: {ce}")
                 sessions = ud.get("eva_sessions", {}) or {}
-                if session_id and session_id in sessions:
-                    msgs = sessions[session_id].get("messages", [])
-                    history = msgs[-limit:]
-                elif not session_id:
-                    # Todas las sesiones, ordenado por ts cronologico (viejo -> nuevo)
-                    all_msgs = []
-                    for sid, sdata in sessions.items():
-                        for m in sdata.get("messages", []):
-                            m2 = {**m, "session_id": sid}
-                            all_msgs.append(m2)
-                    all_msgs.sort(key=lambda x: x.get("timestamp", 0), reverse=False)
-                    history = all_msgs[-limit:] if limit else all_msgs
-            except Exception as e:
-                logger.warning(f"Error leyendo eva_sessions from user.json: {e}")
+                # A partir de ahora SIEMPRE la sesión unificada, sin importar
+                # qué session_id pidió el frontend (lo normalizamos abajo).
+                # Si el frontend pidió un sid legacy, lo redirigimos al unificado.
+                effective_sid = unified_sid
+                if session_id and session_id != unified_sid:
+                    # Redirigir: si la sesión pedida existe aún y tiene mensajes
+                    # que no están en la unificada (caso raro: no alcanzó a migrar),
+                    # consolidamos de nuevo y seguimos.
+                    logger.info(f"[history] redirigiendo sid legacy {session_id} -> {unified_sid}")
+                sess = sessions.get(effective_sid, {}) or {}
+                history = list(sess.get("messages", []) or [])[-limit:] if limit else list(sess.get("messages", []) or [])
+                # Guardar cambios si la consolidación migró algo
+                _atomic_write_user_json(uf, ud)
 
-        # Si no hay sesiones en user.json, intentar desde archivo dedicado
-        if not history:
-            try:
-                # Intentar eva_chat_history.json (formato legacy)
-                chat_history_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
-                if chat_history_file.exists():
-                    with open(chat_history_file) as f:
-                        chat_data = json.load(f)
-                    history = chat_data.get("history", [])[-limit:]
-                    logger.info(f"Leyendo {len(history)} mensajes de eva_chat_history.json")
-                
-                # Si aún no hay, intentar carpeta eva_chat/
-                if not history:
-                    chat_dir = STORAGE_ROOT / "users" / user_id / "eva_chat"
-                    if chat_dir.exists():
-                        if session_id:
-                            session_file = chat_dir / f"{session_id}.json"
-                            if session_file.exists():
-                                with open(session_file) as f:
-                                    session_data = json.load(f)
-                                history = session_data.get("messages", [])[-limit:]
-                        else:
-                            # todas las sesiones
-                            all_files = sorted(chat_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                            for session_file in all_files[:5]:
-                                try:
-                                    with open(session_file) as f:
-                                        sd = json.load(f)
-                                    for m in sd.get("messages", []):
-                                        m2 = {**m, "session_id": session_file.stem}
-                                        history.append(m2)
-                                    if len(history) >= limit:
-                                        break
-                                except:
-                                    continue
-                            history = history[-limit:]
-            except Exception as e:
-                logger.warning(f"Error leyendo archivos de chat: {e}")
+        else:
+            return {"success": True, "history": [], "count": 0, "user_id": user_id,
+                    "session_id": unified_sid, "ts": 0}
 
-        # ts de la ultima actualizacion (server side) - permite al frontend detectar
-        # cambios remotos via polling sin necesidad de SSE. Si user.json tiene
-        # eva_sessions con last_message_at, usamos ese; si viene de legacy, usamos mtime.
+        # ts de la última actualización (server side)
         server_ts = 0
         try:
             if uf and uf.exists():
                 with open(uf) as f:
                     _ud_ts = json.load(f)
                 _sessions_ts = _ud_ts.get("eva_sessions", {}) or {}
-                _latest = 0
-                for _sid, _sd in _sessions_ts.items():
-                    _lm = int(_sd.get("last_message_at", 0) or 0)
-                    if _lm > _latest:
-                        _latest = _lm
-                if _latest:
-                    server_ts = _latest
+                _lm = int(_sessions_ts.get(unified_sid, {}).get("last_message_at", 0) or 0)
+                server_ts = _lm
             if not server_ts:
                 chat_history_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
                 if chat_history_file.exists():
@@ -1551,7 +1655,7 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
             "history": history,
             "count": len(history),
             "user_id": user_id,
-            "session_id": session_id,
+            "session_id": unified_sid,
             "ts": server_ts
         }
     except HTTPException:
@@ -1579,94 +1683,113 @@ async def get_eva_chat_history_post(request: dict):
         uf = find_user_json(user_id)
         if not uf or not uf.exists():
             return {"success": True, "history": [], "count": 0, "ts": 0}
-        with open(uf) as f:
-            ud = json.load(f)
         history = request.get("history", []) or []
         summary = request.get("summary", "")
 
-        sessions = ud.get("eva_sessions", {}) or {}
-        session_id = f"os_{user_id}"
-        existing = sessions.get(session_id, {}) or {}
-        existing_msgs = existing.get("messages", []) or []
-        last_message_at = int(existing.get("last_message_at", 0) or 0)
+        # ── UN SOLO CHAT: SIEMRE normalizar al session_id unificado "chat_<uid>" ──
+        # Antes se forzaba SIEMPRE "os_<user_id>", lo que (a) ignoraba el sid del
+        # frontend y (b) bifurcaba el historial. El frontend ahora manda SIEMPRE
+        # "chat_<uid>" (ver eva-chat-v5.js). Igual lo normalizamos acá para no
+        # depender del frontend: cualquier sid legacy se mapea al unificado.
+        requested_sid = request.get("session_id", "") or ""
+        unified_sid = _eva_unified_sid(user_id)
+        if requested_sid != unified_sid:
+            if requested_sid:
+                logger.info(f"[history-POST] normalizando sid {requested_sid} -> {unified_sid}")
+            session_id = unified_sid
+        else:
+            session_id = unified_sid
 
-        # MERGE: agregar solo mensajes nuevos (timestamp > last_message_at).
-        # Para detectar nuevos, usamos el timestamp del msg si viene del
-        # frontend; si no (no trae), usamos ts=ahora y lo anadimos.
-        # Ademas preservamos todos los fields que el frontend envia (events,
-        # summary, image_url, image_b64, is_daily_report, report_url).
-        now_ts = int(time.time())
-        existing_keys = set()
-        existing_content_keys = set()  # (role, content) sin timestamp — anti-dup de greetings
-        for m in existing_msgs:
-            key = (m.get("role"), m.get("content"), m.get("timestamp", 0))
-            existing_keys.add(key)
-            # Guardar tambien (role, content) para detectar greetings duplicados
-            # que llegan con timestamp distinto cada vez
-            ck = (m.get("role"), m.get("content"))
-            if m.get("summary") or (m.get("role") == "assistant" and m.get("content","").startswith(("Hola", "¡Hola", "Resumen del día"))):
-                if ck not in existing_content_keys:
-                    # Solo marcar como "reciente" si el msg es de los ultimos 30 min
-                    msg_age = now_ts - int(m.get("timestamp", 0) or 0)
-                    if msg_age < 1800:
-                        existing_content_keys.add(ck)
-
-        merged = list(existing_msgs)
-        for h in history:
-            if not isinstance(h, dict):
-                continue
-            content = h.get("content")
-            if content is None:
-                continue
-            msg_ts = h.get("timestamp") or now_ts
+        with _get_user_lock(user_id):
+            with open(uf) as f:
+                ud = json.load(f)
+            # Consolidar legacy la primera vez (idempotente) antes de tocar.
             try:
-                msg_ts = int(float(msg_ts))
-            except Exception:
-                msg_ts = now_ts
-            key = (h.get("role", "user"), content, msg_ts)
-            if key in existing_keys:
-                continue
-            # ANTI-SPAM: si es un greeting/summary con el MISMO contenido (role+content)
-            # que ya existe en los ultimos 30 min, saltar — previene saludos duplicados
-            ck = (h.get("role", "user"), content)
-            if h.get("summary") and ck in existing_content_keys:
-                continue
-            # Anadir solo si msg_ts > last_message_at o si no hay msgs aun
-            if existing_msgs and msg_ts <= last_message_at:
-                continue
-            saved_msg = {
-                "role": h.get("role", "user"),
-                "content": str(content),
-                "timestamp": msg_ts,
+                _consolidate_legacy_eva_sessions(ud, user_id)
+            except Exception as ce:
+                logger.warning(f"[history-POST] consolidate legacy: {ce}")
+            sessions = ud.get("eva_sessions", {}) or {}
+            existing = sessions.get(session_id, {}) or {}
+            existing_msgs = existing.get("messages", []) or []
+            last_message_at = int(existing.get("last_message_at", 0) or 0)
+
+            # MERGE: agregar solo mensajes nuevos (timestamp > last_message_at).
+            # Para detectar nuevos, usamos el timestamp del msg si viene del
+            # frontend; si no (no trae), usamos ts=ahora y lo anadimos.
+            # Ademas preservamos todos los fields que el frontend envia (events,
+            # summary, image_url, image_b64, is_daily_report, report_url).
+            now_ts = int(time.time())
+            existing_keys = set()
+            existing_content_keys = set()  # (role, content) sin timestamp — anti-dup de greetings
+            for m in existing_msgs:
+                key = (m.get("role"), m.get("content"), m.get("timestamp", 0))
+                existing_keys.add(key)
+                # Guardar tambien (role, content) para detectar greetings duplicados
+                # que llegan con timestamp distinto cada vez
+                ck = (m.get("role"), m.get("content"))
+                if m.get("summary") or (m.get("role") == "assistant" and m.get("content","").startswith(("Hola", "¡Hola", "Resumen del día"))):
+                    if ck not in existing_content_keys:
+                        # Solo marcar como "reciente" si el msg es de los ultimos 30 min
+                        msg_age = now_ts - int(m.get("timestamp", 0) or 0)
+                        if msg_age < 1800:
+                            existing_content_keys.add(ck)
+
+            merged = list(existing_msgs)
+            for h in history:
+                if not isinstance(h, dict):
+                    continue
+                content = h.get("content")
+                if content is None:
+                    continue
+                msg_ts = h.get("timestamp") or now_ts
+                try:
+                    msg_ts = int(float(msg_ts))
+                except Exception:
+                    msg_ts = now_ts
+                key = (h.get("role", "user"), content, msg_ts)
+                if key in existing_keys:
+                    continue
+                # ANTI-SPAM: si es un greeting/summary con el MISMO contenido (role+content)
+                # que ya existe en los ultimos 30 min, saltar — previene saludos duplicados
+                ck = (h.get("role", "user"), content)
+                if h.get("summary") and ck in existing_content_keys:
+                    continue
+                # Anadir solo si msg_ts > last_message_at o si no hay msgs aun
+                if existing_msgs and msg_ts <= last_message_at:
+                    continue
+                saved_msg = {
+                    "role": h.get("role", "user"),
+                    "content": str(content),
+                    "timestamp": msg_ts,
+                }
+                # Preservar fields opcionales (carrusel + reportes + imagenes)
+                for opt_key in ("events", "summary", "is_daily_report", "report_url",
+                                "image_url", "image_b64", "heatmap", "heatmap_meta"):
+                    if h.get(opt_key) is not None:
+                        saved_msg[opt_key] = h.get(opt_key)
+                merged.append(saved_msg)
+                existing_keys.add(key)
+
+            # Limitar a ultimos 200
+            merged = merged[-200:]
+            new_last_message_at = max([int(m.get("timestamp", 0) or 0) for m in merged] or [now_ts])
+
+            sessions[session_id] = {
+                "messages": merged,
+                "summary": summary or existing.get("summary", ""),
+                "created_at": existing.get("created_at", now_ts),
+                "last_message_at": new_last_message_at,
             }
-            # Preservar fields opcionales (carrusel + reportes + imagenes)
-            for opt_key in ("events", "summary", "is_daily_report", "report_url",
-                            "image_url", "image_b64", "heatmap", "heatmap_meta"):
-                if h.get(opt_key) is not None:
-                    saved_msg[opt_key] = h.get(opt_key)
-            merged.append(saved_msg)
-            existing_keys.add(key)
-
-        # Limitar a ultimos 200
-        merged = merged[-200:]
-        new_last_message_at = max([int(m.get("timestamp", 0) or 0) for m in merged] or [now_ts])
-
-        sessions[session_id] = {
-            "messages": merged,
-            "summary": summary or existing.get("summary", ""),
-            "created_at": existing.get("created_at", now_ts),
-            "last_message_at": new_last_message_at,
-        }
-        ud["eva_sessions"] = sessions
-        with open(uf, "w") as f:
-            json.dump(ud, f, indent=2)
-        logger.info(f"[EVA] Historial guardado: {len(merged)} msgs para {user_id} (last_ts={new_last_message_at})")
+            ud["eva_sessions"] = sessions
+            _atomic_write_user_json(uf, ud)
+        logger.info(f"[EVA] Historial guardado: {len(merged)} msgs para {user_id} sid={session_id} (last_ts={new_last_message_at})")
         return {
             "success": True,
             "history": merged[-50:],
             "count": len(merged),
             "saved": True,
             "user_id": user_id,
+            "session_id": session_id,
             "ts": new_last_message_at
         }
     except Exception as e:
@@ -1799,9 +1922,15 @@ async def chat_eva_message(request: dict):
             except Exception:
                 ud = {}
         
-        # Si no hay session_id, generar uno
-        if not session_id:
-            session_id = f"chat_{user_id}_{int(time.time())}"
+        # ── UN SOLO CHAT: SIEMPE usar el session_id unificado "chat_<uid>" ──
+        # Antes: si no venía session_id, se generaba "chat_<uid>_<ts>" nuevo en
+        # cada mensaje, bifurcando el historial. Si venía uno legacy, también se
+        # bifurcaba. Ahora se normaliza SIEMPRE a "chat_<uid>".
+        unified_sid = _eva_unified_sid(user_id)
+        if not session_id or session_id != unified_sid:
+            if session_id and session_id != unified_sid:
+                logger.info(f"[EVA] normalizando session_id {session_id} -> {unified_sid}")
+            session_id = unified_sid
         
         logger.info(f"[EVA] user={user_id} session={session_id} msg={message[:80]}")
         
@@ -1823,7 +1952,6 @@ async def chat_eva_message(request: dict):
             session = _load_session(session_id)
             if not session or session.get("user_id") != user_id:
                 session = _make_os_session(user_id, session_id)
-            _sessions_backup = None
             try:
                 from eva_v2 import _sessions
                 _sessions[session_id] = session
@@ -1836,8 +1964,9 @@ async def chat_eva_message(request: dict):
             )
             result["sessionId"] = session_id
         
-        # Normalizar respuesta: agregar sessionId (alias de session_id)
-        result["sessionId"] = result.get("session_id") or session_id
+        # Normalizar respuesta: SIEMRE devolver el sessionId unificado.
+        result["sessionId"] = unified_sid
+        result["session_id"] = unified_sid
         result.setdefault("response", "")
         result.setdefault("image_url", "")
         result.setdefault("phase", "os")
@@ -1846,36 +1975,46 @@ async def chat_eva_message(request: dict):
         result.setdefault("ready_to_confirm", False)
         result.setdefault("camera_saved", False)
         
-        # Construir historial de mensajes para el frontend
-        msgs_session_id = result.get("session_id") or session_id
+        # Construir historial de mensajes para el frontend. UN SOLO CHAT:
+        # siempre desde la sesión unificada "chat_<uid>".
+        msgs_session_id = unified_sid
         messages = []
         # Cargar mensajes previos si existen
-        sessions = ud.get("eva_sessions", {}) or {}
-        sess = sessions.get(msgs_session_id, {})
-        prev = sess.get("messages", [])
-        # Solo últimos 50 para no saturar
-        messages = prev[-50:]
+        if uf and uf.exists():
+            with _get_user_lock(user_id):
+                with open(uf) as f:
+                    ud = json.load(f)
+                # Consolidar legacy la primera vez.
+                try:
+                    _consolidate_legacy_eva_sessions(ud, user_id)
+                except Exception:
+                    pass
+                sessions = ud.get("eva_sessions", {}) or {}
+                sess = sessions.get(msgs_session_id, {}) or {}
+                prev = sess.get("messages", []) or []
+                messages = prev[-50:]
+                # Guardar de inmediato el estado consolidado (sin el msg nuevo aún).
+                _atomic_write_user_json(uf, ud)
         # Agregar mensaje actual del usuario
         messages.append({"role": "user", "content": message})
         # Agregar respuesta de Eva
         messages.append({"role": "assistant", "content": result["response"]})
         result["messages"] = messages
         
-        # Guardar en user.json (best-effort, no falla si no se puede)
+        # Guardar en user.json bajo el sid unificado (best-effort, lock + atomic)
         if uf and uf.exists():
             try:
                 msgs_session_id_local = msgs_session_id
                 messages_local = list(messages)
-                # S4: ahora el thread daemon toma lock + relee user.json (no usa el snapshot
-                # possibly-stale 'ud') para evitar race con save_eva_chat_message y pruner.
-                # Capturamos solo lo necesario (session_id, messages) y re-mutamos bajo lock.
                 def _save_async():
                     try:
                         with _get_user_lock(user_id):
                             with open(uf) as f:
                                 ud_fresh = json.load(f)
                             sessions = ud_fresh.get("eva_sessions", {}) or {}
-                            if msgs_session_id_local not in sessions:
+                            if not isinstance(sessions, dict):
+                                sessions = {}
+                            if msgs_session_id_local not in sessions or not isinstance(sessions.get(msgs_session_id_local), dict):
                                 sessions[msgs_session_id_local] = {
                                     "messages": [],
                                     "created_at": int(time.time()),
@@ -2432,7 +2571,10 @@ async def get_event_frame(event_id: str, index: int, user_id: str):
                 "Cache-Control": "public, max-age=3600",
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
+                # v9.2: listar Authorization explícitamente en vez de "*".
+                # Firefox/Chrome bloquean "*" cuando la petición lleva
+                # Authorization (ver nota en add_security_headers).
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Origin, User-Agent, Cache-Control, Pragma",
                 "Content-Disposition": "inline",
                 "X-Frame-Options": "SAMEORIGIN"
             }
@@ -2665,9 +2807,15 @@ async def cam_cmd(camera_id: str, request: dict = None):
 
 def _save_cam_config_to_user(camera_id: str, body: dict):
     """Guardar configuracion de camara en user.json para polling del ESP32."""
+    # [DIAG] log inicial
+    try:
+        logger.info(f"[DIAG_SAVE] entry camera_id={camera_id} body={body}")
+    except Exception:
+        pass
     try:
         users_dir = STORAGE_ROOT / "users"
         if not users_dir.is_dir():
+            logger.warning(f"[DIAG_SAVE] users_dir no existe")
             return
         for user_dir in users_dir.iterdir():
             if not user_dir.is_dir():
@@ -2675,37 +2823,56 @@ def _save_cam_config_to_user(camera_id: str, body: dict):
             uf = user_dir / "user.json"
             if not uf.exists():
                 continue
+            user_id = user_dir.name
+            # [Fix B1] Usar _get_user_lock para evitar race con _update_camera_last_frame
+            # que pisa user.json cada frame (cada ~1s). Sin este lock, el save del
+            # LED quedaba escrito durante milisegundos antes de ser pisado por el
+            # próximo frame que escribía un snapshot sin led_on.
             try:
-                with open(uf) as f:
-                    ud = json.load(f)
-                for c in ud.get("cameras", []):
-                    if c.get("camera_id") == camera_id:
-                        # Guardar campos que el ESP32 entiende
-                        if "quality" in body:
-                            c["quality"] = body["quality"]
-                        if "interval_ms" in body:
-                            c["interval_ms"] = body["interval_ms"]
-                        if "framesize" in body:
-                            c["framesize"] = body["framesize"]
-                        if "led_auto" in body:
-                            c["led_auto"] = body["led_auto"]
-                        if "led_bright" in body:
-                            c["led_bright"] = body["led_bright"]
-                        if "h_mirror" in body:
-                            c["h_mirror"] = body["h_mirror"]
-                        if "v_flip" in body:
-                            c["v_flip"] = body["v_flip"]
-                        if "led_on" in body:
-                            c["led_on"] = body["led_on"]
-                        if "brightness" in body:
-                            c["brightness"] = body["brightness"]
-                        if "contrast" in body:
-                            c["contrast"] = body["contrast"]
-                        with open(uf, "w") as f:
-                            json.dump(ud, f, indent=2)
-                        return
-            except Exception:
+                with _get_user_lock(user_id):
+                    # Re-leer DENTRO del lock — el snapshot puede haber cambiado
+                    with open(uf) as f:
+                        ud = json.load(f)
+                    cams = ud.get("cameras", [])
+                    found = False
+                    for c in cams:
+                        if c.get("camera_id") == camera_id:
+                            # Guardar campos que el ESP32 entiende
+                            if "quality" in body:
+                                c["quality"] = body["quality"]
+                            if "interval_ms" in body:
+                                c["interval_ms"] = body["interval_ms"]
+                            if "framesize" in body:
+                                c["framesize"] = body["framesize"]
+                            if "led_auto" in body:
+                                c["led_auto"] = body["led_auto"]
+                            if "led_bright" in body:
+                                c["led_bright"] = body["led_bright"]
+                            if "h_mirror" in body:
+                                c["h_mirror"] = body["h_mirror"]
+                            if "v_flip" in body:
+                                c["v_flip"] = body["v_flip"]
+                            if "led_on" in body:
+                                c["led_on"] = body["led_on"]
+                            if "brightness" in body:
+                                c["brightness"] = body["brightness"]
+                            if "contrast" in body:
+                                c["contrast"] = body["contrast"]
+                            # Escritura atómica dentro del lock
+                            tmp = uf.with_suffix(".tmp")
+                            with open(tmp, "w") as f:
+                                json.dump(ud, f, indent=2)
+                            tmp.replace(uf)
+                            found = True
+                            logger.info(f"[DIAG_SAVE] OK camera_id={camera_id} keys_after={list(c.keys())}")
+                            break
+                    if not found:
+                        logger.info(f"[DIAG_SAVE] camera_id={camera_id} NOT FOUND in user {user_id}")
+            except Exception as e:
+                logger.warning(f"[DIAG_SAVE] error user {user_id}: {e}")
                 continue
+        else:
+            logger.warning(f"[DIAG_SAVE] camera_id={camera_id} NO ENCONTRADA en ningún user.json")
     except Exception as e:
         logger.warning(f"Error saving cam config: {e}")
 
@@ -3194,36 +3361,45 @@ def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = Non
     try:
         uf = find_user_json(user_id)
         if uf and uf.exists():
-            with open(uf) as f:
-                ud = json.load(f)
-            cameras = ud.get("cameras", []) or []
-            now = int(time.time())
-            found = False
-            for c in cameras:
-                if c.get("camera_id") == camera_id:
-                    c["last_frame"] = now
-                    if client_ip:
-                        c["last_announce_ip"] = client_ip
-                    found = True
-                    break
-            # Auto-registrar nueva cámara (basado en camera.json del FS)
-            if not found and camera_id and camera_id != "unknown":
-                cam_cfg = get_camera_config_static(user_id, camera_id) if 'get_camera_config_static' in globals() else {}
-                cameras.append({
-                    "camera_id": camera_id,
-                    "name": cam_cfg.get("name") or camera_id,
-                    "zone": cam_cfg.get("zone", ""),
-                    "business_type": cam_cfg.get("business_type", ""),
-                    "business_name": cam_cfg.get("business_name", ""),
-                    "active": True,
-                    "last_frame": now,
-                    "last_announce_ip": client_ip or "",
-                    "configured_at": cam_cfg.get("configured_at", now),
-                })
-                logger.info(f"[cameras] Auto-registrada cámara {camera_id} para user {user_id}")
-            ud["cameras"] = cameras
-            with open(uf, "w") as f:
-                json.dump(ud, f, indent=2)
+            # [Fix B2] Encerrar todo el read-modify-write en _get_user_lock para
+            # evitar race condition con _save_cam_config_to_user y otros
+            # escritores de user.json. Sin lock, last_frame pisaba los
+            # led_on/led_bright/etc escritos por el POST de la UI cada ~1s.
+            with _get_user_lock(user_id):
+                with open(uf) as f:
+                    ud = json.load(f)
+                cameras = ud.get("cameras", []) or []
+                now = int(time.time())
+                found = False
+                for c in cameras:
+                    if c.get("camera_id") == camera_id:
+                        c["last_frame"] = now
+                        if client_ip:
+                            c["last_announce_ip"] = client_ip
+                        found = True
+                        break
+                # Auto-registrar nueva cámara (basado en camera.json del FS)
+                if not found and camera_id and camera_id != "unknown":
+                    cam_cfg = get_camera_config_static(user_id, camera_id) if 'get_camera_config_static' in globals() else {}
+                    cameras.append({
+                        "camera_id": camera_id,
+                        "name": cam_cfg.get("name") or camera_id,
+                        "zone": cam_cfg.get("zone", ""),
+                        "business_type": cam_cfg.get("business_type", ""),
+                        "business_name": cam_cfg.get("business_name", ""),
+                        "active": True,
+                        "last_frame": now,
+                        "last_announce_ip": client_ip or "",
+                        "configured_at": cam_cfg.get("configured_at", now),
+                    })
+                    logger.info(f"[cameras] Auto-registrada cámara {camera_id} para user {user_id}")
+                ud["cameras"] = cameras
+                # [Fix B2] Escritura atómica (tmp + rename) sobre el lock:
+                # reduce la ventana de carrera a casi cero.
+                tmp = uf.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(ud, f, indent=2)
+                tmp.replace(uf)
     except Exception as e:
         logger.error(f"Error updating camera last_frame: {e}")
 
@@ -3262,6 +3438,16 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                 f.write(img_bytes)
             # Cache en RAM para MJPEG stream
             _cache_frame(user_id, camera_id, img_bytes)
+            # ── EVA WIZARD: alimentar el buffer de frames de Eva para que el
+            # wizard de "instalar cámara nueva" pueda detectar el frame de la
+            # cámara física nueva (que todavía no está registrada en user.json).
+            # Sin esto, _get_unconfigured_frame en eva_v2.py nunca encuentra el
+            # frame y el wizard se queda bucleando "Esperando imagen...".
+            try:
+                from eva_v2 import ingest_frame_for_eva
+                ingest_frame_for_eva(img_bytes, camera_id)
+            except Exception as ingest_e:
+                logger.debug(f"ingest_frame_for_eva skip: {ingest_e}")
         except Exception as e:
             logger.error(f"Error guardando frame: {e}")
 
