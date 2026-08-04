@@ -2125,36 +2125,6 @@ const App = {
                     <section class="config-section">
                         <div class="section-heading">
                             <div>
-                                <div class="section-kicker">Calidad JPEG</div>
-                                <div class="section-title">📐 Calidad</div>
-                            </div>
-                        </div>
-                        <div class="segmented">
-                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="8" onclick="App._sendCamCmd('${camId}','quality',8,this)">Baja</button>
-                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="12" onclick="App._sendCamCmd('${camId}','quality',12,this)">Media</button>
-                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="6" onclick="App._sendCamCmd('${camId}','quality',6,this)">Alta</button>
-                        </div>
-                    </section>
-
-                    <section class="config-section">
-                        <div class="section-heading">
-                            <div>
-                                <div class="section-kicker">Frecuencia de frames</div>
-                                <div class="section-title">⚡ Velocidad de envío</div>
-                            </div>
-                        </div>
-                        <div class="segmented four">
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="200" onclick="App._sendCamCmd('${camId}','fps',200,this)">5 fps</button>
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="500" onclick="App._sendCamCmd('${camId}','fps',500,this)">2 fps</button>
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="1000" onclick="App._sendCamCmd('${camId}','fps',1000,this)">1 fps</button>
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="2000" onclick="App._sendCamCmd('${camId}','fps',2000,this)">0.5 fps</button>
-                        </div>
-                        <p class="meta" style="margin:8px 0 0;text-align:center;">2 fps recomendado para vivo fluido. Más fps = más ancho de banda.</p>
-                    </section>
-
-                    <section class="config-section">
-                        <div class="section-heading">
-                            <div>
                                 <div class="section-kicker">LED flash</div>
                                 <div class="section-title">💡 Iluminación</div>
                             </div>
@@ -2164,6 +2134,7 @@ const App = {
                             <button class="btn-ghost" data-config-cmd="led" data-config-value="0" onclick="App._sendCamCmd('${camId}','led',0,this)">🌙 Off</button>
                             <button class="btn-ghost" data-config-cmd="led_auto" data-config-value="1" onclick="App._sendCamCmd('${camId}','led_auto',1,this)">⚡ Auto</button>
                         </div>
+                        <p class="meta" style="margin:8px 0 0;text-align:center;">⚡ Auto: el firmware prende el flash solo si detecta poca luz.</p>
                     </section>
 
                     <section class="config-section">
