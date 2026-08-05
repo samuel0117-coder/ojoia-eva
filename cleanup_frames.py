@@ -124,5 +124,81 @@ def cleanup_old_frames():
     log("=" * 60 + "\n")
 
 
+def cleanup_old_events():
+    """Limpia frames viejos dentro de events/ (conserva los .json de alerta).
+
+    [Fix] El script original solo limpiaba cameras/<id>/frames/, omitiendo
+    cameras/<id>/events/<evt>/frames/*.jpg — que es donde se acumulan los
+    frames de vigilancia (puede superar 10GB y llenar el disco). Se aplica
+    la misma política de retención (24h activo/trial, 45min gratis/inactivo).
+    Solo se borran los .jpg; los .json de metadata de alerta se conservan.
+    """
+    log("=" * 60)
+    log("Iniciando limpieza de frames antiguos en events/")
+    total_deleted = 0
+    total_size_mb = 0
+    empty_events_removed = 0
+
+    users_dir = STORAGE_ROOT / "users"
+    if not users_dir.exists():
+        return
+
+    for user_dir in users_dir.iterdir():
+        if not user_dir.is_dir():
+            continue
+        user_id = user_dir.name
+        user_plan = get_user_plan(user_id)
+        max_age_seconds = (24 * 3600) if user_plan in ("active", "trial") else (0.75 * 3600)
+        cutoff_time = time.time() - max_age_seconds
+
+        cameras_dir = user_dir / "cameras"
+        if not cameras_dir.exists():
+            continue
+
+        for cam_dir in cameras_dir.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            events_dir = cam_dir / "events"
+            if not events_dir.is_dir():
+                continue
+
+            for event_dir in events_dir.iterdir():
+                if not event_dir.is_dir():
+                    continue
+                frames_dir = event_dir / "frames"
+                if not frames_dir.is_dir():
+                    continue
+                del_count = 0
+                del_size = 0
+                for frame_file in frames_dir.glob("*.jpg"):
+                    try:
+                        if frame_file.stat().st_mtime < cutoff_time:
+                            sz = frame_file.stat().st_size
+                            frame_file.unlink()
+                            del_count += 1
+                            del_size += sz
+                    except Exception as e:
+                        log(f"Error en evento {frame_file}: {e}")
+                if del_count > 0:
+                    log(f"  Evento {event_dir.name[:40]}: {del_count} frames borrados ({del_size/1024/1024:.2f} MB)")
+                    total_deleted += del_count
+                    total_size_mb += del_size / 1024 / 1024
+                # Limpiar dirs vacíos (frames y evento) para no acumular basura
+                try:
+                    if frames_dir.is_dir() and not any(frames_dir.iterdir()):
+                        frames_dir.rmdir()
+                    if event_dir.is_dir() and not any(event_dir.iterdir()):
+                        event_dir.rmdir()
+                        empty_events_removed += 1
+                except Exception:
+                    pass
+
+    log(f"Limpieza events/ completada: {total_deleted} frames borrados ({total_size_mb:.2f} MB liberados)")
+    if empty_events_removed:
+        log(f"  Directorios de eventos vacíos eliminados: {empty_events_removed}")
+    log("=" * 60 + "\n")
+
+
 if __name__ == "__main__":
     cleanup_old_frames()
+    cleanup_old_events()
