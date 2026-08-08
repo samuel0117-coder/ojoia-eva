@@ -192,7 +192,7 @@ def normalize_camera_vigilance_config(config: Dict[str, Any]) -> Dict[str, Any]:
             "owner_notes": owner_notes,
         }, normal_mode),
         "sentinel_mode": _merge_dict({
-            "enabled": True,
+            "enabled": False,
             "cooldown_min": config.get("cooldown_min", 5),
             "yolo_triggers": ["person"],
         }, sentinel_mode),
