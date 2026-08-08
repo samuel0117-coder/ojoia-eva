@@ -1,0 +1,32 @@
+# B6 — parche systemd: api-eva.service
+# Cambios vs /etc/systemd/system/api-eva.service actual:
+#   - Restart=on-failure -> Restart=always   (reinicia tambien salidas exit-0, OOM-kill que mandan signal limpio)
+#   + StartLimitIntervalSec=300 + StartLimitBurst=5 (no crash-loop infinito)
+#
+# Aplicar:
+#   sudo cp /opt/ojoia/docs/systemd/api-eva.service /etc/systemd/system/api-eva.service
+#   sudo systemctl daemon-reload && sudo systemctl restart api-eva.service
+
+[Unit]
+Description=OjoIA API Eva (CPU)
+After=network-online.target tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+WorkingDirectory=/opt/ojoia/code
+ExecStart=/home/sam/ai_system/venv/bin/python -u /opt/ojoia/code/api_eva.py
+# B6: Restart=always (antes on-failure) cubre salidas exit-0/OOM-kill/signal.
+# StartLimitBurst=5 en 300s evita crash-loop infinito (queda en failed).
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=4G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
