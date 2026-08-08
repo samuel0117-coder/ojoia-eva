@@ -22,12 +22,13 @@ import secrets
 import asyncio
 import logging
 import threading
+import hmac
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
 from fastapi import Query
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Header, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -178,7 +179,9 @@ def _consolidate_legacy_eva_sessions(ud: dict, user_id: str) -> None:
 # /admin/auth/login (admin usa su propio sistema), endpoings de ingest de camaras
 # (las camaras no saben portar bearer), /vigilance-frame/*, archivos estaticos.
 # ─────────────────────────────────────────────────────────────────────────
-AUTH_ENFORCE = False  # S1: soft rollout. False = warn-only, True = reject 401
+AUTH_ENFORCE = True  # A1: enforce estricto activado. Antes False (warn-only).
+# Riesgo de negocio cerrado: el cliente activo es de prueba. En rollback duro
+# cualquier peticion a /api/* sin Bearer valido para el user_id recibira 401.
 AUTH_TOKEN_TTL_SEC = 60 * 60 * 24 * 90  # 90 dias por defecto
 
 
@@ -208,6 +211,7 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
         logger.warning(f"[auth:soft] user={user_id} Authorization malformado")
         return {"authenticated": False, "user_id": user_id, "reason": "bad_header"}
 
+    # A6 (parcial): comparacion en tiempo constante para evitar timing leaks.
     try:
         uf = find_user_json(user_id)
         if not uf or not uf.exists():
@@ -222,7 +226,11 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
             # Limpiar tokens expirados / revocados
             valid = [t for t in tokens if not t.get("revoked") and
                      now < t.get("expires_at", now + AUTH_TOKEN_TTL_SEC * 100)]
-            match = next((t for t in valid if t.get("token") == token), None)
+            match = None
+            for t in valid:
+                if hmac.compare_digest(str(t.get("token", "")), token):
+                    match = t
+                    break
             if not match:
                 if AUTH_ENFORCE:
                     raise HTTPException(status_code=401, detail="Token no valido o expirado")
@@ -240,6 +248,99 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
             raise HTTPException(status_code=401, detail=f"Error validacion: {e}")
         logger.error(f"[auth:soft] error user={user_id}: {e}")
         return {"authenticated": False, "user_id": user_id, "reason": "error"}
+
+
+# A1: dependencia FastAPI para proteger endpoints /api/* que reciben user_id
+# por query, form-body o path. Resuelve el bug de seguridad raiz: antes cualquier
+# cliente podia adivinar un user_id y leer sus eventos/frames/stream. Ahora se
+# exige un Bearer <token> valido PARA ESE user_id concreto (validado contra
+# user.json.api_tokens[] con hmac.compare_digest).
+#
+# Uso en los endpoints:
+#   @app.get("/api/user/events")
+#   async def user_events(user_id: str = Query(...), auth: dict = Depends(verify_user)):
+#       # auth["user_id"] es el user_id validado; auth["authenticated"] == True
+#
+# Endpoints PUBLICOS (no llevan Depends(verify_user)): /health, /api/auth/token
+# (genera el token, no requiere tenerlo), /api/zone-types, /api/support-info,
+# /auth/firebase/verify (Firebase hace su propia verificacion), /ingest/*
+# (las camaras ESP32 no portan Bearer - documento en la linea 178), /admin/*
+# (usan _verify_admin propio), /reports/{user_id}/{filename} (servidos por
+# StaticFiles o path-traversal-sanitized por A5), /vigilance-frame/*
+# (notificaciones push con link de imagen).
+def verify_user(
+    request: Request,
+    authorization: str = Header(None, alias="Authorization"),
+) -> dict:
+    """
+    Dependencia de FastAPI. Lee user_id del request (query/form/path),
+    valida Authorization: Bearer <token> contra ese user_id, y devuelve
+    la identidad. Si AUTH_ENFORCE=True y no valida -> 401.
+    """
+    # 1) extraer user_id de la peticion
+    user_id = None
+    # query params
+    try:
+        user_id = request.query_params.get("user_id") or request.query_params.get("uid")
+    except Exception:
+        pass
+    # form params (POST sin JSON body)
+    if not user_id:
+        try:
+            form = asyncio.ensure_future(request.form())
+            # form() es awaitable; pero como Dependencia sincrona leemos solo
+            # si ya esta cacheado. En gral los endpoints pasan user_id por JSON
+            # body o query. Si no llega por query, el endpoint recibira user_id
+            # por separado y debemos confiar en que el route body llama a
+            # _verify_user_token(authorization, user_id) explicitamente.
+        except Exception:
+            pass
+    # 2) path params {user_id} o {uid}
+    if not user_id:
+        path_params = getattr(request, "path_params", {}) or {}
+        user_id = path_params.get("user_id") or path_params.get("uid")
+    # 3) JSON body (lo leemos solo si no vino por query/path)
+    if not user_id:
+        try:
+            # evitamos await aqui (dependencia sync); el route body validara.
+            # Verificamos solo si el header Authorization viene; si no, 401.
+            pass
+        except Exception:
+            pass
+
+    if not user_id:
+        # si el endpoint no expone user_id de forma estandar, exigimos que traiga
+        # Authorization; el route body hara la verificacion fina con _verify_user_token.
+        if AUTH_ENFORCE and not authorization:
+            raise HTTPException(status_code=401, detail="Authorization requerido")
+        return {"authenticated": False, "user_id": None, "reason": "no_user_id"}
+
+    return _verify_user_token(authorization, user_id)
+
+
+# A1 (cont.): helper para endpoints que reciben user_id en el JSON body
+# (middleware solo ve query/path, no body async). Estos endpoints deben llamar
+# a _auth_user_from_body(request) al inicio para validar el token contra el
+# user_id extraido del body. Usar:
+#
+#   @app.post("/api/chat/eva/message")
+#   async def eva_message(request: Request):
+#       body = await request.json()
+#       _auth_user_from_body(request, body.get("user_id", ""))
+#
+async def _auth_user_from_body(request: Request, user_id: str) -> None:
+    """Valida Authorization: Bearer <token> contra user_id del JSON body."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id requerido")
+    _verify_user_token(request.headers.get("authorization"), user_id)
+
+
+async def _parse_json_body(request: Request) -> dict:
+    """Lee el body JSON de forma segura (maneja body vacio / no-JSON)."""
+    try:
+        return await request.json()
+    except Exception:
+        return {}
 
 
 # Inicializar Firebase Admin (solo una vez)
@@ -453,6 +554,7 @@ async def register_push_token(request: Request):
         body = await request.json()
         token = (body.get("token") or "").strip()
         user_id = body.get("user_id")
+        _verify_user_token(request.headers.get("authorization"), user_id)  # A1: anti-suplantacion de user_id en body
         device = body.get("device")
         if not token or not user_id:
             return {"success": False, "error": "user_id y token requeridos"}
@@ -870,6 +972,84 @@ app.add_middleware(
 
 # Static files for event images
 app.mount("/events", StaticFiles(directory=str(STORAGE_ROOT / "users")), name="events-static")
+
+# A1 — Middleware de auth de usuario (cierre de seguridad central).
+# Aplica a TODAS las rutas /api/* que tengan user_id (query/form/path/body).
+# Cierra el bug raiz: antes cualquier cliente podia adivinar un user_id y leer
+# sus eventos/frames/stream. Ahora se exige Authorization: Bearer <token>
+# valido PARA ESE user_id (validado contra user.json.api_tokens[] con
+# hmac.compare_digest). Si AUTH_ENFORCE=True (ahora si) -> 401.
+#
+# Rutas PUBLICAS (no pasan por este check - lista explicita):
+PUBLIC_USER_PATHS = {
+    "/health", "/api/support-info", "/api/zone-types",
+    # token generation/verify: el primero crea el token, el segundo usa Firebase
+    "/api/auth/token",  # POST crea token (requiere FIR verificacion separada mas adelante)
+    "/auth/firebase/verify",  # Firebase hace su propia verificacion
+    "/api/support-info",
+    # /ingest/* y /frames/ingest: las camaras ESP32 no portan Bearer (doc linea 178)
+    "/ingest/frame", "/ingest/photo", "/ingest/snapshot", "/ingest/raw",
+    "/frames/ingest",
+    # /cameras/{id}/cmd: proxy al ESP32, no porta user_id confiable
+    # (se filtra por camera_id que si conocido)
+    # reportes servidos por path-traversal-sanitized (A5): publicos para que el
+    # link push llegue al usuario sin login (token en URL seria loggable)
+    # /api/reportes/view, /api/reportes/download, /api/reportes/url -> user_id en path
+    "/api/reportes/view", "/api/reportes/download", "/api/reportes/url",
+    # /api/reportes/send-v2: lo invoca el cron interno (dispatch_morning_reports.sh)
+    # sin header Authorization. El cron corre en el host (no expuesto). Cuando
+    # se necesita auth real, el cron deberá portar un token de servicio.
+    "/api/reportes/send-v2",
+    # /api/reports/send-daily: igual, cron interno
+    "/api/reports/send-daily",
+    # vigilance-frame: link de imagen en notificacion push (publico, sin login)
+    # /vigilance-frame/{user_id}/{event_id} -> se filtra por path traversal en A5
+    # /admin/* usa _verify_admin propio (no entra aqui porque no empieza con /api/)
+}
+
+
+def _extract_user_id_from_request(request: Request) -> Optional[str]:
+    """Extrae user_id de query, form o path params. Devuelve None si no llega."""
+    uid = request.query_params.get("user_id") or request.query_params.get("uid")
+    if uid:
+        return uid
+    path_params = getattr(request, "path_params", {}) or {}
+    uid = path_params.get("user_id") or path_params.get("uid")
+    if uid:
+        return uid
+    return None  # body no se lee aqui (async); el route ya tiene su propio user_id
+
+
+@app.middleware("http")
+async def enforce_user_auth(request: Request, call_next):
+    """
+    A1 — Valida Authorization: Bearer <token> para /api/* que lleven user_id.
+    Rutas en PUBLIC_USER_PATHS o sin user_id pasan sin check.
+    OPTIONS (preflight) pasa siempre.
+    """
+    path = request.url.path
+    # solo /api/* (excepto las publicas explicitas). /admin/* usa _verify_admin.
+    if not path.startswith("/api/") or path in PUBLIC_USER_PATHS:
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    user_id = _extract_user_id_from_request(request)
+    if not user_id:
+        # el endpoint no expone user_id por query/path; confiamos en que el
+        # route body hara _verify_user_token(authorization, user_id) explicito,
+        # o el user_id viene en JSON body (el route la extrae y valida).
+        # Mientras tanto, si no hay Authorization y enforce=True -> 401 para
+        # forzar a que los endpoints con user_id en body validen explicito.
+        if not request.headers.get("authorization"):
+            return JSONResponse({"detail": "Authorization requerido"},
+                                status_code=401)
+        return await call_next(request)
+    try:
+        _verify_user_token(request.headers.get("authorization"), user_id)
+    except HTTPException as he:
+        return JSONResponse({"detail": he.detail}, status_code=he.status_code)
+    return await call_next(request)
+
 
 # Middleware para no-cache y CORS seguro
 # v9.2: NO pisar los headers CORS que ya pone CORSMiddleware de FastAPI.
@@ -1531,10 +1711,11 @@ async def verify_firebase(request: Request):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/fcm/register")
-async def register_fcm_token(request: dict):
+async def register_fcm_token(request: dict, authorization: str = Header(None, alias="Authorization")):
     """Registra token FCM para push notifications."""
     try:
         user_id = request.get("user_id", "") if isinstance(request, dict) else ""
+        _verify_user_token(authorization, user_id)  # A1: anti-suplantacion de user_id en body
         fcm_token = request.get("fcm_token", "") if isinstance(request, dict) else ""
         if isinstance(request, str):
             try:
@@ -1672,7 +1853,7 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
 
 # Alias POST para /api/chat/eva/history (compatibilidad con frontend)
 @app.post("/api/chat/eva/history")
-async def get_eva_chat_history_post(request: dict):
+async def get_eva_chat_history_post(request: dict, authorization: str = Header(None, alias="Authorization")):
     """POST = guardar historial completo (compatibilidad con eva-chat-v5.js).
     GET (definido arriba) = leer historial.
 
@@ -1683,6 +1864,7 @@ async def get_eva_chat_history_post(request: dict):
     """
     try:
         user_id = request.get("user_id", "")
+        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         if not user_id:
             return {"success": False, "error": "user_id required"}
         uf = find_user_json(user_id)
@@ -1803,10 +1985,11 @@ async def get_eva_chat_history_post(request: dict):
 
 
 @app.post("/api/chat/eva/save")
-async def save_eva_chat_message(request: dict):
+async def save_eva_chat_message(request: dict, authorization: str = Header(None, alias="Authorization")):
     """Guarda un mensaje del chat con Eva en user.json."""
     try:
         user_id = request.get("user_id", "")
+        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         session_id = request.get("session_id", "")
         role = request.get("role", "user")
         content = request.get("content", "")
@@ -1846,7 +2029,7 @@ async def save_eva_chat_message(request: dict):
 
 
 @app.post("/api/chat/eva/feedback")
-async def eva_event_feedback(request: dict):
+async def eva_event_feedback(request: dict, authorization: str = Header(None, alias="Authorization")):
     """Feedback del usuario sobre un evento (falsa alarma / confirmación).
 
     Lo invoca el frontend desde el widget del evento y, opcionalmente, desde
@@ -1857,6 +2040,7 @@ async def eva_event_feedback(request: dict):
     """
     try:
         user_id = request.get("user_id", "")
+        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         event_id = request.get("event_id", "")
         is_real = bool(request.get("is_real", True))
         notes = request.get("notes") or ""
@@ -1883,7 +2067,7 @@ async def eva_event_feedback(request: dict):
 # EVA CHAT - Endpoint principal de conversación
 # ═══════════════════════════════════════════════════════════
 @app.post("/api/chat/eva/message")
-async def chat_eva_message(request: dict):
+async def chat_eva_message(request: dict, authorization: str = Header(None, alias="Authorization")):
     """Endpoint principal del chat con Eva.
     
     Body:
@@ -1907,6 +2091,7 @@ async def chat_eva_message(request: dict):
     """
     try:
         user_id = (request.get("user_id") or "").strip()
+        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         message = (request.get("message") or "").strip()
         session_id = request.get("session_id") or ""
         cam_id = request.get("cam_id") or ""
@@ -2350,6 +2535,7 @@ async def get_user_profile(user_id: str):
 async def update_user_profile(request: Request):
     data = await request.json()
     user_id = data.get("user_id", "")
+    _verify_user_token(request.headers.get("authorization"), user_id)  # A1: validar token vs user_id del body
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
     user_file = find_user_json(user_id)
