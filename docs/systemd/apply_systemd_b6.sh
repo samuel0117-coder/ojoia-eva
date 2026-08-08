@@ -33,9 +33,26 @@ done
 echo
 
 # 2) copiar las nuevas versiones
+# NOTA: /etc/systemd/system/api-eva.service puede tener el atributo
+# immutable (chattr +i) del setup original de tunnel/proteccion. Eso hace
+# que `cp` falle con "Operacion no permitida" aunque seamos root. Manejo:
+#   - detectar si tiene 'i' (lsattr)
+#   -> quitarlo (chattr -i), copiar, reaplicarlo (chattr +i) para no
+#      perder la proteccion original.
+#   - si no tiene 'i', cp directo.
+# Usamos `|| true` para no abortar el script con `set -e` si un cp falla.
 for u in "${UNITS_SYSTEM[@]}"; do
-  cp "$SRC_DIR/$u" "/etc/systemd/system/$u"
-  echo "[patch] /etc/systemd/system/$u"
+  DST="/etc/systemd/system/$u"
+  SRC="$SRC_DIR/$u"
+  IMMU=$(lsattr "$DST" 2>/dev/null | awk '{print $1}' | grep -q 'i' && echo yes || echo no)
+  if [ "$IMMU" = "yes" ]; then
+    echo "[immutable] $u tiene chattr +i -> quitando temporalmente"
+    chattr -i "$DST" 2>/dev/null
+    cp "$SRC" "$DST" 2>/dev/null && echo "[patch] $DST (immutable restaurado)" || echo "[WARN] cp $DST fallo"
+    chattr +i "$DST" 2>/dev/null
+  else
+    cp "$SRC" "$DST" 2>/dev/null && echo "[patch] $DST" || echo "[WARN] cp $DST fallo"
+  fi
 done
 echo
 
