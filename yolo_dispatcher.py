@@ -225,12 +225,26 @@ async def enqueue_request(files, camera_id, confidence):
 
 @app.get("/health")
 async def health():
+    # B6-fix: antes el gather de WORKERS health-checks lanzaba excepcion si
+    # CUALQUIERA tardaba >2s o fallaba -> 503 falso (el detect seguia
+    # funcionando). Ahora: chequeo por-worker con timeout generoso (5s) y
+    # gather tolerante (return_exceptions=True); reportamos ok si AL MENOS
+    # un worker responde 200. Asi el health-monitor no marca el servicio
+    # caido por un health-check transitorio del worker TRT (que tarda en
+    # cargar ~10s tras restart).
     try:
-        await asyncio.gather(*[
-            http_client.get(f"http://127.0.0.1:{BASE_PORT + i}/health", timeout=2)
+        results = await asyncio.gather(*[
+            http_client.get(f"http://127.0.0.1:{BASE_PORT + i}/health", timeout=5)
             for i in range(WORKERS)
-        ])
-        return {"status": "ok", "workers": WORKERS,
+        ], return_exceptions=True)
+        alive = sum(1 for r in results if getattr(r, "status_code", 0) == 200)
+        if alive == 0:
+            return JSONResponse(
+                {"status": "error", "detail": "no workers responding",
+                 "workers": WORKERS, "alive": 0},
+                status_code=503,
+            )
+        return {"status": "ok", "workers": WORKERS, "alive": alive,
                 "micro_batch_ms": MICRO_BATCH_MS, "micro_batch_max": MICRO_BATCH_MAX}
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
