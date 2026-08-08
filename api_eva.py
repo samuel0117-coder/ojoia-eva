@@ -381,6 +381,12 @@ eva_sessions: Dict[str, Dict[str, Any]] = {}
 # Cola asíncrona para procesamiento de frames (desacoplado del endpoint)
 FRAME_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=1000)
 WORKER_RUNNING = False
+# B5: contador de frames descartados por queue llena. Metrica defensiva:
+# antes await FRAME_QUEUE.put() bloqueaba al ESP32 hasta que el worker
+# consumiera; ahora intentamos put_nowait y si QueueFull -> drop + metrica.
+# El ESP32 recibe respuesta inmediata (no se ve afectado por backpressure).
+FRAME_QUEUE_DROPS = 0
+FRAME_QUEUE_DROP_TS = 0.0  # ultimo log de drops (rate-limit de log)
 
 
 # ── Plan & Billing Helpers ──────────────────────────────────────────────
@@ -1270,7 +1276,15 @@ async def health():
             status = "ok" if resp.status_code == 200 else "degraded"
     except:
         status = "error"
-    return {"status": status, "service": "eva-api", "version": "7.0"}
+    return {
+        "status": status, "service": "eva-api", "version": "7.0",
+        # B5: metricas de queue (para observabilidad)
+        "frame_queue": {
+            "size": FRAME_QUEUE.qsize(),
+            "maxsize": FRAME_QUEUE.maxsize,
+            "drops": FRAME_QUEUE_DROPS,
+        },
+    }
 
 @app.get("/api/support-info")
 async def support_info():
@@ -3761,7 +3775,12 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         #      en modo centinela no queremos capa de inteligencia Qwen, solo YOLO)
         #   3) resto (count>0, modo normal) → encolar
         if yolo_count > 0 and not is_vigilante:
-            await FRAME_QUEUE.put({
+            # B5: drop policy. Antes: await FRAME_QUEUE.put() bloqueaba al
+            # ESP32 si queue llena (maxsize=1000). Ahora intentamos put_nowait;
+            # si QueueFull -> descartamos el frame viejo (no bloqueamos al
+            # ESP32) y contamos para metrica/logs. El frame se pierde (grid
+            # + Qwen se saltan uno) pero el ESP32 sigue recibiendo 200.
+            frameData = {
                 "frame_id": frame_id,
                 "user_id": user_id,
                 "camera_id": camera_id,
@@ -3775,8 +3794,22 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                 "yolo_count": yolo_count,
                 "yolo_classes": yolo_classes,
                 "yolo_detections": yolo_detections
-            })
-            processing = "queued"
+            }
+            try:
+                FRAME_QUEUE.put_nowait(frameData)
+                processing = "queued"
+            except asyncio.QueueFull:
+                global FRAME_QUEUE_DROPS, FRAME_QUEUE_DROP_TS
+                FRAME_QUEUE_DROPS += 1
+                processing = "dropped"
+                # log rate-limit ~cada 30s para no llenar log de drops
+                if time.time() - FRAME_QUEUE_DROP_TS > 30:
+                    FRAME_QUEUE_DROP_TS = time.time()
+                    logger.warning(
+                        f"[FRAME_QUEUE] lleno, frame descartado: {frame_id} "
+                        f"cam={camera_id} user={user_id} "
+                        f"total_drops={FRAME_QUEUE_DROPS} qsize={FRAME_QUEUE.qsize()}"
+                    )
 
         # ── [7] Actualizar last_frame de la cámara ──
         _update_camera_last_frame(user_id, camera_id, client_ip)
