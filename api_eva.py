@@ -47,7 +47,10 @@ import camera_zones
 STORAGE_ROOT = Path("/home/sam/storage")
 DISKS_CONFIG_FILE = STORAGE_ROOT / "disks_config.json"
 EVA_CONFIG_FILE = STORAGE_ROOT / "eva_config.json"
-FIREBASE_KEY_PATH = Path("/home/sam/Downloads/firebase-key.json")
+# A9: path canonico de firebase-key.json (antes /home/sam/Downloads/, que es un
+# directorio de descargas no controlado). El archivo vive en ai_system/ con
+# permisos 600. Las 3 referencias en este archivo apuntan aqui ahora.
+FIREBASE_KEY_PATH = Path("/home/sam/ai_system/firebase-key.json")
 
 # ─────────────────────────────────────────────────────────────────────────
 # S4: Lock de user.json — protege escrituras concurrentes.
@@ -923,48 +926,6 @@ async def serve_vigilance_frame(user_id: str, event_id: str):
             return FileResponse(str(cand), media_type="image/jpeg",
                                 headers={"Cache-Control": "private, max-age=600"})
     return HTMLResponse(content="404 frame no encontrado", status_code=404)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TEST ENDPOINTS — para validar push y centinela sin esperar gatillo real
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.post("/api/admin/centinela-test")
-async def centinela_test(user_id: str, camera_id: str = "OJO-E17604", count: int = 1):
-    """Fuerza una alerta centinela de prueba (mismo path que produccion, con push + imagen)."""
-    if not user_id or not camera_id:
-        return {"success": False, "error": "user_id y camera_id requeridos"}
-    # Bypass de cooldown para el test
-    _vigilance_cooldowns.pop(f"{user_id}_{camera_id}", None)
-    # Usar un frame real si hay uno disponible, sino uno sintetico (para que la miniatura funcione)
-    img_bytes = b""
-    for cand in [
-        STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / "latest_vigilance.jpg",
-        STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "latest_raw.jpg",
-        STORAGE_ROOT / "users" / "default" / "cameras" / camera_id / "frames" / "latest_raw.jpg",
-    ]:
-        if cand.exists() and cand.stat().st_size > 100:
-            img_bytes = cand.read_bytes()
-            break
-    if not img_bytes:
-        try:
-            from io import BytesIO
-            from PIL import Image as _PILImage
-            _buf = BytesIO()
-            _im = _PILImage.new("RGB", (320, 240), (90, 90, 90))
-            _im.save(_buf, format="JPEG", quality=70)
-            img_bytes = _buf.getvalue()
-        except Exception:
-            pass
-    try:
-        result = _save_vigilance_event(user_id, camera_id, img_bytes, count, ["person", "test"], "127.0.0.1")
-        if result is None:
-            _vigilance_cooldowns.pop(f"{user_id}_{camera_id}", None)
-            result = _save_vigilance_event(user_id, camera_id, img_bytes, count, ["person", "test"], "127.0.0.1")
-        return {"success": True, "triggered": result is not None, "event_id": result,
-                "user_id": user_id, "camera_id": camera_id, "had_frame": len(img_bytes) > 0}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 # CORS middleware — A3: lista de origenes explicita (no wildcard+credentials,
@@ -4103,21 +4064,6 @@ async def list_reports(user_id: str, limit: int = 10):
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/reports/test")
-async def test_report_send(user_id: str, camera_id: str = None):
-    """
-    Prueba envío de reporte (para debugging).
-    """
-    try:
-        from reportes.scheduler import test_send_report
-        
-        result = await test_send_report(user_id, camera_id)
-        return result
-    except Exception as e:
-        logger.error(f"Error en test de reporte: {e}")
-        return {"success": False, "error": str(e)}
-
-
 @app.get("/api/reports/stats")
 async def get_report_stats(user_id: str):
     """
@@ -5787,4 +5733,9 @@ async def admin_update_server_status(request: dict, authorization: str = Header(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8005, loop="asyncio")
+    # A8: bind loopback. Antes host="0.0.0.0" exponía el API a todas las
+    # interfaces (incluso interfaces externas si las hubiera). Ahora solo
+    # escucha en 127.0.0.1:8005; todo el trafico legitimo llega via nginx
+    # (upstream backend_eva -> 127.0.0.1:8005) o desde cloudflared/tunel.
+    # No se pierde acceso: backend_eva en nginx.conf apunta a 127.0.0.1:8005.
+    uvicorn.run(app, host="127.0.0.1", port=8005, loop="asyncio")
