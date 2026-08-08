@@ -5800,6 +5800,109 @@ async def admin_update_server_status(request: dict, authorization: str = Header(
     return {"success": True, "backend": "https://api.ojoia.com.do"}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# B2 — Configuracion de retencion de eventos (editable desde admin panel)
+# ═══════════════════════════════════════════════════════════════════════════
+# Persiste en admin_config.json bajo "retention.days_by_plan" para que el
+# cron cleanup_frames.py lo lea. Si falta la key, usa defaults codificados.
+
+# Defaults hardcoded (single source of truth para el script y la API):
+DEFAULT_RETENTION = {
+    "days_by_plan": {
+        "active": 7,
+        "trial": 7,
+        "free": 1,
+        "expired": 1,
+    },
+    "frames_hours_by_plan": {
+        "active": 24,
+        "trial": 24,
+        "free": 0.75,
+        "expired": 0.75,
+    },
+    "cleanup_cron": "0 3 * * *",  # frecuencia default (3 AM diaria)
+}
+
+
+def get_retention_config() -> dict:
+    """Lee retention de admin_config.json + aplica defaults donde falte."""
+    cfg = _load_admin_config()
+    saved = cfg.get("retention", {}) or {}
+    out = {
+        "days_by_plan": {**(DEFAULT_RETENTION["days_by_plan"]),
+                          **(saved.get("days_by_plan") or {})},
+        "frames_hours_by_plan": {**(DEFAULT_RETENTION["frames_hours_by_plan"]),
+                                  **(saved.get("frames_hours_by_plan") or {})},
+        "cleanup_cron": saved.get("cleanup_cron") or DEFAULT_RETENTION["cleanup_cron"],
+    }
+    return out
+
+
+@app.get("/admin/retention")
+async def admin_get_retention(authorization: str = Header(None)):
+    """Devuelve configuracion de retencion actual (工期days_by_plan, frames_hours_by_plan, cron)."""
+    _verify_admin(authorization)
+    return {"success": True, "retention": get_retention_config(),
+            "defaults": DEFAULT_RETENTION}
+
+
+@app.put("/admin/retention")
+async def admin_update_retention(request: dict, authorization: str = Header(None)):
+    """
+    Actualiza configuracion de retencion. Body parcial aceptado:
+      {"days_by_plan": {"active": 7, "trial": 7, "free": 1, "expired": 1},
+       "frames_hours_by_plan": {"active": 24, ...},
+       "cleanup_cron": "0 3 * * *"}
+    Solo persiste keys presentes; las ausentes conservan defaults.
+
+    NOTA sobre cleanup_cron: se persiste como referencia para el operador,
+    pero NO se aplica automaticamente al crontab del sistema (riesgo: el
+    proceso API no deberia escribir el crontab del usuario). Si el operador
+    cambia la frecuencia, debe actualizar `crontab -e` manualmente con el
+    valor guardado aqui. El valor default es "0 3 * * *" (3 AM diaria).
+    """
+    _verify_admin(authorization)
+    current = get_retention_config()
+    # merge defensivo: solo aceptar keys conocidas y tipos validos
+    if "days_by_plan" in request and isinstance(request["days_by_plan"], dict):
+        for plan, val in request["days_by_plan"].items():
+            if plan not in DEFAULT_RETENTION["days_by_plan"]:
+                continue
+            try:
+                iv = int(val)
+                if iv == 0 or iv >= 1:  # min 1 día de retention (0 = borrar todo, peligroso)
+                    current["days_by_plan"][plan] = max(1, iv)
+            except (TypeError, ValueError):
+                continue
+    if "frames_hours_by_plan" in request and isinstance(request["frames_hours_by_plan"], dict):
+        for plan, val in request["frames_hours_by_plan"].items():
+            if plan not in DEFAULT_RETENTION["frames_hours_by_plan"]:
+                continue
+            try:
+                fv = float(val)
+                if 0 < fv <= 24 * 7:  # 1 min a 7 días
+                    current["frames_hours_by_plan"][plan] = fv
+            except (TypeError, ValueError):
+                continue
+    if "cleanup_cron" in request and isinstance(request["cleanup_cron"], str):
+        # Validacion minima de formato cron (5 campos)
+        parts = request["cleanup_cron"].split()
+        if len(parts) == 5:
+            current["cleanup_cron"] = request["cleanup_cron"]
+    # persistir
+    cfg = _load_admin_config()
+    cfg["retention"] = {
+        "days_by_plan": current["days_by_plan"],
+        "frames_hours_by_plan": current["frames_hours_by_plan"],
+        "cleanup_cron": current["cleanup_cron"],
+        "updated_at": int(time.time()),
+    }
+    _save_admin_config(cfg)
+    logger.info(f"[admin] retention actualizada: days={current['days_by_plan']} "
+                f"frames_h={current['frames_hours_by_plan']} cron={current['cleanup_cron']}")
+    return {"success": True, "retention": current}
+
+
 if __name__ == "__main__":
     import uvicorn
     # A8: bind loopback. Antes host="0.0.0.0" exponía el API a todas las
