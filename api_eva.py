@@ -357,11 +357,19 @@ except ValueError:
         print(f"Firebase key no encontrado en {FIREBASE_KEY_PATH}")
 
 # Configurar logging
+# B1: RotatingFileHandler (antes FileHandler plano -> api_eva.log crecio a 344M
+# sin tope y lleno el disco 99%). Ahora rota en 10MB x 5 backups = 50MB maximo.
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(STORAGE_ROOT / "api_eva.log"),
+        RotatingFileHandler(
+            STORAGE_ROOT / "api_eva.log",
+            maxBytes=10 * 1024 * 1024,   # 10MB
+            backupCount=5,                # 5 archivos rotados + el activo
+            encoding="utf-8",
+        ),
         logging.StreamHandler()
     ]
 )
