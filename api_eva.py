@@ -889,7 +889,13 @@ async def send_report_v2(user_id: str, request: Request = None):
 async def serve_report_file(user_id: str, filename: str):
     from fastapi.responses import FileResponse, HTMLResponse, Response
     base = STORAGE_ROOT / "report_pages" / user_id
-    fp = base / filename
+    fp = (base / filename).resolve()
+    # A5: path traversal — antes fp = base / filename sin validar; un request
+    # con filename="../../etc/passwd" escapaba del base. Ahora exigimos que el
+    # path resuelto SIGA dentro de base. ademas rechazamos ".." y slashes.
+    if not fp.is_relative_to(base.resolve()):
+        logger.warning(f"[traversal] rechazo reportes: user_id={user_id} filename={filename!r}")
+        return HTMLResponse(content="<h1>403 Forbidden</h1>", status_code=403)
     if not fp.exists():
         return HTMLResponse(content=f"<h1>404</h1><p>{filename} no encontrado. Genera con /api/reportes/send-v2</p>", status_code=404)
     if filename.lower().endswith(".pdf"):
@@ -902,10 +908,17 @@ async def serve_report_file(user_id: str, filename: str):
 async def serve_vigilance_frame(user_id: str, event_id: str):
     """Sirve el frame JPG de una alerta de vigilancia/centinela (para push con imagen)."""
     from fastapi.responses import FileResponse, HTMLResponse, Response
+    # A5: path traversal — user_id y event_id vienen del path y se interpolan
+    # en rutas fs. Sin validar, event_id="../../etc/passwd" escapaba. Validar.
+    _validate_safe_path(user_id, "user_id")
+    _validate_safe_path(event_id, "event_id")
     cam_dir = STORAGE_ROOT / "users" / user_id / "cameras"
     # Buscar el event_id.jpg en cualquier carpeta de cámara
     for cam_sub in cam_dir.iterdir() if cam_dir.exists() else []:
-        cand = cam_sub / "events" / f"{event_id}.jpg"
+        cand = (cam_sub / "events" / f"{event_id}.jpg").resolve()
+        # A5: confirmar que el candidato resuelto sigue dentro de cam_sub/events
+        if not cand.is_relative_to((cam_sub / "events").resolve()):
+            continue
         if cand.exists():
             return FileResponse(str(cand), media_type="image/jpeg",
                                 headers={"Cache-Control": "private, max-age=600"})
@@ -994,6 +1007,19 @@ app.add_middleware(
 # Static files for event images
 app.mount("/events", StaticFiles(directory=str(STORAGE_ROOT / "users")), name="events-static")
 
+# A5: helper anti-path-traversal. Rechaza user_id/date/path segments que
+# contengan "..", "/", "\" o null bytes. Pensado para path params que se
+# interpolan en rutas del filesystem. No reemplaza is_relative_to() (que se
+# usa donde se construye fp completo), sino que filtra inputs temprano.
+def _validate_safe_path(value: str, name: str = "param") -> str:
+    if not value or not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"{name} requerido")
+    # rechazar componentes peligrosos
+    if "\\" in value or "/" in value or ".." in value or "\x00" in value:
+        raise HTTPException(status_code=400, detail=f"{name} invalido")
+    return value
+
+
 # A1 — Middleware de auth de usuario (cierre de seguridad central).
 # Aplica a TODAS las rutas /api/* que tengan user_id (query/form/path/body).
 # Cierra el bug raiz: antes cualquier cliente podia adivinar un user_id y leer
@@ -1049,8 +1075,14 @@ async def enforce_user_auth(request: Request, call_next):
     OPTIONS (preflight) pasa siempre.
     """
     path = request.url.path
-    # solo /api/* (excepto las publicas explicitas). /admin/* usa _verify_admin.
-    if not path.startswith("/api/") or path in PUBLIC_USER_PATHS:
+    # solo /api/* (excepto las publicas explicitas o sus prefijos con path params).
+    # /admin/* usa _verify_admin propio.
+    # PUBLIC_USER_PATHS admite entradas con barra final como PREFIJO (startswith).
+    public_prefixes = ("/api/reportes/view/", "/api/reportes/download/",
+                       "/api/reportes/url/", "/reportes/")
+    if (not path.startswith("/api/")
+            or path in PUBLIC_USER_PATHS
+            or path.startswith(public_prefixes)):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
@@ -4463,6 +4495,8 @@ async def get_report_page(user_id: str, date: str):
     URL: /api/reportes/view/{user_id}/2026-07-09
     """
     try:
+        _validate_safe_path(user_id, "user_id")  # A5
+        _validate_safe_path(date, "date")
         from reportes.page_generator import generate_report_page
         
         # Generar página
@@ -4491,26 +4525,38 @@ async def download_report_pdf(user_id: str, date: str):
     URL: /api/reportes/download/{user_id}/2026-07-09.pdf
     """
     try:
+        # A5: validar que user_id y date no contengan path components maliciosos.
+        _validate_safe_path(user_id, "user_id")
+        _validate_safe_path(date, "date")
         from reportes.page_generator import generate_report_page
-        
+
         # Generar página (esto también genera PDF)
         result = await generate_report_page(user_id, date)
-        
+
         if not result.get("success"):
             return {"error": result.get("error")}
-        
+
         # Servir PDF
         from fastapi.responses import FileResponse
-        pdf_file = Path(result.get("pdf_path"))
-        if pdf_file.exists():
-            return FileResponse(
-                str(pdf_file),
-                media_type='application/pdf',
-                filename=f"reporte_{date}.pdf"
-            )
-        
-        return {"error": "PDF no generado"}
-        
+        # A5: el pdf_path viene de generate_report_page (interno), pero validamos
+        # que este dentro de STORAGE_ROOT/report_pages para evititar path traversal
+        # si algun bug interno devolviera una ruta arbitraria.
+        pdf_file = Path(result.get("pdf_path") or "")
+        try:
+            if not pdf_file.is_file():
+                return {"error": "PDF no generado"}
+            report_base = (STORAGE_ROOT / "report_pages").resolve()
+            if not pdf_file.resolve().is_relative_to(report_base):
+                logger.warning(f"[traversal] pdf_path fuera de base: {pdf_file}")
+                return {"error": "PDF invalido"}
+        except Exception:
+            return {"error": "PDF invalido"}
+        return FileResponse(
+            str(pdf_file),
+            media_type='application/pdf',
+            filename=f"reporte_{date}.pdf"
+        )
+
     except Exception as e:
         logger.error(f"Error sirviendo PDF: {e}")
         return {"error": str(e)}
@@ -4523,6 +4569,7 @@ async def get_report_urls(user_id: str, date: str):
     Útil para compartir en chat, push, etc.
     """
     try:
+        _validate_safe_path(user_id, "user_id")  # A5: no path components en user_id
         base_url = "https://api.ojoia.com.do"
         date_str = _resolve_report_date(date)
         html_url = f"{base_url}/reportes/{user_id}/reporte_{date_str}.html"
@@ -5279,7 +5326,6 @@ async def admin_dismiss_event(event_id: str, request: dict, authorization: str =
 async def admin_stats(authorization: str = Header(None)):
     _verify_admin(authorization)
     cfg = get_disk_config()
-    import subprocess
     events_count = 0
     violations_count = 0
     for disk in cfg.get("disks", []):
@@ -5291,11 +5337,12 @@ async def admin_stats(authorization: str = Header(None)):
                 if not events_dir.exists():
                     continue
                 try:
-                    r = subprocess.run(
-                        ["sh", "-c", f"find '{events_dir}' -name '*.json' -type f | wc -l"],
-                        capture_output=True, text=True, timeout=15)
-                    if r.returncode == 0:
-                        events_count += int(r.stdout.strip() or "0")
+                    # A4: contar *.json sin sh -c (antes: f"find '{events_dir}' ..."
+                    # que era inyectable desde disks_config.json + bloqueaba el loop
+                    # hasta 15s por camara). Ahora iterdir puro en Python.
+                    for _f in events_dir.iterdir():
+                        if _f.suffix == ".json":
+                            events_count += 1
                 except Exception:
                     pass
     total_cameras = set()
