@@ -120,6 +120,48 @@ async def wait_workers_ready(timeout=120):
         log.info(f"worker {port} listo")
 
 
+async def _worker_watchdog():
+    """B6-fix: supervisa los workers subprocess y los reengendra si mueren.
+
+    Antes: si el worker (yolo_server.py) moria (OOM, crash TRT, kill -9), el
+    dispatcher seguia vivo y devolvia 500/503 en cascada hasta que reiniciaban
+    manualmente el servicio. systemd Restart=always NO cubre esto porque solo
+    el proceso PADRE (dispatcher) reinicia si muere, no los hijos.
+
+    Ahora: cada ~5s revisa si cada worker subprocess sigue vivo (poll());
+    si murio, lo reengendra con start_worker y espera a que responda health
+    (carga TRT ~10s). Asi el servicio se autorecupera sin intervencion.
+    """
+    log.info("[watchdog] iniciando supervisor de workers")
+    while True:
+        try:
+            await asyncio.sleep(5)
+            for idx, (p, port) in enumerate(workers):
+                # poll() devuelve None si sigue vivo; objeto exit si murio
+                if p.poll() is None:
+                    continue  # vivo
+                log.warning(f"[watchdog] worker {port} muerto (pid={p.pid}), reengendrando...")
+                try:
+                    new_p = start_worker(port)
+                    workers[idx] = (new_p, port)
+                    # esperar a que el nuevo worker cargue y responda health
+                    t0 = time.time()
+                    while time.time() - t0 < 120:
+                        try:
+                            async with http_client.stream("GET", f"http://127.0.0.1:{port}/health", timeout=2) as r:
+                                if r.status_code == 200:
+                                    break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                    log.info(f"[watchdog] worker {port} reengendrado pid={new_p.pid}")
+                except Exception as e:
+                    log.error(f"[watchdog] no pudo reengendar worker {port}: {e}")
+        except Exception as e:
+            log.error(f"[watchdog] error: {e}")
+            await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global workers, http_client, infer_semaphore
@@ -134,6 +176,8 @@ async def lifespan(app: FastAPI):
         log.error(f"fallo arranque workers: {e}")
         stop_workers()
         raise
+    # B6-fix: arrancar supervisor de workers (reengendra hijos muertos).
+    asyncio.create_task(_worker_watchdog())
     yield
     await http_client.aclose()
     stop_workers()
