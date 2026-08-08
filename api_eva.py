@@ -4645,8 +4645,13 @@ def _verify_admin(authorization: str = Header(None)) -> dict:
         raise HTTPException(status_code=401, detail="Token invalido")
     cfg = _load_admin_config()
     sessions = cfg.get("sessions", {})
-    s = sessions.get(token)
-    if not s:
+    # A6: comparar token en tiempo constante (anti timing-attack).
+    s = None
+    for sess_tok, sess_data in sessions.items():
+        if hmac.compare_digest(str(sess_tok), token):
+            s = sess_data
+            break
+    if s is None:
         raise HTTPException(status_code=401, detail="Sesion no encontrada")
     if int(time.time()) > s.get("expires_at", 0):
         sessions.pop(token, None)
@@ -4662,7 +4667,8 @@ async def admin_auth_login(request: dict):
     if not token:
         raise HTTPException(status_code=400, detail="token requerido")
     cfg = _load_admin_config()
-    if token != cfg.get("admin_token"):
+    # A6: comparacion en tiempo constante (anti timing-attack). Antes: token != cfg.get("admin_token")
+    if not hmac.compare_digest(token, str(cfg.get("admin_token") or "")):
         raise HTTPException(status_code=401, detail="Credencial invalida")
     session_token = secrets.token_urlsafe(32)
     cfg.setdefault("sessions", {})[session_token] = {
