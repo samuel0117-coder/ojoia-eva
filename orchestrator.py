@@ -1711,6 +1711,29 @@ class QwenOrchestrator:
         self._last_notification_ts: Dict[str, float] = {}
         # Configuración de cooldown (en segundos)
         self._notification_cooldown = 300  # 5 minutos entre notificaciones por cámara
+        # C4: AsyncClient compartido. Antes se creaba por llamada (pool
+        # de conexiones efímero -> overhead TLS + connection setup cada vez).
+        # Ahora lazy-init: se crea en el primer uso y se reusa en todas las
+        # llamadas a Qwen (L1912, L2232). close() en shutdown del app.
+        self._shared_client: httpx.AsyncClient = None
+        self._client_lock = asyncio.Lock()
+
+    async def _client(self) -> httpx.AsyncClient:
+        """Devuelve el AsyncClient compartido (lazy-init)."""
+        if self._shared_client is None or self._shared_client.is_closed:
+            async with self._client_lock:
+                if self._shared_client is None or self._shared_client.is_closed:
+                    self._shared_client = httpx.AsyncClient(
+                        timeout=self.timeout,
+                        limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+                    )
+        return self._shared_client
+
+    async def close(self):
+        """Cerrar el AsyncClient compartido (llamar desde shutdown del app)."""
+        if self._shared_client is not None and not self._shared_client.is_closed:
+            await self._shared_client.aclose()
+            self._shared_client = None
     
     def _get_grid(self, user_id: str, camera_id: str, grid_size: int = 16) -> FrameGrid:
         """Obtener o crear grid para una cámara específica."""
@@ -1909,16 +1932,17 @@ class QwenOrchestrator:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
-                resp.raise_for_status()
-                raw_content = resp.json()["choices"][0]["message"]["content"]
-                # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
-                logger.info(f"[QWEN_RAW] {raw_content[:600]}")
-                parsed = _parse_qwen_json(raw_content)
-                # LOGGING CRUDO - Capa 3: JSON parseado
-                logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:600]}")
-                return parsed
+            # C4: reusar AsyncClient compartido (no crear por llamada).
+            client = await self._client()
+            resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
+            resp.raise_for_status()
+            raw_content = resp.json()["choices"][0]["message"]["content"]
+            # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
+            logger.info(f"[QWEN_RAW] {raw_content[:600]}")
+            parsed = _parse_qwen_json(raw_content)
+            # LOGGING CRUDO - Capa 3: JSON parseado
+            logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:600]}")
+            return parsed
         except Exception as e:
             logger.error(f"Vision Analyst error: {e}")
             return {}
@@ -2021,9 +2045,14 @@ class QwenOrchestrator:
             if use_grid_image and len(frames) > 1:
                 # 4×4 mosaico numerado de TODOS los frames en disco (P1)
                 # para verificacion rapida del usuario desde el listado.
-                grid_img = create_grid_image([f.get("image_bytes") or b"" for f in frames], max_size=240)
-                # Eje 1: usar panels 2x2 (4 imágenes grandes con numeración visible) en vez de 1 grid 4x4 chico
-                panels_bytes = create_panels_2x2([f["image_bytes"] for f in frames])
+                # C3: create_grid_image + create_panels_2x2 son CPU work
+                # (PIL C-level). Mover al thread pool para liberar el event
+                # loop (otros workers pueden servir ESP32 / handlers async
+                # mientras PIL hace el mosaico). No cambia el output.
+                imgs = [f.get("image_bytes") or b"" for f in frames]
+                grid_img = await asyncio.to_thread(create_grid_image, imgs, 240)
+                imgs_all = [f["image_bytes"] for f in frames]
+                panels_bytes = await asyncio.to_thread(create_panels_2x2, imgs_all)
                 panels_b64 = [image_to_base64(p) for p in panels_bytes if p]
                 logger.info(f"[GRID] Panels 2x2 created: {len(panels_b64)} panels, frames={len(frames)}")
                 try:
@@ -2224,10 +2253,11 @@ class QwenOrchestrator:
             "max_tokens": 1200
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+        # C4: reusar AsyncClient compartido (no crear por llamada).
+        client = await self._client()
+        resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
 
     def _extract_tracking_summary(self, frames: List[Dict[str, Any]],

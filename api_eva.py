@@ -388,6 +388,39 @@ WORKER_RUNNING = False
 FRAME_QUEUE_DROPS = 0
 FRAME_QUEUE_DROP_TS = 0.0  # ultimo log de drops (rate-limit de log)
 
+# C1+C2 — Pool de workers + lock por cámara para evitar race condition.
+# ANTES (single worker): 1 task consumia FRAME_QUEUE en serie. Mientras
+# ese worker hacia await orchestrator.process_grid (Qwen GPU, 2-5s),
+# todos los demas frames esperaban. Techo: ~10-14 camaras.
+# AHORA (pool): WORKER_COUNT tasks (4 default, env OJOIA_WORKER_COUNT).
+#
+# RACE CONDITION (fix critico del colega): con multiples workers
+# concurrentes, dos podrian llegar a la misma camara con el grid casi
+# lleno. Worker A: add_frame -> full=True -> await process_grid() -> al
+# entrar al await cede control; Worker B: add_frame -> overflow (!16=17)
+# -> full=True tambien -> dispara process_grid() duplicado/anomalo.
+#
+# FIX: un asyncio.Lock por (user_id, camera_id). Dentro del lock:
+#   - grid.add_frame(...)                             (sincrono, rapido)
+#   - is_full -> grid.get_and_reset() para capturar y vaciar a 0
+# Fuera del lock (no bloquea a otras camaras):
+#   - await orchestrator.process_grid(...)            (GPU, lento)
+# El lock es held brevemente (I/O CPU puro), liberado antes del await.
+CAMERA_LOCKS: Dict[tuple, asyncio.Lock] = {}
+
+def _get_camera_lock(user_id: str, camera_id: str) -> asyncio.Lock:
+    key = (user_id, camera_id)
+    lk = CAMERA_LOCKS.get(key)
+    if lk is None:
+        lk = asyncio.Lock()
+        CAMERA_LOCKS[key] = lk
+    return lk
+
+# C1: numero de workers en el pool (default 4, ajustable por env).
+# No mas de 4 concurrentes porque Qwen en GPU0 tiene Semaphore(12)
+# en el orchestrator; superarlo solo generaria await-serialization.
+WORKER_COUNT = int(os.getenv("OJOIA_WORKER_COUNT", "4"))
+
 
 # ── Plan & Billing Helpers ──────────────────────────────────────────────
 def _get_plan_field(plan_name: str, field: str, default=None):
@@ -1293,6 +1326,8 @@ async def health():
             "size": FRAME_QUEUE.qsize(),
             "maxsize": FRAME_QUEUE.maxsize,
             "drops": FRAME_QUEUE_DROPS,
+            "workers": WORKER_COUNT,         # C1
+            "camera_locks": len(CAMERA_LOCKS),  # C2 (locks activos)
         },
     }
 
@@ -3891,8 +3926,15 @@ async def yolo_worker():
 
     Flujo:
     1. Obtiene frame de la cola (con YOLO ya ejecutado en el endpoint)
-    2. Agrega frame al grid para acumulación (análisis Qwen)
-    3. Si el grid se llena o modo centinela con suficientes frames, procesa Qwen
+    2. TOMA LOCK POR CAMARA (asyncio.Lock). Dentro del lock:
+       - add_frame al grid para acumulacion Qwen
+       - is_full=True => grid.get_and_reset() para capturar frames y vaciar
+    3. Si captured_frames (afuera del lock): await process_grid (lento, GPU)
+
+    El lock es held SOLO por add_frame + get_and_reset (CPU puro, sin await).
+    El await a process_grid queda FUERA del lock - eso a proposito para
+    no bloquear a otras camaras mientras Qwen corre, pero solo un worker
+    por camara puede "reclamar" un grid lleno, eliminando la race condition.
     """
     global WORKER_RUNNING
     WORKER_RUNNING = True
@@ -3921,29 +3963,45 @@ async def yolo_worker():
                 FRAME_QUEUE.task_done()
                 continue
 
-            # Agregar frame al grid para acumulación Qwen
             from orchestrator import orchestrator
             grid = orchestrator._get_grid(user_id, camera_id, grid_size=16)
-            grid_is_full = grid.add_frame(
-                image_bytes=img_bytes,
-                camera_id=camera_id,
-                user_id=user_id,
-                yolo_count=yolo_count,
-                yolo_classes=yolo_classes,
-                yolo_detections=yolo_detections,
-                mode=mode
-            )
+
+            # RACE FIX: lock por camara - add_frame + get_and_reset atomicos.
+            # is_full=True significa que el que llama debe reclamar (pop/reset).
+            # Varias cameras pueden procesar en paralelo (lock distinto cada una).
+            cam_lock = _get_camera_lock(user_id, camera_id)
+            captured_frames = None
+            async with cam_lock:
+                grid_is_full = grid.add_frame(
+                    image_bytes=img_bytes,
+                    camera_id=camera_id,
+                    user_id=user_id,
+                    yolo_count=yolo_count,
+                    yolo_classes=yolo_classes,
+                    yolo_detections=yolo_detections,
+                    mode=mode
+                )
+                if grid_is_full:
+                    # Atomico: capturar snapshot y vaciar el grid a 0.
+                    # Capturamos los 16 frames aqui; cualquier worker
+                    # posterior encontrara el grid vacio (no duplica).
+                    captured_frames = grid.get_and_reset()
+                current_count = grid.get_frame_count()
 
             current_time = datetime.now().strftime("%H:%M")
             is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False), user_id=user_id, camera_id=camera_id)
 
-            logger.info(f"YOLO gate: {yolo_count} objects {yolo_classes} → frame AGREGADO al grid ({grid.get_frame_count()}/16)")
+            logger.info(f"YOLO gate: {yolo_count} objects {yolo_classes} → frame AGREGADO al grid "
+                        f"(captured={bool(captured_frames)}, current_count={current_count})")
 
-            # Procesar grid solo cuando esté lleno (16 frames en modo normal).
+            # Procesar grid solo cuando este lleno (16 frames en modo normal).
             # En modo vigilante no procesamos Qwen (defensa en profundidad): la
             # alerta centinela ya fue guardada por _save_vigilance_event en [5]
             # y los frames vigilantes no se encolaron en [6].
-            if grid_is_full:
+            #
+            # IMPORTANTE: el await queda FUERA del lock - no bloquea el lock de
+            # la camara mientras Qwen corre. El grid ya esta reseteado y vacio.
+            if captured_frames:
                 grid_result = await orchestrator.process_grid(
                     user_id=user_id,
                     camera_id=camera_id,
@@ -3953,7 +4011,7 @@ async def yolo_worker():
                 )
                 logger.info(f"Grid procesado: {grid_result.get('frame_count', 0)}/16 frames")
             else:
-                logger.info(f"Grid aún no lleno ({grid.get_frame_count()}/16), esperando más frames")
+                logger.info(f"Grid aún no lleno (current_count={current_count}/16), esperando más frames")
 
             FRAME_QUEUE.task_done()
 
@@ -3971,17 +4029,35 @@ _WORKER_STARTED = False
 
 @app.on_event("startup")
 async def _start_background_tasks():
-    """Iniciar tareas en background: YOLO Worker + Scheduler de Reportes."""
+    """Iniciar tareas en background: YOLO Worker(s) + Scheduler de Reportes."""
     global _WORKER_STARTED
     if not _WORKER_STARTED:
         _WORKER_STARTED = True
-        logger.info("🚀 Iniciando YOLO Worker en background...")
-        asyncio.create_task(yolo_worker())
+        # C1: pool de WORKER_COUNT workers (default 4, env OJOIA_WORKER_COUNT).
+        # Cada worker consume FRAME_QUEUE de forma independiente y procesa en
+        # paralelo (subject al lock por camara - C2). Mas workers = mas cameras
+        # concurrentes ( Semaphore(12) de Qwen es el proximo ceiling real).
+        logger.info(f"🚀 Iniciando {WORKER_COUNT} YOLO Worker(s) en background...")
+        for i in range(WORKER_COUNT):
+            asyncio.create_task(yolo_worker())
         
         # Iniciar scheduler de reportes automáticos (7:30 AM diario)
         logger.info("⏰ Iniciando scheduler de reportes diarios (7:30 AM)...")
         from reportes.scheduler import start_scheduler
         asyncio.create_task(start_scheduler())
+
+
+@app.on_event("shutdown")
+async def _shutdown_tasks():
+    """Cerrar recursos asíncronos compartidos al detener el servicio."""
+    try:
+        # C4: cerrar el httpx.AsyncClient compartido del QwenOrchestrator
+        # para liberar conexiones keepalive limpiamente (no colgar el proc).
+        from orchestrator import orchestrator
+        await orchestrator.close()
+        logger.info("🛑 AsyncClient compartido cerrado (C4)")
+    except Exception as e:
+        logger.warning(f"shutdown orchestrator.close() falló: {e}")
 
 
 @app.get("/api/business/is_open")
