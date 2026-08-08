@@ -758,8 +758,12 @@ async def send_report_v2(user_id: str, request: Request = None):
         page = await generate_report_page(user_id, date, camera_id, cutoff_hour=cutoff_hour)
         if not page.get("success"):
             return page
-        html_url = page["html_url"]
-        pdf_url = page["pdf_url"]
+        # B4: defensivo — page generator podria retornar success=True sin
+        # completar html_url/pdf_url en paths de error parciales.
+        html_url = page.get("html_url", "")
+        pdf_url = page.get("pdf_url", "")
+        if not html_url or not pdf_url:
+            return {"success": False, "error": "Reporte generado sin URLs", "page": page}
         report = page.get("report", {})
         summary = report.get("summary", {})
         date_str = page.get("date_str", date)
@@ -1375,18 +1379,30 @@ async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[
 
 @app.get("/grid/latest")
 async def get_latest_grid(partial: int = 1, camera_id: Optional[str] = None, user_id: Optional[str] = None):
-    grid = orchestrator._get_grid(user_id or "", camera_id or "")
-    info = grid.get_grid_info()
-    grid_b64 = ""
-    if info["frame_count"] > 0:
-        grid_img = grid.get_grid_image()
-        grid_b64 = base64.b64encode(grid_img).decode()
-    return {
-        "frames_used": info["frame_count"],
-        "grid_b64": grid_b64,
-        "camera_ids": info["camera_ids"],
-        "partial": bool(partial)
-    }
+    # B4: envolver en try — si orchestrator._get_grid o get_grid_image/encode
+    # tiran (entrada corrupta, grid vacio, encoding fallido), devolver 502
+    # controlado en vez de 500 con traceback al cliente.
+    try:
+        grid = orchestrator._get_grid(user_id or "", camera_id or "")
+        info = grid.get_grid_info()
+        grid_b64 = ""
+        if info.get("frame_count", 0) > 0:
+            grid_img = grid.get_grid_image()
+            if grid_img:
+                grid_b64 = base64.b64encode(grid_img).decode()
+        return {
+            "frames_used": info.get("frame_count", 0),
+            "grid_b64": grid_b64,
+            "camera_ids": info.get("camera_ids", []),
+            "partial": bool(partial)
+        }
+    except Exception as e:
+        logger.error(f"[grid/latest] {type(e).__name__}: {e}")
+        return JSONResponse(
+            {"frames_used": 0, "grid_b64": "", "camera_ids": [],
+             "partial": bool(partial), "error": str(e)},
+            status_code=502,
+        )
 
 
 # ── MJPEG Stream (viewer en tiempo real) ──────────────────────────────────
@@ -1600,7 +1616,11 @@ async def verify_firebase(request: Request):
         raise HTTPException(status_code=400, detail="Missing idToken")
     try:
         decoded = auth.verify_id_token(id_token)
-        uid = decoded["uid"]
+        # B4: defensivo — si Firebase no trae uid (token malformado/exotico),
+        # devolver 400 en vez de KeyError 500.
+        uid = decoded.get("uid")
+        if not uid:
+            raise HTTPException(status_code=400, detail="Token sin uid")
         email = decoded.get("email", "")
         name = data.get("name", "")
         business_name = data.get("business_name", "")
@@ -2588,10 +2608,15 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
     cam_names = {}
     user_file = find_user_json(user_id)
     if user_file and user_file.exists():
-        with open(user_file) as f:
-            ud = json.load(f)
-        for cam in ud.get("cameras", []):
-            cam_names[cam.get("camera_id", "")] = cam.get("name", "")
+        try:
+            # B4: user.json corrupto (parcial/vacio) no debe tirar 500 a un
+            # cliente legitimo. Cargar de forma defensiva.
+            with open(user_file) as f:
+                ud = json.load(f)
+            for cam in ud.get("cameras", []):
+                cam_names[cam.get("camera_id", "")] = cam.get("name", "")
+        except Exception as e:
+            logger.warning(f"[user/events] user.json corrupto para {user_id}: {e}")
     # M4.4: si filtra por camera_id, no recorrer dirs de otras camaras
     target_cam_ids = {camera_id} if camera_id else None
     for cam_id, events_dir in resolve_user_events_dirs(user_id):
@@ -2605,7 +2630,10 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
             entries = [e for e in os.scandir(str(events_dir)) if e.name.endswith(".json") and e.is_file()]
         except Exception:
             continue
-        entries.sort(key=lambda e: e.stat(follow_symlinks=False).st_mtime, reverse=True)
+        try:
+            entries.sort(key=lambda e: e.stat(follow_symlinks=False).st_mtime, reverse=True)
+        except OSError:
+            continue  # B4: stat() puede fallar si el archivo se borra entre scandir y sort
         scanned = 0
         for entry in entries:
             scanned += 1
