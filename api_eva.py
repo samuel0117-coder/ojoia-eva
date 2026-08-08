@@ -954,11 +954,32 @@ async def centinela_test(user_id: str, camera_id: str = "OJO-E17604", count: int
         return {"success": False, "error": str(e)}
 
 
-# CORS middleware — permisivo para todos los orígenes
+# CORS middleware — A3: lista de origenes explicita (no wildcard+credentials,
+# que es invalido por spec y los browsers rechazan). Antes:
+#   allow_origins=["*"] + allow_credentials=True  -> rechazado por spec.
+# Origenes legitimos: el SPA publico (ojoia.com.do), el panel admin
+# (admin.ojoia.com.do) y localhost para desarrollo. El API mismo recibe
+# peticiones via api.ojoia.com.do (algunas con Origin = propio dominio).
+# Los bearer tokens van en header Authorization (no en cookies), asi que
+# allow_credentials=False es seguro y permitido por la spec.
+ALLOWED_ORIGINS_ENV = os.environ.get("OJOIA_ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [
+    "https://ojoia.com.do", "https://www.ojoia.com.do",
+    "https://admin.ojoia.com.do", "https://api.ojoia.com.do",
+    # localhost para dev (cualquier puerto) -> los listamos explicitos
+    "http://localhost", "http://127.0.0.1",
+]
+# si el operador configura orígenes extra por env (CSV), anadirlos
+for _o in ALLOWED_ORIGINS_ENV.split(","):
+    _o = _o.strip()
+    if _o and _o not in ALLOWED_ORIGINS:
+        ALLOWED_ORIGINS.append(_o)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # bearer en header, no cookies
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     # [Fix CORS] El SPA admin envia SIEMPRE el header 'ngrok-skip-browser-warning'
     # (desde HDRS) en cada request. El navegador lo incluye en
