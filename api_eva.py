@@ -528,10 +528,15 @@ async def _prune_stale_push_tokens():
                 removed = 0
                 for t in probed:
                     try:
-                        resp = _req.post(
-                            probe_url, params={"dry_run": "true"}, headers=headers,
-                            json={"message": {"token": t, "notification": {"title": "_", "body": "_"}}},
-                            timeout=8
+                        # B3: requests.post es sincrono; daemon pruner corre en el
+                        # event loop principal. Offload al thread pool para no bloquear
+                        # otros handlers mientras prueba tokens (8s timeout cada uno).
+                        resp = await asyncio.to_thread(
+                            lambda: _req.post(
+                                probe_url, params={"dry_run": "true"}, headers=headers,
+                                json={"message": {"token": t, "notification": {"title": "_", "body": "_"}}},
+                                timeout=8
+                            )
                         )
                         if resp.status_code == 200:
                             kept.append(t)
@@ -871,17 +876,22 @@ async def send_report_v2(user_id: str, request: Request = None):
                     t0 = time.time()
                     for tok in tokens:
                         try:
-                            _req.post(
-                                "https://fcm.googleapis.com/v1/projects/ojoia-67216/messages:send",
-                                headers={"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"},
-                                json={"message": {
-                                    "token": tok,
-                                    "notification": {"title": "📊 Reporte Diario", "body": f"Tu reporte de {biz} está listo", "click_action": html_url},
-                                    "data": {"type": "daily_report", "url": html_url, "title": "📊 Reporte Diario", "body": f"Tu reporte de {biz} está listo", "tag": "daily_report"},
-                                    "webpush": {"notification": {"title": "📊 Reporte Diario", "body": f"Tu reporte de {biz} está listo", "icon": "/img/icon-192.png", "tag": "daily_report"}, "fcm_options": {"link": html_url}},
-                                    "android": {"priority": "high", "ttl": "15s", "notification": {"channel_id": "daily_reports", "click_action": html_url}}
-                                }},
-                                timeout=10
+                            # B3: requests.post bloquea el event loop (I/O sincrono).
+                            # Offload al thread pool con asyncio.to_thread + lambda
+                            # para preservar kwargs (to_thread solo acepta *args).
+                            await asyncio.to_thread(
+                                lambda: _req.post(
+                                    "https://fcm.googleapis.com/v1/projects/ojoia-67216/messages:send",
+                                    headers={"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"},
+                                    json={"message": {
+                                        "token": tok,
+                                        "notification": {"title": "📊 Reporte Diario", "body": f"Tu reporte de {biz} está listo", "click_action": html_url},
+                                        "data": {"type": "daily_report", "url": html_url, "title": "📊 Reporte Diario", "body": f"Tu reporte de {biz} está listo", "tag": "daily_report"},
+                                        "webpush": {"notification": {"title": "📊 Reporte Diario", "body": f"Tu reporte de {biz} está listo", "icon": "/img/icon-192.png", "tag": "daily_report"}, "fcm_options": {"link": html_url}},
+                                        "android": {"priority": "high", "ttl": "15s", "notification": {"channel_id": "daily_reports", "click_action": html_url}}
+                                    }},
+                                    timeout=10
+                                )
                             )
                         except Exception as e:
                             logger.warning(f"[reportes] fcm token err: {e}")
@@ -1629,7 +1639,10 @@ async def verify_firebase(request: Request):
     if not id_token:
         raise HTTPException(status_code=400, detail="Missing idToken")
     try:
-        decoded = auth.verify_id_token(id_token)
+        # B3: verify_id_token hace llamada de red a Google (I/O bloqueante).
+        # Mover fuera del event loop con asyncio.to_thread para no bloquear
+        # otros handlers durante la verificacion (puede tardar 200-1000ms).
+        decoded = await asyncio.to_thread(auth.verify_id_token, id_token)
         # B4: defensivo — si Firebase no trae uid (token malformado/exotico),
         # devolver 400 en vez de KeyError 500.
         uid = decoded.get("uid")
@@ -2724,11 +2737,19 @@ async def get_event_thumb(event_id: str, user_id: str = None):
             img_file = cam_dir / "events" / f"{event_id}.jpg"
             if img_file.exists():
                 try:
-                    img = PILImage.open(img_file)
-                    img.thumbnail((160, 120))
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=60)
-                    return Response(content=buf.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
+                    # B3: PIL open+thumbnail+save es CPU work que bloquea el
+                    # event loop (decodificacion JPEG). Offload al thread pool.
+                    def _gen_thumb(p):
+                        from PIL import Image as _PIL
+                        import io as _io
+                        im = _PIL.open(p)
+                        im.thumbnail((160, 120))
+                        b = _io.BytesIO()
+                        im.save(b, format="JPEG", quality=60)
+                        return b.getvalue()
+                    thumb_bytes = await asyncio.to_thread(_gen_thumb, img_file)
+                    if thumb_bytes:
+                        return Response(content=thumb_bytes, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
                 except Exception:
                     pass
     raise HTTPException(status_code=404, detail="Image not found")
@@ -4354,7 +4375,10 @@ async def _send_daily_report_whatsapp(user_id: str, message: str, pdf_url: str =
             "text": {"body": wa_message[:4000]}  # WhatsApp limit
         }
         
-        resp = _req.post(api_url, headers=headers, json=payload, timeout=10)
+        # B3: requests.post sincrono - offload al thread pool (10s timeout).
+        resp = await asyncio.to_thread(
+            lambda: _req.post(api_url, headers=headers, json=payload, timeout=10)
+        )
         
         if resp.status_code in (200, 201):
             result = resp.json()
@@ -4950,7 +4974,10 @@ async def admin_users(authorization: str = Header(None)):
                 access_status = _compute_access_status(ud)
                 plan_def = cfg.get("plans", {}).get(ud.get("plan", "free"), {})
                 sp = Path(ud.get("storage_path", str(user_file.parent)))
-                used_mb = _dir_used_mb(sp) if sp.exists() else 0
+                # B3: _dir_used_mb hace subprocess.run(du) - bloquea el event loop.
+                # Mover a thread para no serializar el endpoint admin_users cuando
+                # hay muchos usuarios (cada du ~5-50ms, 100 users = 500ms-5s).
+                used_mb = await asyncio.to_thread(_dir_used_mb, sp) if sp.exists() else 0
                 ud["_plan_status"] = check["status"]
                 ud["_access_status"] = access_status
                 ud["_days_left"] = check["days_left"]
@@ -5614,7 +5641,8 @@ async def admin_get_user_storage(user_id: str, authorization: str = Header(None)
             ud = json.load(f)
         plan = ud.get("plan", "free")
     storage_path = get_user_storage_path(user_id, plan)
-    used_mb = _dir_used_mb(storage_path) if storage_path.exists() else 0
+    # B3: _dir_used_mb subprocess du - offload al thread pool.
+    used_mb = await asyncio.to_thread(_dir_used_mb, storage_path) if storage_path.exists() else 0
     plan_data = cfg.get("plans", {}).get(plan, {})
     return {
         "user_id": user_id, "disk_mount": str(storage_path.parent),
