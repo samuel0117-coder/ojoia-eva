@@ -214,19 +214,24 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
         logger.warning(f"[auth:soft] user={user_id} Authorization malformado")
         return {"authenticated": False, "user_id": user_id, "reason": "bad_header"}
 
-    # A6 (parcial): comparacion en tiempo constante para evitar timing leaks.
+    # A1 (complemento Firebase): primero validar contra api_tokens[] locales
+    # (token emitido por /api/auth/token). Si no hay match, intentar validar
+    # como Firebase ID Token (el SPA usa Firebase Auth y envia getIdToken()).
+    # Esto cierra el flujo del SPA sin romper la seguridad: el uid del
+    # Firebase token DEBE coincidir con el user_id de la query (anti-suplantacion).
     try:
         uf = find_user_json(user_id)
         if not uf or not uf.exists():
             if AUTH_ENFORCE:
                 raise HTTPException(status_code=401, detail="Usuario no encontrado")
             return {"authenticated": False, "user_id": user_id, "reason": "no_user"}
+
+        # 1) token local (api_tokens[])
         with _get_user_lock(user_id):
             with open(uf) as f:
                 ud = json.load(f)
             tokens = ud.get("api_tokens", []) or []
             now = int(time.time())
-            # Limpiar tokens expirados / revocados
             valid = [t for t in tokens if not t.get("revoked") and
                      now < t.get("expires_at", now + AUTH_TOKEN_TTL_SEC * 100)]
             match = None
@@ -234,16 +239,41 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
                 if hmac.compare_digest(str(t.get("token", "")), token):
                     match = t
                     break
-            if not match:
-                if AUTH_ENFORCE:
-                    raise HTTPException(status_code=401, detail="Token no valido o expirado")
-                logger.warning(f"[auth:soft] user={user_id} token invalido (len={len(token)})")
-                return {"authenticated": False, "user_id": user_id, "reason": "bad_token"}
+
+        if match:
             # Refrescar last_used
             match["last_used"] = now
-            ud["api_tokens"] = valid
-            _atomic_write_user_json(uf, ud)
-        return {"authenticated": True, "user_id": user_id, "token_id": match.get("id")}
+            with _get_user_lock(user_id):
+                with open(uf) as f:
+                    ud = json.load(f)
+                ud["api_tokens"] = [t for t in ud.get("api_tokens", []) if not t.get("revoked") and
+                                     now < t.get("expires_at", now + AUTH_TOKEN_TTL_SEC * 100)] + \
+                                    [t for t in ud.get("api_tokens", []) if (t.get("revoked") or
+                                     now >= t.get("expires_at", 0))][-20:]
+                match_idx = next((i for i, t in enumerate(ud["api_tokens"]) if t.get("id") == match.get("id")), None)
+                if match_idx is not None:
+                    ud["api_tokens"][match_idx]["last_used"] = now
+                _atomic_write_user_json(uf, ud)
+            return {"authenticated": True, "user_id": user_id, "token_id": match.get("id")}
+
+        # 2) Firebase ID Token (SPA usa Firebase Auth). Verificar uid == user_id.
+        # B3: verify_id_token hace llamada de red a Google — fuera del event loop.
+        try:
+            decoded = await asyncio.to_thread(auth.verify_id_token, token)
+            fb_uid = decoded.get("uid")
+            if fb_uid and fb_uid == user_id:
+                return {"authenticated": True, "user_id": user_id, "token_id": "firebase", "firebase": True}
+            # uid no coincide -> rechazar (anti-suplantacion de user_id)
+            if AUTH_ENFORCE:
+                raise HTTPException(status_code=401, detail="Token Firebase no corresponde a este usuario")
+        except HTTPException:
+            raise
+        except Exception as e:
+            # no es un Firebase token valido -> token rechazado
+            if AUTH_ENFORCE:
+                raise HTTPException(status_code=401, detail="Token no valido o expirado")
+            logger.warning(f"[auth:soft] user={user_id} token no valido (local ni firebase): {e}")
+            return {"authenticated": False, "user_id": user_id, "reason": "bad_token"}
     except HTTPException:
         raise
     except Exception as e:
@@ -251,6 +281,8 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
             raise HTTPException(status_code=401, detail=f"Error validacion: {e}")
         logger.error(f"[auth:soft] error user={user_id}: {e}")
         return {"authenticated": False, "user_id": user_id, "reason": "error"}
+    # Si llegamos aqui sin retornar (solo en soft rollout)
+    return {"authenticated": False, "user_id": user_id, "reason": "bad_token"}
 
 
 # A1: dependencia FastAPI para proteger endpoints /api/* que reciben user_id
