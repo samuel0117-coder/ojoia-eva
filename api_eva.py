@@ -1095,6 +1095,15 @@ async def enforce_user_auth(request: Request, call_next):
     A1 — Valida Authorization: Bearer <token> para /api/* que lleven user_id.
     Rutas en PUBLIC_USER_PATHS o sin user_id pasan sin check.
     OPTIONS (preflight) pasa siempre.
+
+    CORS FIX: cuando este middleware corta con 401/403, agrega
+    Access-Control-Allow-Origin a la respuesta. Razon: el navegador hace
+    fetch() con header Origin y, si el backend responde 401 SIN ACAO, el
+    navegador bloquea la lectura del response (CORS Missing Allow Origin) y
+    el SPA queda "Offline" aunque el server este vivo. El 401 sigue siendo
+    401 (no abre ningun hueco); solo permitimos que el navegador LO LEA.
+    Usamos el Origin de la request si viene, sino "*" (allow_credentials=False
+    asi "*" es valido por la spec).
     """
     path = request.url.path
     # solo /api/* (excepto las publicas explicitas o sus prefijos con path params).
@@ -1116,14 +1125,31 @@ async def enforce_user_auth(request: Request, call_next):
         # Mientras tanto, si no hay Authorization y enforce=True -> 401 para
         # forzar a que los endpoints con user_id en body validen explicito.
         if not request.headers.get("authorization"):
-            return JSONResponse({"detail": "Authorization requerido"},
-                                status_code=401)
+            resp = JSONResponse({"detail": "Authorization requerido"}, status_code=401)
+            _add_cors_to_response(request, resp)
+            return resp
         return await call_next(request)
     try:
         _verify_user_token(request.headers.get("authorization"), user_id)
     except HTTPException as he:
-        return JSONResponse({"detail": he.detail}, status_code=he.status_code)
+        resp = JSONResponse({"detail": he.detail}, status_code=he.status_code)
+        _add_cors_to_response(request, resp)
+        return resp
     return await call_next(request)
+
+
+def _add_cors_to_response(request: Request, response):
+    """Agrega Access-Control-Allow-Origin a una respuesta generada por un
+    middleware (no pasa por CORSMiddleware de FastAPI en ese path). Si la
+    request trajo Origin, lo reflejamos; sino usamos '*' (valido porque
+    allow_credentials=False). No altera el status ni el body."""
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    # Permitir que el navegador lea el cuerpo del 401 (necesario para fetch).
+    response.headers["Access-Control-Allow-Credentials"] = "false"
 
 
 # Middleware para no-cache y CORS seguro
