@@ -173,8 +173,8 @@ def _consolidate_legacy_eva_sessions(ud: dict, user_id: str) -> None:
 # Flujo soft rollout:
 #   - Nuevo endpoint POST /api/auth/token genera token random y lo guarda
 #     en user.json.api_tokens[] (con created_at).
-#   - _verify_user_token(header) valida Authorization: Bearer <token>.
-#   - Endpoints protegidos llaman a _verify_user_token(...) como dependencia
+#   - await _verify_user_token(header) valida Authorization: Bearer <token>.
+#   - Endpoints protegidos llaman a await _verify_user_token(...) como dependencia
 #     con user_id conocido; si la auth falta, loguea warning pero ACEPTA.
 #   - Adelante (Fase 2): switch a enforce=True para rechazar 401.
 #
@@ -193,9 +193,11 @@ def _generate_user_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
+async def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
     """
-    Valida Authorization: Bearer <token> contra user.json.api_tokens[].
+    Valida Authorization: Bearer <token> contra user.json.api_tokens[] O contra
+    Firebase ID Token (el SPA usa Firebase Auth). Async porque verificar el
+    Firebase token requiere await asyncio.to_thread(auth.verify_id_token).
 
     Soft rollout (AUTH_ENFORCE=False): si la auth falta o es invalida,
     se loguea WARNING pero el request continúa (devuelve identity=None).
@@ -303,7 +305,7 @@ def _verify_user_token(authorization: Optional[str], user_id: str) -> dict:
 # (usan _verify_admin propio), /reports/{user_id}/{filename} (servidos por
 # StaticFiles o path-traversal-sanitized por A5), /vigilance-frame/*
 # (notificaciones push con link de imagen).
-def verify_user(
+async def verify_user(
     request: Request,
     authorization: str = Header(None, alias="Authorization"),
 ) -> dict:
@@ -327,7 +329,7 @@ def verify_user(
             # si ya esta cacheado. En gral los endpoints pasan user_id por JSON
             # body o query. Si no llega por query, el endpoint recibira user_id
             # por separado y debemos confiar en que el route body llama a
-            # _verify_user_token(authorization, user_id) explicitamente.
+            # await _verify_user_token(authorization, user_id) explicitamente.
         except Exception:
             pass
     # 2) path params {user_id} o {uid}
@@ -350,7 +352,7 @@ def verify_user(
             raise HTTPException(status_code=401, detail="Authorization requerido")
         return {"authenticated": False, "user_id": None, "reason": "no_user_id"}
 
-    return _verify_user_token(authorization, user_id)
+    return await _verify_user_token(authorization, user_id)
 
 
 # A1 (cont.): helper para endpoints que reciben user_id en el JSON body
@@ -367,7 +369,7 @@ async def _auth_user_from_body(request: Request, user_id: str) -> None:
     """Valida Authorization: Bearer <token> contra user_id del JSON body."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id requerido")
-    _verify_user_token(request.headers.get("authorization"), user_id)
+    await _verify_user_token(request.headers.get("authorization"), user_id)
 
 
 async def _parse_json_body(request: Request) -> dict:
@@ -641,7 +643,7 @@ async def register_push_token(request: Request):
         body = await request.json()
         token = (body.get("token") or "").strip()
         user_id = body.get("user_id")
-        _verify_user_token(request.headers.get("authorization"), user_id)  # A1: anti-suplantacion de user_id en body
+        await _verify_user_token(request.headers.get("authorization"), user_id)  # A1: anti-suplantacion de user_id en body
         device = body.get("device")
         if not token or not user_id:
             return {"success": False, "error": "user_id y token requeridos"}
@@ -1152,7 +1154,7 @@ async def enforce_user_auth(request: Request, call_next):
     user_id = _extract_user_id_from_request(request)
     if not user_id:
         # el endpoint no expone user_id por query/path; confiamos en que el
-        # route body hara _verify_user_token(authorization, user_id) explicito,
+        # route body hara await _verify_user_token(authorization, user_id) explicito,
         # o el user_id viene en JSON body (el route la extrae y valida).
         # Mientras tanto, si no hay Authorization y enforce=True -> 401 para
         # forzar a que los endpoints con user_id en body validen explicito.
@@ -1162,7 +1164,7 @@ async def enforce_user_auth(request: Request, call_next):
             return resp
         return await call_next(request)
     try:
-        _verify_user_token(request.headers.get("authorization"), user_id)
+        await _verify_user_token(request.headers.get("authorization"), user_id)
     except HTTPException as he:
         resp = JSONResponse({"detail": he.detail}, status_code=he.status_code)
         _add_cors_to_response(request, resp)
@@ -1877,7 +1879,7 @@ async def register_fcm_token(request: dict, authorization: str = Header(None, al
     """Registra token FCM para push notifications."""
     try:
         user_id = request.get("user_id", "") if isinstance(request, dict) else ""
-        _verify_user_token(authorization, user_id)  # A1: anti-suplantacion de user_id en body
+        await _verify_user_token(authorization, user_id)  # A1: anti-suplantacion de user_id en body
         fcm_token = request.get("fcm_token", "") if isinstance(request, dict) else ""
         if isinstance(request, str):
             try:
@@ -2026,7 +2028,7 @@ async def get_eva_chat_history_post(request: dict, authorization: str = Header(N
     """
     try:
         user_id = request.get("user_id", "")
-        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
+        await _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         if not user_id:
             return {"success": False, "error": "user_id required"}
         uf = find_user_json(user_id)
@@ -2151,7 +2153,7 @@ async def save_eva_chat_message(request: dict, authorization: str = Header(None,
     """Guarda un mensaje del chat con Eva en user.json."""
     try:
         user_id = request.get("user_id", "")
-        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
+        await _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         session_id = request.get("session_id", "")
         role = request.get("role", "user")
         content = request.get("content", "")
@@ -2202,7 +2204,7 @@ async def eva_event_feedback(request: dict, authorization: str = Header(None, al
     """
     try:
         user_id = request.get("user_id", "")
-        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
+        await _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         event_id = request.get("event_id", "")
         is_real = bool(request.get("is_real", True))
         notes = request.get("notes") or ""
@@ -2253,7 +2255,7 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
     """
     try:
         user_id = (request.get("user_id") or "").strip()
-        _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
+        await _verify_user_token(authorization, user_id)  # A1: validar token vs user_id del body
         message = (request.get("message") or "").strip()
         session_id = request.get("session_id") or ""
         cam_id = request.get("cam_id") or ""
@@ -2697,7 +2699,7 @@ async def get_user_profile(user_id: str):
 async def update_user_profile(request: Request):
     data = await request.json()
     user_id = data.get("user_id", "")
-    _verify_user_token(request.headers.get("authorization"), user_id)  # A1: validar token vs user_id del body
+    await _verify_user_token(request.headers.get("authorization"), user_id)  # A1: validar token vs user_id del body
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
     user_file = find_user_json(user_id)
