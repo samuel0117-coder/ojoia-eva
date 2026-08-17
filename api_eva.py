@@ -209,6 +209,19 @@ async def _verify_user_token(authorization: Optional[str], user_id: str) -> dict
         logger.warning(f"[auth:soft] user={user_id} request SIN Authorization header")
         return {"authenticated": False, "user_id": user_id, "reason": "no_header"}
 
+    # A2 fix (2026-08-09): Starlette entrega el header Authorization como objeto
+    # Header (o como lista si llega repetido) cuando se declara con
+    # `Header(None, alias="Authorization")` en el endpoint. Antes llamabamos
+    #authorization.replace("Bearer ", "") directamente y revientaba con
+    # "'Header' object has no attribute 'replace'" en TODOS los endpoints que
+    # validan token explicitamente (chat de Eva, history POST, ...). El plan A1
+    # (AUTH_ENFORCE=True) hizo que el header SIEMPRE llegue desde el SPA y
+    # destapo bug latente. Normalizamos a str de forma robusta antes de .replace.
+    if isinstance(authorization, (list, tuple)):
+        authorization = authorization[0] if authorization else ""
+    if not isinstance(authorization, str):
+        authorization = str(authorization)
+
     token = authorization.replace("Bearer ", "").strip()
     if not token:
         if AUTH_ENFORCE:
@@ -1143,8 +1156,16 @@ async def enforce_user_auth(request: Request, call_next):
     # solo /api/* (excepto las publicas explicitas o sus prefijos con path params).
     # /admin/* usa _verify_admin propio.
     # PUBLIC_USER_PATHS admite entradas con barra final como PREFIJO (startswith).
+    # A2 fix (2026-08-09): /api/event-thumb/ y /api/thumb/ como PREFIJOS publicos.
+    # Los thumbs se cargan como <img src="..."> desde el SPA y NO pueden portar
+    # header Authorization. Antes el middleware A1 (AUTH_ENFORCE=True) los cortaba
+    # con 401 JSON -> Firefox dispara OpaqueResponseBlocking (ORB) al ver una
+    # respuesta no-imagen en un tag <img> -> thumbs no cargaban y el feed de
+    # eventos se veia "vacio". Mismo criterio que /vigilance-frame/* (publicas
+    # porque solo exponen miniaturas de eventos de seguridad, sin PII).
     public_prefixes = ("/api/reportes/view/", "/api/reportes/download/",
-                       "/api/reportes/url/", "/reportes/")
+                       "/api/reportes/url/", "/reportes/",
+                       "/api/event-thumb/", "/api/thumb/")
     if (not path.startswith("/api/")
             or path in PUBLIC_USER_PATHS
             or path.startswith(public_prefixes)):
@@ -2393,10 +2414,16 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
 
 
 # Alias para compatibilidad con frontend actual (/config/chat)
+# A2 fix (2026-08-09): el alias antes NO extraia el header Authorization y lo
+# pasaba como None a chat_eva_message -> _verify_user_token(None, user_id) ->
+# 401 "Authorization requerido" -> success:false "Error procesando mensaje".
+# El navegador usa /config/chat (eva-chat-v6.js:450), NO /api/chat/eva/message,
+# asi que el chat de Eva entero estaba roto por este alias. Ahora extraemos el
+# header del Request y lo pasamos explicito.
 @app.post("/config/chat")
-async def chat_config_alias(request: dict):
+async def chat_config_alias(request: dict, authorization: str = Header(None, alias="Authorization")):
     """Alias del endpoint de chat para compatibilidad con versiones anteriores."""
-    return await chat_eva_message(request)
+    return await chat_eva_message(request, authorization)
 
 
 # --- UTIL FUNCTIONS NEW ---
@@ -2741,73 +2768,85 @@ async def get_user_events(user_id: str, date: str = None, filter: str = None, li
             logger.warning(f"[user/events] user.json corrupto para {user_id}: {e}")
     # M4.4: si filtra por camera_id, no recorrer dirs de otras camaras
     target_cam_ids = {camera_id} if camera_id else None
+    # W3 fix (2026-08-11): recolectar TODOS los .json de todas las camaras en
+    # una sola lista con su mtime, ordenar globalmente por mtime DESC, y luego
+    # iterar cortando por limit. ANTES el loop procesaba camara por camara
+    # (os.listdir orden arbitrario: OJO-D1CC08 primero) y llenaba limit=50 con
+    # los 50 .json mas recientes de la primera camara, sin visitar la siguiente.
+    # Resultado: si OJO-D1CC08 tenia miles de eventos viejos, el backend devolvia
+    # 50 eventos de vitrina y 0 de OJO-E17604 aunque esta tuviera 313 evt_*
+    # de HOY. El front mostraba solo los vigilance_* del 8-ago que el usuario
+    # veia como "no hay eventos nuevos".
+    all_entries = []  # list of (mtime, entry, cam_id_for_name_fallback)
     for cam_id, events_dir in resolve_user_events_dirs(user_id):
         if not events_dir.exists():
             continue
         # M4.4: saltar dirs de camaras que no nos interesan
         if target_cam_ids and cam_id not in target_cam_ids and cam_id != "_global":
             continue
-        # Usar scandir (mas eficiente) y limitar cuantos examinamos para no recorrer 9000+ archivos
         try:
-            entries = [e for e in os.scandir(str(events_dir)) if e.name.endswith(".json") and e.is_file()]
+            for e in os.scandir(str(events_dir)):
+                if e.name.endswith(".json") and e.is_file():
+                    try:
+                        all_entries.append((e.stat(follow_symlinks=False).st_mtime, e, cam_id))
+                    except OSError:
+                        continue
         except Exception:
             continue
+    # Ordenar globalmente por mtime descendente — mix entre camaras.
+    all_entries.sort(key=lambda t: t[0], reverse=True)
+    scanned = 0
+    for _mtime, entry, _cam_id in all_entries:
+        scanned += 1
+        if len(events) >= limit:
+            break
+        if scanned > limit * 20:
+            break  # seguro: no recorrer todo el storage
         try:
-            entries.sort(key=lambda e: e.stat(follow_symlinks=False).st_mtime, reverse=True)
-        except OSError:
-            continue  # B4: stat() puede fallar si el archivo se borra entre scandir y sort
-        scanned = 0
-        for entry in entries:
-            scanned += 1
-            if len(events) >= limit:
-                break
-            if scanned > limit * 20:
-                break  # seguro: no recorrer todo el storage
-            try:
-                with open(entry.path) as f:
-                    ev = json.load(f)
-            except Exception:
-                continue  # json corrupto/vacio -> skip
-            # M4.4: filtrar por camera_id del propio evento (fallback si events_dir agrupa _global)
-            if target_cam_ids and ev.get("camera_id", "") not in target_cam_ids:
+            with open(entry.path) as f:
+                ev = json.load(f)
+        except Exception:
+            continue  # json corrupto/vacio -> skip
+        # M4.4: filtrar por camera_id del propio evento (fallback si events_dir agrupa _global)
+        if target_cam_ids and ev.get("camera_id", "") not in target_cam_ids:
+            continue
+        if date == "hoy" or filter == "today":
+            if int(ev.get("timestamp", 0) or 0) < start_of_today:
                 continue
-            if date == "hoy" or filter == "today":
-                if int(ev.get("timestamp", 0) or 0) < start_of_today:
-                    continue
-            # M4.6: vigilance_alert es centinela de 1 frame. Bandera + opcionalmente excluido.
-            is_centinela = ev.get("event_type") in ("vigilance_alert", "night_alert")
-            ev["is_centinela"] = is_centinela
-            if exclude_vigilance and is_centinela:
-                continue
-            # M4.6: filtro "alerts" ahora incluye centinelas como alertas operacionales,
-            # con prioridad violation > vigilance_alert/night_alert para el chat brief.
-            if filter == "alerts" and not (ev.get("event_type") == "violation" or is_centinela):
-                continue
-            cid = ev.get("camera_id", "")
-            ev["camera_name"] = cam_names.get(cid, cam_id if cam_id != "_global" else "Camara")
-            if ev.get("event_type") == "violation":
-                rule_violated = ev.get("metadata", {}).get("rule_violated", "")
-                qa = rule_violated if rule_violated else ev.get("metadata", {}).get("qwen_analysis", "")[:60] if isinstance(ev.get("metadata", {}).get("qwen_analysis"), str) else ""
-            else:
-                _qa = ev.get("metadata", {}).get("qwen_analysis", "")
-                qa = (_qa[:100] if isinstance(_qa, str) else "")
-            is_violation = ev.get("event_type") in ("violation", "vigilance_alert", "night_alert")
-            ev["qwen"] = {"violation": is_violation, "description": qa}
-            ev_meta = ev.get("metadata", {}) if isinstance(ev.get("metadata"), dict) else {}
-            yolo_classes = ev_meta.get("yolo_classes") if isinstance(ev_meta, dict) else None
-            if isinstance(yolo_classes, str):
-                yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
-            yolo_classes = yolo_classes or []
-            md_persons = ev_meta.get("person_tracking", {}) if isinstance(ev_meta, dict) else {}
-            md_unique = int(md_persons.get("unique_persons") or 0) if isinstance(md_persons, dict) else 0
-            md_total_yolo = int(ev_meta.get("total_yolo_objects") or 0) if isinstance(ev_meta, dict) else 0
-            yolo_count = md_total_yolo or md_unique or len(yolo_classes) or 1
-            ev["yolo"] = {"count": yolo_count, "classes": yolo_classes}
-            ev["persons"] = md_unique or yolo_count
-            if "metadata" in ev and isinstance(ev["metadata"], dict) and "grid_b64" in ev["metadata"]:
-                del ev["metadata"]["grid_b64"]
-            ev["thumb_url"] = f"https://api.ojoia.com.do/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
-            events.append(ev)
+        # M4.6: vigilance_alert es centinela de 1 frame. Bandera + opcionalmente excluido.
+        is_centinela = ev.get("event_type") in ("vigilance_alert", "night_alert")
+        ev["is_centinela"] = is_centinela
+        if exclude_vigilance and is_centinela:
+            continue
+        # M4.6: filtro "alerts" ahora incluye centinelas como alertas operacionales,
+        # con prioridad violation > vigilance_alert/night_alert para el chat brief.
+        if filter == "alerts" and not (ev.get("event_type") == "violation" or is_centinela):
+            continue
+        cid = ev.get("camera_id", "")
+        ev["camera_name"] = cam_names.get(cid, _cam_id if _cam_id != "_global" else "Camara")
+        if ev.get("event_type") == "violation":
+            rule_violated = ev.get("metadata", {}).get("rule_violated", "")
+            qa = rule_violated if rule_violated else ev.get("metadata", {}).get("qwen_analysis", "")[:60] if isinstance(ev.get("metadata", {}).get("qwen_analysis"), str) else ""
+        else:
+            _qa = ev.get("metadata", {}).get("qwen_analysis", "")
+            qa = (_qa[:100] if isinstance(_qa, str) else "")
+        is_violation = ev.get("event_type") in ("violation", "vigilance_alert", "night_alert")
+        ev["qwen"] = {"violation": is_violation, "description": qa}
+        ev_meta = ev.get("metadata", {}) if isinstance(ev.get("metadata"), dict) else {}
+        yolo_classes = ev_meta.get("yolo_classes") if isinstance(ev_meta, dict) else None
+        if isinstance(yolo_classes, str):
+            yolo_classes = [c.strip() for c in yolo_classes.split(",") if c.strip()]
+        yolo_classes = yolo_classes or []
+        md_persons = ev_meta.get("person_tracking", {}) if isinstance(ev_meta, dict) else {}
+        md_unique = int(md_persons.get("unique_persons") or 0) if isinstance(md_persons, dict) else 0
+        md_total_yolo = int(ev_meta.get("total_yolo_objects") or 0) if isinstance(ev_meta, dict) else 0
+        yolo_count = md_total_yolo or md_unique or len(yolo_classes) or 1
+        ev["yolo"] = {"count": yolo_count, "classes": yolo_classes}
+        ev["persons"] = md_unique or yolo_count
+        if "metadata" in ev and isinstance(ev["metadata"], dict) and "grid_b64" in ev["metadata"]:
+            del ev["metadata"]["grid_b64"]
+        ev["thumb_url"] = f"https://api.ojoia.com.do/api/event-thumb/{ev.get('event_id', '')}?user_id={user_id}"
+        events.append(ev)
     return {"events": events}
 
 
@@ -3861,20 +3900,17 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             with open(frames_dir_v / "latest_yolo.json", "w") as f:
                 json.dump(yolo_data, f, indent=2)
 
-            # Actualizar grid inmediatamente con el último frame y detecciones
-            from orchestrator import orchestrator
-            grid = orchestrator._get_grid(user_id, camera_id, grid_size=16)
-            grid.add_frame(
-                image_bytes=img_bytes,
-                camera_id=camera_id,
-                user_id=user_id,
-                yolo_count=yolo_count,
-                yolo_classes=yolo_classes,
-                yolo_detections=yolo_detections,
-                mode=mode
-            )
+            # W2 fix (2026-08-09): NO llamar grid.add_frame() aqui. El worker
+            # (yolo_worker, api_eva.py:4062) ya lo hace bajo cam_lock y dispara
+            # process_grid cuando el grid se llena. Si tambien lo hacemos aqui,
+            # cada frame con yolo_count>0 se annade DOS VECES al mismo grid
+            # (mismo dict key {uid}_{cam}) -> 16 frames son en realidad 8 unicos
+            # x 2 copias -> Qwen pierde mitad del rango temporal del analisis.
+            # Verificado en evt_1786311096_OJO-E17604.json: frame_timestamps
+            # vienen en 8 pares consecutivos a ~10ms, frame_sizes 8 unicos/16.
+            # Aqui solo escribimos latest_yolo.json para el viewer (sin tocar grid).
         except Exception as e:
-            logger.error(f"Error actualizando YOLO/grid para viewer: {e}")
+            logger.error(f"Error actualizando YOLO para viewer: {e}")
 
         # ── [5] MODO CENTINELA: alerta directa si YOLO detecta algo ──
         # En modo vigilante SOLO generamos el evento centinela (YOLO + notificacion).
@@ -4062,12 +4098,18 @@ async def yolo_worker():
             # IMPORTANTE: el await queda FUERA del lock - no bloquea el lock de
             # la camara mientras Qwen corre. El grid ya esta reseteado y vacio.
             if captured_frames:
+                # grid-fix (2026-08-09): pasar captured_frames directamente a
+                # process_grid. Antes el worker capturaba los 16 con
+                # get_and_reset() (linea 4075) pero process_grid reeleria el
+                # grid YA VACIO -> "Grid procesado: 0/16 frames" y los 16 frames
+                # se perdian. Ver LEEME.md seccion 11.
                 grid_result = await orchestrator.process_grid(
                     user_id=user_id,
                     camera_id=camera_id,
                     mode="vigilante" if is_vigilante else "normal",
                     use_grid_image=True,
-                    grid_size=16
+                    grid_size=16,
+                    frames=captured_frames
                 )
                 logger.info(f"Grid procesado: {grid_result.get('frame_count', 0)}/16 frames")
             else:

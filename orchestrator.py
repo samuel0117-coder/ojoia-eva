@@ -1960,18 +1960,28 @@ class QwenOrchestrator:
     async def process_grid(self, prompt: str = None, vigilance_prompt: str = None,
                                 vigilance_rules: str = None, use_grid_image: bool = True,
                                 user_id: str = "default", camera_id: str = "unknown",
-                                mode: str = "normal", grid_size: int = 16) -> Dict[str, Any]:
+                                mode: str = "normal", grid_size: int = 16,
+                                frames: list = None) -> Dict[str, Any]:
             """Process full grid of 16 frames with Qwen.
-    
+
             Arquitectura 2 etapas:
             Etapa 1: Qwen Vision Analyst — solo describe (personas, ropa, acciones, objetos)
             Etapa 2: Attention Hit Detection — detecta si lo observado coincide con frases de atención
+
+            grid-fix (2026-08-09): añadido parámetro opcional `frames`. El worker en
+            api_eva.py:4075 ya capturó (y vació) el grid via grid.get_and_reset();
+            si llamamos aquí a grid.get_and_reset() de nuevo obtenemos [] (vacío)
+            -> 100% de grids resultaban en "Grid procesado: 0/16 frames" y NUNCA
+            se guardaban evt_* con análisis LLM. Ahora el worker pasa los frames
+            capturados y aquí se usan directo (sin releer el grid).
             """
-            grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
-            frames = grid.get_and_reset()
-    
+            if frames is None:
+                # path legacy (si alguien llama sin frames): releer el grid
+                grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
+                frames = grid.get_and_reset()
+
             if not frames:
-                return {"error": "No frames in grid"}
+                return {"error": "No frames in grid", "frame_count": 0}
     
             # Extraer vigilance_prompt y vigilance_rules del primer frame (enviados desde api_eva.py)
             if vigilance_prompt is None and frames:
@@ -2215,6 +2225,7 @@ class QwenOrchestrator:
     
             return {
                 "frames_processed": len(frames),
+                "frame_count": len(frames),
                 "grid_result": grid_result,
                 "qwen_json": qwen_json,
                 "attention_hits": attention_hits,
