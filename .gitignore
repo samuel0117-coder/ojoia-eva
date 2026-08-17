@@ -1,33 +1,66 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.log
-.env
-node_modules/
-.DS_Store
-Thumbs.db
-*.tmp
-*.swp
-.idea/
-.vscode/
+*.pyd
 
-ai_system/ComfyUI*/
-ai_system/SadTalker*/
-ai_system/chatrd/
-ai_system/.insightface/
+# Secrets — NUNCA trackear
+firebase-key.json
+.env
+*.env.local
+
+# Logs
+*.log
 cloudflared.log
 ai_system/api_eva.log
 ai_system/api_eva_chat.log
 
+# Storage de usuarios (PII, cámaras, frames)
 storage/
+!storage/.gitkeep
+
+# Venvs (no trackear, son locales)
+venv*/
+venv*/
+*/venv*/
+**/venv*/
+
+# Assets pesados (imágenes, vídeo, modelos)
 *.jpg
 *.jpeg
+*.png
 *.mp4
+*.mov
+*.avi
+*.engine
+*.pt
+*.safetensors
+*.bin
 !frontend/img/
-venv*/
-venv*/
-*/venv*/
-**/venv*/
-venv*/
-*/venv*/
-**/venv*/
+!frontend/assets/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+
+# AI system (submódulos externos, no trackear)
+ai_system/ComfyUI*/
+ai_system/SadTalker*/
+ai_system/chatrd/
+ai_system/.insightface/
+ai_system/voxtral*/
+ai_system/wan*/
+ai_system/RealESRGAN*/
+ai_system/Wav2Lip*/
+
+# Node
+node_modules/
+
+# Certificados (se trackean separado, no en el repo)
+*.crt
+*.key
+*.p12

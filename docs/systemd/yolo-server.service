@@ -1,0 +1,54 @@
+# B6 — parche systemd: yolo-server.service
+# Cambios vs /etc/systemd/system/yolo-server.service actual:
+#   - Restart=on-failure -> Restart=always
+#   + StartLimitIntervalSec=300 + StartLimitBurst=5
+#
+# YOLO dispatcher arranca 1 worker subprocess (yolo_server.py) en GPU1.
+# Si el worker muere (OOM, crash TRT) el dispatcher se queda dando 500
+# hasta que reinician el servicio manualmente. Con Restart=always, systemd
+# reengendra dispatcher + worker solo. Verificado el comportamiento el
+# 2026-08-08 (worker caido, 500 en cascada, restart manual).
+#
+# Aplicar:
+#   sudo cp /opt/ojoia/docs/systemd/yolo-server.service /etc/systemd/system/yolo-server.service
+#   sudo systemctl daemon-reload && sudo systemctl restart yolo-server.service
+
+[Unit]
+Description=OjoIA YOLO Pose Detection (GPU configurable)
+After=network-online.target
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+WorkingDirectory=/opt/ojoia/code
+# GPU selection and VRAM tuning via env vars (future-proof: change GPU without code edits)
+# YOLO_GPU: physical GPU index (default "1")
+# YOLO_MEM_FRAC: per-process VRAM fraction (default 0.10 ~ 2.4 GB)
+# YOLO_GLOBAL_CONCURRENT: cap on simultaneous GPU inferences (default 2)
+# YOLO_IMGSZ: inference image size (default 416)
+# YOLO_MODEL: model file name (default yolov8s-pose.pt)
+Environment=YOLO_PERSON_CONF=0.20
+Environment=YOLO_GPU=1
+Environment=YOLO_WORKERS=1
+Environment=YOLO_WORKER_BASE_PORT=8100
+Environment=YOLO_MEM_FRAC=0.13
+Environment=YOLO_GLOBAL_CONCURRENT=4
+Environment=MICRO_BATCH_MS=30
+Environment=MICRO_BATCH_MAX=32
+Environment=YOLO_IMGSZ=416
+# Environment=YOLO_MODEL=yolov8s-pose.pt  # auto: .engine si existe (TRT)
+AmbientCapabilities=CAP_IPC_LOCK
+LimitMEMLOCK=infinity
+ExecStart=/home/sam/ai_system/venv/bin/python -u /opt/ojoia/code/yolo_dispatcher.py
+# B6: Restart=always — dispatcher reengenda worker subprocess on crash.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=8G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

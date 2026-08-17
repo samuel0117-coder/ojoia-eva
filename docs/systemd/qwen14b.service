@@ -1,0 +1,38 @@
+# B6 — parche user-systemd: qwen14b.service (SGLang Qwen2.5-14B-Instruct en GPU 1)
+# Ruta: ~/.config/systemd/user/qwen14b.service (no requiere sudo)
+# Cambios vs el actual:
+#   - Restart=on-failure -> Restart=always
+#   + StartLimitIntervalSec=300 + StartLimitBurst=5
+#
+# Aplicar (sin sudo):
+#   cp /opt/ojoia/docs/systemd/qwen14b.service ~/.config/systemd/user/qwen14b.service
+#   systemctl --user daemon-reload && systemctl --user restart qwen14b.service
+
+[Unit]
+Description=Qwen2.5-14B Chat Server (GPU 1)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+WorkingDirectory=/home/sam/ai_system
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+Environment=CUDA_MODULE_LOADING=EAGER
+Environment=HF_HOME=/home/sam/.cache/hf_models
+Environment=SGLANG_FORCE_GPU_MEMORY_PREALLOC=1
+ExecStart=/home/sam/ai_system/venv/bin/python3.12 /home/sam/ai_system/venv/bin/sglang serve --model-path /opt/ai_models/Qwen2.5-14B-Instruct-AWQ --host 127.0.0.1 --port 8015 --dtype float16 --trust-remote-code --mem-fraction-static 0.78 --context-length 32768 --max-running-requests 48 --chunked-prefill-size 4096 --cuda-graph-max-bs 32 --log-level warning
+# B6: Restart=always
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=20G
+MemorySwapMax=4G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

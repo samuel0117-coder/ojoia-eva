@@ -1,0 +1,45 @@
+# B1 (refuerzo) — logrotate de sistema para los logs de OjoIA.
+# El RotatingFileHandler de Python (comit 2d2b0b7) ya rota api_eva.log
+# (10MB x 5 = 50MB max). Este logrotate de sistema cubre los OTROS logs
+# que no son manejados por Python (cleanup_frames.log, megapanel.log,
+# service-bus.logs, etc.) — cap 10MB x 5 cada uno.
+#
+# Aplicar con sudo:
+#   sudo cp /opt/ojoia/docs/systemd/ojoia.logrotate /etc/logrotate.d/ojoia
+#   sudo logRotate -vf /etc/logrotate.d/ojoia   # rotacion forzada de prueba
+
+/home/sam/storage/*.log /home/sam/storage/**/*.log {
+    size 10M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su sam sam
+    weekly
+}
+
+# logs de megapanel y ai_system (servicios auxiliares)
+/home/sam/ai_system/*.log {
+    size 10M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su sam sam
+}
+
+# logs del panel legacy (admin_panel / chatrd / cineia)
+/home/sam/*.log {
+    size 10M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su sam sam
+}
