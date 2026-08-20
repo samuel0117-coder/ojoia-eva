@@ -447,9 +447,14 @@ async def _describe_frame(b64: str, zone: str = "", biz_type: str = "") -> str:
         if zone: ctx += f"La cámara está instalada en la zona: {zone}. "
         if biz_type: ctx += f"El negocio es un {biz_type}. "
         prompt = (f"Analiza esta imagen de seguridad. {ctx}\n"
-                  "Describe:\n1. Qué zona ves realmente\n2. Objetos, personas, animales\n"
-                  "3. ¿Coincide con la zona indicada?\n4. Iluminación (buena/regular/mala)\n"
-                  "5. ¿Recomendarías ajustar la posición?\nResponde en español, 5-7 líneas, específico y práctico.")
+                  "Eres un asistente de instalación de cámaras. Describe:\n"
+                  "1. Qué zona ves realmente\n"
+                  "2. Objetos, personas, animales visibles\n"
+                  "3. ¿Coincide con la zona indicada?\n"
+                  "4. Iluminación (buena/regular/mala) — ¿hay contraluz?\n"
+                  "5. ¿Se ve bien lo que se quiere vigilar en esta zona?\n"
+                  "6. ¿Recomendarías ajustar la posición, el ángulo o la iluminación?\n"
+                  "Responde en español, 5-7 líneas, específico y práctico.")
         msgs = [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{small_b64}"}},
             {"type": "text", "text": prompt}]}]
@@ -467,6 +472,8 @@ async def _analyze_frame_for_prompt(b64: str, zone: str, biz_type: str) -> Dict:
                   "¿Coincide lo que ves con la zona? Extrae JSON:\n"
                   '{"zona_real":"...","coincide_zona":true/false,"objetos":[...],'
                   '"personas_estimadas":n,"iluminacion":"buena/regular/mala",'
+                  '"contraluz":true/false,"orientacion":"correcta/torcida/invertida",'
+                  '"visibilidad_objetivo":"buena/regular/mala",'
                   '"es_zona_correcta":true/false,"sugerencia_posicion":"..."}\n'
                   "Responde SOLO JSON.")
         msgs = [{"role": "user", "content": [
@@ -1938,14 +1945,40 @@ async def _handle_analyze(session, session_id, first):
     if not coincide or (zona_real and zona_real.lower() != zone.lower()):
         position_ok = False
 
+    # ── v16: Evaluación de calidad de imagen (WOW #1 — asistente de colocación) ──
+    iluminacion = img_analysis.get("iluminacion","")
+    contraluz = img_analysis.get("contraluz", False)
+    orientacion = img_analysis.get("orientacion","")
+    visibilidad = img_analysis.get("visibilidad_objetivo","")
+    sugerencia = img_analysis.get("sugerencia_posicion","")
+
     lines = ["📷 Cámara conectada ✅\n", f"Zona configurada: {zone}"]
     if zona_real: lines.append(f"Zona detectada: {zona_real}")
     lines.append(f"\nDescripción: {img_desc}")
+
+    # Feedback de calidad (WOW #1)
+    quality_notes = []
+    if iluminacion and iluminacion != "buena":
+        quality_notes.append(f"💡 Iluminación: {iluminacion}")
+    if contraluz:
+        quality_notes.append("⚠️ Veo contraluz — la cámara está apuntando hacia la luz")
+    if orientacion and orientacion != "correcta":
+        quality_notes.append(f"🔄 Orientación: {orientacion}")
+    if visibilidad and visibilidad != "buena":
+        quality_notes.append(f"👁️ Visibilidad del área: {visibilidad}")
+    if sugerencia:
+        quality_notes.append(f"🔍 Sugerencia: {sugerencia}")
+
+    if quality_notes:
+        lines.append("\n" + "\n".join(quality_notes))
+
     if position_ok:
         lines.append(f"\n✅ La posición se ve bien para vigilar **{zone}**.")
     else:
         lines.append(f"\n⚠️ La imagen no coincide con la zona **{zone}**.")
         if zona_real: lines.append(f"Parece enfocando **{zona_real}**.")
+
+    # Pregunta abierta — el usuario decide
     lines.append("\n\n¿La dejamos en el mismo lugar, la movemos, o qué opinas?")
 
     session["phase"] = SetupPhase.CONTEXT.value
