@@ -1888,6 +1888,22 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
     if session.get("phase") == SetupPhase.WAIT_IMAGE.value:
         session["wait_attempts"] = session.get("wait_attempts", 0) + 1
 
+    # v16: Si no hay camera_id en la session, buscar cámara pendiente (nueva,
+    # con frames pero sin configurar) o última cámara del usuario.
+    if not session.get("camera_id"):
+        pending_cam = _find_pending_camera(user_id, storage_root)
+        if pending_cam:
+            session["camera_id"] = pending_cam
+        else:
+            ud = _load_user_data(user_id)
+            cams = ud.get("cameras", [])
+            for c in cams:
+                if c.get("active"):
+                    session["camera_id"] = c.get("camera_id", "")
+                    break
+            if not session.get("camera_id") and cams:
+                session["camera_id"] = cams[-1].get("camera_id", "")
+
     frame = None
     frame_camera_id = ""
     if session.get("camera_id"):
@@ -1993,6 +2009,7 @@ async def _handle_analyze(session, session_id, first):
     # v16: Ir a ZONES (WOW #2) en vez de CONTEXT directamente.
     # Una vez confirmada la posición, Eva sugiere zonas con IA.
     session["phase"] = SetupPhase.ZONES.value
+    session["context_step"] = "concern"
     session["position_confirmed"] = position_ok
     _sessions[session_id] = session
     _save_session_to_disk(session)
@@ -2006,18 +2023,146 @@ async def _handle_analyze(session, session_id, first):
 # =============================================================================
 
 async def _suggest_zones_via_api(user_id: str, camera_id: str, zone: str = "", biz_type: str = "") -> dict:
-    """Llama al endpoint suggest-zones de api_eva.py y devuelve las zonas sugeridas."""
+    """WOW #2 — Sugiere zonas con IA usando Qwen directamente (sin HTTP, evita auth)."""
     try:
-        async with httpx.AsyncClient(timeout=90) as cl:
-            r = await cl.post(
-                "http://127.0.0.1:8005/api/cameras/" + camera_id + "/suggest-zones",
-                json={"user_id": user_id, "zone": zone, "business_type": biz_type},
-            )
-            if r.status_code == 200:
-                return r.json()
+        # Obtener el frame de la cámara
+        frame_bytes = _get_frame_bytes(camera_id, user_id)
+        if not frame_bytes:
+            logger.warning("[ZONES] No frame available for camera=%s user=%s", camera_id, user_id)
+            return {"success": False, "zones": []}
+
+        b64 = base64.b64encode(_resize(frame_bytes, 640)).decode()
+
+        # Pedir sugerencias a Qwen directamente
+        zones = await _suggest_zones_with_qwen(b64, zone, biz_type)
+        return {
+            "success": True,
+            "zones": zones,
+            "image_b64": b64,
+            "count": len(zones),
+            "suggested_by": "qwen",
+        }
     except Exception as e:
-        logger.error(f"Error calling suggest-zones: {e}")
+        logger.error("[ZONES] Error sugiriendo zonas: %s", e)
     return {"success": False, "zones": []}
+
+
+async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str = "") -> list:
+    """Pide a Qwen que sugiera zonas de interés para el frame actual."""
+    try:
+        prompt = (
+            "Eres un asistente de instalación de cámaras de seguridad. Analiza esta imagen "
+            "y sugiere entre 3 y 6 zonas de interés (ROI) para vigilar. "
+            "Para cada zona, identifica: tipo (entrance/cashier/kitchen/dining/inventory/"
+            "counter/hall/parking/restricted/office/storage/hallway/production/other), "
+            "un nombre descriptivo, y coordenadas relativas (0-1) como {x, y, w, h} donde "
+            "(x,y) es la esquina superior izquierda y (w,h) el ancho y alto.\n"
+            "Devuelve SOLO JSON:\n"
+            '{"zones":[{"type":"cashier","name":"Mostrador principal","coords":{"x":0.35,"y":0.20,"w":0.40,"h":0.50}}, ...]}\n'
+            "Las coordenadas deben ser entre 0 y 1, reflejando la posición real en la imagen. "
+            "Enfoca zonas críticas: entradas, cajas, almacenes, áreas restringidas, zonas de tráfico."
+        )
+        if zone: prompt += f" La cámara está en: {zone}."
+        if biz_type: prompt += f" Negocio: {biz_type}."
+
+        msgs = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            {"type": "text", "text": prompt},
+        ]}]
+        result = await _call_qwen(msgs, 600)
+        content = result.get("content", "")
+
+        # Parsear JSON
+        import re as _re
+        content = _re.sub(r'^```json\s*', '', content)
+        content = _re.sub(r'\s*```$', '', content).strip()
+        m = _re.search(r'\{.*\}', content, _re.DOTALL)
+        if not m:
+            return []
+        parsed = json.loads(m.group())
+        zones = parsed.get("zones", [])
+        if not isinstance(zones, list):
+            return []
+
+        # Normalizar cada zona
+        result_zones = []
+        for i, z in enumerate(zones):
+            if not isinstance(z, dict):
+                continue
+            coords = z.get("coords", {})
+            if not all(k in coords for k in ("x", "y", "w", "h")):
+                continue
+            coords = {k: max(0.0, min(1.0, float(v))) for k, v in coords.items()}
+            result_zones.append({
+                "id": f"sug_{i}_{int(time.time())}",
+                "name": str(z.get("name", f"Zona {i+1}"))[:60],
+                "type": str(z.get("type", "other"))[:30],
+                "coords": coords,
+                "color": _zone_color_for_type(z.get("type", "other")),
+                "icon": _zone_icon_for_type(z.get("type", "other")),
+                "suggested_by": "qwen",
+                "created_at": time.time(),
+            })
+        return result_zones
+    except Exception as e:
+        logger.error("[ZONES] Error en _suggest_zones_with_qwen: %s", e)
+    return []
+
+
+def _zone_color_for_type(zone_type: str) -> str:
+    """Color hex para un tipo de zona (mismo mapping que el drawer)."""
+    color_map = {
+        "entrance": "#2196f3", "cashier": "#ff9800", "register": "#ff9800",
+        "kitchen": "#f44336", "dining": "#4caf50", "inventory": "#9c27b0",
+        "counter": "#e91e63", "hall": "#607d8b", "parking": "#8bc34a",
+        "restricted": "#f44336", "office": "#3f51b5", "storage": "#795548",
+        "hallway": "#607d8b", "production": "#607d8b", "other": "#9e9e9e",
+    }
+    return color_map.get(zone_type, "#9e9e9e")
+
+
+def _zone_icon_for_type(zone_type: str) -> str:
+    """Icono para un tipo de zona."""
+    icon_map = {
+        "entrance": "🚪", "cashier": "💰", "register": "🧾",
+        "kitchen": "🍳", "dining": "🍽️", "inventory": "📦",
+        "counter": "🛍️", "hall": "🏠", "parking": "🚗",
+        "restricted": "🚫", "office": "💼", "storage": "📦",
+        "hallway": "🚶", "production": "🏭", "other": "📍",
+    }
+    return icon_map.get(zone_type, "📍")
+
+
+def _get_frame_bytes(camera_id: str, user_id: str) -> bytes:
+    """Obtiene el último frame de la cámara en bytes (misma lógica que /frames/latest)."""
+    if not camera_id or not user_id:
+        return b""
+    try:
+        # 1. Intentar grid de YOLO (cámara activa en tiempo real)
+        try:
+            from orchestrator import _get_grid
+            grid = _get_grid(user_id, camera_id)
+            frame_bytes = grid.get_last_frame_bytes()
+            last_cam = grid.get_last_camera_id()
+            if last_cam and last_cam != camera_id:
+                frame_bytes = b""
+            if frame_bytes:
+                return frame_bytes
+        except Exception:
+            pass
+
+        # 2. Fallback: leer del disco (latest_vigilance.jpg o latest_raw.jpg)
+        events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+        latest_vig = events_dir / "latest_vigilance.jpg"
+        if latest_vig.exists():
+            return latest_vig.read_bytes()
+        frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+        latest_raw = frames_dir / "latest_raw.jpg"
+        if latest_raw.exists():
+            return latest_raw.read_bytes()
+    except Exception:
+        return b""
+    return b""
 
 
 def _format_zones_summary(zones: list) -> str:
@@ -2042,7 +2187,7 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
 
     # Si es la primera entrada (message vacío o primer turno), sugerir zonas
     if not message or message == "__zones__":
-        # Buscar camera_id si no está en la session
+        # Buscar camera_id en user.json (cámaras existentes)
         if not camera_id:
             ud = _load_user_data(user_id)
             cams = ud.get("cameras", [])
@@ -2051,11 +2196,26 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
                     camera_id = c.get("camera_id", "")
                     session["camera_id"] = camera_id
                     break
+            # Fallback: usar la última cámara activa
+            if not camera_id and cams:
+                for c in cams:
+                    if c.get("active"):
+                        camera_id = c.get("camera_id", "")
+                        session["camera_id"] = camera_id
+                        break
             if not camera_id and cams:
                 camera_id = cams[-1].get("camera_id", "")
                 session["camera_id"] = camera_id
 
+        # Fallback: buscar cámara pendiente (nueva, sin configurar aún)
         if not camera_id:
+            pending = _find_pending_camera(user_id, storage_root)
+            if pending:
+                camera_id = pending
+                session["camera_id"] = camera_id
+
+        if not camera_id:
+            # Sin cámara disponible — pasar a CONTEXT directamente
             session["phase"] = SetupPhase.CONTEXT.value
             _sessions[session_id] = session
             _save_session_to_disk(session)
@@ -2081,6 +2241,8 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
 
         session["suggested_zones"] = zones
         session["phase"] = SetupPhase.CONTEXT.value
+        # v16: Inicializar context_step para que el flujo CONTEXT empiece en "concern"
+        session["context_step"] = "concern"
         _sessions[session_id] = session
         _save_session_to_disk(session)
 
@@ -2094,11 +2256,55 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
         )
         return _mk_resp(session, text, img_b64=image_b64)
 
-    # El usuario respondió — pasar a CONTEXT (ya está configurado)
-    session["phase"] = SetupPhase.CONTEXT.value
-    _sessions[session_id] = session
-    _save_session_to_disk(session)
-    return await _handle_context(session, session_id, user_id, message, first)
+    # El usuario respondió — processar respuesta de ANALYZE y luego sugerir zonas
+    # v16: Si el usuario está respondiendo a la pregunta de colocación,
+    # confirmar la posición y luego sugerir zonas (WOW #2).
+    user_msg = message.strip().lower()
+    is_positive = any(w in user_msg for w in ["si", "sí", "dale", "bien", "ok", "dejamos", "igual", "asis", "perfecto"])
+    is_negative = any(w in user_msg for w in ["no", "mover", "cambiar", "ajustar", "otra", "diferente"])
+
+    if is_positive:
+        session["position_confirmed"] = True
+        session["user_position_response"] = message
+        # v16: Proceder a sugerir zonas (WOW #2)
+        session["phase"] = SetupPhase.ZONES.value
+        session["context_step"] = "concern"
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return await _handle_zones(session, session_id, user_id, first, "__zones__", storage_root)
+    elif is_negative:
+        session["position_confirmed"] = False
+        session["user_position_response"] = message
+        # Si el usuario quiere mover/ajustar, pedirle que lo haga y volver a analizar
+        session["phase"] = SetupPhase.WAIT_IMAGE.value
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return _mk_resp(session,
+            f"Claro, {first}. Vamos a ajustar la cámara. Cuando la hayas movido "
+            f"y la tengas en la posición que querés, dime 'listo' y volvemos a analizar la imagen.")
+
+
+def _find_pending_camera(user_id: str, storage_root) -> str:
+    """Busca una cámara pendiente (nueva, con frames pero sin configurar)."""
+    try:
+        cams_dir = storage_root / "users" / user_id / "cameras"
+        if not cams_dir.exists():
+            return ""
+        for cam_dir in cams_dir.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            # Buscar si tiene frames pero no tiene camera.json
+            has_frames = (cam_dir / "frames" / "latest_raw.jpg").exists()
+            has_config = (cam_dir / "camera.json").exists()
+            if has_frames and not has_config:
+                return cam_dir.name
+        # Fallback: buscar pending_*
+        pending = cams_dir / "pending_127_0_0_1"
+        if (pending / "frames" / "latest_raw.jpg").exists():
+            return "pending_127_0_0_1"
+    except Exception:
+        pass
+    return ""
 
 
 # =============================================================================
