@@ -125,22 +125,15 @@ def ingest_frame_for_eva(frame_bytes: bytes, camera_id: str = "default"):
 
 def _get_frame(camera_id: str = "", user_id: str = "") -> Optional[bytes]:
     global _latest_frame, _latest_frame_time
-    # v16: Si se especifica camera_id, usar ese frame primero
+    # v16: Si se especifica camera_id, usar ese frame primero.
+    # NOTA: NO priorizar cámaras configuradas aquí — eso rompe el wizard de
+    # nueva cámara, que espera el frame de la cámara NUEVA (no configurada).
+    # La priorización de cámaras configuradas se hace en _pick_best_camera_id
+    # para comandos de OS mode (ej: "muestrame la camara"), no aquí.
     if camera_id and camera_id in _latest_frame:
         if time.time() - _latest_frame_time[camera_id] < 120:
             return _latest_frame[camera_id]
-    # v16: Priorizar frames de cámaras CONFIGURADAS del usuario
-    # (evita mostrar cámaras no configuradas que están oscuras/desconectadas)
-    try:
-        ud = _load_user_data(user_id) if user_id else {}
-        configured_cams = [c.get("camera_id") for c in ud.get("cameras", []) if c.get("active")]
-        for cid in configured_cams:
-            if cid and cid in _latest_frame:
-                if time.time() - _latest_frame_time.get(cid, 0) < 120:
-                    return _latest_frame[cid]
-    except Exception:
-        pass
-    # Fallback: cualquier frame reciente
+    # Fallback: cualquier frame reciente (para when camera_id no está en buffer)
     for cid, frame in _latest_frame.items():
         if time.time() - _latest_frame_time.get(cid, 0) < 120:
             return frame
@@ -1922,19 +1915,28 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
 
     # v16: Si no hay camera_id en la session, buscar cámara pendiente (nueva,
     # con frames pero sin configurar) o última cámara del usuario.
+    # PRIORIDAD: cámara nueva (no configurada) > cámaras configuradas.
+    # Si el usuario está en medio de instalar una cámara NUEVA, debe ver la
+    # imagen de ESA cámara, no la de una ya existente.
     if not session.get("camera_id"):
-        pending_cam = _find_pending_camera(user_id, storage_root)
-        if pending_cam:
-            session["camera_id"] = pending_cam
+        # 1) Buscar cámara no configurada con frame reciente (la nueva)
+        frame_unconf, cam_unconf = _get_unconfigured_frame(user_id)
+        if frame_unconf and cam_unconf:
+            session["camera_id"] = cam_unconf
         else:
-            ud = _load_user_data(user_id)
-            cams = ud.get("cameras", [])
-            for c in cams:
-                if c.get("active"):
-                    session["camera_id"] = c.get("camera_id", "")
-                    break
-            if not session.get("camera_id") and cams:
-                session["camera_id"] = cams[-1].get("camera_id", "")
+            # 2) Fallback: buscar cámara pendiente en el usuario
+            pending_cam = _find_pending_camera(user_id, storage_root)
+            if pending_cam:
+                session["camera_id"] = pending_cam
+            else:
+                ud = _load_user_data(user_id)
+                cams = ud.get("cameras", [])
+                for c in cams:
+                    if c.get("active"):
+                        session["camera_id"] = c.get("camera_id", "")
+                        break
+                if not session.get("camera_id") and cams:
+                    session["camera_id"] = cams[-1].get("camera_id", "")
 
     frame = None
     frame_camera_id = ""
