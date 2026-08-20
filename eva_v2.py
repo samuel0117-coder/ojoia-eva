@@ -1877,8 +1877,12 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
     # ── HARDWARE ─────────────────────────────────────────────────────────────
     if phase == SetupPhase.HARDWARE.value:
         session["msgs"].append({"role":"user","content":message})
-        # Usar el modelo para entender la intención del usuario
-        if await _is_intent_confirmed(message, "Usuario completando pasos de conexión"):
+        # v16: Match directo para "listo"/"ok" antes de usar Qwen.
+        # _is_intent_confirmed usa Qwen y puede fallar, dejando el flujo
+        # trabado en HARDWARE para siempre.
+        msg_lower = message.strip().lower()
+        is_done = any(w in msg_lower for w in ("listo", "ok", "si", "sí", "ya", "hecho", "terminé", "terminé", "conecté", "conecte", "ready"))
+        if is_done or await _is_intent_confirmed(message, "Usuario completando pasos de conexión"):
             session["phase"] = SetupPhase.WAIT_IMAGE.value
             _sessions[session_id] = session
             return await _handle_wait_image(session, session_id, user_id, first, message, storage_root, include_frame)
