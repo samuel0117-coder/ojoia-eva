@@ -2377,7 +2377,9 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
                 storage_root=STORAGE_ROOT
             )
         except Exception as e1:
+            import traceback
             logger.exception(f"[EVA] handle_eva_v2 falló: {e1}")
+            logger.error(f"[EVA] TRACEBACK: {traceback.format_exc()}")
             from eva_v2 import _make_os_session, _load_session, _mk_resp as _eva_mk_resp
             session = _load_session(session_id)
             if not session or session.get("user_id") != user_id:

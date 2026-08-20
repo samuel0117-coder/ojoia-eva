@@ -766,16 +766,23 @@ def _vigilance_camera_id(message):
 
 
 async def _pick_best_camera_id(user_id):
-    camera_base = STORAGE_ROOT / "users" / user_id / "cameras"
-    if camera_base.exists():
-        cams = sorted([p for p in camera_base.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
-        if cams:
-            return cams[0].name
+    # v16: Priorizar cámaras activas del usuario (por user.json)
     ud = _load_user_data(user_id)
     cams = [c for c in ud.get("cameras", []) if c.get("active")]
-    if not cams:
-        return ""
-    return cams[0].get("camera_id") or cams[0].get("id") or ""
+    if cams:
+        return cams[0].get("camera_id") or cams[0].get("id") or ""
+    # Fallback: buscar por directorio en disco
+    camera_base = STORAGE_ROOT / "users" / user_id / "cameras"
+    if camera_base.exists():
+        # Filtrar solo directorios que tengan camera.json (cámaras configuradas)
+        configured = []
+        for p in camera_base.iterdir():
+            if p.is_dir() and (p / "camera.json").exists():
+                configured.append(p)
+        if configured:
+            configured.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return configured[0].name
+    return ""
 
 
 def _extract_camera_id_from_message(message):
@@ -2697,6 +2704,14 @@ async def _handle_os_mode(session, user_id, message, session_id):
 
 
 async def _handle_os_mode_v2(session, user_id, message, session_id):
+    # v16: setdefault msgs para evitar KeyError si la sessión se cargó
+    # desde disco sin este campo (ej: sessión legacy o parcialmente cargada).
+    # También evita 'NoneType' object does not support item assignment
+    # cuando session es None (cargó desde disco y se perdió).
+    if session is None:
+        logger.error("[OS_MODE] session is None for session_id=%s user=%s", session_id, user_id)
+        return {"success": False, "error": "Sessión perdida. Por favor, escribe 'Quiero instalar una cámara nueva' para empezar de nuevo."}
+    session.setdefault("msgs", [])
     session["msgs"].append({"role":"user","content":message})
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
     ud = _load_user_data(user_id)
@@ -2739,6 +2754,39 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     
     if any(k in msg_lower for k in ("está abierto", "esta abierto", "estamos abiertos", "horario de apertura", "cerrado ahora", "abierto ahora")):
         tool_result = await _execute_os_tool_v2(user_id, "is_open_hours", {}, message, first, recent, cam_count, session)
+
+    # v16: Comando "muestrame la cámara" / "mostrar cámara" — muestra la última
+    # imagen de la cámara configurada en el chat (WOW #1).
+    if any(k in msg_lower for k in ("muestrame la camara", "mostrar camara", "muestra la camara",
+                                     "ver la camara", "ver la cámara", "muestra la imagen",
+                                     "quiere ver la camara", "ver la cámara", "muestra la ultima imagen",
+                                     "ultima imagen", "muestra lo que ve")):
+        best_cam = await _pick_best_camera_id(user_id) or ""
+        frame_bytes = _get_frame(best_cam, user_id) if best_cam else _get_frame(user_id=user_id)
+        if frame_bytes:
+            b64 = base64.b64encode(_resize(frame_bytes, 640)).decode()
+            session["image_b64"] = b64
+            desc = await _describe_frame(b64, session.get("zone",""), ud.get("business_type","negocio"))
+            session["image_desc"] = desc
+            session["image_sent"] = False
+            _sessions[session_id] = session
+            uid = session.get("user_id", user_id)
+            cam = best_cam or session.get("camera_id", "")
+            if uid and cam:
+                img_dir = STORAGE_ROOT / "users" / uid / "cameras" / cam / "frames"
+                img_dir.mkdir(parents=True, exist_ok=True)
+                (img_dir / "eva_frame.jpg").write_bytes(_resize(frame_bytes, 640))
+                img_url = f"/eva-frame/{uid}/{cam}"
+            else:
+                img_url = ""
+            text = f"📷 Aquí tienes la imagen de la cámara:\n\n{desc}"
+            session["image_url"] = img_url
+            _sessions[session_id] = session
+            return _mk_resp(session, text, img_b64=b64, force_image=True)
+        else:
+            return _mk_resp(session,
+                f"Lo siento, {first}. No pude obtener una imagen reciente de la cámara. "
+                f"Asegurate de que está conectada y mandando frames.")
         session["msgs"].append({"role": "assistant", "content": tool_result.get("text", "")})
         _sessions[session_id] = session
         return _mk_resp(session, tool_result.get("text", ""), suggestions=suggestions, events_found=tool_result.get("events", []))
