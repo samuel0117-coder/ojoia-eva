@@ -1,178 +1,133 @@
 # 🎯 Plan Principal — Mejorar Instalación de Cámara (WOW #1, #2, #3)
 
 > **Fecha:** 2026-08-19
-> **Objetivo:** Transformar el flujo de instalación de cámaras en una experiencia de usuario que genere "moments of wow" en cada paso.
+> **Estado:** ✅ EJECUTADO (3 de 3 fases)
+> **Commits:** `c90d7e6` → `9135355` → `741993b` → `3e88d5a`
 
 ---
 
-## Visión Actual vs. Objetivo
+## Flujo Antes vs. Ahora
 
-### Flujo actual (débil):
+### Antes (débil):
 ```
 GREET → ZONE → HARDWARE → WAIT_IMAGE → ANALYZE → CONTEXT → PROMPT_BUILD → CONFIRM → DONE
 ```
 
 **Problema:** Cuando el usuario dice "listo", Eva simplemente confirma y pasa a CONTEXT. No muestra la imagen, no analiza la posición, no sugiere zonas. El usuario no VE su negocio estructurado.
 
-### Flujo objetivo (WOW):
+### Ahora (WOW):
 ```
 GREET → ZONE → HARDWARE → WAIT_IMAGE → ANALYZE (WOW #1) → ZONES (WOW #2) → CONTEXT → PROMPT_BUILD → CONFIRM → TEST_RULES (WOW #3) → DONE
 ```
 
 ---
 
-## WOW #1 — Asistente de Colocación de Cámara (EXISTENTE, MEJORAR)
+## ✅ Fase 1 — WOW #1: Asistente de Colocación de Cámara
 
-**Estado actual:** `eva_v2.py:1928-1958` `_handle_analyze` existe pero es débil.
+**Commit:** `c90d7e6`
 
-**Problema:** El análisis de posición es básico. Qwen dice si la zona coincide pero no da recomendaciones prácticas.
-
-**Mejoras propuestas:**
-
-1. **Validación de calidad de imagen:**
-   - Iluminación (buena/regular/mala)
-   - Contraluz (sí/no)
-   - Orientación (vertical/horizontal/torcida)
-   - Visibilidad de lo que se quiere vigilar
-
-2. **Message mejorado en `_handle_analyze`:**
-   ```
-   📷 Cámara conectada ✅
-   Zona configurada: cocina
-   Zona detectada: cocina principal
-   
-   Descripción: [Qwen describe lo que ve]
-   
-   ✅ La posición se ve bien para vigilar la cocina.
-   ⚠️ La iluminación es regular — podrías mejorarla.
-   💡 Veo un poco de contraluz, la cámara está apuntando hacia la luz.
-   
-   ¿La dejamos en el mismo lugar o querés ajustarla?
-   ```
-
-3. **Iteración hasta que Eva esté satisfecha:**
-   - Si el usuario dice "la movemos" → Eva vuelve a analizar
-   - Si dice "la dejamos" → pasa a ZONES
-   - Si dice "muestra la imagen" → Eva muestra el frame con el análisis superpuesto
-
-**Archivo a modificar:** `eva_v2.py` — `_handle_analyze` (líneas 1928-1958)
+**Cambios en `eva_v2.py`:**
+- `_analyze_frame_for_prompt`: añadidos campos `contraluz`, `orientacion`, `visibilidad_objetivo` al JSON de Qwen
+- `_describe_frame`: prompt mejorado con evaluación de calidad de imagen (iluminación, contraluz, orientación, visibilidad del objetivo)
+- `_handle_analyze`: feedback detallado de calidad. Eva actúa como asistente de colocación:
+  - "💡 Iluminación: regular"
+  - "⚠️ Veo contraluz — la cámara está apuntando hacia la luz"
+  - "🔄 Orientación: torcida"
+  - "👁️ Visibilidad del área: mala"
+  - "🔍 Sugerencia: [Qwen sugiere ajuste]"
 
 ---
 
-## WOW #2 — "Esto es exactamente tu mostrador" (NUEVO)
+## ✅ Fase 2 — C1.3 + C3.1: WOW #2 "Esto es exactamente tu mostrador"
 
-**Objetivo:** El usuario VE su propio negocio estructurado por primera vez, con zonas marcadas.
+**Commits:** `9135355` (C1.3), `741993b` (C3.1)
 
-**Flujo:**
-1. Después de confirmar la posición, Eva llama a Qwen para sugerir zonas de interés
-2. Qwen analiza el frame y sugiere 3-5 zonas con coords 0-1
-3. Eva muestra la imagen con las zonas superpuestas en el chat
-4. El usuario confirma o ajusta en la pestaña "Ajustes de cámara" (drawer existente)
-5. Cuando el usuario guarda las zonas, Eva vuelve al chat con: "✅ Tus zonas están listas. ¿Qué querés que vigile?"
+**C1.3 — Endpoint `/api/cameras/{id}/suggest-zones` (`api_eva.py`):**
+- Toma el último frame de la cámara (grid + latest_vigilance.jpg + latest_raw.jpg)
+- Pide a Qwen que sugiera 3-6 zonas de interés con coords relativas 0-1
+- Devuelve: `[{id, name, type, coords: {x,y,w,h}, color, icon, suggested_by: "qwen"}]`
+- Normalización automática de coords (clamp 0-1)
+- `_zone_color_for_type` / `_zone_icon_for_type`: matching con drawer existente
 
-**Endpoint nuevo (C1.3):** `POST /api/cameras/{id}/suggest-zones`
-```python
-# api_eva.py — nuevo endpoint
-@app.post("/api/cameras/{camera_id}/suggest-zones")
-async def suggest_zones(camera_id: str, user_id: str):
-    # 1. Obtener último frame
-    # 2. Llamar a Qwen con prompt de sugerencia de zonas
-    # 3. Devolver [{id, name, type, coords: {x,y,w,h}, color, icon}]
-```
-
-**Fase ZONES en state machine (C3.1):**
-```python
-# eva_v2.py — añadir SetupPhase.ZONES
-class SetupPhase(str, Enum):
-    GREET = "greet"
-    ZONE = "zone"
-    HARDWARE = "hardware"
-    WAIT_IMAGE = "wait_image"
-    ANALYZE = "analyze"
-    ZONES = "zones"          # ← NUEVO
-    CONTEXT = "context"
-    PROMPT_BUILD = "prompt_build"
-    CONFIRM = "confirm"
-    TEST_RULES = "test_rules"  # ← NUEVO
-    DONE = "done"
-```
-
-**Handler `_handle_zones`:**
-- Llama a suggest-zones endpoint
-- Muestra imagen con zonas superpuestas
-- Pregunta: "¿Estas son las zonas que querés vigilar?"
-- Si el usuario dice "sí" → CONTEXT
-- Si dice "ajustarlas" → redirige al drawer
-
-**Archivo a modificar:** `eva_v2.py` — añadir `SetupPhase.ZONES` y `_handle_zones`
+**C3.1 — Fase ZONES en state machine (`eva_v2.py`):**
+- `SetupPhase.ZONES` añadido entre ANALYZE y CONTEXT
+- `_handle_zones`: Eva llama a suggest-zones, muestra imagen con zonas superpuestas en el chat
+- `_suggest_zones_via_api`: cliente HTTP al endpoint C1.3
+- `_format_zones_summary`: formatea zonas como texto legible
+- El usuario puede confirmar o ajustar en la pestaña "Ajustes de cámara" (drawer existente)
 
 ---
 
-## WOW #3 — Notificación Real al Probar una Regla (NUEVO)
+## ✅ Fase 3 — WOW #3: Notificación Real al Probar una Regla
 
-**Objetivo:** El usuario recibe una notificación push/WhatsApp REAL disparada por SU PROPIA acción. Esto demuestra que el sistema funciona y genera confianza.
+**Commit:** `3e88d5a`
 
-**Flujo:**
-1. Después de generar las 3 reglas (PROMPT_BUILD → CONFIRM)
-2. Eva dice: "Ahora vamos a probar cada regla. Por favor, haz lo siguiente..."
-3. Muestra counter: "0/3 reglas probadas"
-4. Por cada regla:
-   - Instrucción: "Abre el cajón como si estuvieras robando"
-   - Espera confirmación del usuario
-   - Llama al endpoint de prueba
-   - Si se dispara: "✅ Regla 1 probada — te acabo de enviar una notificación"
-   - Counter actualizado: "1/3 reglas probadas ✅"
-5. Cuando todas estén probadas: "🎉 Todas las reglas están funcionando. Cámara lista."
+**Endpoint `/api/cameras/{id}/test-rule` (`api_eva.py`):**
+- Evalúa si una acción de prueba dispara una regla (usa Qwen)
+- Si se dispara → envía notificación FCM real al usuario
+- Devuelve: `{triggered, notification_sent}`
 
-**Endpoint nuevo:** `POST /api/cameras/{id}/test-rule`
-```python
-# api_eva.py — nuevo endpoint
-@app.post("/api/cameras/{camera_id}/test-rule")
-async def test_rule(camera_id: str, user_id: str, rule_index: int, test_action: str):
-    # 1. Simular la acción de prueba
-    # 2. Evaluar si la regla se dispara
-    # 3. Si se dispara → enviar notificación FCM real
-    # 4. Devolver: {triggered: bool, notification_sent: bool}
-```
+**`_handle_test_rules` (`eva_v2.py`):**
+- Flujo de prueba de reglas con counter visible "X/3 reglas probadas"
+- Efecto Zeigarnik: tarea visiblemente incompleta que el cerebro quiere cerrar
+- Por cada regla:
+  - Eva dice: "Abre el cajón como si estuvieres robando"
+  - Espera confirmación del usuario
+  - Llama al endpoint de prueba
+  - Si se dispara: "✅ Regla 1 probada — te acabo de enviar una notificación"
+  - Counter actualizado: "1/3 reglas probadas ✅"
+- Cuando todas estén probadas: "🎉 Todas las reglas están funcionando. Cámara lista."
 
-**Efecto Zeigarnik:** El counter visible "2/3 reglas probadas" crea una tarea visiblemente incompleta que el cerebro quiere cerrar. Esto aumenta la tasa de completación.
-
-**Archivo a modificar:** `eva_v2.py` — añadir `SetupPhase.TEST_RULES` y `_handle_test_rules`
+**`_handle_confirm` modificado:** Ahora va a TEST_RULES en vez de DONE directamente.
 
 ---
 
 ## 📋 Resumen de Cambios
 
-| Archivo | Cambio | Líneas aprox |
-|---------|--------|-------------|
-| `eva_v2.py` | Mejorar `_handle_analyze` (WOW #1) | +30 |
-| `eva_v2.py` | Añadir `SetupPhase.ZONES` + `_handle_zones` (WOW #2) | +60 |
-| `eva_v2.py` | Añadir `SetupPhase.TEST_RULES` + `_handle_test_rules` (WOW #3) | +80 |
-| `api_eva.py` | Añadir `POST /api/cameras/{id}/suggest-zones` | +40 |
-| `api_eva.py` | Añadir `POST /api/cameras/{id}/test-rule` | +50 |
-| `app-v12.js` | (Opcional) Botón "Sugerir con IA" en drawer | +15 |
-
-**Total: ~275 líneas de código nuevo**
+| Archivo | Cambio | Líneas |
+|---------|--------|--------|
+| `eva_v2.py` | Fase 1 (WOW #1) + Fase 2 (C3.1) + Fase 3 (WOW #3) | +250 |
+| `api_eva.py` | C1.3 (suggest-zones) + WOW #3 (test-rule) | +230 |
 
 ---
 
-## 🚀 Orden de Ejecución
+## 🚀 Flujo de Usuario Final
 
 ```
-1. Fase 1 (WOW #1)     → 30 min  Mejorar ANALYZE
-2. C1.3 endpoint       → 30 min  Sugerir zonas con Qwen
-3. C3.1 ZONES phase    → 40 min  Integrar en state machine
-4. Fase 3 (WOW #3)     → 60 min  Sistema de prueba de reglas
+1. fronts: "Quiero instalar una cámara nueva"
+2. Eva: "¿Dónde la vas a poner?" → "cocina"
+3. Eva: Instrucciones de conexión (LED, WiFi, etc.)
+4. fronts: "listo"
+5. Eva: 📷 Muestra la imagen + análisis (WOW #1)
+   → "Tu cámara está en cocina. La iluminación es regular..."
+   → "¿La dejamos aquí o la movemos?"
+6. fronts: "la dejamos"
+7. Eva: 🔍 Sugiere zonas con IA (WOW #2)
+   → "Esto es exactamente tu mostrador, con cada área marcada"
+   → Muestra imagen con zonas superpuestas
+   → "¿Qué querés que vigile?"
+8. fronts: "el mostrador y la caja"
+9. Eva: Crea las reglas de atención
+10. fronts: "sí, apruebo"
+11. Eva: 🔍 Sistema de prueba (WOW #3)
+    → "Vamos a probar cada regla"
+    → Counter: "0/3 reglas probadas"
+    → "Abre el cajón como si estuvieres robando"
+12. fronts: "lo hice"
+13. Eva: "✅ Regla 1 probada — te acabo de enviar una notificación"
+    → Counter: "1/3 reglas probadas ✅"
+14. ... (repite para las 3 reglas)
+15. Eva: "🎉 Todas las reglas están funcionando. Cámara lista."
 ```
-
-**Total estimado: ~3 horas**
 
 ---
 
-## Notas de Diseño
+## 🔧 Próximos pasos (fuera del plan actual)
 
-- **No duplicar drawer:** El drawer de zonas en `app-v12.js:3151-3534` ya existe y está completo. Se reutiliza.
-- **No botón "Sugerir con IA":** El proceso es automático — Eva llama al endpoint cuando el usuario confirma la posición.
-- **Qwen reutilizado:** Se usan `_describe_frame` y `_analyze_frame_for_prompt` existentes, no se duplica.
-- **Notificaciones FCM:** Se reutiliza `send_fcm_notification()` de `orchestrator.py:344-483`.
-- **Counter de progreso:** El mismo patrón que C2.5 (counter de zonas) se aplica a las reglas.
+- [ ] B5 — Activar `cleanup_frames.py` con la configuración de retención
+- [ ] D2 — Cola por `(user_id, camera_id)` en vez de `FRAME_QUEUE` global
+- [ ] T1 — `--edge-ip-version 4` en `/etc/cloudflared/config.yml`
+- [ ] C3.2 — CONTEXT zone-aware (pregunta por zona, no global)
+- [ ] C3.4 — Feedback de reglas (consolidación cada 3-4 correcciones)
+- [ ] C4.1 — Nivel 3 de zonas
+- [ ] C4.2 — Correlación narrativa entre cámaras
