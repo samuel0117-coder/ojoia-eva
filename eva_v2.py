@@ -1787,6 +1787,11 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
 # =============================================================================
 
 async def _handle_setup(session, user_id, message, session_id, cam_id, storage_root, include_frame=False):
+    # v16: Guard centralizado — si session es None (cargó desde disco y se perdió),
+    # no podemos hacer item assignment. Retornamos error amigable en vez de crash.
+    if session is None:
+        logger.error("[SETUP] session is None for session_id=%s user=%s", session_id, user_id)
+        return {"success": False, "error": "Sessión perdida. Por favor, escribe 'Quiero instalar una cámara nueva' para empezar de nuevo."}
     phase = session["phase"]
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
 
@@ -1885,6 +1890,9 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
 # =============================================================================
 
 async def _handle_wait_image(session, session_id, user_id, first, message, storage_root, include_frame=False):
+    # v16: setdefault wait_attempts para evitar KeyError si la sessión se cargó
+    # desde disco sin este campo.
+    session.setdefault("wait_attempts", 0)
     if session.get("phase") == SetupPhase.WAIT_IMAGE.value:
         session["wait_attempts"] = session.get("wait_attempts", 0) + 1
 
@@ -1933,6 +1941,16 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
         return await _handle_analyze(session, session_id, first)
 
     attempts = session.get("wait_attempts", 0)
+    # v16: Si el usuario ya tiene una imagen analizada y vuelve a decir "listo"
+    # (por ejemplo, después de pedir que repita la imagen), usar la imagen
+    # existente y reanalizar en vez de quedar en loop esperando un frame nuevo.
+    if session.get("image_b64") and session.get("image_desc") and await _is_intent_confirmed(message, f"Esperando imagen. Usuario dice: {message}"):
+        session["phase"] = SetupPhase.ANALYZE.value
+        session["wait_attempts"] = 0
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return await _handle_analyze(session, session_id, first)
+
     if await _is_intent_confirmed(message, f"Esperando imagen. Usuario dice: {message}") and not frame:
         session["phase"] = SetupPhase.CONTEXT.value
         session["manual_image_confirmed"] = True
@@ -1958,6 +1976,9 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
 # =============================================================================
 
 async def _handle_analyze(session, session_id, first):
+    # v16: setdefault msgs para evitar KeyError si la sessión se cargó desde disco
+    # sin el campo msgs (ej: sessión legacy o parcialmente cargada).
+    session.setdefault("msgs", [])
     session["msgs"].append({"role":"user","content":""})
     session["image_sent"] = False
     img_desc = session.get("image_desc","")
@@ -2181,6 +2202,11 @@ def _format_zones_summary(zones: list) -> str:
 
 async def _handle_zones(session, session_id, user_id, first, message, storage_root):
     """WOW #2 — Eva sugiere zonas con IA y el usuario las confirma/ajusta."""
+    # v16: Guard contra sesiones None (evita 'NoneType' object does not
+    # support item assignment cuando _load_session falló o la sessión se perdió).
+    if session is None:
+        logger.error("[ZONES] session is None for session_id=%s user=%s", session_id, user_id)
+        return {"success": False, "error": "Sessión perdida. Por favor, empieza de nuevo."}
     zone = session.get("zone", "esta zona")
     biz_type = session.get("business_type", "negocio")
     camera_id = session.get("camera_id", "")
@@ -2261,7 +2287,20 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
     # confirmar la posición y luego sugerir zonas (WOW #2).
     user_msg = message.strip().lower()
     is_positive = any(w in user_msg for w in ["si", "sí", "dale", "bien", "ok", "dejamos", "igual", "asis", "perfecto"])
-    is_negative = any(w in user_msg for w in ["no", "mover", "cambiar", "ajustar", "otra", "diferente"])
+    # Solo es negativo si el usuario claramente quiere MOVER/AJUSTAR la cámara.
+    # "no vi la imagen", "repite", "volve a mostrar" NO son negativos — son
+    # peticiones de repetir la imagen actual. Sin esto el flujo salta a
+    # WAIT_IMAGE y se traban esperando un frame que nunca llega.
+    is_move_request = any(w in user_msg for w in ["mover", "moverla", "cambiar de lugar", "ajustar la posicion", "ajustar el angulo", "otra zona", "otro lugar"])
+    is_repeat_request = any(w in user_msg for w in ["repite", "repetir", "no vi", "no veo", "volve a mostrar", "mostrar de nuevo", "otra vez"])
+
+    if is_repeat_request and not is_move_request:
+        # El usuario no vio la imagen o quiere verla otra vez — repetir la imagen actual
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return _mk_resp(session,
+            f"Claro, {first}. Aquí tienes la imagen de nuevo:\n\n{session.get('image_desc','')}",
+            img_b64=session.get("image_b64",""), force_image=True)
 
     if is_positive:
         session["position_confirmed"] = True
@@ -2272,7 +2311,7 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
         _sessions[session_id] = session
         _save_session_to_disk(session)
         return await _handle_zones(session, session_id, user_id, first, "__zones__", storage_root)
-    elif is_negative:
+    elif is_move_request:
         session["position_confirmed"] = False
         session["user_position_response"] = message
         # Si el usuario quiere mover/ajustar, pedirle que lo haga y volver a analizar
@@ -3689,7 +3728,12 @@ async def _extract_business_data(user_id, message, session):
 
 def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=False, suggestions=None, force_image=False, events_found=None, heatmap=None, heatmap_meta=None):
     img_url = ""
-    if img_b64 and (force_image or not session.get("image_sent")):
+    # v16: force_image=True significa que el usuario pidió ver la imagen otra vez.
+    # Usamos el image_url ya guardado en la session (relativo /eva-frame/...)
+    # o el image_b64 si es que nos pasaron uno nuevo.
+    if force_image and session.get("image_url"):
+        img_url = session["image_url"]
+    elif img_b64 and (force_image or not session.get("image_sent")):
         try:
             small = _resize(base64.b64decode(img_b64), 640)
             uid = session.get("user_id","")
