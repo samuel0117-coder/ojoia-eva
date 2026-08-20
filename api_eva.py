@@ -2818,6 +2818,95 @@ async def suggest_zones_endpoint(camera_id: str, request: Request):
         return {"success": False, "error": str(e), "zones": [], "image_b64": ""}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WOW #3 — Prueba de reglas con notificación real
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoint que permite al usuario probar una regla y recibe una notificación
+# FCM real si la regla se dispara. Efecto Zeigarnik: counter visible "X/3".
+
+@app.post("/api/cameras/{camera_id}/test-rule")
+async def test_rule_endpoint(camera_id: str, request: Request):
+    """
+    WOW #3 — Prueba una regla y envía notificación real si se dispara.
+
+    Body: {"user_id": "...", "rule_index": 0, "test_action": "abrir cajón",
+           "rule_text": "Alerta si hay movimiento en la zona de caja"}
+
+    Devuelve: {"success": true, "triggered": true, "notification_sent": true}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_id = body.get("user_id", "")
+    rule_index = body.get("rule_index", 0)
+    test_action = body.get("test_action", "")
+    rule_text = body.get("rule_text", "")
+
+    if not user_id or not camera_id:
+        return {"success": False, "error": "user_id y camera_id requeridos",
+                "triggered": False, "notification_sent": False}
+
+    try:
+        # Evaluar si la regla se dispara con la acción de prueba
+        # Usamos Qwen para que evalúe si el test_action activa la regla
+        triggered = await _evaluate_rule_trigger(rule_text, test_action, user_id, camera_id)
+
+        notification_sent = False
+        if triggered:
+            # Enviar notificación FCM real
+            try:
+                from orchestrator import send_fcm_notification
+                result = await send_fcm_notification(
+                    title=f"🔍 Prueba de regla #{rule_index + 1}",
+                    body=f"✅ Tu regla se activó correctamente: \"{rule_text[:80]}\"\n"
+                         f"Acción de prueba: \"{test_action}\"",
+                    user_id=user_id,
+                    notif_type="vigilance_alert",
+                    tag=f"rule_test_{camera_id}_{rule_index}",
+                )
+                notification_sent = bool(result)
+            except Exception as e:
+                logger.error(f"Error sending test notification: {e}")
+
+        return {
+            "success": True,
+            "triggered": triggered,
+            "notification_sent": notification_sent,
+            "rule_index": rule_index,
+            "test_action": test_action,
+            "rule_text": rule_text,
+        }
+    except Exception as e:
+        logger.error(f"Error en test-rule: {e}")
+        return {"success": False, "error": str(e),
+                "triggered": False, "notification_sent": False}
+
+
+async def _evaluate_rule_trigger(rule_text: str, test_action: str, user_id: str, camera_id: str) -> bool:
+    """Usa Qwen para evaluar si una acción de prueba dispara una regla."""
+    try:
+        prompt = (
+            f"Estás evaluando una regla de seguridad para una cámara.\n\n"
+            f"Regla: \"{rule_text}\"\n"
+            f"Acción de prueba que el usuario está realizando: \"{test_action}\"\n\n"
+            f"¿Esta acción de prueba activaría o no esta regla? "
+            f"Responde SOLO 'SI' o 'NO'."
+        )
+        async with httpx.AsyncClient(timeout=30) as cl:
+            r = await cl.post("http://localhost:8004/v1/chat/completions",
+                              json={"model": "qwen",
+                                    "messages": [{"role": "user", "content": prompt}],
+                                    "max_tokens": 10, "temperature": 0.0})
+            if r.status_code == 200:
+                data = r.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
+                return content.startswith("SI")
+    except Exception as e:
+        logger.error(f"Error evaluando regla: {e}")
+    return False
+
+
 @app.delete("/api/cameras/{camera_id}")
 async def delete_camera_endpoint(camera_id: str, user_id: str = ""):
     """Elimina una cámara del usuario.

@@ -2272,13 +2272,118 @@ async def _handle_confirm(session, session_id, user_id, message, first, storage_
         }
         from eva.camera_builder import save_camera_config
         save_camera_config(user_id, cfg, storage_root)
-        session["phase"] = SetupPhase.DONE.value
+
+        # v16: Ir a TEST_RULES (WOW #3) en vez de DONE directamente.
+        # El usuario prueba cada regla y recibe una notificación real.
+        session["test_rules"] = {
+            "rules": session.get("attention_phrases", []),
+            "tested": [],
+            "current": 0,
+        }
+        session["phase"] = SetupPhase.TEST_RULES.value
         _sessions[session_id] = session
         _save_session_to_disk(session)
-        return _mk_resp(session, f"🎉 ¡Listo {first}! Tu cámara está configurada y vigilando.\n\n¿Qué quieres saber?", camera_saved=True)
+        return await _handle_test_rules(session, session_id, user_id, "__start__", first, storage_root)
     session["phase"] = SetupPhase.CONTEXT.value
     _sessions[session_id] = session
     return _mk_resp(session, f"Entendido. ¿Qué quieres cambiar?\n\n• La zona\n• La preocupación\n• El horario\n• Empezar de nuevo")
+
+# =============================================================================
+# TEST_RULES (v16 — WOW #3: probar reglas con notificación real)
+# =============================================================================
+
+async def _handle_test_rules(session, session_id, user_id, message, first, storage_root):
+    """WOW #3 — El usuario prueba cada regla y recibe una notificación real."""
+    tr = session.get("test_rules", {})
+    rules = tr.get("rules", [])
+    tested = tr.get("tested", [])
+    current = tr.get("current", 0)
+
+    # Inicializar
+    if message == "__start__":
+        if not rules:
+            session["phase"] = SetupPhase.DONE.value
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            return _mk_resp(session,
+                f"🎉 ¡Listo {first}! No hay reglas que probar. Tu cámara está configurada.\n\n"
+                f"¿Qué quieres saber?")
+
+        session["test_rules"] = {"rules": rules, "tested": [], "current": 0}
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+
+        rules_text = "\n".join([f"{i+1}. \"{r}\"" for i, r in enumerate(rules)])
+        text = (
+            f"🔍 **Vamos a probar las {len(rules)} reglas** que configuraste para tu cámara.\n\n"
+            f"Reglas:\n{rules_text}\n\n"
+            f"Por favor, realiza la acción que describo para cada una. "
+            f"Cuando la hagas, dime 'listo' y yo evalúo si la regla se activó.\n\n"
+            f"**Progreso: 0/{len(rules)} reglas probadas**"
+        )
+        return _mk_resp(session, text)
+
+    # Si el usuario dice que probó la regla actual
+    if current < len(rules):
+        rule = rules[current]
+        # Llamar al endpoint de prueba
+        try:
+            async with httpx.AsyncClient(timeout=60) as cl:
+                r = await cl.post(
+                    "http://127.0.0.1:8005/api/cameras/" + session.get("camera_id", "") + "/test-rule",
+                    json={
+                        "user_id": user_id,
+                        "rule_index": current,
+                        "test_action": message,
+                        "rule_text": rule,
+                    },
+                )
+                result = r.json() if r.status_code == 200 else {"triggered": False}
+        except Exception:
+            result = {"triggered": False}
+
+        triggered = result.get("triggered", False)
+        tested.append({"rule": rule, "test_action": message, "triggered": triggered})
+        current += 1
+        session["test_rules"] = {"rules": rules, "tested": tested, "current": current}
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+
+        if triggered:
+            text = (
+                f"✅ **Regla #{current} probada** — ¡Se activó correctamente!\n\n"
+                f"Recibiste una notificación push con: \"{rule[:60]}\"\n\n"
+                f"**Progreso: {current}/{len(rules)} reglas probadas ✅**"
+            )
+        else:
+            text = (
+                f"⚠️ **Regla #{current} no se activó** con la acción: \"{message[:50]}\"\n\n"
+                f"¿Quieres reintentar o pasar a la siguiente?\n\n"
+                f"**Progreso: {current}/{len(rules)} reglas probadas**"
+            )
+
+        # Si quedan reglas, preguntar por la siguiente
+        if current < len(rules):
+            next_rule = rules[current]
+            text += f"\n\nAhora para la regla #{current + 1}: \"{next_rule[:80]}\"\n¿Qué acción de prueba querés hacer?"
+        else:
+            # Todas las reglas probadas
+            session["phase"] = SetupPhase.DONE.value
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            text += (
+                f"\n\n🎉 **¡Todas las reglas están probadas!** {first}, tu cámara está "
+                f"completamente configurada y vigilando.\n\n"
+                f"¿Qué quieres saber?"
+            )
+        return _mk_resp(session, text)
+
+    # Fallback
+    session["phase"] = SetupPhase.DONE.value
+    _sessions[session_id] = session
+    _save_session_to_disk(session)
+    return _mk_resp(session, f"🎉 ¡Listo {first}! Tu cámara está configurada y vigilando.\n\n¿Qué quieres saber?")
+
 
 # =============================================================================
 # OS MODE
