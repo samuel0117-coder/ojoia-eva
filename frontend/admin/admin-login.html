@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OjoIA Admin</title>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+    <script>
+        // Initialize Firebase
+        const firebaseConfig = {apiKey:"AIzaSyAtlS7rikClpJBVHM46gPvN4HL_CYyRxP0",authDomain:"ojoia-67216.firebaseapp.com",projectId:"ojoia-67216",storageBucket:"ojoia-67216.firebasestorage.app",messagingSenderId:"490868607747",appId:"1:490868607747:web:f722468d4f3493deb8f736",measurementId:"G-KX5V3B6547"};
+        firebase.initializeApp(firebaseConfig);
+    </script>
+    <style>
+        :root{--bg-primary:#000;--bg-secondary:#1c1c1e;--bg-tertiary:#2c2c2e;--text-primary:#fff;--text-secondary:#aeaeb2;--accent:#0a84ff;--success:#30d158;--warning:#ffd60a;--danger:#ff453a;--border:#38383a}
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg-primary);color:var(--text-primary);line-height:1.5}
+        .header{background:var(--bg-secondary);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+        .header h1{font-size:1.3rem;font-weight:700}
+        .status-badge{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:0.8rem;font-weight:500}
+        .status-badge.online{background:rgba(48,209,88,.15);color:var(--success)}
+        .status-badge.offline{background:rgba(255,69,58,.15);color:var(--danger)}
+        .status-dot{width:8px;height:8px;border-radius:50%}
+        .status-dot.online{background:var(--success);animation:pulse 2s infinite}
+        .status-dot.offline{background:var(--danger)}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+        .admin-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 24px;gap:4px;overflow-x:auto;background:var(--bg-secondary)}
+        .admin-tab{padding:14px 20px;background:transparent;border:none;color:var(--text-secondary);cursor:pointer;font-size:0.9rem;border-bottom:2px solid transparent;white-space:nowrap}
+        .admin-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+        .container{max-width:1200px;margin:0 auto;padding:24px}
+        .panel{display:none}.panel.active{display:block}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+        .card{background:var(--bg-secondary);border-radius:12px;padding:20px;border:1px solid var(--border)}
+        .card-title{font-size:0.75rem;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px}
+        .form-group{margin-bottom:16px}
+        .form-group label{display:block;font-size:0.85rem;color:var(--text-secondary);margin-bottom:6px}
+        .form-group input,.form-group textarea,.form-group select{width:100%;padding:12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:0.9rem;font-family:inherit}
+        .form-group textarea{min-height:100px;resize:vertical}
+        .form-group input:focus,.form-group select:focus{border-color:var(--accent);outline:none}
+        .btn{padding:10px 20px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-size:0.9rem;font-weight:600;cursor:pointer}
+        .btn:disabled{opacity:.5;cursor:not-allowed}
+        .btn-sm{padding:6px 12px;font-size:0.8rem}
+        .btn-danger{background:var(--danger)}.btn-success{background:var(--success)}
+        .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text-primary)}
+        .btn-warning{background:var(--warning);color:#000}
+        .server-url-box{background:var(--bg-tertiary);border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid var(--border)}
+        .server-url-box .url{font-family:'SF Mono',monospace;font-size:1.1rem;color:var(--accent);word-break:break-all}
+        .server-url-box .url.empty{color:var(--text-secondary)}
+        .copy-btn{padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:0.8rem;cursor:pointer;margin-left:8px}
+        .copy-btn:hover{background:var(--bg-tertiary)}
+        .info-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:0.9rem}
+        .info-row:last-child{border-bottom:none}
+        .info-label{color:var(--text-secondary)}
+        .info-value{font-weight:500;font-family:'SF Mono',monospace;font-size:0.85rem}
+        .info-value.ok{color:var(--success)}.info-value.err{color:var(--danger)}
+        .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:0.9rem;z-index:1000;display:none}
+        .toast.show{display:block}.toast.success{background:var(--success);color:#000}.toast.error{background:var(--danger);color:#fff}
+        table{width:100%;border-collapse:collapse}
+        th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);font-size:0.85rem}
+        th{color:var(--text-secondary);font-weight:500;font-size:0.75rem;text-transform:uppercase}
+        tr:hover{background:var(--bg-tertiary)}
+        .badge{display:inline-block;padding:3px 8px;border-radius:4px;font-size:0.7rem;font-weight:600}
+        .badge-ok{background:rgba(48,209,88,.15);color:var(--success)}
+        .badge-warn{background:rgba(255,214,10,.15);color:var(--warning)}
+        .badge-err{background:rgba(255,69,58,.15);color:var(--danger)}
+        .user-detail{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:999;align-items:center;justify-content:center}
+        .user-detail.show{display:flex}
+        .user-detail-card{background:var(--bg-secondary);border-radius:12px;padding:24px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;border:1px solid var(--border)}
+        .user-detail-card h3{margin-bottom:16px}
+        .user-detail-card .close{float:right;cursor:pointer;font-size:1.5rem}
+        .rules-box{background:var(--bg-tertiary);border-radius:8px;padding:12px;margin:8px 0;font-size:0.85rem;border:1px solid var(--border)}
+        .rules-box h4{color:var(--accent);margin-bottom:8px;font-size:0.8rem}
+        .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:998;align-items:center;justify-content:center}
+        .modal-overlay.show{display:flex}
+        .modal-box{background:var(--bg-secondary);border-radius:12px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto;border:1px solid var(--border)}
+        .modal-box h3{margin-bottom:16px}
+        .modal-box .modal-close{float:right;cursor:pointer;font-size:1.5rem}
+        .plan-editor{border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
+        .plan-editor input,.plan-editor select{margin-bottom:8px}
+        .plan-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+        .disk-userpath{font-size:0.75rem;color:var(--text-secondary);margin-top:4px}
+    </style>
+</head>
+<body>
+<div class="header">
+    <h1>🛡️ OjoIA Admin</h1>
+    <div class="header-right">
+        <div class="status-badge offline" id="hdr-badge">
+            <span class="status-dot offline" id="hdr-dot"></span>
+            <span id="hdr-text">Offline</span>
+        </div>
+    </div>
+</div>
+
+<div class="admin-tabs">
+    <button class="admin-tab active" id="tab-server" onclick="switchTab('server')">🖥️ Servidor</button>
+    <button class="admin-tab" id="tab-dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
+    <button class="admin-tab" id="tab-users" onclick="switchTab('users')">👥 Usuarios</button>
+    <button class="admin-tab" id="tab-events" onclick="switchTab('events')">📈 Eventos</button>
+    <button class="admin-tab" id="tab-storage" onclick="switchTab('storage')">💾 Almacenamiento</button>
+    <button class="admin-tab" id="tab-events" onclick="switchTab('events')">📈 Eventos</button>
+    <button class="admin-tab" id="tab-queue" onclick="switchTab('queue')">📋 Cola</button>
+</div>
+
+<!-- OFFLINE BANNER -->
+<div id="offline-banner" style="display:none;background:rgba(255,69,58,.12);border:1px solid var(--danger);border-radius:8px;padding:12px 16px;margin:16px 24px 0;display:flex;align-items:center;justify-content:space-between">
+    <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:1.2rem">⚠️</span>
+        <div>
+            <p style="font-weight:600;font-size:0.85rem;color:var(--danger)">Servidor Offline</p>
+            <p style="font-size:0.75rem;color:var(--text-secondary)">El backend no está disponible. Los frames se acumulan en Firebase hasta que el servidor vuelva.</p>
+        </div>
+    </div>
+    <button class="btn btn-sm btn-outline" onclick="autoConnect()" style="border-color:var(--danger);color:var(--danger)">🔄 Reconectar</button>
+</div>
+
+<div class="container">
+    <!-- SERVIDOR -->
+    <div class="panel active" id="panel-server">
+        <div class="grid">
+            <div class="card" style="grid-column:1/-1;display:none" id="cfg-card">
+                <div class="card-title">⚙️ Configuración de Conexión</div>
+                <p style="color:var(--text-secondary);margin-bottom:12px;font-size:0.85rem">Ingresa la URL del servidor OjoIA (ngrok o cloudflared).</p>
+                <div class="form-group">
+                    <label>URL del Servidor</label>
+                    <div style="display:flex;gap:8px">
+                        <input id="cfg-url" type="url" placeholder="https://xxxxx.trycloudflare.com" style="flex:1">
+                        <button class="btn" onclick="cfgSave()">Conectar</button>
+                    </div>
+                </div>
+            </div>
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">🌐 Acceso Remoto (cloudflared/ngrok)</div>
+                <div class="server-url-box">
+                    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px">
+                        <span class="url empty" id="ngrok-url">Sin conexión</span>
+                        <button class="copy-btn" id="btn-copy" onclick="cfgCopy()" style="display:none">📋 Copiar</button>
+                        <span class="badge badge-ok" id="ngrok-on" style="display:none">Activo</span>
+                        <span class="badge badge-err" id="ngrok-off">Inactivo</span>
+                    </div>
+                </div>
+                <small style="color:var(--text-secondary)">Ingresa la URL de cloudflared manualmente si no se detecta automáticamente.</small>
+            </div>
+            <div class="card">
+                <div class="card-title">📡 Estado del Servidor</div>
+                <div class="info-row"><span class="info-label">Estado</span><span class="info-value" id="srv-status">—</span></div>
+                <div class="info-row"><span class="info-label">Hostname</span><span class="info-value" id="srv-host">—</span></div>
+                <div class="info-row"><span class="info-label">IP</span><span class="info-value" id="srv-ip">—</span></div>
+                <div class="info-row"><span class="info-label">Puerto</span><span class="info-value" id="srv-port">—</span></div>
+                <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="srv-up">—</span></div>
+            </div>
+            <div class="card">
+                <div class="card-title">🔧 Acciones Rápidas</div>
+                <div style="display:flex;flex-direction:column;gap:8px">
+                    <button class="btn btn-outline" onclick="cfgShow()">⚙️ Cambiar URL Manualmente</button>
+                    <button class="btn btn-outline" onclick="reloadStatus()">🔄 Refrescar Estado</button>
+                    <button class="btn btn-outline" onclick="testHealth()">💓 Test Health</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- DASHBOARD -->
+    <div class="panel" id="panel-dashboard">
+        <div class="grid">
+            <div class="card"><div class="card-title">👥 Usuarios</div><div class="info-value" style="font-size:2rem" id="d-users">—</div></div>
+            <div class="card"><div class="card-title">📷 Cámaras</div><div class="info-value" style="font-size:2rem" id="d-cams">—</div></div>
+            <div class="card"><div class="card-title">✅ Activas</div><div class="info-value" style="font-size:2rem" id="d-active">—</div></div>
+            <div class="card"><div class="card-title">💾 Almacenamiento</div><div class="info-value" style="font-size:2rem" id="d-storage">—</div><div style="font-size:0.8rem;color:var(--text-secondary)">GB usados</div></div>
+            <div class="card"><div class="card-title">🧠 Memoria</div><div class="info-value" style="font-size:2rem" id="d-mem">—</div><div style="font-size:0.8rem;color:var(--text-secondary)">% usado</div></div>
+            <div class="card"><div class="card-title">⏱️ Uptime</div><div class="info-value" style="font-size:2rem" id="d-uptime">—</div><div style="font-size:0.8rem;color:var(--text-secondary)">horas</div></div>
+        </div>
+    </div>
+
+    <!-- USUARIOS -->
+    <div class="panel" id="panel-users">
+        <div class="card">
+            <div class="card-title">👥 Usuarios Registrados (<span id="users-count">0</span>)</div>
+            <div style="overflow-x:auto">
+            <table style="min-width:1100px">
+                <thead><tr>
+                    <th>Nombre</th>
+                    <th>Negocio</th>
+                    <th>Tipo</th>
+                    <th>Email</th>
+                    <th>Teléfono</th>
+                    <th>Plan</th>
+                    <th>Estado</th>
+                    <th>Registro</th>
+                    <th>Último Acceso</th>
+                    <th>Vence</th>
+                    <th>Cámaras</th>
+                    <th>Storage</th>
+                    <th></th>
+                </tr></thead>
+                <tbody id="users-tbody"><tr><td colspan="13" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
+            </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- PROMPTS DE EVA -->
+    <div class="panel" id="panel-prompts">
+        <div class="grid">
+            <!-- PROMPT PRINCIPAL -->
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">🤖 Prompt de Eva</div>
+                <p style="color:var(--text-secondary);font-size:0.8rem;margin-bottom:8px">Este es el ÚNICO prompt que controla a Eva. El contexto del negocio y los documentos RAG se inyectan automáticamente.</p>
+                <div class="form-group">
+                    <textarea id="prompt-eva" rows="16" placeholder="Prompt de Eva..." oninput="updateTokenCount()"></textarea>
+                </div>
+                <!-- TOKEN COUNTER -->
+                <div id="token-counter" style="display:flex;align-items:center;gap:12px;margin-bottom:12px;padding:10px 14px;background:var(--bg-tertiary);border-radius:8px;border:1px solid var(--border)">
+                    <div style="flex:1">
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+                            <span style="font-size:0.8rem;color:var(--text-secondary)">Tokens del prompt</span>
+                            <span id="token-count" style="font-size:0.9rem;font-weight:600;font-family:'SF Mono',monospace">0</span>
+                        </div>
+                        <div style="width:100%;height:6px;background:var(--bg-primary);border-radius:3px;overflow:hidden">
+                            <div id="token-bar" style="height:100%;width:0%;background:var(--success);border-radius:3px;transition:width 0.3s,background 0.3s"></div>
+                        </div>
+                    </div>
+                    <div style="text-align:center;min-width:60px">
+                        <div id="token-status" style="font-size:1.2rem">✅</div>
+                        <div style="font-size:0.65rem;color:var(--text-secondary)">/ 2000</div>
+                    </div>
+                </div>
+                <div id="token-warning" style="display:none;margin-bottom:10px;padding:8px 12px;background:rgba(255,69,58,.15);border-radius:6px;color:var(--danger);font-size:0.8rem">
+                    ⚠️ El prompt excede el límite de 2000 tokens. Reduce el contenido o los documentos RAG.
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-success" onclick="saveEvaPrompt()">💾 Guardar Prompt</button>
+                    <button class="btn btn-outline" onclick="loadEvaPrompt()">🔄 Recargar</button>
+                    <button class="btn btn-outline" onclick="calcTokens()">🔢 Calcular Tokens</button>
+                </div>
+            </div>
+            <!-- DOCUMENTOS RAG -->
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">📚 Documentos RAG de Eva</div>
+                <p style="color:var(--text-secondary);font-size:0.8rem;margin-bottom:8px">Archivos de conocimiento que Eva consulta. Se inyectan como índice compacto en el prompt.</p>
+                <div id="eva-docs-list" style="margin-bottom:12px"></div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-outline" onclick="loadEvaDocs()">🔄 Recargar Lista</button>
+                    <button class="btn btn-outline" onclick="showAddDocForm()">➕ Nuevo Documento</button>
+                </div>
+            </div>
+            <!-- EDITOR DE DOCUMENTO -->
+            <div class="card" style="grid-column:1/-1;display:none" id="eva-doc-editor">
+                <div class="card-title" id="doc-editor-title">📝 Editar Documento</div>
+                <div class="form-group">
+                    <label>Nombre del documento</label>
+                    <input id="doc-name" type="text" placeholder="guia_instalacion">
+                </div>
+                <div class="form-group">
+                    <label>Contenido (Markdown)</label>
+                    <textarea id="doc-content" rows="12" placeholder="# Título..."></textarea>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-success" onclick="saveEvaDoc()">💾 Guardar Documento</button>
+                    <button class="btn btn-outline" onclick="hideDocEditor()">Cancelar</button>
+                    <button class="btn btn-danger" id="btn-delete-doc" onclick="deleteEvaDoc()" style="display:none">🗑️ Eliminar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ALMACENAMIENTO -->
+    <div class="panel" id="panel-storage">
+        <div class="grid">
+            <!-- DISCOS -->
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">🗂️ Discos Disponibles</div>
+                <div id="disks-list" style="margin-bottom:16px"></div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-outline" onclick="scanDisks()">🔄 Escanear Discos</button>
+                    <button class="btn btn-outline" onclick="autodetectDisks()">🔍 Auto-detectar</button>
+                    <button class="btn btn-outline" onclick="showAddDiskForm()">➕ Agregar Disco</button>
+                </div>
+                <div id="autodetect-results" style="margin-top:12px"></div>
+                <div id="add-disk-form" style="display:none;margin-top:12px" class="rules-box">
+                    <h4>➕ Agregar Nuevo Disco</h4>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+                        <div><label style="font-size:0.75rem;color:var(--text-secondary)">Montaje</label><br><input id="new-disk-mount" type="text" placeholder="/mnt/disk2" style="width:200px"></div>
+                        <div><label style="font-size:0.75rem;color:var(--text-secondary)">Etiqueta</label><br><input id="new-disk-label" type="text" placeholder="HDD Backup" style="width:150px"></div>
+                        <button class="btn btn-sm" onclick="addDisk()">Agregar</button>
+                    </div>
+                </div>
+            </div>
+            <!-- PLANES -->
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">📊 Configuración de Planes</div>
+                <div id="plans-config"></div>
+                <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+                    <button class="btn btn-outline" onclick="showAddPlanForm()">➕ Nuevo Plan</button>
+                    <button class="btn btn-success btn-sm" onclick="savePlansConfig()">💾 Guardar Planes</button>
+                </div>
+            </div>
+            <!-- TTLs -->
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">🕐 Configuración de Limpieza (TTLs)</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px">
+                    <div class="form-group">
+                        <label>Hora de limpieza (0-23)</label>
+                        <input type="number" id="ttl-cleanup-hour" min="0" max="23" value="23">
+                    </div>
+                    <div class="form-group">
+                        <label>Frames TTL (horas)</label>
+                        <input type="number" id="ttl-frames" min="1" max="720" value="24">
+                    </div>
+                    <div class="form-group">
+                        <label>Sessions TTL (días)</label>
+                        <input type="number" id="ttl-sessions" min="1" max="90" value="7">
+                    </div>
+                    <div class="form-group">
+                        <label>Umbral llenado disco (%)</label>
+                        <input type="number" id="ttl-fill-threshold" min="50" max="99" value="90">
+                        <small style="color:var(--text-secondary)">Cuando un disco supere este %, nuevos usuarios van al siguiente</small>
+                    </div>
+                </div>
+                <button class="btn" onclick="saveTTLs()" style="margin-top:12px">Guardar TTLs</button>
+            </div>
+            <!-- STORAGE POR USUARIO -->
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">👤 Almacenamiento por Usuario</div>
+                <div style="overflow-x:auto">
+                <table style="min-width:900px">
+                    <thead><tr>
+                        <th>Usuario</th>
+                        <th>Disco</th>
+                        <th>Plan</th>
+                        <th>Cuota</th>
+                        <th>Usado</th>
+                        <th>%</th>
+                        <th>Editar</th>
+                        <th>Migrar</th>
+                    </tr></thead>
+                    <tbody id="storage-tbody"><tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
+                </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- EVENTOS -->
+    <div class="panel" id="panel-events">
+        <div class="grid">
+            <div class="card" style="grid-column:1/-1">
+                <div class="card-title">📇 Eventos por Día (últimos 7 días)</div>
+                <canvas id="events-chart" height="80" style="width:100%;max-height:200px"></canvas>
+            </div>
+            <div class="card">
+                <div class="card-title">📊 Resumen</div>
+                <div class="info-row"><span class="info-label">Total eventos</span><span class="info-value" id="ev-total">—</span></div>
+                <div class="info-row"><span class="info-label">Violaciones</span><span class="info-value" id="ev-violations" style="color:var(--danger)">—</span></div>
+                <div class="info-row"><span class="info-label">Normal</span><span class="info-value" id="ev-normal" style="color:var(--success)">—</span></div>
+                <div class="info-row"><span class="info-label">Alertas hoy</span><span class="info-value" id="ev-today" style="color:var(--warning)">—</span></div>
+            </div>
+            <div class="card">
+                <div class="card-title">📜 Últimos Eventos</div>
+                <div style="display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto" id="ev-list">
+                    <p style="color:var(--text-secondary);text-align:center">Cargando...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- COLA -->
+    <div class="panel" id="panel-queue">
+        <div class="grid">
+            <div class="card"><div class="card-title">📋 En Cola</div><div class="info-value" style="font-size:2rem" id="q-pending">—</div></div>
+            <div class="card"><div class="card-title">⚙️ Procesando</div><div class="info-value" style="font-size:2rem" id="q-proc">—</div></div>
+            <div class="card"><div class="card-title">✅ Completados</div><div class="info-value" style="font-size:2rem" id="q-done">—</div></div>
+            <div class="card"><div class="card-title">❌ Errores</div><div class="info-value" style="font-size:2rem" id="q-err">—</div></div>
+        </div>
+        <!-- Queue detail -->
+        <div class="card" style="margin-top:16px">
+            <div class="card-title">📊 Detalle de Cola</div>
+            <div class="info-row"><span class="info-label">Total items</span><span class="info-value" id="q-total">—</span></div>
+            <div class="info-row"><span class="info-label">Tamaño estimado</span><span class="info-value" id="q-size">—</span></div>
+            <div class="info-row"><span class="info-label">Más antiguo</span><span class="info-value" id="q-oldest">—</span></div>
+            <div class="info-row"><span class="info-label">Último procesado</span><span class="info-value" id="q-last">—</span></div>
+            <div class="info-row"><span class="info-label">Worker status</span><span class="info-value" id="q-worker">—</span></div>
+        </div>
+        <!-- Pending frames list -->
+        <div class="card" style="margin-top:16px">
+            <div class="card-title">🖼️ Frames Pendientes <span id="q-frame-count" style="color:var(--text-secondary);font-size:0.8rem"></span></div>
+            <div id="q-frames-list" style="max-height:400px;overflow-y:auto">
+                <p style="color:var(--text-secondary);text-align:center;padding:20px">Cargando...</p>
+            </div>
+        </div>
+        <!-- Firebase offline queue -->
+        <div class="card" style="margin-top:16px">
+            <div class="card-title">☁️ Cola Offline (Firebase)</div>
+            <div class="info-row"><span class="info-label">Items en cola offline</span><span class="info-value" id="q-offline-count">—</span></div>
+            <div class="info-row"><span class="info-label">Tamaño</span><span class="info-value" id="q-offline-size">—</span></div>
+            <div id="q-offline-list" style="max-height:300px;overflow-y:auto;margin-top:8px">
+                <p style="color:var(--text-secondary);text-align:center;padding:10px">Sin items</p>
+            </div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn btn-outline btn-sm" onclick="loadQueue()">🔄 Refrescar</button>
+            <button class="btn btn-danger btn-sm" onclick="clearQueue()">🗑️ Limpiar Cola</button>
+        </div>
+    </div>
+</div>
+
+<!-- USER DETAIL MODAL -->
+<div class="user-detail" id="user-detail">
+    <div class="user-detail-card">
+        <span class="close" onclick="closeUserDetail()">&times;</span>
+        <h3 id="ud-name">Usuario</h3>
+        <div id="ud-content"></div>
+    </div>
+</div>
+
+<!-- EDIT USER STORAGE MODAL -->
+<div class="modal-overlay" id="edit-storage-modal">
+    <div class="modal-box">
+        <span class="modal-close" onclick="closeEditStorageModal()">&times;</span>
+        <h3>✏️ Editar Almacenamiento</h3>
+        <div id="edit-storage-content"></div>
+    </div>
+</div>
+
+<!-- MIGRATE USER MODAL -->
+<div class="modal-overlay" id="migrate-modal">
+    <div class="modal-box">
+        <span class="modal-close" onclick="closeMigrateModal()">&times;</span>
+        <h3>📦 Migrar Usuario</h3>
+        <div id="migrate-content"></div>
+    </div>
+</div>
+
+<!-- ADD PLAN MODAL -->
+<div class="modal-overlay" id="add-plan-modal">
+    <div class="modal-box">
+        <span class="modal-close" onclick="closeAddPlanModal()">&times;</span>
+        <h3>➕ Nuevo Plan</h3>
+        <div class="form-group">
+            <label>Nombre del Plan</label>
+            <input id="new-plan-name" type="text" placeholder="premium">
+        </div>
+        <div class="form-group">
+            <label>Storage (GB)</label>
+            <input id="new-plan-storage" type="number" placeholder="250" min="1">
+        </div>
+        <div class="form-group">
+            <label>Cámaras</label>
+            <input id="new-plan-cameras" type="number" placeholder="20" min="1">
+        </div>
+        <div class="form-group">
+            <label>Disco Prioritario</label>
+            <select id="new-plan-disk"></select>
+        </div>
+        <div style="display:flex;gap:8px">
+            <button class="btn btn-success" onclick="addPlan()">Crear Plan</button>
+            <button class="btn btn-outline" onclick="closeAddPlanModal()">Cancelar</button>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+const fCfg = {apiKey:"AIzaSyAtlS7rikClpJBVHM46gPvN4HL_CYyRxP0",authDomain:"ojoia-67216.firebaseapp.com",projectId:"ojoia-67216",storageBucket:"ojoia-67216.firebasestorage.app",messagingSenderId:"490868607747",appId:"1:490868607747:web:f722468d4f3493deb8f736",measurementId:"G-KX5V3B6547"};
+firebase.initializeApp(fCfg);
+
+let API = '';
+const HDRS = { 'ngrok-skip-browser-warning': 'true' };
+let _offlineMode = false;
+let _queueRef = null;
+
+function apiFetch(path, opts = {}) {
+    return fetch(API + path, { mode: 'cors', headers: { ...HDRS, ...opts.headers }, ...opts });
+}
+function apiGetJSON(path) { return apiFetch(path).then(r => r.json()); }
+
+// ========== FIREBASE QUEUE (offline) ==========
+function _initQueue() {
+    if (!_queueRef && typeof firebase !== 'undefined' && firebase.firestore) {
+        _queueRef = firebase.firestore().collection('system').doc('frame_queue');
+    }
+}
+function enqueueFrame(data) {
+    _initQueue();
+    if (!_queueRef) return Promise.resolve();
+    return _queueRef.set({
+        frames: firebase.firestore.FieldValue.arrayUnion({
+            ...data,
+            queued_at: new Date().toISOString()
+        }),
+        updated_at: new Date().toISOString()
+    }, { merge: true });
+}
+
+// ========== AUTO-CONNECT ==========
+function autoConnect() {
+    const saved = localStorage.getItem('ojoia_admin_api');
+    if (saved) { API = saved; cfgHide(); reloadStatus(); return; }
+    // Try Firestore for auto-discovery
+    try {
+        firebase.firestore().collection('system').doc('server_status').onSnapshot(doc => {
+            if (doc.exists) {
+                let d;
+                try { d = doc.data(); } catch(e) { d = doc._data; }
+                if (d && d.ngrok_url && d.status === 'online') {
+                    API = d.ngrok_url;
+                    localStorage.setItem('ojoia_admin_api', API);
+                    cfgHide();
+                    reloadStatus();
+                }
+            }
+        }, err => console.error('FS:', err));
+    } catch(e) { console.error('Firestore error:', e); }
+    // Try known cloudflared tunnel after 2s
+    setTimeout(() => {
+        if (!API) {
+            const knownUrl = 'https://api.ojoia.com.do';
+            fetch(knownUrl + '/health', {mode: 'cors'})
+                .then(r => r.json())
+                .then(d => {
+                    if (d.status === 'ok') {
+                        API = knownUrl;
+                        localStorage.setItem('ojoia_admin_api', API);
+                        cfgHide();
+                        reloadStatus();
+                    }
+                }).catch(() => {
+                    // Backend offline - show offline banner but keep UI
+                    _offlineMode = true;
+                    setHeader(false);
+                    document.getElementById('offline-banner').style.display = 'block';
+                });
+        }
+    }, 2000);
+}
+
+// ========== UI ==========
+function toast(msg, ok) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show' + (ok ? ' success' : ' error');
+    setTimeout(() => t.className = 'toast', 3000);
+}
+function cfgShow() { document.getElementById('cfg-card').style.display = 'block'; }
+function cfgHide() { document.getElementById('cfg-card').style.display = 'none'; }
+function cfgSave() {
+    const u = document.getElementById('cfg-url').value.trim().replace(/\/$/, '');
+    if (!u) return;
+    API = u; localStorage.setItem('ojoia_admin_api', API);
+    // Save to server config and sync to Firestore
+    fetch(API + '/admin/server/cloudflared/save', {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+        body: JSON.stringify({ url: u })
+    }).then(() => {
+        // Sync to Firestore so the app can read the new URL
+        return fetch(API + '/admin/server/sync-firestore', {
+            method: 'POST',
+            mode: 'cors',
+            headers: { 'ngrok-skip-browser-warning': 'true' }
+        });
+    }).then(() => {
+        cfgHide(); reloadStatus(); toast('URL guardada y sincronizada', true);
+    }).catch(e => {
+        console.error(e); cfgHide(); reloadStatus();
+    });
+}
+function cfgCopy() {
+    const u = document.getElementById('ngrok-url').textContent;
+    if (u && u !== 'Sin conexión') { navigator.clipboard.writeText(u); toast('✅ Copiada', true); }
+}
+function switchTab(t) {
+    ['server','dashboard','users','storage','prompts','queue'].forEach(x => {
+        document.getElementById('tab-' + x).classList.toggle('active', x === t);
+        document.getElementById('panel-' + x).classList.toggle('active', x === t);
+    });
+    if (t === 'dashboard') loadStats();
+    if (t === 'users') loadUsers();
+    if (t === 'events') loadEvents();
+    if (t === 'storage') { loadDisks(); loadStorageUsers(); }
+    if (t === 'queue') loadQueue();
+    if (t === 'prompts') loadPrompts();
+}
+
+// ========== STATUS ==========
+let curNgrok = '';
+function reloadStatus() {
+    apiGetJSON('/admin/server/status').then(d => {
+        curNgrok = d.ngrok_url || '';
+        document.getElementById('ngrok-url').textContent = curNgrok || 'Sin conexión';
+        document.getElementById('ngrok-url').className = 'url' + (curNgrok ? '' : ' empty');
+        document.getElementById('ngrok-on').style.display = curNgrok ? 'inline-block' : 'none';
+        document.getElementById('ngrok-off').style.display = curNgrok ? 'none' : 'inline-block';
+        document.getElementById('btn-copy').style.display = curNgrok ? 'inline-block' : 'none';
+        document.getElementById('srv-status').textContent = 'Online';
+        document.getElementById('srv-status').className = 'info-value ok';
+        document.getElementById('srv-host').textContent = d.hostname || '—';
+        document.getElementById('srv-ip').textContent = d.local_ip || '—';
+        document.getElementById('srv-port').textContent = d.backend_port || '—';
+        document.getElementById('srv-up').textContent = fmtUp(d.uptime_seconds);
+        setHeader(true);
+    }).catch(e => {
+        console.error('Status:', e);
+        document.getElementById('srv-status').textContent = 'Offline';
+        document.getElementById('srv-status').className = 'info-value err';
+        document.getElementById('ngrok-url').textContent = 'Sin conexión';
+        document.getElementById('ngrok-url').className = 'url empty';
+        document.getElementById('ngrok-on').style.display = 'none';
+        document.getElementById('ngrok-off').style.display = 'inline-block';
+        setHeader(false);
+    });
+}
+function setHeader(ok) {
+    document.getElementById('hdr-dot').className = 'status-dot ' + (ok ? 'online' : 'offline');
+    document.getElementById('hdr-text').textContent = ok ? 'Online' : 'Offline';
+    document.getElementById('hdr-badge').className = 'status-badge ' + (ok ? 'online' : 'offline');
+    _offlineMode = !ok;
+    const banner = document.getElementById('offline-banner');
+    if (banner) banner.style.display = ok ? 'none' : 'flex';
+}
+function fmtUp(s) {
+    if (!s) return '—';
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 24) return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+    return h + 'h ' + m + 'm';
+}
+function fmtDate(s) {
+    if (!s) return '—';
+    try { return new Date(s).toLocaleDateString('es-ES', {day:'2-digit',month:'short',year:'numeric'}); } catch(e) { return s.substring(0,10); }
+}
+function fmtSize(mb) {
+    if (!mb) return '0 MB';
+    if (mb >= 1024) return (mb / 1024).toFixed(1) + ' GB';
+    return mb + ' MB';
+}
+function testHealth() {
+    apiGetJSON('/health').then(d => toast('💓 ' + d.status, true)).catch(() => toast('❌ Sin respuesta', false));
+}
+
+// ========== STATS ==========
+function loadStats() {
+    apiGetJSON('/admin/stats').then(d => {
+        document.getElementById('d-users').textContent = d.total_users || 0;
+        document.getElementById('d-cams').textContent = d.total_cameras || 0;
+        document.getElementById('d-active').textContent = d.active_cameras || 0;
+        document.getElementById('d-storage').textContent = d.storage_used_gb || 0;
+        document.getElementById('d-mem').textContent = d.memory_used_percent || 0;
+        document.getElementById('d-uptime').textContent = d.uptime_hours || 0;
+    }).catch(() => {});
+}
+
+// ========== USERS ==========
+function loadUsers() {
+    apiGetJSON('/admin/users').then(d => {
+        const us = d.users || [];
+        document.getElementById('users-count').textContent = us.length;
+        const tb = document.getElementById('users-tbody');
+        if (!us.length) { tb.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--text-secondary)">Sin usuarios</td></tr>'; return; }
+        tb.innerHTML = us.map(u => {
+            const planColors = { founder: 'badge-ok', pro: 'badge-ok', free: '', trial: 'badge-warn' };
+            const planLabel = (u.plan || 'free').charAt(0).toUpperCase() + (u.plan || 'free').slice(1);
+            const bizType = u.business_type || '—';
+            const lastAccess = u.last_login || u.last_access || '—';
+            const storageMb = u.storage_used_mb || 0;
+            return '<tr>' +
+                '<td style="font-weight:500">' + (u.name || u.user_id || '—') + '</td>' +
+                '<td>' + (u.business_name || '—') + '</td>' +
+                '<td style="font-size:0.75rem">' + bizType + '</td>' +
+                '<td style="font-size:0.75rem">' + (u.email || '—') + '</td>' +
+                '<td style="font-size:0.75rem">' + (u.phone || '—') + '</td>' +
+                '<td><span class="badge ' + (planColors[u.plan] || '') + '">' + planLabel + '</span></td>' +
+                '<td><span class="badge ' + (u.status === 'active' ? 'badge-ok' : 'badge-err') + '">' + (u.status === 'active' ? 'Activo' : 'Inactivo') + '</span></td>' +
+                '<td style="font-size:0.75rem">' + fmtDate(u.created_at) + '</td>' +
+                '<td style="font-size:0.75rem">' + fmtDate(lastAccess) + '</td>' +
+                '<td style="font-size:0.75rem">' + fmtDate(u.plan_end) + '</td>' +
+                '<td style="text-align:center">' + (u.camera_count || 0) + '</td>' +
+                '<td style="font-size:0.75rem">' + fmtSize(storageMb) + '</td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="showUserDetail(\'' + u.user_id + '\')">📋</button></td>' +
+            '</tr>';
+        }).join('');
+    }).catch(e => {
+        document.getElementById('users-tbody').innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--danger)">Error: ' + e.message + '</td></tr>';
+    });
+}
+
+// ========== STORAGE & DISKS ==========
+let _disksData = null;
+
+function loadDisks() {
+    apiGetJSON('/admin/disks').then(d => {
+        _disksData = d;
+        const threshold = d.disk_fill_threshold_pct || 90;
+        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">';
+        (d.disks || []).forEach((disk, i) => {
+            const pct = disk.total_gb > 0 ? Math.round((disk.used_gb / disk.total_gb) * 100) : 0;
+            const isFull = pct >= threshold;
+            const color = pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--success)';
+            const statusBadge = isFull ? '<span class="badge badge-err" style="margin-left:8px">LLENO</span>' : '<span class="badge badge-ok" style="margin-left:8px">OK</span>';
+            html += '<div class="rules-box" style="border-color:' + (isFull ? 'var(--danger)' : 'var(--border)') + '">';
+            html += '<div class="plan-header"><h4>🗂️ ' + (disk.label || disk.mount) + statusBadge + '</h4>';
+            if (d.disks.length > 1) {
+                html += '<button class="btn btn-sm btn-danger" onclick="removeDisk(' + i + ')">🗑️</button>';
+            }
+            html += '</div>';
+            html += '<p><strong>Montaje:</strong> ' + disk.mount + '</p>';
+            html += '<p><strong>Espacio:</strong> ' + (disk.used_gb || 0) + ' GB / ' + (disk.total_gb || 0) + ' GB</p>';
+            html += '<div style="background:var(--bg-primary);border-radius:4px;height:8px;margin:8px 0"><div style="background:' + color + ';border-radius:4px;height:8px;width:' + Math.min(pct, 100) + '%"></div></div>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">' + pct + '% usado — ' + (disk.free_gb || 0) + ' GB libre</p>';
+            // User folder path config
+            html += '<div class="disk-userpath">';
+            html += '<label style="font-size:0.7rem;color:var(--text-secondary)">Carpeta de usuarios:</label>';
+            html += '<input type="text" id="disk-path-' + i + '" value="' + (disk.user_folder || 'users') + '" placeholder="users" style="width:100%;margin-top:4px;padding:6px;font-size:0.8rem">';
+            html += '</div>';
+            html += '</div>';
+        });
+        html += '</div>';
+
+        document.getElementById('disks-list').innerHTML = html;
+
+        // Render plans config with full editing
+        renderPlansConfig(d);
+
+        // Set TTL values
+        document.getElementById('ttl-cleanup-hour').value = d.default_cleanup_hour || 23;
+        document.getElementById('ttl-frames').value = d.default_frames_ttl_hours || 24;
+        document.getElementById('ttl-sessions').value = d.default_sessions_ttl_days || 7;
+        document.getElementById('ttl-fill-threshold').value = d.disk_fill_threshold_pct || 90;
+    }).catch(e => {
+        document.getElementById('disks-list').innerHTML = '<p style="color:var(--danger)">Error: ' + e.message + '</p>';
+    });
+}
+
+function renderPlansConfig(d) {
+    const plans = d.plans || {};
+    const disks = d.disks || [];
+    let plansHtml = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">';
+    for (const [planName, cfg] of Object.entries(plans)) {
+        plansHtml += '<div class="plan-editor" id="plan-editor-' + planName + '">';
+        plansHtml += '<div class="plan-header">';
+        plansHtml += '<h4>📊 ' + planName.toUpperCase() + '</h4>';
+        plansHtml += '<button class="btn btn-sm btn-danger" onclick="removePlan(\'' + planName + '\')">🗑️</button>';
+        plansHtml += '</div>';
+        plansHtml += '<div class="form-group" style="margin-bottom:8px">';
+        plansHtml += '<label>Storage (GB)</label>';
+        plansHtml += '<input type="number" id="plan-' + planName + '-storage" value="' + (cfg.max_storage_gb || 0) + '" min="1">';
+        plansHtml += '</div>';
+        plansHtml += '<div class="form-group" style="margin-bottom:8px">';
+        plansHtml += '<label>Cámaras</label>';
+        plansHtml += '<input type="number" id="plan-' + planName + '-cameras" value="' + (cfg.max_cameras || 0) + '" min="1">';
+        plansHtml += '</div>';
+        plansHtml += '<div class="form-group" style="margin-bottom:8px">';
+        plansHtml += '<label>Disco Prioritario</label>';
+        plansHtml += '<select id="plan-' + planName + '-disk">';
+        plansHtml += '<option value="">Auto (el más libre)</option>';
+        disks.forEach(disk => {
+            const sel = cfg.priority_disk === disk.mount ? 'selected' : '';
+            plansHtml += '<option value="' + disk.mount + '" ' + sel + '>' + (disk.label || disk.mount) + '</option>';
+        });
+        plansHtml += '</select>';
+        plansHtml += '</div>';
+        plansHtml += '</div>';
+    }
+    plansHtml += '</div>';
+    document.getElementById('plans-config').innerHTML = plansHtml;
+}
+
+function savePlansConfig() {
+    if (!_disksData) return;
+    const plans = _disksData.plans || {};
+    for (const planName of Object.keys(plans)) {
+        const storage = document.getElementById('plan-' + planName + '-storage');
+        const cameras = document.getElementById('plan-' + planName + '-cameras');
+        const disk = document.getElementById('plan-' + planName + '-disk');
+        if (storage) plans[planName].max_storage_gb = parseInt(storage.value) || 1;
+        if (cameras) plans[planName].max_cameras = parseInt(cameras.value) || 1;
+        if (disk) plans[planName].priority_disk = disk.value;
+    }
+    // Also save disk user_folder paths
+    (_disksData.disks || []).forEach((disk, i) => {
+        const pathInput = document.getElementById('disk-path-' + i);
+        if (pathInput) disk.user_folder = pathInput.value.trim() || 'users';
+    });
+    saveDisksConfig();
+}
+
+function showAddPlanForm() {
+    if (!_disksData) return;
+    const select = document.getElementById('new-plan-disk');
+    select.innerHTML = '<option value="">Auto (el más libre)</option>';
+    (_disksData.disks || []).forEach(disk => {
+        select.innerHTML += '<option value="' + disk.mount + '">' + (disk.label || disk.mount) + '</option>';
+    });
+    document.getElementById('add-plan-modal').classList.add('show');
+}
+
+function closeAddPlanModal() {
+    document.getElementById('add-plan-modal').classList.remove('show');
+}
+
+function addPlan() {
+    const name = document.getElementById('new-plan-name').value.trim().toLowerCase();
+    const storage = parseInt(document.getElementById('new-plan-storage').value) || 1;
+    const cameras = parseInt(document.getElementById('new-plan-cameras').value) || 1;
+    const disk = document.getElementById('new-plan-disk').value;
+    if (!name) { toast('❌ Nombre requerido', false); return; }
+    if (!_disksData) return;
+    if (_disksData.plans[name]) { toast('❌ El plan ya existe', false); return; }
+    _disksData.plans[name] = {
+        max_storage_gb: storage,
+        max_cameras: cameras,
+        priority_disk: disk
+    };
+    closeAddPlanModal();
+    renderPlansConfig(_disksData);
+    toast('✅ Plan creado. Guarda para aplicar.', true);
+    // Clear inputs
+    document.getElementById('new-plan-name').value = '';
+    document.getElementById('new-plan-storage').value = '';
+    document.getElementById('new-plan-cameras').value = '';
+}
+
+function removePlan(planName) {
+    if (!confirm('¿Eliminar el plan "' + planName + '"?')) return;
+    if (!_disksData) return;
+    delete _disksData.plans[planName];
+    renderPlansConfig(_disksData);
+    toast('✅ Plan eliminado. Guarda para aplicar.', true);
+}
+
+function autodetectDisks() {
+    apiGetJSON('/admin/disks/autodetect').then(d => {
+        const detected = d.detected || [];
+        if (!detected.length) {
+            document.getElementById('autodetect-results').innerHTML = '<p style="color:var(--text-secondary)">No se detectaron discos adicionales</p>';
+            return;
+        }
+        let html = '<h4 style="color:var(--accent);margin-bottom:8px">🔍 Discos Detectados</h4>';
+        detected.forEach(disk => {
+            html += '<div class="rules-box" style="margin-bottom:8px">';
+            html += '<p><strong>' + disk.mount + '</strong> (' + disk.source + ')</p>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">' + disk.free_gb + ' GB libre / ' + disk.total_gb + ' GB total</p>';
+            html += '<button class="btn btn-sm" onclick="addDetectedDisk(\'' + disk.mount + '\', \'' + (disk.label || disk.mount) + '\')">➕ Agregar este disco</button>';
+            html += '</div>';
+        });
+        document.getElementById('autodetect-results').innerHTML = html;
+    }).catch(e => {
+        document.getElementById('autodetect-results').innerHTML = '<p style="color:var(--danger)">Error: ' + e.message + '</p>';
+    });
+}
+
+function showAddDiskForm() {
+    const form = document.getElementById('add-disk-form');
+    form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+function addDetectedDisk(mount, label) {
+    document.getElementById('new-disk-mount').value = mount;
+    document.getElementById('new-disk-label').value = label;
+    addDisk();
+}
+
+function addDisk() {
+    const mount = document.getElementById('new-disk-mount').value.trim();
+    const label = document.getElementById('new-disk-label').value.trim() || mount;
+    if (!mount) { toast('❌ Ingresa el montaje', false); return; }
+    apiFetch('/admin/disks/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mount: mount, label: label })
+    }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Disco agregado', true); loadDisks(); document.getElementById('add-disk-form').style.display = 'none'; }
+        else toast('❌ ' + (d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function removeDisk(index) {
+    if (!confirm('¿Quitar este disco de la configuración?')) return;
+    const disk = _disksData.disks[index];
+    apiFetch('/admin/disks/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mount: disk.mount })
+    }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Disco removido', true); loadDisks(); }
+        else toast('❌ ' + (d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function loadStorageUsers() {
+    apiGetJSON('/admin/storage').then(d => {
+        const us = d.users || [];
+        const tb = document.getElementById('storage-tbody');
+        if (!us.length) { tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Sin usuarios</td></tr>'; return; }
+        tb.innerHTML = us.map(u => {
+            const pct = u.usage_percent || 0;
+            const color = pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--success)';
+            return '<tr>' +
+                '<td style="font-weight:500;font-size:0.8rem">' + (u.user_id || '—') + '</td>' +
+                '<td style="font-size:0.75rem">' + (u.disk_mount || '—') + '</td>' +
+                '<td><span class="badge badge-ok">' + (u.plan || 'free') + '</span></td>' +
+                '<td>' + (u.quota_gb || 0) + ' GB</td>' +
+                '<td>' + fmtSize(u.used_mb) + '</td>' +
+                '<td><div style="background:var(--bg-primary);border-radius:4px;height:6px;width:60px;display:inline-block;vertical-align:middle"><div style="background:' + color + ';border-radius:4px;height:6px;width:' + Math.min(pct, 100) + '%"></div></div> <span style="font-size:0.75rem">' + pct + '%</span></td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="openEditStorageModal(\'' + u.user_id + '\')">✏️</button></td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="openMigrateModal(\'' + u.user_id + '\')">📦</button></td>' +
+            '</tr>';
+        }).join('');
+    }).catch(e => {
+        document.getElementById('storage-tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">Error</td></tr>';
+    });
+}
+
+
+// ========== EVENTS ==========
+function loadEvents() {
+    Promise.all([
+        apiGetJSON('/admin/events?limit=20'),
+        apiGetJSON('/admin/events/stats?days=7')
+    ]).then(([ev, stats]) => {
+        // Chart
+        drawEventsChart(stats.by_day || []);
+        // Summary
+        document.getElementById('ev-total').textContent = stats.total_events || 0;
+        document.getElementById('ev-violations').textContent = (stats.by_type?.violation || 0);
+        document.getElementById('ev-normal').textContent = (stats.by_type?.normal || stats.total_events - (stats.by_type?.violation || 0));
+        // Today count
+        const today = new Date().toISOString().slice(0, 10);
+        const todayCount = (stats.by_day || []).filter(d => d.date === today).reduce((s, d) => s + d.count, 0);
+        document.getElementById('ev-today').textContent = todayCount;
+        // Event list
+        const events = ev.events || [];
+        const listEl = document.getElementById('ev-list');
+        if (!events.length) {
+            listEl.innerHTML = '<p style="color:var(--text-secondary);text-align:center">Sin eventos</p>';
+            return;
+        }
+        let h = '';
+        events.forEach(evt => {
+            const type = evt.event_type || 'info';
+            const typeBadge = type === 'violation' ? '<span class="badge badge-err">VIOLACIÓN</span>' : '<span class="badge">' + type + '</span>';
+            const desc = evt.description || evt.event_id || '—';
+            const ts = evt.timestamp ? fmtDate(evt.timestamp) : '—';
+            h += '<div class="rules-box" style="margin-bottom:8px">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center">' +
+                typeBadge +
+                '<span style="font-size:0.7rem;color:var(--text-secondary)">' + ts + '</span>' +
+                '</div>' +
+                '<p style="font-size:0.85rem;margin-top:6px">' + desc + '</p>' +
+                '<p style="font-size:0.7rem;color:var(--text-secondary);margin-top:4px">' +
+                '📹 ' + (evt.camera_id || '—') + ' · 👤 ' + (evt._user_id || evt.user_id || '—') +
+                '</p>' +
+                '</div>';
+        });
+        listEl.innerHTML = h;
+    }).catch(e => {
+        document.getElementById('ev-list').innerHTML = '<p style="color:var(--danger);text-align:center">Error: ' + e.message + '</p>';
+    });
+}
+
+function drawEventsChart(byDay) {
+    const canvas = document.getElementById('events-chart');
+    if (!canvas || !byDay.length) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.offsetWidth, h = 200;
+    canvas.width = w; canvas.height = h;
+    const pad = 40, bw = 8;
+    const counts = byDay.map(d => d.count);
+    const max = Math.max(...counts, 1);
+    const barW = Math.min(40, (w - pad * 2) / counts.length - 4);
+    const stepX = (w - pad * 2) / counts.length;
+
+    // Background
+    ctx.fillStyle = '#1c1c1e'; ctx.fillRect(0, 0, w, h);
+    // Grid lines
+    ctx.strokeStyle = '#2c2c2e'; ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = pad + ((h - pad * 2) * i / 4);
+        ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
+        ctx.fillStyle = '#aeaeb2'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+        ctx.fillText(Math.round(max * (1 - i / 4)), pad - 6, y + 3);
+    }
+
+    // Bars
+    counts.forEach((c, i) => {
+        const x = pad + stepX * i + (stepX - barW) / 2;
+        const barH = (c / max) * (h - pad * 2);
+        const y = h - pad - barH;
+        const col = c > 0 ? '#ff453a' : '#2c2c2e';
+        ctx.fillStyle = col;
+        ctx.beginPath();
+        ctx.roundRect(x, y, barW, barH, [4, 4, 0, 0]);
+        ctx.fill();
+        // Label
+        ctx.fillStyle = '#aeaeb2'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
+        const label = byDay[i].date.slice(5); // MM-DD
+        ctx.fillText(label, x + barW / 2, h - pad + 14);
+        // Value
+        if (c > 0) {
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 10px monospace';
+            ctx.fillText(c, x + barW / 2, y - 5);
+        }
+    });
+}
+
+
+function scanDisks() {
+    apiFetch('/admin/disks/scan', { method: 'POST' }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Discos escaneados', true); loadDisks(); }
+        else toast('❌ Error', false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function saveDisksConfig() {
+    if (!_disksData) return;
+    _disksData.default_cleanup_hour = parseInt(document.getElementById('ttl-cleanup-hour').value) || 23;
+    _disksData.default_frames_ttl_hours = parseInt(document.getElementById('ttl-frames').value) || 24;
+    _disksData.default_sessions_ttl_days = parseInt(document.getElementById('ttl-sessions').value) || 7;
+    _disksData.disk_fill_threshold_pct = parseInt(document.getElementById('ttl-fill-threshold').value) || 90;
+    apiFetch('/admin/disks/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(_disksData)
+    }).then(r => r.json()).then(d => {
+        if (d.success) toast('✅ Configuración guardada', true);
+        else toast('❌ Error: ' + (d.error || ''), false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function saveTTLs() { saveDisksConfig(); }
+
+// ========== EDIT USER STORAGE (MODAL) ==========
+function openEditStorageModal(userId) {
+    apiGetJSON('/admin/storage/' + userId).then(d => {
+        const disks = _disksData?.disks || [];
+        let diskOptions = '';
+        disks.forEach(disk => {
+            const sel = d.disk_mount === disk.mount ? 'selected' : '';
+            diskOptions += '<option value="' + disk.mount + '" ' + sel + '>' + (disk.label || disk.mount) + ' (' + disk.free_gb + 'GB libre)</option>';
+        });
+        let html = '<div class="form-group">';
+        html += '<label>Usuario</label>';
+        html += '<input type="text" value="' + userId + '" disabled>';
+        html += '</div>';
+        html += '<div class="form-group">';
+        html += '<label>Cuota de Almacenamiento (GB)</label>';
+        html += '<input type="number" id="edit-storage-quota" value="' + (d.quota_gb || 1) + '" min="1">';
+        html += '</div>';
+        html += '<div class="form-group">';
+        html += '<label>Disco</label>';
+        html += '<select id="edit-storage-disk">' + diskOptions + '</select>';
+        html += '</div>';
+        html += '<div class="form-group">';
+        html += '<label>Plan</label>';
+        html += '<select id="edit-storage-plan">';
+        const plans = Object.keys(_disksData?.plans || {});
+        plans.forEach(p => {
+            const sel = d.plan === p ? 'selected' : '';
+            html += '<option value="' + p + '" ' + sel + '>' + p.toUpperCase() + '</option>';
+        });
+        html += '</select>';
+        html += '</div>';
+        html += '<div class="form-group">';
+        html += '<label>Cámaras máximas</label>';
+        html += '<input type="number" id="edit-storage-cameras" value="' + (d.max_cameras || 1) + '" min="1">';
+        html += '</div>';
+        html += '<div style="display:flex;gap:8px;margin-top:16px">';
+        html += '<button class="btn btn-success" onclick="saveUserStorage(\'' + userId + '\')">💾 Guardar</button>';
+        html += '<button class="btn btn-outline" onclick="closeEditStorageModal()">Cancelar</button>';
+        html += '</div>';
+        document.getElementById('edit-storage-content').innerHTML = html;
+        document.getElementById('edit-storage-modal').classList.add('show');
+    }).catch(() => toast('❌ Error cargando usuario', false));
+}
+
+function closeEditStorageModal() {
+    document.getElementById('edit-storage-modal').classList.remove('show');
+}
+
+function saveUserStorage(userId) {
+    const quota = document.getElementById('edit-storage-quota').value;
+    const disk = document.getElementById('edit-storage-disk').value;
+    const plan = document.getElementById('edit-storage-plan').value;
+    const cameras = document.getElementById('edit-storage-cameras').value;
+    apiFetch('/admin/storage/' + userId + '/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            storage_quota_gb: parseInt(quota) || 1,
+            disk_mount: disk,
+            plan: plan,
+            max_cameras: parseInt(cameras) || 1
+        })
+    }).then(r => r.json()).then(res => {
+        if (res.success) {
+            toast('✅ Actualizado', true);
+            closeEditStorageModal();
+            loadStorageUsers();
+            loadUsers();
+        } else {
+            toast('❌ Error: ' + (res.error || ''), false);
+        }
+    }).catch(() => toast('❌ Error', false));
+}
+
+// ========== MIGRATE USER (MODAL) ==========
+function openMigrateModal(userId) {
+    apiGetJSON('/admin/storage/' + userId).then(d => {
+        const disks = _disksData?.disks || [];
+        const otherDisks = disks.filter(x => x.mount !== d.disk_mount);
+        if (!otherDisks.length) { toast('❌ No hay otros discos disponibles', false); return; }
+        let html = '<p style="margin-bottom:12px;color:var(--text-secondary)">Migrar <strong>' + userId + '</strong> de <code>' + (d.disk_mount || '—') + '</code> a:</p>';
+        otherDisks.forEach((disk, i) => {
+            html += '<div class="rules-box" style="margin-bottom:8px">';
+            html += '<p><strong>' + (disk.label || disk.mount) + '</strong></p>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">' + disk.mount + ' — ' + disk.free_gb + ' GB libre</p>';
+            html += '<button class="btn btn-sm btn-warning" onclick="migrateUser(\'' + userId + '\', \'' + disk.mount + '\')">📦 Migrar aquí</button>';
+            html += '</div>';
+        });
+        html += '<button class="btn btn-outline" onclick="closeMigrateModal()" style="margin-top:8px">Cancelar</button>';
+        document.getElementById('migrate-content').innerHTML = html;
+        document.getElementById('migrate-modal').classList.add('show');
+    }).catch(() => toast('❌ Error', false));
+}
+
+function closeMigrateModal() {
+    document.getElementById('migrate-modal').classList.remove('show');
+}
+
+function migrateUser(userId, targetDisk) {
+    if (!confirm('¿Migrar ' + userId + ' a ' + targetDisk + '?')) return;
+    apiFetch('/admin/storage/' + userId + '/migrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disk_mount: targetDisk })
+    }).then(r => r.json()).then(res => {
+        if (res.success) {
+            toast('✅ Usuario migrado', true);
+            closeMigrateModal();
+            loadStorageUsers();
+            loadUsers();
+        } else {
+            toast('❌ Error: ' + (res.error || ''), false);
+        }
+    }).catch(() => toast('❌ Error', false));
+}
+
+// ========== USER DETAIL ==========
+function showUserDetail(userId) {
+    apiGetJSON('/admin/users/' + userId).then(d => {
+        document.getElementById('ud-name').textContent = (d.name || d.user_id) + ' — Detalle';
+        let html = '';
+        html += '<div class="info-row"><span class="info-label">User ID</span><span class="info-value">' + d.user_id + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Email</span><span class="info-value">' + (d.email || '—') + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Teléfono</span><span class="info-value">' + (d.phone || '—') + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Negocio</span><span class="info-value">' + (d.business_name || '—') + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Tipo Negocio</span><span class="info-value">' + (d.business_type || '—') + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Plan</span><span class="info-value">' + (d.plan || '—') + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Estado</span><span class="info-value">' + (d.status || '—') + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Registro</span><span class="info-value">' + fmtDate(d.created_at) + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Último Acceso</span><span class="info-value">' + fmtDate(d.last_login || d.last_access) + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Plan Vence</span><span class="info-value">' + fmtDate(d.plan_end) + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Próximo Pago</span><span class="info-value">' + fmtDate(d.next_payment) + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Cámaras</span><span class="info-value">' + (d.camera_count || 0) + '</span></div>';
+        html += '<div class="info-row"><span class="info-label">Storage</span><span class="info-value">' + fmtSize(d.storage_used_mb) + '</span></div>';
+
+        if (d.cameras && d.cameras.length > 0) {
+            html += '<h4 style="margin-top:16px;color:var(--accent)">📷 Cámaras y Reglas de Vigilancia</h4>';
+            d.cameras.forEach(cam => {
+                html += '<div class="rules-box">';
+                html += '<h4>📹 ' + (cam.name || cam.camera_id) + ' — ' + (cam.zone || 'Sin zona') + '</h4>';
+                if (cam.config) {
+                    const cfg = cam.config;
+                    if (cfg.rules) html += '<p><strong>Reglas:</strong> ' + cfg.rules + '</p>';
+                    if (cfg.prompt_template) html += '<p><strong>Prompt:</strong> ' + cfg.prompt_template + '</p>';
+                    if (cfg.riesgo_principal) html += '<p><strong>Riesgo:</strong> ' + cfg.riesgo_principal + '</p>';
+                    if (cfg.zona_critica) html += '<p><strong>Zona Crítica:</strong> ' + cfg.zona_critica + '</p>';
+                    if (cfg.horario_open) html += '<p><strong>Horario:</strong> ' + cfg.horario_open + '</p>';
+                    if (cfg.sensibilidad) html += '<p><strong>Sensibilidad:</strong> ' + cfg.sensibilidad + '</p>';
+                } else {
+                    html += '<p style="color:var(--text-secondary)">Sin configuración</p>';
+                }
+                html += '</div>';
+            });
+        }
+
+        document.getElementById('ud-content').innerHTML = html;
+        document.getElementById('user-detail').classList.add('show');
+    }).catch(e => toast('❌ Error: ' + e.message, false));
+}
+
+function closeUserDetail() {
+    document.getElementById('user-detail').classList.remove('show');
+}
+
+// ========== QUEUE ==========
+function loadQueue() {
+    // Load from backend
+    apiGetJSON('/admin/queue').then(d => {
+        document.getElementById('q-pending').textContent = d.queue_length || 0;
+        document.getElementById('q-proc').textContent = d.processing || 0;
+        document.getElementById('q-done').textContent = d.done || 0;
+        document.getElementById('q-err').textContent = d.error || 0;
+        document.getElementById('q-total').textContent = (d.queue_length || 0) + (d.processing || 0) + (d.done || 0) + (d.error || 0);
+        document.getElementById('q-size').textContent = d.queue_size_mb ? d.queue_size_mb.toFixed(1) + ' MB' : '—';
+        document.getElementById('q-oldest').textContent = d.oldest_item ? fmtDate(d.oldest_item) : '—';
+        document.getElementById('q-last').textContent = d.last_processed ? fmtDate(d.last_processed) : '—';
+        document.getElementById('q-worker').textContent = d.worker_running ? '✅ Corriendo' : '⏹️ Detenido';
+
+        // Render pending frames list
+        const frames = d.pending_frames || [];
+        const framesEl = document.getElementById('q-frames-list');
+        document.getElementById('q-frame-count').textContent = '(' + frames.length + ')';
+        if (!frames.length) {
+            framesEl.innerHTML = '<p style="color:var(--text-secondary);text-align:center;padding:20px">Sin frames pendientes</p>';
+        } else {
+            let html = '<table><thead><tr><th>ID</th><th>Cámara</th><th>Usuario</th><th>Tamaño</th><th>Cola desde</th><th></th></tr></thead><tbody>';
+            frames.forEach(f => {
+                html += '<tr>' +
+                    '<td style="font-size:0.75rem;font-family:monospace">' + (f.id || f.frame_id || '—').substring(0,8) + '</td>' +
+                    '<td style="font-size:0.75rem">' + (f.camera_id || '—') + '</td>' +
+                    '<td style="font-size:0.75rem">' + (f.user_id || '—') + '</td>' +
+                    '<td style="font-size:0.75rem">' + (f.size_kb ? f.size_kb + ' KB' : '—') + '</td>' +
+                    '<td style="font-size:0.75rem">' + (f.queued_at ? fmtDate(f.queued_at) : '—') + '</td>' +
+                    '<td>' + (f.thumbnail ? '<img src="' + f.thumbnail + '" style="width:40px;height:30px;object-fit:cover;border-radius:4px">' : '—') + '</td>' +
+                '</tr>';
+            });
+            html += '</tbody></table>';
+            framesEl.innerHTML = html;
+        }
+    }).catch(() => {
+        document.getElementById('q-frames-list').innerHTML = '<p style="color:var(--warning);text-align:center;padding:20px">⚠️ Backend offline - No se puede cargar la cola</p>';
+    });
+
+    // Load offline queue from Firebase
+    _initQueue();
+    if (_queueRef) {
+        _queueRef.get().then(doc => {
+            if (doc.exists) {
+                const d = doc.data();
+                const frames = d.frames || [];
+                document.getElementById('q-offline-count').textContent = frames.length;
+                let totalSize = 0;
+                frames.forEach(f => { totalSize += f.size_kb || 0; });
+                document.getElementById('q-offline-size').textContent = totalSize > 0 ? (totalSize / 1024).toFixed(1) + ' MB' : '0 KB';
+
+                const offlineEl = document.getElementById('q-offline-list');
+                if (!frames.length) {
+                    offlineEl.innerHTML = '<p style="color:var(--text-secondary);text-align:center;padding:10px">Sin items</p>';
+                } else {
+                    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">';
+                    frames.slice(0, 20).forEach((f, i) => {
+                        html += '<div class="rules-box" style="padding:8px">' +
+                            '<p style="font-size:0.7rem;font-family:monospace">' + (f.camera_id || '—') + '</p>' +
+                            '<p style="font-size:0.65rem;color:var(--text-secondary)">' + (f.queued_at ? fmtDate(f.queued_at) : '—') + '</p>' +
+                            (f.thumbnail ? '<img src="' + f.thumbnail + '" style="width:100%;height:60px;object-fit:cover;border-radius:4px;margin-top:4px">' : '') +
+                            '<p style="font-size:0.65rem;color:var(--text-secondary);margin-top:4px">' + (f.size_kb ? f.size_kb + ' KB' : '') + '</p>' +
+                        '</div>';
+                    });
+                    if (frames.length > 20) html += '<p style="color:var(--text-secondary);font-size:0.75rem;padding:8px">...y ' + (frames.length - 20) + ' más</p>';
+                    html += '</div>';
+                    offlineEl.innerHTML = html;
+                }
+            }
+        }).catch(() => {
+            document.getElementById('q-offline-list').innerHTML = '<p style="color:var(--text-secondary)">Sin acceso a Firebase</p>';
+        });
+    }
+}
+function clearQueue() {
+    if (!confirm('¿Limpiar cola?')) return;
+    apiFetch('/admin/queue/clear', { method: 'POST' }).then(() => { toast('✅ Limpiada', true); loadQueue(); }).catch(() => toast('❌ Error', false));
+}
+
+// ========== EVA PROMPT & DOCS ==========
+function loadEvaPrompt() {
+    apiFetch('/admin/eva-config').then(r => r.json()).then(d => {
+        if (d.prompt) {
+            document.getElementById('prompt-eva').value = d.prompt;
+            updateTokenCount();
+        }
+    }).catch(() => {});
+}
+
+function updateTokenCount() {
+    const prompt = document.getElementById('prompt-eva').value;
+    // Approximate tokens: ~3 chars per token for Spanish text
+    const tokens = Math.ceil(prompt.length / 3);
+    const maxTokens = 2000;
+    const pct = Math.min((tokens / maxTokens) * 100, 100);
+    
+    document.getElementById('token-count').textContent = tokens;
+    document.getElementById('token-bar').style.width = pct + '%';
+    
+    const bar = document.getElementById('token-bar');
+    const status = document.getElementById('token-status');
+    const warning = document.getElementById('token-warning');
+    
+    if (tokens > maxTokens) {
+        bar.style.background = 'var(--danger)';
+        status.textContent = '❌';
+        warning.style.display = 'block';
+    } else if (tokens > maxTokens * 0.8) {
+        bar.style.background = 'var(--warning)';
+        status.textContent = '⚠️';
+        warning.style.display = 'none';
+    } else {
+        bar.style.background = 'var(--success)';
+        status.textContent = '✅';
+        warning.style.display = 'none';
+    }
+}
+
+function calcTokens() {
+    const prompt = document.getElementById('prompt-eva').value;
+    // Send to server for accurate count
+    apiFetch('/admin/calc-tokens', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: prompt})
+    }).then(r => r.json()).then(d => {
+        document.getElementById('token-count').textContent = d.tokens;
+        const pct = Math.min((d.tokens / 2000) * 100, 100);
+        document.getElementById('token-bar').style.width = pct + '%';
+        toast('📊 Tokens: ' + d.tokens + ' / 2000', d.tokens <= 2000);
+    }).catch(() => {
+        // Fallback to local calculation
+        updateTokenCount();
+    });
+}
+
+function saveEvaPrompt() {
+    const content = document.getElementById('prompt-eva').value;
+    if (!content.trim()) { toast('❌ Prompt vacío', false); return; }
+    
+    // Check token limit before saving
+    const tokens = Math.ceil(content.length / 3);
+    if (tokens > 2000) {
+        toast('❌ Prompt excede 2000 tokens (' + tokens + ')', false);
+        return;
+    }
+    
+    // Guardar en el archivo de prompts
+    apiFetch('/admin/system/prompts', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: content})
+    }).then(() => {
+        toast('✅ Prompt guardado (' + tokens + ' tokens)', true);
+    }).catch(() => toast('❌ Error guardando', false));
+}
+
+function loadEvaDocs() {
+    apiFetch('/admin/eva-docs').then(r => r.json()).then(d => {
+        const docs = d.documents || [];
+        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px">';
+        docs.forEach(doc => {
+            html += '<div class="rules-box" style="cursor:pointer" onclick="editEvaDoc(\''+doc+'\')">';
+            html += '<h4>📄 '+doc+'</h4>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">Clic para editar</p>';
+            html += '</div>';
+        });
+        html += '</div>';
+        document.getElementById('eva-docs-list').innerHTML = html;
+    }).catch(() => {
+        document.getElementById('eva-docs-list').innerHTML = '<p style="color:var(--danger)">Error cargando documentos</p>';
+    });
+}
+
+function editEvaDoc(name) {
+    apiFetch('/admin/eva-docs/' + name).then(r => r.json()).then(doc => {
+        document.getElementById('doc-name').value = name;
+        document.getElementById('doc-content').value = doc.content || '';
+        document.getElementById('doc-editor-title').textContent = '📝 Editar: ' + name;
+        document.getElementById('eva-doc-editor').style.display = 'block';
+        document.getElementById('btn-delete-doc').style.display = 'inline-block';
+    }).catch(() => toast('❌ Error cargando documento', false));
+}
+
+function showAddDocForm() {
+    document.getElementById('doc-name').value = '';
+    document.getElementById('doc-content').value = '';
+    document.getElementById('doc-editor-title').textContent = '📝 Nuevo Documento';
+    document.getElementById('eva-doc-editor').style.display = 'block';
+    document.getElementById('btn-delete-doc').style.display = 'none';
+}
+
+function hideDocEditor() {
+    document.getElementById('eva-doc-editor').style.display = 'none';
+}
+
+function saveEvaDoc() {
+    const name = document.getElementById('doc-name').value.trim();
+    const content = document.getElementById('doc-content').value;
+    if (!name) { toast('❌ Nombre requerido', false); return; }
+    apiFetch('/admin/eva-docs/save', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: name, content: content})
+    }).then(() => {
+        toast('✅ Documento guardado', true);
+        hideDocEditor();
+        loadEvaDocs();
+    }).catch(() => toast('❌ Error', false));
+}
+
+function deleteEvaDoc() {
+    const name = document.getElementById('doc-name').value.trim();
+    if (!confirm('¿Eliminar "'+name+'"?')) return;
+    // Eliminar guardando contenido vacío
+    apiFetch('/admin/eva-docs/save', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: name, content: ''})
+    }).then(() => {
+        toast('✅ Eliminado', true);
+        hideDocEditor();
+        loadEvaDocs();
+    }).catch(() => toast('❌ Error', false));
+}
+
+// ========== INIT ==========
+autoConnect();
+setInterval(() => { if (API) reloadStatus(); }, 15000);
+// Cargar prompt y docs al abrir la tab
+const _origSwitchTab = switchTab;
+switchTab = function(t) {
+    _origSwitchTab(t);
+    if (t === 'prompts') { loadEvaPrompt(); loadEvaDocs(); }
+};
+// Auto-cargar prompt después de 2 segundos si API está conectada
+setTimeout(() => {
+    if (API) { loadEvaPrompt(); loadEvaDocs(); }
+}, 2000);
+</script>
+</body>
+</html>

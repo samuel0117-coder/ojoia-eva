@@ -1,0 +1,43 @@
+# B6 — parche systemd: qwen.service (SGLang Qwen2.5-VL-7B en GPU 0)
+# Cambios vs /etc/systemd/system/qwen.service actual:
+#   - Restart=on-failure -> Restart=always
+#   + StartLimitIntervalSec=300 + StartLimitBurst=5
+#   (RestartSec 15 conservado: load del modelo 7B es costoso, no queremos thrash)
+#
+# Aplicar:
+#   sudo cp /opt/ojoia/docs/systemd/qwen.service /etc/systemd/system/qwen.service
+#   sudo systemctl daemon-reload && sudo systemctl restart qwen.service
+
+[Unit]
+Description=Qwen 2.5-VL-7B SGLang (GPU 0) - OPTIMIZADO 0.42/16k/120
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+WorkingDirectory=/home/sam/ai_system
+Environment=CUDA_VISIBLE_DEVICES=0
+ExecStart=/home/sam/ai_system/venv/bin/sglang serve \
+    --model-path /opt/ai_models/Qwen2.5-VL-7B-Instruct-AWQ \
+    --host 127.0.0.1 \
+    --port 8004 \
+    --dtype float16 \
+    --mem-fraction-static 0.42 \
+    --context-length 16000 \
+    --max-running-requests 120 \
+    --chunked-prefill-size 2048 --schedule-conservativeness 1.4 --prefill-max-requests 120 \
+    --cuda-graph-max-bs 120 \
+    --trust-remote-code \
+    --log-level warning
+# B6: Restart=always
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

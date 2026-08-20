@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""
+OjoIA API Eva v7.1 — "Cámara Primero, Reglas Después"
+Flujo optimizado: conectar cámara en turno 3-5, reglas basadas en imagen real.
+Mejoras v7.1:
+- Análisis inteligente de imagen al primer frame (640px, no 512px)
+- Eva da opinión experta sobre ubicación de cámara (¿es correcta? ¿enfocada? ¿obstáculos?)
+- Sugiere ajustes específicos basados en tipo de negocio + imagen real
+- describe_image mejorado: 60 palabras, análisis de nitidez, ángulo, obstáculos
+"""
+import logging
+import os
+import json
+import re
+import time
+import base64
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, List, Any
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from starlette.status import HTTP_200_OK
+from pydantic import BaseModel
+import httpx
+import firebase_admin
+from firebase_admin import auth, credentials
+
+# Importar modulos locales
+from gateway_resize import resize_image, image_to_base64
+from orchestrator import orchestrator
+
+# Configuracion Global
+STORAGE_ROOT = Path("/home/sam/storage")
+DISKS_CONFIG_FILE = STORAGE_ROOT / "disks_config.json"
+EVA_CONFIG_FILE = STORAGE_ROOT / "eva_config.json"
+FIREBASE_KEY_PATH = Path("/home/sam/Downloads/firebase-key.json")
+
+# Inicializar Firebase Admin (solo una vez)
+try:
+    firebase_admin.get_app()
+except ValueError:
+    if FIREBASE_KEY_PATH.exists():
+        cred = credentials.Certificate(str(FIREBASE_KEY_PATH))
+        firebase_admin.initialize_app(cred)
+    else:
+        print(f"Firebase key no encontrado en {FIREBASE_KEY_PATH}")
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(STORAGE_ROOT / "api_eva.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Estado de Sesiones Eva
+eva_sessions: Dict[str, Dict[str, Any]] = {}
+
+# App FastAPI
+app = FastAPI(title="OjoIA Eva API", version="7.0")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Middleware para headers CORS y no-cache
+@app.middleware("http")
+async def add_cors_and_no_cache(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            }
+        )
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
+
+# Helpers de Almacenamiento
+def get_disk_config() -> dict:
+    """Cargar configuracion de discos o crear defaults."""
+    if DISKS_CONFIG_FILE.exists():
+        with open(DISKS_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        if "disks" in cfg:
+            return cfg
+    default = {
+        "disks": [{"mount": str(STORAGE_ROOT), "label": "Primary", "total_gb": 1000,
+                   "used_gb": 0, "free_gb": 1000, "user_folder": "users"}],
+        "plans": {
+            "founder": {"max_storage_gb": 500, "max_cameras": 5},
+            "pro": {"max_storage_gb": 250, "max_cameras": 3},
+            "free": {"max_storage_gb": 10, "max_cameras": 1}
+        }
+    }
+    save_disk_config(default)
+    return default
+
+def save_disk_config(cfg: dict):
+    """Guardar configuracion de discos atomicamente."""
+    DISKS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DISKS_CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    tmp.replace(DISKS_CONFIG_FILE)
+
+def get_user_storage_path(user_id: str, plan: str = "founder") -> Path:
+    """Resolver ruta de almacenamiento del usuario segun config de discos."""
+    cfg = get_disk_config()
+    disks = cfg.get("disks", [])
+    plans = cfg.get("plans", {})
+    target = plans.get(plan, plans.get("founder", {}))
+    selected = None
+    priority = target.get("priority_disk")
+    if priority:
+        selected = next((d for d in disks if d.get("mount") == priority), None)
+    if not selected:
+        selected = max(disks, key=lambda d: d.get("free_gb", 0), default=disks[0] if disks else None)
+    if not selected:
+        selected = {"mount": str(STORAGE_ROOT), "user_folder": "users"}
+    return Path(selected["mount"]) / selected["user_folder"].strip("/") / user_id
+
+def find_user_json(user_id: str) -> Optional[Path]:
+    """Buscar user.json de un usuario en todos los discos."""
+    for plan in ("founder", "pro", "free"):
+        path = get_user_storage_path(user_id, plan) / "user.json"
+        if path.exists():
+            return path
+    compat = STORAGE_ROOT / "users" / user_id / "user.json"
+    return compat if compat.exists() else None
+
+def resolve_user_events_dirs(user_id: str) -> List[tuple]:
+    """Devolver carpetas del usuario (nueva estructura + compat)."""
+    base = get_user_storage_path(user_id, "founder")
+    dirs = []
+    cameras_dir = base / "cameras"
+    if cameras_dir.exists():
+        for cam_id in cameras_dir.iterdir():
+            events = cam_id / "events"
+            if events.is_dir():
+                dirs.append((cam_id.name, events))
+    legacy = base / "events"
+    if legacy.is_dir():
+        dirs.append(("_global", legacy))
+    return dirs
+
+def resolve_user_id(camera_id: str, provided_user_id: str, client_ip: str = "unknown") -> str:
+    """Resolver user_id desde camera_id si provided es default."""
+    if provided_user_id and provided_user_id != "default":
+        return provided_user_id
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        founder_match = None
+        any_match = None
+        for user_folder in users_dir.iterdir():
+            user_file = user_folder / "user.json"
+            if user_file.is_file():
+                try:
+                    with open(user_file) as f:
+                        ud = json.load(f)
+                    for cam in ud.get("cameras", []):
+                        if cam.get("camera_id") == camera_id:
+                            uid = ud.get("user_id", user_folder.name)
+                            plan = ud.get("plan", "")
+                            has_fcm = bool(ud.get("fcm_tokens"))
+                            if plan == "founder" and has_fcm:
+                                founder_match = uid
+                            else:
+                                any_match = uid
+                except:
+                    pass
+        return founder_match or any_match or provided_user_id
+    return provided_user_id
+
+# Modelos Pydantic
+class AnalysisRequest(BaseModel):
+    prompt: str = "Describe this image briefly."
+    priority: int = 10
+    max_tokens: int = 100
+
+class ChatRequest(BaseModel):
+    message: str
+    user_id: str
+    session_id: str
+    cam_id: Optional[str] = None
+    include_frame: bool = False
+
+# Endpoints Publicos
+@app.get("/health")
+async def health():
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get("http://localhost:8004/health")
+            status = "ok" if resp.status_code == 200 else "degraded"
+    except:
+        status = "error"
+    return {"status": status, "service": "eva-api", "version": "7.0"}
+
+@app.get("/frames/latest")
+async def get_latest_frame(camera_id: Optional[str] = None):
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    last_cam = orchestrator.grid.get_last_camera_id()
+    if camera_id and last_cam != camera_id:
+        frame_bytes = b""
+    image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
+    return {
+        "success": bool(frame_bytes),
+        "image_b64": image_b64,
+        "camera_id": last_cam,
+        "yolo": {"count": orchestrator.grid.get_last_yolo_count()},
+        "metadata": {"timestamp": datetime.now().isoformat()}
+    }
+
+@app.get("/grid/latest")
+async def get_latest_grid(partial: int = 1):
+    info = orchestrator.grid.get_grid_info()
+    grid_b64 = ""
+    if info["frame_count"] > 0:
+        grid_img = orchestrator.grid.get_grid_image()
+        grid_b64 = base64.b64encode(grid_img).decode()
+    return {
+        "frames_used": info["frame_count"],
+        "grid_b64": grid_b64,
+        "camera_ids": info["camera_ids"],
+        "partial": bool(partial)
+    }
+
+# Auth Firebase
+@app.post("/auth/firebase/verify")
+async def verify_firebase(request: dict):
+    id_token = request.get("id_token") or request.get("idToken")
+    if not id_token:
+        raise HTTPException(status_code=400, detail="Missing idToken")
+    try:
+        decoded = auth.verify_id_token(id_token)
+        uid = decoded["uid"]
+        email = decoded.get("email", "")
+        name = request.get("name", "")
+        business_name = request.get("business_name", "")
+        business_type = request.get("business_type", "")
+        plan = request.get("plan", "founder") or "founder"
+        storage_path = get_user_storage_path(uid, plan)
+        existing = {}
+        user_file = find_user_json(uid)
+        if user_file and user_file.exists():
+            with open(user_file) as f:
+                existing = json.load(f)
+        user_data = {
+            "user_id": uid,
+            "name": name or existing.get("name", ""),
+            "email": email or existing.get("email", ""),
+            "business_name": business_name or existing.get("business_name", ""),
+            "business_type": business_type or existing.get("business_type", ""),
+            "plan": plan,
+            "status": "active",
+            "created_at": existing.get("created_at", str(int(time.time()))),
+            "schedule": existing.get("schedule", {"open": "08:00", "close": "22:00"}),
+            "cameras": existing.get("cameras", []),
+            "fcm_tokens": existing.get("fcm_tokens", []),
+            "storage_path": str(storage_path),
+            "disk_mount": str(storage_path.parent)
+        }
+        storage_path.mkdir(parents=True, exist_ok=True)
+        with open(storage_path / "user.json", "w") as f:
+            json.dump(user_data, f, indent=2)
+        compat_dir = STORAGE_ROOT / "users" / uid
+        compat_dir.mkdir(parents=True, exist_ok=True)
+        with open(compat_dir / "user.json", "w") as f:
+            json.dump(user_data, f, indent=2)
+        return {
+            "success": True,
+            "user_id": uid,
+            "email": email,
+            "name": user_data["name"],
+            "business_name": business_name,
+            "plan": plan
+        }
+    except Exception as e:
+        logger.error(f"Firebase verify error: {e}")
+        return {"success": False, "error": str(e)}
+
+# Perfil y Eventos de Usuario
+@app.get("/api/user/profile")
+async def get_user_profile(user_id: str):
+    user_file = find_user_json(user_id)
+    if user_file and user_file.exists():
+        with open(user_file) as f:
+            data = json.load(f)
+        return {
+            "user_id": user_id,
+            "name": data.get("name", ""),
+            "email": data.get("email", ""),
+            "business_name": data.get("business_name", ""),
+            "business_type": data.get("business_type", ""),
+            "plan": data.get("plan", "founder"),
+            "status": data.get("status", "active"),
+            "schedule": data.get("schedule", {}),
+            "cameras": data.get("cameras", [])
+        }
+    return {"user_id": user_id, "plan": "founder", "status": "active", "cameras": []}
+
+@app.post("/api/user/profile")
+async def update_user_profile(request: Request):
+    data = await request.json()
+    user_id = data.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        user_data = json.load(f)
+    if "vigilance_prompt" in data:
+        user_data["vigilance_prompt"] = data["vigilance_prompt"]
+    if "vigilance_rules" in data:
+        user_data["vigilance_rules"] = data["vigilance_rules"]
+    with open(user_file, "w") as f:
+        json.dump(user_data, f, indent=2)
+    return {"success": True}
+
+@app.get("/api/user/events")
+async def get_user_events(user_id: str, date: str = None, filter: str = None, limit: int = 50):
+    events = []
+    now = int(time.time())
+    start_of_today = now - (now % 86400)
+    cam_names = {}
+    user_file = find_user_json(user_id)
+    if user_file and user_file.exists():
+        with open(user_file) as f:
+            ud = json.load(f)
+        for cam in ud.get("cameras", []):
+            cam_names[cam.get("camera_id", "")] = cam.get("name", "")
+    for cam_id, events_dir in resolve_user_events_dirs(user_id):
+        if not events_dir.exists():
+            continue
+        for fname in sorted(events_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+            if not fname.name.endswith(".json"):
+                continue
+            if len(events) >= limit:
+                break
+            with open(fname) as f:
+                ev = json.load(f)
+            if date == "hoy" or filter == "today":
+                if ev.get("timestamp", 0) < start_of_today:
+                    continue
+            if filter == "alerts" and ev.get("event_type") != "violation":
+                continue
+            cid = ev.get("camera_id", "")
+            ev["camera_name"] = cam_names.get(cid, cam_id if cam_id != "_global" else "Camara")
+            qa = ev.get("metadata", {}).get("qwen_analysis", "")[:200]
+            ev["qwen"] = {"violation": ev.get("event_type") == "violation", "description": qa}
+            ev["yolo"] = {"count": 1}
+            if "metadata" in ev and "grid_b64" in ev["metadata"]:
+                del ev["metadata"]["grid_b64"]
+            events.append(ev)
+    return {"events": events}
+
+@app.get("/api/events/{event_id}")
+async def get_event_detail(event_id: str, user_id: str):
+    event_file = None
+    img_file = None
+    for _cam_id, events_dir in resolve_user_events_dirs(user_id):
+        ef = events_dir / f"{event_id}.json"
+        if ef.exists():
+            event_file = ef
+            img_file = events_dir / f"{event_id}.jpg"
+            break
+    if not event_file or not event_file.exists():
+        raise HTTPException(status_code=404, detail="Evento no encontrado")
+    with open(event_file) as f:
+        event = json.load(f)
+    if img_file and img_file.exists():
+        with open(img_file, "rb") as f:
+            event["frame_b64"] = base64.b64encode(f.read()).decode()
+    event["qwen"] = {
+        "violation": event.get("event_type") == "violation",
+        "description": event.get("metadata", {}).get("qwen_analysis", "")
+    }
+    event["yolo"] = {"count": 1}
+    event["grid_b64"] = event.get("metadata", {}).get("grid_b64", "")
+    return event
+
+@app.get("/api/user/events/stats")
+async def get_user_events_stats(user_id: str, date: str = None):
+    now = int(time.time())
+    start_of_today = now - (now % 86400)
+    total = 0
+    today_count = 0
+    alerts_count = 0
+    for cam_id, events_dir in resolve_user_events_dirs(user_id):
+        if not events_dir.exists():
+            continue
+        for fname in sorted(events_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+            if not fname.name.endswith(".json"):
+                continue
+            try:
+                with open(fname) as f:
+                    ev = json.load(f)
+            except:
+                continue
+            total += 1
+            ts = ev.get("timestamp", 0)
+            if ts >= start_of_today:
+                today_count += 1
+            if ev.get("event_type") == "violation":
+                alerts_count += 1
+    return {"total": total, "today": today_count, "alerts": alerts_count}
+
+# Camaras
+@app.get("/api/cameras")
+async def get_cameras(user_id: str):
+    user_file = find_user_json(user_id)
+    if user_file and user_file.exists():
+        with open(user_file) as f:
+            ud = json.load(f)
+        return {"cameras": ud.get("cameras", [])}
+    return {"cameras": []}
+
+@app.get("/api/cameras/{camera_id}/grid")
+async def get_camera_grid(camera_id: str):
+    last_cam = orchestrator.grid.get_last_camera_id()
+    frame_bytes = orchestrator.grid.get_last_frame_bytes() if last_cam == camera_id else b""
+    image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "image_b64": image_b64,
+        "yolo": {"count": 0},
+        "qwen": {"violation": False}
+    }
+
+# Ingesta de Frames (ESP32-CAM)
+@app.post("/ingest/frame")
+@app.post("/frames/ingest")
+async def ingest_frame(request: Request, camera_id: str = Form(None),
+                       user_id: str = Form("default"), image: UploadFile = File(None)):
+    cid = camera_id or "unknown"
+    uid = user_id or "default"
+    if image is None:
+        body = await request.body()
+        ct = request.headers.get("content-type", "")
+        if "image" in ct and body:
+            from io import BytesIO
+            image = UploadFile(filename=f"{cid}.jpg", file=BytesIO(body))
+        else:
+            raise HTTPException(status_code=400, detail="No image provided")
+    return await _process_ingest(request, cid, uid, image)
+
+@app.post("/ingest/photo")
+@app.post("/ingest/snapshot")
+async def ingest_photo(request: Request, filename: str = Form(None),
+                       camera_id: str = Form(None), user_id: str = Form(None),
+                       image: UploadFile = File(None)):
+    cid = camera_id or filename or "unknown"
+    uid = user_id or "default"
+    if image is None:
+        body = await request.body()
+        ct = request.headers.get("content-type", "")
+        if "image" in ct and body:
+            from io import BytesIO
+            image = UploadFile(filename=f"{cid}.jpg", file=BytesIO(body))
+        else:
+            raise HTTPException(status_code=400, detail="No image provided")
+    return await _process_ingest(request, cid, uid, image)
+
+@app.post("/ingest/raw")
+async def ingest_raw(request: Request):
+    """ESP32 envia bytes puros (image/jpeg) con query params camera_id y user_id."""
+    try:
+        body = await request.body()
+        ct = request.headers.get("content-type", "")
+        qp = request.query_params
+        cid = qp.get("camera_id") or "unknown"
+        uid = qp.get("user_id") or "default"
+        if not body:
+            return {"success": False, "error": "empty body"}
+        from io import BytesIO
+        fake = UploadFile(filename=f"{cid}.jpg", file=BytesIO(body))
+        return await _process_ingest(request, cid, uid, fake)
+    except Exception as e:
+        logger.error(f"Ingest raw error: {e}")
+        return {"success": False, "error": str(e)}
+
+async def _process_ingest(request: Request, camera_id: str, user_id: str, image: UploadFile):
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        user_id = resolve_user_id(camera_id, user_id, client_ip)
+        img_bytes = await image.read()
+        frame_size = len(img_bytes)
+        logger.info(f"Frame: IP={client_ip} Cam={camera_id} User={user_id} Size={frame_size}B")
+        # 1. YOLO detection
+        yolo_count = 0
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                yolo_resp = await client.post(
+                    "http://localhost:8002/detect",
+                    files={"image": ("frame.jpg", img_bytes, "image/jpeg")},
+                )
+                if yolo_resp.status_code == 200:
+                    yolo_count = yolo_resp.json().get("count", 0)
+        except Exception as e:
+            logger.warning(f"YOLO unavailable: {e}")
+        logger.info(f"YOLO: {yolo_count} objects")
+        # 2. Agregar al grid SOLO si YOLO detecto objetos
+        grid_result = {"frame_count": 0, "grid_full": False, "ready_for_analysis": False}
+        if yolo_count > 0:
+            v_prompt, v_rules = "", ""
+            uf = find_user_json(user_id)
+            if uf and uf.exists():
+                with open(uf) as f:
+                    ud = json.load(f)
+                v_prompt = ud.get("vigilance_prompt", "")
+                v_rules_raw = ud.get("vigilance_rules", [])
+                v_rules = v_rules_raw if isinstance(v_rules_raw, str) else "\n".join(v_rules_raw) if v_rules_raw else ""
+            grid_result = orchestrator.add_frame(
+                img_bytes, camera_id, user_id,
+                yolo_count=yolo_count,
+                vigilance_prompt=v_prompt,
+                vigilance_rules=v_rules
+            )
+            logger.info(f"Grid: {grid_result['frame_count']}/16 | YOLO:{yolo_count}")
+        else:
+            logger.info(f"Skip: no YOLO objects")
+        # 3. Registrar camara si es nueva
+        if user_id and user_id != "default":
+            uf = find_user_json(user_id)
+            if uf and uf.exists():
+                with open(uf) as f:
+                    ud = json.load(f)
+                existing_ids = [c.get("camera_id") for c in ud.get("cameras", [])]
+                if camera_id not in existing_ids:
+                    ud.setdefault("cameras", []).append({
+                        "camera_id": camera_id,
+                        "name": camera_id,
+                        "zone": "",
+                        "active": True,
+                        "first_seen": int(time.time()),
+                        "last_frame": int(time.time())
+                    })
+                    uf.parent.mkdir(parents=True, exist_ok=True)
+                    with open(uf, "w") as f:
+                        json.dump(ud, f, indent=2)
+                    compat_dir = STORAGE_ROOT / "users" / user_id
+                    compat_dir.mkdir(parents=True, exist_ok=True)
+                    with open(compat_dir / "user.json", "w") as f:
+                        json.dump(ud, f, indent=2)
+        return {
+            "success": True,
+            "camera_id": camera_id,
+            "user_id": user_id,
+            "client_ip": client_ip,
+            "frame_size": frame_size,
+            "timestamp": datetime.now().isoformat(),
+            "yolo": {"count": yolo_count},
+            **grid_result
+        }
+    except Exception as e:
+        logger.error(f"Ingest error: {e}")
+        return {"success": False, "error": str(e)}
+
+# Anuncio de Dispositivo
+@app.post("/devices/announce")
+async def device_announce(request: dict = None):
+    if not request:
+        request = {}
+    camera_id = request.get("camera_id", "unknown")
+    user_id = request.get("user_id", "")
+    if not camera_id:
+        raise HTTPException(status_code=400, detail="camera_id required")
+    logger.info(f"Device announce: Cam={camera_id} User={user_id}")
+    image_b64 = ""
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    last_cam = orchestrator.grid.get_last_camera_id()
+    if frame_bytes and (last_cam == camera_id or not user_id):
+        try:
+            resized = resize_image(frame_bytes, max_size=256)
+            image_b64 = base64.b64encode(resized).decode()
+        except:
+            image_b64 = base64.b64encode(frame_bytes).decode()
+    if user_id and user_id in eva_sessions:
+        s = eva_sessions[user_id]
+        s["camera_id"] = camera_id
+        s["camera_image_b64"] = image_b64
+        s["camera_connected"] = True
+        s["phase"] = "esperando_imagen"
+        eva_sessions[user_id] = s
+    return {
+        "success": True,
+        "message": f"Camera {camera_id} connected",
+        "camera_id": camera_id,
+        "image_b64": image_b64,
+        "frame_available": bool(frame_bytes)
+    }
+
+# ── Eva Chat v10 — Deterministic State Machine ────────────────────────────
+from eva.eva_chat import handle_eva_chat, set_orchestrator
+
+# Set the orchestrator for the eva module
+set_orchestrator(orchestrator)
+
+@app.post("/config/chat")
+async def config_chat(request: dict):
+    return await handle_eva_chat(
+        user_id=request.get("user_id", ""),
+        message=request.get("message", "hola"),
+        session_id=request.get("session_id", ""),
+        cam_id=request.get("cam_id"),
+        include_frame=request.get("include_frame", False),
+        orchestrator=orchestrator,
+        storage_root=STORAGE_ROOT,
+    )
+
+@app.post("/config/confirm")
+async def config_confirm(request: dict):
+    from eva.eva_chat import _sessions as _eva_s
+    user_id = request.get("user_id", "")
+    sess = _eva_s.get(request.get("session_id", ""), {})
+    if sess.get("phase") == "done":
+        return {"success": True, "message": "Cámara ya configurada"}
+    # Also check legacy sessions for compatibility
+    if user_id in eva_sessions:
+        eva_sessions[user_id]["configured"] = True
+        eva_sessions[user_id]["phase"] = "completado"
+    return {"success": True}
+
+@app.get("/config/camera_status")
+async def config_camera_status(user_id: str):
+    from eva.eva_chat import _sessions as _eva_s
+    # Try to get session from new system first
+    # In a real implementation, we'd need to pass session_id
+    # For now, we'll check if there's any session for this user
+    session = None
+    for sid, sess in _eva_s.items():
+        if sess.get("user_id") == user_id:
+            session = sess
+            break
+    
+    # Fallback to legacy system
+    if not session:
+        session = eva_sessions.get(user_id, {})
+    
+    frame_bytes = orchestrator.grid.get_last_frame_bytes()
+    image_b64 = ""
+    if frame_bytes:
+        try:
+            resized = resize_image(frame_bytes, max_size=512)
+            image_b64 = base64.b64encode(resized).decode()
+        except:
+            image_b64 = base64.b64encode(frame_bytes).decode()
+    
+    return {
+        "camera_connected": session.get("camera_connected", False) if session else False,
+        "camera_id": session.get("camera_id", "") if session else "",
+        "has_frame": bool(frame_bytes),
+        "image_b64": image_b64,
+        "zone": session.get("zone", "") if session else "",
+        "rules_count": len(session.get("confirmed_rules", [])) if session else 0,
+        "rules": session.get("confirmed_rules", []) if session else [],
+        "phase": session.get("phase", "unknown") if session else "unknown",
+        "configured": session.get("phase") == "done" if session else False,
+        "has_image": bool(session.get("image_b64", "")) if session else False
+    }
+
+@app.post("/config/reset")
+async def config_reset(request: dict):
+    user_id = request.get("user_id", "")
+    session_id = request.get("session_id", "")
+    eva_sessions.pop(user_id, None)
+    from eva.eva_chat import _sessions as _eva_s, destroy_session
+    if session_id:
+        destroy_session(session_id)
+    # Also clear all sessions for this user as fallback
+    # In a real implementation, we'd be more specific
+    return {"success": True, "message": "Sesion reiniciada"}
+
+@app.get("/config/session")
+async def config_session(user_id: str):
+    from eva.eva_chat import _sessions as _eva_s, get_user_sessions
+    # Get sessions for this user from new system
+    user_sessions = get_user_sessions(user_id)
+    # Take the most recent session
+    if user_sessions:
+        most_recent_session = max(user_sessions.values(), key=lambda s: s.get("last_activity", 0))
+        return {
+            "active": bool(most_recent_session),
+            "camera_id": most_recent_session.get("camera_id", ""),
+            "camera_image_b64": most_recent_session.get("image_b64", ""),
+            "zone": most_recent_session.get("zone", ""),
+            "rules": most_recent_session.get("confirmed_rules", []),
+            "phase": most_recent_session.get("phase", "unknown"),
+            "rules_count": len(most_recent_session.get("confirmed_rules", [])),
+            "has_image": bool(most_recent_session.get("image_b64", "")),
+            "session_id": most_recent_session.get("session_id", "")
+        }
+    
+    # Fallback to legacy system
+    session = eva_sessions.get(user_id, {})
+    return {
+        "active": bool(session),
+        "camera_id": session.get("camera_id", ""),
+        "camera_image_b64": session.get("camera_image_b64", ""),
+        "zone": session.get("zone", ""),
+        "rules": session.get("rules", []),
+        "phase": session.get("phase", "unknown"),
+        "rules_count": len(session.get("rules", [])),
+        "has_image": bool(session.get("camera_image_b64", "")),
+        "session_id": ""
+    }
+
+# ── FCM ─────
