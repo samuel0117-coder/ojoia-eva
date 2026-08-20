@@ -1518,6 +1518,47 @@ async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[
         pass
     return Response(status_code=204)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C2.1 — Eva Frame (imagen que Eva muestra en el chat de configuración)
+# ═══════════════════════════════════════════════════════════════════════════
+# Sirve el archivo eva_frame.jpg que Eva guardó al analizar la imagen.
+# El frontend lo carga como <img src="/eva-frame/{user_id}/{camera_id}">.
+
+@app.get("/eva-frame/{user_id}/{camera_id}")
+async def get_eva_frame_endpoint(user_id: str, camera_id: str):
+    """Sirve la imagen que Eva guardó para el chat de configuración (eva_frame.jpg)."""
+    try:
+        # 1. Buscar en la cámara configurada
+        frame_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "eva_frame.jpg"
+        if frame_path.exists():
+            return Response(content=frame_path.read_bytes(), media_type="image/jpeg", headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+            })
+
+        # 2. Fallback: latest_raw.jpg
+        raw_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "latest_raw.jpg"
+        if raw_path.exists():
+            return Response(content=raw_path.read_bytes(), media_type="image/jpeg", headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+            })
+
+        # 3. Fallback: latest_vigilance.jpg
+        vig_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / "latest_vigilance.jpg"
+        if vig_path.exists():
+            return Response(content=vig_path.read_bytes(), media_type="image/jpeg", headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+            })
+    except Exception as e:
+        logger.error(f"Error sirviendo eva-frame: {e}")
+    return Response(status_code=204)
+
 @app.get("/grid/latest")
 async def get_latest_grid(partial: int = 1, camera_id: Optional[str] = None, user_id: Optional[str] = None):
     # B4: envolver en try — si orchestrator._get_grid o get_grid_image/encode
