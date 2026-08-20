@@ -2638,6 +2638,186 @@ async def get_zone_types_endpoint():
     return {"success": True, "zone_types": camera_zones.get_zone_types()}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# C1.3 — Sugerir zonas con IA (WOW #2)
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoint que toma el último frame de la cámara y pide a Qwen que sugiera
+# zonas de interés (ROI) con coords relativas 0-1, listas para el drawer.
+
+_QWEN_SUGGEST_ZONES_PROMPT = (
+    "Eres un asistente de instalación de cámaras de seguridad. Analiza esta imagen "
+    "y sugiere entre 3 y 6 zonas de interés (ROI) para vigilar. "
+    "Para cada zona, identifica: tipo (entrance/cashier/kitchen/dining/inventory/"
+    "counter/hall/parking/restricted/office/storage/hallway/production/other), "
+    "un nombre descriptivo, y coordenadas relativas (0-1) como {x, y, w, h} donde "
+    "(x,y) es la esquina superior izquierda y (w,h) el ancho y alto.\n"
+    "Devuelve SOLO JSON:\n"
+    '{"zones":[{"type":"cashier","name":"Mostrador principal","coords":{"x":0.35,"y":0.20,"w":0.40,"h":0.50}}, ...]}\n'
+    "Las coordenadas deben ser entre 0 y 1, reflejando la posición real en la imagen. "
+    "Enfoca zonas críticas: entradas, cajas, almacenes, áreas restringidas, zonas de tráfico."
+)
+
+
+async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str = "") -> list:
+    """Pide a Qwen que sugiera zonas de interés para el frame actual."""
+    try:
+        import base64 as _b64
+        raw = _b64.b64decode(image_b64)
+        # Redimensionar a 640px de ancho para ahorrar tokens
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(raw))
+        img.thumbnail((640, 640), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        small_b64 = _b64.b64encode(buf.getvalue()).decode()
+
+        ctx = ""
+        if zone: ctx += f"La cámara está en: {zone}. "
+        if biz_type: ctx += f"Negocio: {biz_type}. "
+        prompt = _QWEN_SUGGEST_ZONES_PROMPT + f" {ctx}"
+
+        msgs = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{small_b64}"}},
+            {"type": "text", "text": prompt}]}]
+
+        async with httpx.AsyncClient(timeout=60) as cl:
+            r = await cl.post("http://localhost:8004/v1/chat/completions",
+                              json={"model": "qwen", "messages": msgs, "max_tokens": 500, "temperature": 0.2})
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        # Parsear JSON de la respuesta
+        import re as _re
+        content = _re.sub(r'^```json\s*', '', content)
+        content = _re.sub(r'\s*```$', '', content).strip()
+        m = _re.search(r'\{.*\}', content, _re.DOTALL)
+        if not m:
+            return []
+        parsed = json.loads(m.group())
+        zones = parsed.get("zones", [])
+        if not isinstance(zones, list):
+            return []
+
+        # Normalizar cada zona
+        result = []
+        for i, z in enumerate(zones):
+            if not isinstance(z, dict):
+                continue
+            coords = z.get("coords", {})
+            if not all(k in coords for k in ("x", "y", "w", "h")):
+                continue
+            # Clamp coords a 0-1
+            coords = {k: max(0.0, min(1.0, float(v))) for k, v in coords.items()}
+            result.append({
+                "id": f"sug_{i}_{int(time.time())}",
+                "name": str(z.get("name", f"Zona {i+1}"))[:60],
+                "type": str(z.get("type", "other"))[:30],
+                "coords": coords,
+                "color": _zone_color_for_type(z.get("type", "other")),
+                "icon": _zone_icon_for_type(z.get("type", "other")),
+                "suggested_by": "qwen",
+                "created_at": time.time(),
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Error sugiriendo zonas con Qwen: {e}")
+        return []
+
+
+def _zone_color_for_type(zone_type: str) -> str:
+    """Color hex para un tipo de zona (mismo mapping que el drawer)."""
+    color_map = {
+        "entrance": "#2196f3", "cashier": "#ff9800", "register": "#ff9800",
+        "kitchen": "#f44336", "dining": "#4caf50", "inventory": "#9c27b0",
+        "counter": "#e91e63", "hall": "#607d8b", "parking": "#8bc34a",
+        "restricted": "#f44336", "office": "#3f51b5", "storage": "#795548",
+        "hallway": "#607d8b", "production": "#607d8b", "other": "#9e9e9e",
+    }
+    return color_map.get(zone_type, "#9e9e9e")
+
+
+def _zone_icon_for_type(zone_type: str) -> str:
+    """Icono para un tipo de zona (mismo mapping que camera_zones.get_zone_types)."""
+    icon_map = {
+        "entrance": "🚪", "cashier": "💰", "register": "🧾",
+        "kitchen": "🍳", "dining": "🍽️", "inventory": "📦",
+        "counter": "🛍️", "hall": "🏠", "parking": "🚗",
+        "restricted": "🚫", "office": "💼", "storage": "📦",
+        "hallway": "🚶", "production": "🏭", "other": "📍",
+    }
+    return icon_map.get(zone_type, "📍")
+
+
+async def _get_latest_frame_b64(user_id: str, camera_id: str) -> str:
+    """Obtiene el último frame de la cámara en base64 (misma lógica que /frames/latest)."""
+    if not user_id or not camera_id:
+        return ""
+    try:
+        grid = orchestrator._get_grid(user_id, camera_id)
+        frame_bytes = grid.get_last_frame_bytes()
+        last_cam = grid.get_last_camera_id()
+        if last_cam and last_cam != camera_id:
+            frame_bytes = b""
+        if not frame_bytes:
+            events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+            latest_vig = events_dir / "latest_vigilance.jpg"
+            if latest_vig.exists():
+                frame_bytes = latest_vig.read_bytes()
+            else:
+                frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                latest_raw = frames_dir / "latest_raw.jpg"
+                if latest_raw.exists():
+                    frame_bytes = latest_raw.read_bytes()
+        if frame_bytes:
+            return base64.b64encode(frame_bytes).decode()
+    except Exception:
+        pass
+    return ""
+
+
+@app.post("/api/cameras/{camera_id}/suggest-zones")
+async def suggest_zones_endpoint(camera_id: str, request: Request):
+    """
+    C1.3 — Sugiere zonas de interés con IA (WOW #2).
+
+    Body opcional: {"user_id": "...", "zone": "...", "business_type": "..."}
+    Devuelve: {"success": true, "zones": [...], "image_b64": "..."}
+    """
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        user_id = body.get("user_id", "")
+        zone = body.get("zone", "")
+        biz_type = body.get("business_type", "")
+
+        if not user_id or not camera_id:
+            return {"success": False, "error": "user_id y camera_id requeridos", "zones": []}
+
+        # Obtener el último frame
+        image_b64 = await _get_latest_frame_b64(user_id, camera_id)
+        if not image_b64:
+            return {"success": False, "error": "Sin frame disponible para esta cámara", "zones": [], "image_b64": ""}
+
+        # Pedir sugerencias a Qwen
+        zones = await _suggest_zones_with_qwen(image_b64, zone, biz_type)
+        return {
+            "success": True,
+            "zones": zones,
+            "image_b64": image_b64,
+            "count": len(zones),
+            "suggested_by": "qwen",
+        }
+    except Exception as e:
+        logger.error(f"Error en suggest-zones: {e}")
+        return {"success": False, "error": str(e), "zones": [], "image_b64": ""}
+
+
 @app.delete("/api/cameras/{camera_id}")
 async def delete_camera_endpoint(camera_id: str, user_id: str = ""):
     """Elimina una cámara del usuario.
