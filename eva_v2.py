@@ -239,9 +239,11 @@ class SetupPhase(str, Enum):
     HARDWARE = "hardware"
     WAIT_IMAGE = "wait_image"
     ANALYZE = "analyze"
+    ZONES = "zones"          # ← v16: sugerir zonas con IA (WOW #2)
     CONTEXT = "context"
     PROMPT_BUILD = "prompt_build"
     CONFIRM = "confirm"
+    TEST_RULES = "test_rules"  # ← v16: probar reglas con notificación real (WOW #3)
     DONE = "done"
 
 # =============================================================================
@@ -1860,6 +1862,10 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
     if phase == SetupPhase.WAIT_IMAGE.value:
         return await _handle_wait_image(session, session_id, user_id, first, message, storage_root, include_frame)
 
+    # ── ZONES (v16 — WOW #2) ──────────────────────────────────────────────────
+    if phase == SetupPhase.ZONES.value:
+        return await _handle_zones(session, session_id, user_id, first, message, storage_root)
+
     if phase == SetupPhase.CONTEXT.value:
         return await _handle_context(session, session_id, user_id, message, first)
 
@@ -1868,6 +1874,9 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
 
     if phase == SetupPhase.CONFIRM.value:
         return await _handle_confirm(session, session_id, user_id, message, first, storage_root)
+
+    if phase == SetupPhase.TEST_RULES.value:
+        return await _handle_test_rules(session, session_id, user_id, message, first, storage_root)
 
     return _mk_resp(session, f"No entendí, {first}. ¿Puedes repetir?")
 
@@ -1981,7 +1990,9 @@ async def _handle_analyze(session, session_id, first):
     # Pregunta abierta — el usuario decide
     lines.append("\n\n¿La dejamos en el mismo lugar, la movemos, o qué opinas?")
 
-    session["phase"] = SetupPhase.CONTEXT.value
+    # v16: Ir a ZONES (WOW #2) en vez de CONTEXT directamente.
+    # Una vez confirmada la posición, Eva sugiere zonas con IA.
+    session["phase"] = SetupPhase.ZONES.value
     session["position_confirmed"] = position_ok
     _sessions[session_id] = session
     _save_session_to_disk(session)
@@ -1989,6 +2000,106 @@ async def _handle_analyze(session, session_id, first):
     session["image_sent"] = True
     _save_session_to_disk(session)
     return resp
+
+# =============================================================================
+# ZONES (v16 — WOW #2: sugerir zonas con IA)
+# =============================================================================
+
+async def _suggest_zones_via_api(user_id: str, camera_id: str, zone: str = "", biz_type: str = "") -> dict:
+    """Llama al endpoint suggest-zones de api_eva.py y devuelve las zonas sugeridas."""
+    try:
+        async with httpx.AsyncClient(timeout=90) as cl:
+            r = await cl.post(
+                "http://127.0.0.1:8005/api/cameras/" + camera_id + "/suggest-zones",
+                json={"user_id": user_id, "zone": zone, "business_type": biz_type},
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception as e:
+        logger.error(f"Error calling suggest-zones: {e}")
+    return {"success": False, "zones": []}
+
+
+def _format_zones_summary(zones: list) -> str:
+    """Formatea una lista de zonas como texto legible para el chat de Eva."""
+    if not zones:
+        return ""
+    lines = []
+    for i, z in enumerate(zones):
+        icon = z.get("icon", "📍")
+        name = z.get("name", "Zona")
+        ztype = z.get("type", "other")
+        coords = z.get("coords", {})
+        lines.append(f"{i+1}. {icon} {name} ({ztype}) — coords: x={coords.get('x',0):.2f}, y={coords.get('y',0):.2f}, w={coords.get('w',0):.2f}, h={coords.get('h',0):.2f}")
+    return "\n".join(lines)
+
+
+async def _handle_zones(session, session_id, user_id, first, message, storage_root):
+    """WOW #2 — Eva sugiere zonas con IA y el usuario las confirma/ajusta."""
+    zone = session.get("zone", "esta zona")
+    biz_type = session.get("business_type", "negocio")
+    camera_id = session.get("camera_id", "")
+
+    # Si es la primera entrada (message vacío o primer turno), sugerir zonas
+    if not message or message == "__zones__":
+        # Buscar camera_id si no está en la session
+        if not camera_id:
+            ud = _load_user_data(user_id)
+            cams = ud.get("cameras", [])
+            for c in cams:
+                if c.get("zone", "").lower() == zone.lower():
+                    camera_id = c.get("camera_id", "")
+                    session["camera_id"] = camera_id
+                    break
+            if not camera_id and cams:
+                camera_id = cams[-1].get("camera_id", "")
+                session["camera_id"] = camera_id
+
+        if not camera_id:
+            session["phase"] = SetupPhase.CONTEXT.value
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            return _mk_resp(session,
+                f"No encontré una cámara activa para {zone}. "
+                f"Vamos a continuar con la configuración de lo que querés vigilar.\n\n"
+                f"¿Qué te gustaría que vigile en {zone}?")
+
+        # Llamar al endpoint de sugerencia
+        result = await _suggest_zones_via_api(user_id, camera_id, zone, biz_type)
+        zones = result.get("zones", [])
+        image_b64 = result.get("image_b64", "")
+
+        if not zones:
+            # Fallback: sin sugerencias, pasar a CONTEXT
+            session["phase"] = SetupPhase.CONTEXT.value
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            return _mk_resp(session,
+                f"No pude sugerir zonas automáticamente para {zone}. "
+                f"Puedes dibujarlas manualmente en la pestaña Ajustes de cámara.\n\n"
+                f"Por ahora, ¿qué querés que vigile en {zone}?")
+
+        session["suggested_zones"] = zones
+        session["phase"] = SetupPhase.CONTEXT.value
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+
+        zones_text = _format_zones_summary(zones)
+        text = (
+            f"🔍 Analicé la imagen de tu cámara en **{zone}** y te sugiero estas zonas de interés:\n\n"
+            f"{zones_text}\n\n"
+            f"Puedes ver y ajustar estas zonas en la pestaña **Ajustes de cámara** "
+            f"(dibujar, mover, cambiar tipo, eliminar).\n\n"
+            f"¿Qué querés que vigile en {zone}? Decime y ya lo tenemos en cuenta."
+        )
+        return _mk_resp(session, text, img_b64=image_b64)
+
+    # El usuario respondió — pasar a CONTEXT (ya está configurado)
+    session["phase"] = SetupPhase.CONTEXT.value
+    _sessions[session_id] = session
+    _save_session_to_disk(session)
+    return await _handle_context(session, session_id, user_id, message, first)
+
 
 # =============================================================================
 # CONTEXT — FLUJO DE CONTEXTO PARA PROMPT DE VIGILANCIA
