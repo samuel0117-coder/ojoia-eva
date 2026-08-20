@@ -125,9 +125,22 @@ def ingest_frame_for_eva(frame_bytes: bytes, camera_id: str = "default"):
 
 def _get_frame(camera_id: str = "", user_id: str = "") -> Optional[bytes]:
     global _latest_frame, _latest_frame_time
+    # v16: Si se especifica camera_id, usar ese frame primero
     if camera_id and camera_id in _latest_frame:
         if time.time() - _latest_frame_time[camera_id] < 120:
             return _latest_frame[camera_id]
+    # v16: Priorizar frames de cámaras CONFIGURADAS del usuario
+    # (evita mostrar cámaras no configuradas que están oscuras/desconectadas)
+    try:
+        ud = _load_user_data(user_id) if user_id else {}
+        configured_cams = [c.get("camera_id") for c in ud.get("cameras", []) if c.get("active")]
+        for cid in configured_cams:
+            if cid and cid in _latest_frame:
+                if time.time() - _latest_frame_time.get(cid, 0) < 120:
+                    return _latest_frame[cid]
+    except Exception:
+        pass
+    # Fallback: cualquier frame reciente
     for cid, frame in _latest_frame.items():
         if time.time() - _latest_frame_time.get(cid, 0) < 120:
             return frame
