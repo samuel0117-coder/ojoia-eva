@@ -366,9 +366,10 @@ async function apiFetch(url, opts) {
 }
 ```
 
+**Estado:** ✅ RESUELTO (commit `eff8a4a`). apiFetch detecta 401, dispara evento `ojoia:auth-expired`. App._handleAuthExpired escucha, hace firebase.auth().signOut(), cierra EvaChat, muestra `_showLogin()` con mensaje. Flag `_authExpiredHandled` evita storms. Sintaxis validada (1183/1183 braces, 2084/2084 parens). Lógica del wrapper verificada con mock test.
+
 **Prioridad:** P0 ( UX crítica — clientes no entran en loop de "vacío" pensando que no hay cámaras).
-**Tiempo:** 30 min + 1h para aplicar `await r.json()` check en los ~10 endpoints críticos.
-**Commit esperado:** `fix(front): apiFetch 401 handler + json-parse guards`
+**Commit:** `eff8a4a` — `P0 (Sección #9): apiFetch 401 handler + auto-redirect a login`
 
 ---
 
@@ -409,7 +410,7 @@ Items que estaban pendientes en planes anteriores y SÍ necesitan acción (los q
 7. ✅ Bug #5 — `/api/auth/token` requiere Firebase — commit `116d766`
 8. ✅ Bug #6 — auditoría completa, marcado como resuelto por extensión
 9. ✅ Fuga #7.1 — escapeAttr en 18+ onclick críticos — commit `e078caa`
-10. ⏳ Sección #9 — apiFetch 401 handler — 1h
+10. ✅ Sección #9 — apiFetch 401 handler — commit `eff8a4a`
 
 ### Sprint 3 — "Mejor diagnóstico" (opcional, 1 día)
 11. ⏳ Sección #8 — 8-10 `except pass` → loggeo — 2h
