@@ -633,8 +633,9 @@ async def _prune_stale_push_tokens():
                         # S4: lock para evitar corrupcion con requests concurrentes.
                         with _get_user_lock(u.name):
                             _atomic_write_user_json(uf, ud)
-                    except Exception:
-                        pass
+                    except Exception as e_p632:
+                        # P0 (Sección #8): loggeo en lugar de pass silencioso
+                        logger.warning(f"[push-prune] atomic_write_user_json failed for {u.name}: {e_p632}")
         except Exception as e:
             logger.error(f"[push-prune] cycle error: {e}")
         await asyncio.sleep(PUSH_TOKEN_PRUNE_EVERY_SEC)
@@ -922,8 +923,9 @@ async def send_report_v2(user_id: str, request: Request = None):
                         ud = json.load(f)
                     try:
                         _consolidate_legacy_eva_sessions(ud, user_id)
-                    except Exception:
-                        pass
+                    except Exception as e_925:
+                        # P0 (Sección #8): loggeo en lugar de pass silencioso
+                        logger.warning(f"[legacy-eva-sessions] consolidate failed for {user_id}: {e_925}")
                     sessions = ud.get("eva_sessions", {}) or {}
                     usess = sessions.get(unified_sid, {}) or {}
                     umsgs = list(usess.get("messages", []) or [])
@@ -1271,8 +1273,10 @@ def get_camera_config_static(user_id: str, camera_id: str) -> dict:
         try:
             with open(cam_file) as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e_1274:
+            # P0 (Sección #8): loggeo en lugar de pass silencioso
+            logger.warning(f"[load-cam-config] {camera_id} corrupt: {e_1274}")
+            return None
     return {}
 
 def get_disk_config() -> dict:
@@ -1310,8 +1314,9 @@ def _dir_used_mb(path) -> float:
         r = subprocess.run(["du", "-sm", str(path)], capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             return float(r.stdout.split()[0])
-    except Exception:
-        pass
+    except Exception as e_1313:
+        # P0 (Sección #8): loggeo en lugar de pass silencioso
+        logger.warning(f"[dir-used-mb] du failed for {path}: {e_1313}")
     return 0.0
 
 def get_user_storage_path(user_id: str, plan: str = "founder") -> Path:
@@ -1386,8 +1391,9 @@ def resolve_user_id(camera_id: str, provided_user_id: str, client_ip: str = "unk
                                 fcm_match = uid
                             else:
                                 any_match = uid
-                except:
-                    pass
+                except Exception as e_1394:
+                    # P0 (Sección #8): loggeo en lugar de pass silencioso
+                    logger.warning(f"[find-user-by-camera] {user_file.name} read failed: {e_1394}")
         return founder_match or fcm_match or any_match or provided_user_id
     return provided_user_id
 
@@ -1638,8 +1644,9 @@ def _read_latest_frame_bytes(user_id: str, camera_id: str) -> Optional[bytes]:
             if data:
                 _cache_frame(user_id, camera_id, data)
                 return data
-    except Exception:
-        pass
+    except Exception as e_1647:
+        # P0 (Sección #8): loggeo en lugar de pass silencioso
+        logger.warning(f"[get-frame-fallback] {user_id}/{camera_id} read failed: {e_1647}")
     return None
 
 
@@ -1979,8 +1986,9 @@ async def register_fcm_token(request: dict, authorization: str = Header(None, al
                 request = json.loads(request)
                 user_id = request.get("user_id", "")
                 fcm_token = request.get("fcm_token", "")
-            except:
-                pass
+            except Exception as e_1989:
+                # P0 (Sección #8): loggeo en lugar de pass silencioso
+                logger.warning(f"[fcm-register] body parse failed: {e_1989}")
         if not user_id or not fcm_token:
             raise HTTPException(status_code=400, detail="user_id and fcm_token required")
         uf = find_user_json(user_id)
@@ -2429,8 +2437,9 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
             try:
                 from eva_v2 import _sessions
                 _sessions[session_id] = session
-            except Exception:
-                pass
+            except Exception as e_2440:
+                # P0 (Sección #8): loggeo en lugar de pass silencioso
+                logger.warning(f"[eva-session-create] {session_id} save failed: {e_2440}")
             result = _eva_mk_resp(
                 session,
                 f"Lo siento, tuve un problema técnico procesando eso. Intenta reformularlo, por favor.",
@@ -2461,8 +2470,9 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
                 # Consolidar legacy la primera vez.
                 try:
                     _consolidate_legacy_eva_sessions(ud, user_id)
-                except Exception:
-                    pass
+                except Exception as e_2473:
+                    # P0 (Sección #8): loggeo en lugar de pass silencioso
+                    logger.warning(f"[legacy-consolidate] {user_id} failed: {e_2473}")
                 sessions = ud.get("eva_sessions", {}) or {}
                 sess = sessions.get(msgs_session_id, {}) or {}
                 prev = sess.get("messages", []) or []
@@ -2858,8 +2868,9 @@ async def _get_latest_frame_b64(user_id: str, camera_id: str) -> str:
                     frame_bytes = latest_raw.read_bytes()
         if frame_bytes:
             return base64.b64encode(frame_bytes).decode()
-    except Exception:
-        pass
+    except Exception as e_2871:
+        # P0 (Sección #8): loggeo en lugar de pass silencioso
+        logger.warning(f"[frame-b64] {user_id}/{camera_id} encode failed: {e_2871}")
     return ""
 
 
@@ -3252,8 +3263,9 @@ async def get_event_thumb(event_id: str, user_id: str = None):
                     thumb_bytes = await asyncio.to_thread(_gen_thumb, img_file)
                     if thumb_bytes:
                         return Response(content=thumb_bytes, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
-                except Exception:
-                    pass
+                except Exception as e_3266:
+                    # P0 (Sección #8): loggeo en lugar de pass silencioso
+                    logger.warning(f"[thumbnail-gen] {img_file.name} failed: {e_3266}")
     raise HTTPException(status_code=404, detail="Image not found")
 
 
@@ -5399,8 +5411,9 @@ async def admin_delete_plan(plan_id: str, authorization: str = Header(None)):
                         with open(uf, "w") as f:
                             json.dump(ud, f, indent=2, ensure_ascii=False)
                         migrated += 1
-                except Exception:
-                    pass
+                except Exception as e_5414:
+                    # P0 (Sección #8): loggeo en lugar de pass silencioso
+                    logger.warning(f"[plan-delete] {uf.name} migrate failed: {e_5414}")
     logger.info(f"Plan deleted: {plan_id}, migrated {migrated} users to free")
     return {"success": True, "migrated_users": migrated}
 

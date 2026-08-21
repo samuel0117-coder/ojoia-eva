@@ -648,7 +648,7 @@ c.style.display = '';
             }
             const idx = this._homeCams.findIndex(c => c.camera_id === camId);
             if (idx >= 0) this._homeCams[idx] = { ...this._homeCams[idx], ...cam };
-        } catch(e) {}
+        } catch(e) { console.warn('[App] _updateHomeCam silent fail:', e); }
     },
 
     _getHomeViewCams(cams = this._homeCams) {
@@ -718,7 +718,7 @@ c.style.display = '';
                     statusEl.className = `badge ${activeCam.active ? 'badge-ok' : 'badge-alert'}`;
                 }
             }
-        } catch(e) {}
+        } catch(e) { console.warn('[App] home status silent fail:', e); }
     },
 
     _homeCams: [],
@@ -1088,7 +1088,7 @@ c.style.display = '';
                 if (progressEl) { progressEl.style.width = '0%'; progressEl.style.transition = 'width 0.5s ease'; }
                 el.innerHTML = '<p class="meta" style="padding:8px 0">Detección encuentra objetos → Eva revisa el área</p>';
             }
-        } catch(e) {}
+        } catch(e) { console.warn('[App] overview meta silent fail:', e); }
     },
 
     async _fetchStats() {
@@ -1112,7 +1112,7 @@ c.style.display = '';
             if (se) se.textContent = totalEvents;
             if (sa) sa.textContent = totalAlerts;
             if (sc) sc.textContent = active;
-        } catch(e) {}
+        } catch(e) { console.warn('[App] counters silent fail:', e); }
     },
 
     // ── CAMERAS ──────────────────────────────────────────────
@@ -1208,7 +1208,7 @@ c.style.display = '';
             if (el && d.success && d.image_b64) {
                 el.innerHTML = `<img src="data:image/jpeg;base64,${d.image_b64}" style="width:100%;height:100%;object-fit:cover;border-radius:8px">`;
             }
-        } catch(e) {}
+        } catch(e) { console.warn('[App] timeline thumb silent fail:', e); }
     },
 
     async _openCameraTimeline(camId) {
@@ -1933,7 +1933,7 @@ async _saveCooldown(camId, btn) {
                     sel.innerHTML += `<option value="${cam.camera_id}">${cam.name}</option>`;
                 });
             }
-        } catch(e) {}
+        } catch(e) { console.warn('[App] events filter select silent fail:', e); }
     },
 
     _filterByCam(camId) {
@@ -1950,7 +1950,7 @@ async _saveCooldown(camId, btn) {
             if (evts.length > 0 && evts[0].timestamp > this._lastEventTs) {
                 this._loadEvents(this._currentEventFilter || 'today');
             }
-        } catch(e) {}
+        } catch(e) { console.warn('[App] events diff silent fail:', e); }
     },
 
     _filterEvents(btn, filter) {
@@ -2039,7 +2039,7 @@ async _saveCooldown(camId, btn) {
         try {
             const parsed = JSON.parse(text);
             if (parsed && typeof parsed === 'object') text = parsed.summary || parsed.description || text;
-        } catch(e) {}
+        } catch(e) { console.warn('[App] event desc JSON.parse silent fail:', e); }
         return text
             .replace(/- If ALL checks NO[\s\S]*/m, '')
             .replace(/No violation detected[\s\S]*/i, 'Sin actividad sospechosa')
@@ -2270,7 +2270,7 @@ async _saveCooldown(camId, btn) {
             content.appendChild(btnRow);
             modal.appendChild(content);
             document.body.appendChild(modal);
-        } catch(e) {}
+        } catch(e) { console.warn('[App] event modal silent fail:', e); }
     },
 
     _showEventFrame(eventId, total, rawIndex) {
@@ -2296,7 +2296,7 @@ async _saveCooldown(camId, btn) {
             const uid = this.userId || 'default';
             await apiFetch(`${this.API}/api/event/${id}/dismiss`, { method: 'POST', body: JSON.stringify({ user_id: uid }) });
             this._toast('', 'Evento marcado como falsa alarma', 'success');
-        } catch(e) {}
+        } catch(e) { console.warn('[App] dismissEvent silent fail:', e); }
     },
 
     async _confirmThreat(id) {
@@ -2304,7 +2304,7 @@ async _saveCooldown(camId, btn) {
             const uid = this.userId || 'default';
             await apiFetch(`${this.API}/api/event/${id}/confirm`, { method: 'POST', body: JSON.stringify({ user_id: uid }) });
             this._toast('', '¡Alerta confirmada! Gracias por la confirmación', 'danger');
-        } catch(e) {}
+        } catch(e) { console.warn('[App] confirmEvent silent fail:', e); }
     },
 
     // ── SETTINGS ─────────────────────────────────────────────
@@ -2313,14 +2313,14 @@ async _saveCooldown(camId, btn) {
         let profile = {};
         let cams = [];
         try { 
-            const r = await apiFetch(`${this.API}/api/user/profile?user_id=${this.userId}`); 
-            profile = await r.json(); 
-        } catch(e) {}
+            const r = await apiFetch(`${this.API}/api/user/profile?user_id=${this.userId}`);
+            profile = await r.json();
+        } catch(e) { console.warn('[App] profile fetch silent fail:', e); }
         try {
             const r2 = await apiFetch(`${this.API}/api/cameras?user_id=${this.userId}`);
             cams = (await r2.json()).cameras || [];
             this._homeCams = cams;
-        } catch(e) {}
+        } catch(e) { console.warn('[App] cameras fetch silent fail:', e); }
         if (!this._isCurrentPage('settings')) return;
         
         const plan = profile.plan || 'Fundador';
@@ -2564,7 +2564,7 @@ async _saveCooldown(camId, btn) {
                 ]);
                 profile = await pr.json();
                 status = await sr.json();
-            } catch(e) {}
+            } catch(e) { console.warn('[App] status fetch silent fail:', e); }
 
             const s = status || {};
             const planName = s.plan_name || s.plan || 'free';
@@ -3192,7 +3192,7 @@ async _saveCooldown(camId, btn) {
                     <div class="prog-bar"><div class="prog-fill" style="width:${Math.round(f/16*100)}%"></div></div>
                     <img src="data:image/jpeg;base64,${d.grid_b64}" style="width:100%;border-radius:8px;display:block;margin-top:8px"></div>`;
             }
-        } catch(e) {}
+        } catch(e) { console.warn('[App] zones preview silent fail:', e); }
     },
 
     async deleteCamera(camId, camName) {
