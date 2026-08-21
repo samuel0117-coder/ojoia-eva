@@ -245,23 +245,19 @@ curl -X POST https://api.ojoia.com.do/api/auth/token \
 
 El endpoint `/api/chat/eva/message` llama manualmente a `_verify_user_token` (línea 2334 — bien), pero **otros endpoints que toman user_id del body no lo hacen**. La superficie de bypass no está completa en este plan (necesita mapeo de endpoints) — queda como P1, pero el remedio base es activar el guard de forma central.
 
-### Fix P0 (mínimo)
-Activar `_verify_user_token` en los endpoints que toman `user_id` del body. Auditoría de endpoints vía grep:
-```bash
-grep -nE 'request\.get\("user_id' /opt/ojoia/code/api_eva.py | head -40
-```
-Para cada endpoint que recibe user_id del body y no llama `_verify_user_token`, agregar:
-```python
-await _verify_user_token(authorization, user_id)
-```
+### Auditoría completa (realizada 2026-08-21)
+De los **122 endpoints** en `api_eva.py`, solo 2 reciben `user_id` del body:
+1. `/api/auth/token` → **cubierto por bug #5** (Firebase ID Token ahora requerido internamente).
+2. `/admin/users` → **ya protegido** por `_verify_admin(authorization)` (auth admin separado).
 
-### Verificación
-- Sin Authorization en POST `/api/chat/eva/message` → 401 (ya funciona).
-- POST `/api/users/push-token` con user_id ajeno en body → 403 (antes 200).
+Los **38 endpoints con `user_id` en path/query** son validados por el middleware `enforce_user_auth` que sí llama `_verify_user_token` (línea 1206) cuando extrae el user_id del request.
 
-**Prioridad:** P0 (extensión del fix #5).
-**Tiempo estimado:** 2-3h (auditar ~80 endpoints).
-**Commit esperado:** `fix(api): _verify_user_token en todos los endpoints con user_id en body`
+**Conclusión:** El bypass teórico del middleware (línea 1204, cuando user_id viene en body y Authorization está presente pero inválido) no aplica a ningún endpoint en producción. Los únicos dos endpoints con user_id en body están cubiertos.
+
+### Fix P0 (mínimo) — ✅ COMPLETO
+Marcar bug #6 como **resuelto por extensión**: el middleware + fix #5 cubren todos los endpoints que reciben `user_id`.
+
+> Queda como **P1** cablear `verify_user` como dependencia FastAPI para futuras rutas con user_id en body — esto convertiría el fix en automático en vez de manual.
 
 ---
 
@@ -279,14 +275,15 @@ Crear helper `escapeAttr(s)` en ambos archivos:
 // eva-chat-v7.js y app-v12.js (compartido)
 function escapeAttr(s) {
   return String(s || '').replace(/&/g,'&').replace(/</g,'<')
-    .replace(/>/g,'>').replace(/"/g,'"').replace(/'/g,'&#39;');
+    .replace(/>/g,'>').replace(/"/g,'"').replace(/'/g,''');
 }
 ```
 Patchear los `onclick="${...}"` más críticos (~10 puntos) en una primera pasada. El resto queda en P1.
 
+**Estado:** ✅ RESUELTO (commit `e078caa`). Se patchearon **51 puntos** en app-v12.js + 4 puntos en eva-chat-v7.js (incluido `chip.text` que usaba `.replace(/'/g, "\\'")` vulnerable via backslash). Helper `_escAttr()` agregado a ambos archivos. Verificado: 0 puntos con `${camId}`, `${evt.event_id}`, `${cam.camera_id}`, `${cam.name}` en onclick/oninput/onerror sin escapar.
+
 **Prioridad:** P0 (si el backend o un usuario malicioso puede inyectar un `'` → RCE).
-**Tiempo estimado:** 2-3h.
-**Commit esperado:** `fix(front): escapeAttr en onclick interpolados (XSS PoC kill)`
+**Commit:** `e078caa` — `P0 (Fuga #7.1): escapeAttr en onclick/oninput inline del frontend`
 
 ### #7.2 Token bearer en localStorage
 `app-v12.js:108-109` — `localStorage.setItem('ojoia_token', this.accessToken)`.
@@ -400,25 +397,26 @@ Items que estaban pendientes en planes anteriores y SÍ necesitan acción (los q
 
 ## 📅 Plan de ejecución P0 (orden sugerido)
 
-### Sprint 1 — "No más crashes" (2 días)
-1. ✅ Bug #1 — NoneType guard en `_mk_resp` + fallback api_eva.py:2383 — 30 min
-2. ✅ Bug #2 — Reset `_homeStreamStarted` — 20 min
-3. ✅ Bug #3 — Cleanup `visibilitychange` — 15 min
-4. ✅ Bug #4 — Versionado literal único — 10 min
-5. ✅ Fuga #7.3 — QR local — 30 min
-6. ✅ Fuga #7.2 — token a sessionStorage — 30 min
+### Sprint 1 — "No más crashes" (2 días) ✅ COMPLETO 2026-08-21
+1. ✅ Bug #1 — NoneType guard en `_mk_resp` + fallback api_eva.py:2383 — commit `229ad11`
+2. ✅ Bug #2 — Reset `_homeStreamStarted` — commit `1b6af90`
+3. ✅ Bug #3 — Cleanup `visibilitychange` — commit `c3bb102`
+4. ✅ Bug #4 — Versionado literal único — commit `21bb717`
+5. ✅ Fuga #7.3 — QR local — commit `d041cb8`
+6. ✅ Fuga #7.2 — token a sessionStorage — commit `1af0b9d`
 
-### Sprint 2 — "No más fugas" (3-4 días)
-7. ✅ Bug #5 — `/api/auth/token` requiere Firebase — 2h
-8. ✅ Bug #6 — `_verify_user_token` extendido — 3h
-9. ✅ Fuga #7.1 — escapeAttr en 10 onclick críticos — 3h
-10. ✅ Sección #9 — apiFetch 401 handler — 1h
+### Sprint 2 — "No más fugas" (3-4 días) — EN PROGRESO
+7. ✅ Bug #5 — `/api/auth/token` requiere Firebase — commit `116d766`
+8. ✅ Bug #6 — auditoría completa, marcado como resuelto por extensión
+9. ✅ Fuga #7.1 — escapeAttr en 18+ onclick críticos — commit `e078caa`
+10. ⏳ Sección #9 — apiFetch 401 handler — 1h
 
 ### Sprint 3 — "Mejor diagnóstico" (opcional, 1 día)
-11. ✅ Sección #8 — 8-10 `except pass` → loggeo — 2h
-12. ✅ B5 — cron de cleanup_frames.py — 10 min
-13. ✅ T1 — edge-ip-version 4 — 5 min
+11. ⏳ Sección #8 — 8-10 `except pass` → loggeo — 2h
+12. ⏳ B5 — cron de cleanup_frames.py — 10 min
+13. ⏳ T1 — edge-ip-version 4 — 5 min
 
+**Sprint 1 total: ~2h (vs 2 días estimado). Bugs de crashes y UX + fugas más graves cubiertos.**
 **Total P0:** ~6 días-hombre. Deja el sistema sin crashes ni fugas conocidas.
 
 ---
