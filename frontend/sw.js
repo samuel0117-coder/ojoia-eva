@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ojoia-v6';
+const CACHE_NAME = 'ojoia-v7';
 
 self.addEventListener('install', e => { 
     e.waitUntil(self.skipWaiting()); 

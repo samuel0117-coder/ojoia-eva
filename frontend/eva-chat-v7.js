@@ -17,6 +17,13 @@ const EvaChat = {
         if (h === '10.0.0.44' || h === 'localhost' || h === '') return 'http://localhost:8007';
         return 'https://api.ojoia.com.do';
     })(),
+    // P0 (Fuga #7.1): helper para escapar valores interpolados en atributos
+    // HTML/onclick. Si un camera_id o event_id del backend contiene ' o "
+    // o <script>, sin este escape tenemos RCE via onclick inline.
+    _escAttr(s) {
+        return String(s || '').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
+            .replace(/"/g, '"').replace(/'/g, ''');
+    },
     sessionId: null,
     history: [],
     isLoading: false,
@@ -284,7 +291,7 @@ const EvaChat = {
         }
 
         const chips = this._buildQuickChips();
-        const suggestionsHtml = chips.length ? `<div class="eva-suggestions" style="display:flex;gap:8px;overflow-x:auto;padding:0 16px 10px">${chips.map(chip => `<button class="suggestion-btn" onclick="EvaChat.sendSuggestion('${chip.text.replace(/'/g, "\\'")}')">${chip.label}</button>`).join('')}</div>` : '';
+        const suggestionsHtml = chips.length ? `<div class="eva-suggestions" style="display:flex;gap:8px;overflow-x:auto;padding:0 16px 10px">${chips.map(chip => `<button class="suggestion-btn" onclick="EvaChat.sendSuggestion(${this._escAttr(JSON.stringify(chip.text))})">${this.escapeHtml(chip.label)}</button>`).join('')}</div>` : '';
 
         // v14: capturar estado de scroll ANTES de rebuildar el DOM.
         // innerHTML destruye la posición de scroll actual; si el usuario estaba
@@ -537,8 +544,8 @@ const EvaChat = {
                 }
                 
                 if (nextPhase === 'WIZARD_ZONES_DRAW' && camId) {
-                    // Mostrar botón para ir a configurar zonas
-                    extraHtml = `<div style="margin-top:12px"><button class="btn" style="width:100%;background:var(--accent);color:#fff" onclick="EvaChat._openZoneEditorFromWizard('${camId}')">📍 Ir a Configurar Zonas</button><div class="meta" style="margin-top:8px;text-align:center">Dibuja las zonas importantes (caja, entrada, cocina) y luego regresa aquí y dime "listo"</div></div>`;
+                    // P0 (Fuga #7.1): _escAttr evita RCE si camId contiene ' o "
+                    extraHtml = `<div style="margin-top:12px"><button class="btn" style="width:100%;background:var(--accent);color:#fff" onclick="EvaChat._openZoneEditorFromWizard('${this._escAttr(camId)}')">📍 Ir a Configurar Zonas</button><div class="meta" style="margin-top:8px;text-align:center">Dibuja las zonas importantes (caja, entrada, cocina) y luego regresa aquí y dime "listo"</div></div>`;
                 }
                 
                 // v14: timestamp entero (segundos) para que el merge por role|content|timestamp
@@ -739,7 +746,8 @@ const EvaChat = {
                 ? `<img src="${imgSrc}" onerror="this.onerror=null;this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 fill=%22%232c2c2e%22/><text x=%2250%22 y=%2252%22 text-anchor=%22middle%22 font-size=%2226%22 fill=%22%238e8e93%22>📷</text></svg>'" loading="lazy">`
                 : `<div style="width:100%;height:90px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);color:var(--text-secondary);font-size:1.5rem">📷</div>`;
             const videoBadge = framesCount ? '<div class="card-video-badge">▶ Video</div>' : '';
-            html += `<div class="carousel-card ${anomalyClass}" onclick="EvaChat.openEventDetail('${evt.event_id}')"><div class="card-time">${this.escapeHtml(this._formatEventDateTime(evt))}</div><div class="card-camera">${this.escapeHtml(evt.camera_name || evt.camera_id || '')}</div><div class="card-frame">${imgHtml}${videoBadge}</div><div class="card-desc">${this.escapeHtml(desc).substring(0, 90)}</div><div class="card-persons">👥 ${persons || '—'} persona${persons === 1 ? '' : 's'}</div>${anomalyClass ? '<div class="card-anomaly-badge">⚠️ Alerta</div>' : ''}</div>`;
+            // P0 (Fuga #7.1): _escAttr evita RCE si event_id contiene ' o "
+            html += `<div class="carousel-card ${anomalyClass}" onclick="EvaChat.openEventDetail('${this._escAttr(evt.event_id)}')"><div class="card-time">${this.escapeHtml(this._formatEventDateTime(evt))}</div><div class="card-camera">${this.escapeHtml(evt.camera_name || evt.camera_id || '')}</div><div class="card-frame">${imgHtml}${videoBadge}</div><div class="card-desc">${this.escapeHtml(desc).substring(0, 90)}</div><div class="card-persons">👥 ${persons || '—'} persona${persons === 1 ? '' : 's'}</div>${anomalyClass ? '<div class="card-anomaly-badge">⚠️ Alerta</div>' : ''}</div>`;
         }
         html += `</div></div>`;
         return html;

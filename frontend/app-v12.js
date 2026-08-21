@@ -29,6 +29,13 @@ function apiFetch(url, opts = {}) {
 }
 
 const App = {
+    // P0 (Fuga #7.1): helper para escapar valores que van dentro de atributos HTML
+    // y onclick inline. Si el backend devuelve un event_id / camera_id / profile.name
+    // con ' o " o <script>, sin este escape tenemos RCE via XSS.
+    _escAttr(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
+            .replace(/"/g, '"').replace(/'/g, ''');
+    },
     userId: null,
     accessToken: null,
     API: '',
@@ -478,13 +485,13 @@ c.style.display = '';
                     const alertColor = isSentinel ? 'var(--warning, #f5a623)' : 'var(--danger)';
                     const alertIcon = isSentinel ? '🛡️' : '📷';
                     const alertTitle = isSentinel ? 'FUERA DE HORARIO — Se detectó presencia' : (isAttention ? '🔍 Observación relevante' : '🚨 Alerta');
-                    lastAlertHTML = `<div class="last-alert" onclick="App._openEvent('${lastEvt.event_id}')" style="background:${isSentinel ? 'rgba(245,166,35,0.08)' : 'rgba(255,59,48,0.06)'};border:1px solid ${alertColor};padding:14px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer">
+                    lastAlertHTML = `<div class="last-alert" onclick="App._openEvent('${this._escAttr(lastEvt.event_id)}')" style="background:${isSentinel ? 'rgba(245,166,35,0.08)' : 'rgba(255,59,48,0.06)'};border:1px solid ${alertColor};padding:14px 16px;border-radius:12px;margin-bottom:12px;cursor:pointer">
                         <div style="font-size:.78rem;color:${alertColor};font-weight:700;margin-bottom:6px">${alertIcon} ${alertTitle} — ${ts}</div>
                         <div style="font-size:.92rem;line-height:1.4;margin-bottom:6px">${evtDesc.substring(0, 180) || 'Se detectó actividad en la zona'}</div>
                         ${evtHits.length ? `<div style="font-size:.78rem;color:var(--text-secondary);margin-bottom:6px">🔍 ${evtHits.slice(0, 2).join(', ')}</div>` : ''}
                         <div style="display:flex;gap:8px;margin-top:8px">
-                            <button class="btn btn-sm" onclick="event.stopPropagation();App._openEvent('${lastEvt.event_id}')" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:8px;font-size:.82rem">Ver detalle</button>
-                            <button class="btn btn-sm" onclick="event.stopPropagation();App._dismissEvent('${lastEvt.event_id}');App.go('home')" style="background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-size:.82rem">✓ Falsa alarma</button>
+                            <button class="btn btn-sm" onclick="event.stopPropagation();App._openEvent('${this._escAttr(lastEvt.event_id)}')" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:8px;font-size:.82rem">Ver detalle</button>
+                            <button class="btn btn-sm" onclick="event.stopPropagation();App._dismissEvent('${this._escAttr(lastEvt.event_id)}');App.go('home')" style="background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-size:.82rem">✓ Falsa alarma</button>
                         </div>
                     </div>`;
                 }
@@ -531,7 +538,7 @@ c.style.display = '';
                             <span class="home-cam-status" data-home-status="${cam.camera_id}" style="color:${statusColor}">${status}</span>
                         </div>
                         <div id="home-frame-${i}" class="home-frame-wrap"><div class="ojo-placeholder">Esperando imagen...</div></div>
-                        <button class="btn btn-sm btn-outline" style="width:100%;margin-top:8px" onclick="event.stopPropagation();App._saveRecentClip('${cam.camera_id}')">Guardar 45 min</button>
+                        <button class="btn btn-sm btn-outline" style="width:100%;margin-top:8px" onclick="event.stopPropagation();App._saveRecentClip('${this._escAttr(cam.camera_id)}')">Guardar 45 min</button>
                     </div>`;
             }).join('') : '<div style="grid-column:1/-1"><div class="empty-state"><div class="empty-icon">📷</div><div class="empty-title">Sin cámaras</div><p>Agrega una cámara desde Eva para verla aquí.</p></div></div>';
 
@@ -1096,11 +1103,11 @@ c.style.display = '';
                             </div>
                         </div>
                         <div class="ojo-card-actions" style="justify-content:flex-end">
-                                    <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();App._openCameraTimeline('${cam.camera_id}')">Ver últimos 45 min</button>
-                                    <button class="btn btn-sm" onclick="event.stopPropagation();App._saveRecentClip('${cam.camera_id}')">Guardar 45 min</button>
-                                    <button class="btn btn-sm" onclick="event.stopPropagation();App._openVigilanceSettings('${cam.camera_id}')">🛡️ Ajustar protección</button>
-                            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();App._openCameraConfig('${cam.camera_id}')">⚙️ Ajustes de cámara</button>
-                            <button class="btn-ghost btn-sm" style="color:var(--danger)" onclick="App.deleteCamera('${cam.camera_id}','${cam.name}')">🗑️</button>
+                                    <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();App._openCameraTimeline('${this._escAttr(cam.camera_id)}')">Ver últimos 45 min</button>
+                                    <button class="btn btn-sm" onclick="event.stopPropagation();App._saveRecentClip('${this._escAttr(cam.camera_id)}')">Guardar 45 min</button>
+                                    <button class="btn btn-sm" onclick="event.stopPropagation();App._openVigilanceSettings('${this._escAttr(cam.camera_id)}')">🛡️ Ajustar protección</button>
+                            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();App._openCameraConfig('${this._escAttr(cam.camera_id)}')">⚙️ Ajustes de cámara</button>
+                            <button class="btn-ghost btn-sm" style="color:var(--danger)" onclick="App.deleteCamera('${this._escAttr(cam.camera_id)}','${this._escAttr(cam.name)}')">🗑️</button>
                         </div>
                     </div>`;
                 });
@@ -1185,16 +1192,16 @@ c.style.display = '';
                                 <div style="font-size:1.35rem;font-weight:800">${cam.name || camId}</div>
                                 <div class="meta">${cam.zone || 'Sin zona'} · ${frames.length} imágenes guardadas · 45 minutos</div>
                             </div>
-                            <button class="btn" id="save-clip-btn" onclick="App._saveRecentClip('${camId}')">Guardar últimos 45 min</button>
+                            <button class="btn" id="save-clip-btn" onclick="App._saveRecentClip('${this._escAttr(camId)}')">Guardar últimos 45 min</button>
                         </div>
                         <div style="margin-top:16px;text-align:center">
                             <img id="timeline-img" style="width:100%;max-height:420px;object-fit:contain;background:#000;border-radius:14px" alt="Imagen reciente">
                         </div>
                         <div id="timeline-status" class="meta" style="margin-top:10px;text-align:center">—</div>
                         <div style="display:flex;gap:8px;align-items:center;margin-top:14px">
-                            <button class="btn btn-sm" onclick="App._moveTimeline('${camId}', -1)">◀ Atrás</button>
-                            <input id="timeline-range" type="range" min="0" max="${Math.max(0, frames.length - 1)}" value="${Math.max(0, frames.length - 1)}" style="flex:1" oninput="App._showTimelineFrame('${camId}', this.value)">
-                            <button class="btn btn-sm" onclick="App._moveTimeline('${camId}', 1)">Adelante ▶</button>
+                            <button class="btn btn-sm" onclick="App._moveTimeline('${this._escAttr(camId)}', -1)">◀ Atrás</button>
+                            <input id="timeline-range" type="range" min="0" max="${Math.max(0, frames.length - 1)}" value="${Math.max(0, frames.length - 1)}" style="flex:1" oninput="App._showTimelineFrame('${this._escAttr(camId)}', this.value)">
+                            <button class="btn btn-sm" onclick="App._moveTimeline('${this._escAttr(camId)}', 1)">Adelante ▶</button>
                         </div>
                         <div class="meta" style="margin-top:10px">
                             Usa Atrás/Adelante para revisar lo que pasó antes o después del momento actual.
@@ -1309,7 +1316,7 @@ c.style.display = '';
                                 <div class="section-kicker">Zonas</div>
                                 <div class="section-title">🗺️ Zonas de interés (ROI)</div>
                             </div>
-                            <button class="btn btn-sm btn-primary" onclick="App._openZoneDrawer('${camId}')">➕ Gestionar zonas</button>
+                            <button class="btn btn-sm btn-primary" onclick="App._openZoneDrawer('${this._escAttr(camId)}')">➕ Gestionar zonas</button>
                         </div>
                         <div id="zones-list-${camId}" class="zones-list">
                             <div class="zones-empty">Sin zonas. Haz clic en "Gestionar zonas" para añadir.</div>
@@ -1326,18 +1333,18 @@ c.style.display = '';
                         <div class="config-grid two">
                             <div class="control-card">
                                 <div class="control-label-row"><span>🔆 Brillo</span><strong id="cfg_brightness_val" class="value-pill">0</strong></div>
-                                <input class="range-control" id="cfg_brightness" type="range" min="-100" max="100" value="0" oninput="App._updateImageFilter('${camId}')">
+                                <input class="range-control" id="cfg_brightness" type="range" min="-100" max="100" value="0" oninput="App._updateImageFilter('${this._escAttr(camId)}')">>
                                 <div class="range-labels"><span>Oscuro</span><span>Brillante</span></div>
                             </div>
                             <div class="control-card">
                                 <div class="control-label-row"><span>🎚️ Contraste</span><strong id="cfg_contrast_val" class="value-pill">0</strong></div>
-                                <input class="range-control" id="cfg_contrast" type="range" min="-100" max="100" value="0" oninput="App._updateImageFilter('${camId}')">
+                                <input class="range-control" id="cfg_contrast" type="range" min="-100" max="100" value="0" oninput="App._updateImageFilter('${this._escAttr(camId)}')">>
                                 <div class="range-labels"><span>Bajo</span><span>Alto</span></div>
                             </div>
                         </div>
                         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-                        <button class="btn config-action" data-config-cmd="brightness" onclick="App._sendCamCmd('${camId}','brightness',document.getElementById('cfg_brightness').value,this)">💾 Aplicar</button>
-                        <button class="btn config-action" onclick="App._resetBrightnessContrast('${camId}')">↩️ Restablecer valores</button>
+                        <button class="btn config-action" data-config-cmd="brightness" onclick="App._sendCamCmd('${this._escAttr(camId)}','brightness',document.getElementById('cfg_brightness').value,this)">💾 Aplicar</button>
+                        <button class="btn config-action" onclick="App._resetBrightnessContrast('${this._escAttr(camId)}')">↩️ Restablecer valores</button>
                         </div>
                     </section>
 
@@ -1349,10 +1356,10 @@ c.style.display = '';
                             </div>
                         </div>
                         <div class="segmented four">
-                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="0" onclick="App._sendCamCmd('${camId}','rotation',0,this)">0°</button>
-                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="1" onclick="App._sendCamCmd('${camId}','rotation',1,this)">90°</button>
-                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="2" onclick="App._sendCamCmd('${camId}','rotation',2,this)">180°</button>
-                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="3" onclick="App._sendCamCmd('${camId}','rotation',3,this)">270°</button>
+                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="0" onclick="App._sendCamCmd('${this._escAttr(camId)}','rotation',0,this)">0°</button>
+                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="1" onclick="App._sendCamCmd('${this._escAttr(camId)}','rotation',1,this)">90°</button>
+                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="2" onclick="App._sendCamCmd('${this._escAttr(camId)}','rotation',2,this)">180°</button>
+                            <button class="btn-ghost" data-config-cmd="rotation" data-config-value="3" onclick="App._sendCamCmd('${this._escAttr(camId)}','rotation',3,this)">270°</button>
                         </div>
                         <p class="meta" style="margin:8px 0 0;text-align:center;">0°/180° giran la imagen; 90°/270° ajustan orientación por espejo.</p>
                     </section>
@@ -1365,9 +1372,9 @@ c.style.display = '';
                             </div>
                         </div>
                         <div class="segmented">
-                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="8" onclick="App._sendCamCmd('${camId}','quality',8,this)">Baja</button>
-                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="12" onclick="App._sendCamCmd('${camId}','quality',12,this)">Media</button>
-                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="6" onclick="App._sendCamCmd('${camId}','quality',6,this)">Alta</button>
+                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="8" onclick="App._sendCamCmd('${this._escAttr(camId)}','quality',8,this)">Baja</button>
+                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="12" onclick="App._sendCamCmd('${this._escAttr(camId)}','quality',12,this)">Media</button>
+                            <button class="btn-ghost" data-config-cmd="quality" data-config-value="6" onclick="App._sendCamCmd('${this._escAttr(camId)}','quality',6,this)">Alta</button>
                         </div>
                     </section>
 
@@ -1379,10 +1386,10 @@ c.style.display = '';
                             </div>
                         </div>
                         <div class="segmented four">
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="200" onclick="App._sendCamCmd('${camId}','fps',200,this)">5 fps</button>
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="500" onclick="App._sendCamCmd('${camId}','fps',500,this)">2 fps</button>
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="1000" onclick="App._sendCamCmd('${camId}','fps',1000,this)">1 fps</button>
-                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="2000" onclick="App._sendCamCmd('${camId}','fps',2000,this)">0.5 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="200" onclick="App._sendCamCmd('${this._escAttr(camId)}','fps',200,this)">5 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="500" onclick="App._sendCamCmd('${this._escAttr(camId)}','fps',500,this)">2 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="1000" onclick="App._sendCamCmd('${this._escAttr(camId)}','fps',1000,this)">1 fps</button>
+                            <button class="btn-ghost" data-config-cmd="fps" data-config-value="2000" onclick="App._sendCamCmd('${this._escAttr(camId)}','fps',2000,this)">0.5 fps</button>
                         </div>
                         <p class="meta" style="margin:8px 0 0;text-align:center;">2 fps recomendado para vivo fluido. Más fps = más ancho de banda.</p>
                     </section>
@@ -1395,9 +1402,9 @@ c.style.display = '';
                             </div>
                         </div>
                         <div class="segmented">
-                            <button class="btn-ghost" data-config-cmd="led" data-config-value="1" onclick="App._sendCamCmd('${camId}','led',1,this)">💡 On</button>
-                            <button class="btn-ghost" data-config-cmd="led" data-config-value="0" onclick="App._sendCamCmd('${camId}','led',0,this)">🌙 Off</button>
-                            <button class="btn-ghost" data-config-cmd="led_auto" data-config-value="1" onclick="App._sendCamCmd('${camId}','led_auto',1,this)">⚡ Auto</button>
+                            <button class="btn-ghost" data-config-cmd="led" data-config-value="1" onclick="App._sendCamCmd('${this._escAttr(camId)}','led',1,this)">💡 On</button>
+                            <button class="btn-ghost" data-config-cmd="led" data-config-value="0" onclick="App._sendCamCmd('${this._escAttr(camId)}','led',0,this)">🌙 Off</button>
+                            <button class="btn-ghost" data-config-cmd="led_auto" data-config-value="1" onclick="App._sendCamCmd('${this._escAttr(camId)}','led_auto',1,this)">⚡ Auto</button>
                         </div>
                     </section>
 
@@ -1411,13 +1418,13 @@ c.style.display = '';
                         <p class="meta" style="margin-bottom:12px;">Tiempo mínimo entre notificaciones de la misma alerta</p>
                         <input class="range-control cooldown-range" id="cfg_cooldown_min" type="range" min="5" max="60" value="${cam.cooldown_min}" oninput="App._updateCooldownLabel()">
                         <div class="cooldown-value"><strong id="cfg_cooldown_val">${cam.cooldown_min}</strong><span>min</span></div>
-                        <button class="btn config-action" onclick="App._saveCooldown('${camId}',this)">💾 Guardar cooldown</button>
+                        <button class="btn config-action" onclick="App._saveCooldown('${this._escAttr(camId)}',this)">💾 Guardar cooldown</button>
                     </section>
 
                     <section class="config-actions">
-                        <button class="btn" onclick="App._sendCamCmd('${camId}','snapshot',0,this)">📸 Snapshot</button>
-                        <button class="btn btn-outline" onclick="App._exportVideo('${camId}', 45, this)">🎬 Guardar video (45 min)</button>
-                        <button class="btn btn-outline" onclick="App._openVigilanceSettings('${camId}')">🛡️ Ajustar protección</button>
+                        <button class="btn" onclick="App._sendCamCmd('${this._escAttr(camId)}','snapshot',0,this)">📸 Snapshot</button>
+                        <button class="btn btn-outline" onclick="App._exportVideo('${this._escAttr(camId)}', 45, this)">🎬 Guardar video (45 min)</button>
+                        <button class="btn btn-outline" onclick="App._openVigilanceSettings('${this._escAttr(camId)}')">🛡️ Ajustar protección</button>
                     </section>
 
                     <button class="btn btn-ghost" onclick="App.go('${returnPage}')">← Volver</button>
@@ -1427,7 +1434,7 @@ c.style.display = '';
             this._startConfigViewerPoll(camId);
         } catch(e) {
             if (this.page !== 'settings' && this.page !== 'cameras' && this.page !== 'home') return;
-            c.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:32px;text-align:center;"><div style="font-size:3rem;margin-bottom:16px;">❌</div><div style="font-weight:600;margin-bottom:8px;">Error cargando cámara</div><button class="btn" style="margin-top:16px" onclick="App._openCameraConfig(\''+camId+'\')">Reintentar</button></div>';
+            c.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:32px;text-align:center;"><div style="font-size:3rem;margin-bottom:16px;">❌</div><div style="font-weight:600;margin-bottom:8px;">Error cargando cámara</div><button class="btn" style="margin-top:16px" onclick="App._openCameraConfig(\''+this._escAttr(camId)+'\')">Reintentar</button></div>';
         }
 
         // Aplicar valores por defecto si la cámara es nueva (nunca configurada)
@@ -1517,10 +1524,10 @@ c.style.display = '';
                     </div>
                     <div id="vig-test-result" style="margin-top:12px;"></div>
 
-                    <button class="btn" style="width:100%;margin-bottom:8px;" onclick="App._saveVigilanceSettings('${camId}')">💾 Guardar y regenerar prompt</button>
-                    <button class="btn btn-outline" style="width:100%;margin-bottom:8px;" onclick="App._regenerateVigilancePrompt('${camId}')">🔄 Regenerar prompt</button>
-                    <button class="btn btn-outline" style="width:100%;margin-bottom:8px;" onclick="App._testVigilancePrompt('${camId}')">🧪 Probar con última imagen</button>
-                    <button class="btn btn-outline" style="width:100%;" onclick="App._editVigilanceWithEva('${camId}')">🤖 Editar con Eva</button>
+                    <button class="btn" style="width:100%;margin-bottom:8px;" onclick="App._saveVigilanceSettings('${this._escAttr(camId)}')">💾 Guardar y regenerar prompt</button>
+                    <button class="btn btn-outline" style="width:100%;margin-bottom:8px;" onclick="App._regenerateVigilancePrompt('${this._escAttr(camId)}')">🔄 Regenerar prompt</button>
+                    <button class="btn btn-outline" style="width:100%;margin-bottom:8px;" onclick="App._testVigilancePrompt('${this._escAttr(camId)}')">🧪 Probar con última imagen</button>
+                    <button class="btn btn-outline" style="width:100%;" onclick="App._editVigilanceWithEva('${this._escAttr(camId)}')">🤖 Editar con Eva</button>
                     <button class="btn btn-ghost" style="width:100%;" onclick="App.go('settings')">← Volver</button>
                 </div>`;
         } catch(e) {
@@ -2037,7 +2044,7 @@ async _saveCooldown(camId, btn) {
             ? `<img src="${evt.thumb_url}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.style.display='none';this.parentElement.innerHTML='<span style=\'font-size:1.3rem\'>${icon}</span>'" />`
             : `<span style="font-size:1.3rem;">${icon}</span>`;
         const evtTime = evt.datetime || ts;
-        return `<div class="event-row ${violation ? 'event-alert' : ''}" onclick="App._openEvent('${evt.event_id}')">
+        return `<div class="event-row ${violation ? 'event-alert' : ''}" onclick="App._openEvent('${this._escAttr(evt.event_id)}')">
             <div class="event-thumb" id="evthumb-${evt.event_id}" style="background:#222;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:10px;flex-shrink:0;width:80px;height:60px">
                 ${thumbHtml}
             </div>
@@ -2132,9 +2139,9 @@ async _saveCooldown(camId, btn) {
                 const frameControls = document.createElement('div');
                 frameControls.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:10px';
                 frameControls.innerHTML = `
-                    <button class="btn btn-sm" onclick="App._moveEventFrame('${eventId}', ${d.frames.length}, -1)">◀ Atrás</button>
-                    <input id="event-frame-range-${eventId}" type="range" min="0" max="${d.frames.length - 1}" value="0" style="flex:1" oninput="App._showEventFrame('${eventId}', ${d.frames.length}, this.value)">
-                    <button class="btn btn-sm" onclick="App._moveEventFrame('${eventId}', ${d.frames.length}, 1)">Adelante ▶</button>`;
+                    <button class="btn btn-sm" onclick="App._moveEventFrame('${this._escAttr(eventId)}', ${d.frames.length}, -1)">◀ Atrás</button>
+                    <input id="event-frame-range-${eventId}" type="range" min="0" max="${d.frames.length - 1}" value="0" style="flex:1" oninput="App._showEventFrame('${this._escAttr(eventId)}', ${d.frames.length}, this.value)">
+                    <button class="btn btn-sm" onclick="App._moveEventFrame('${this._escAttr(eventId)}', ${d.frames.length}, 1)">Adelante ▶</button>`;
                 frameCard.appendChild(frameTitle);
                 frameCard.appendChild(frameImg);
                 frameCard.appendChild(frameStatus);
@@ -2279,7 +2286,7 @@ async _saveCooldown(camId, btn) {
             const rules = cam.rules?.length || 0;
             const lastSeen = cam.last_frame ? this._relTime(cam.last_frame) : 'Sin datos';
             return `
-                <button class="ios-row" onclick="App._openCameraConfig('${cam.camera_id}')">
+                <button class="ios-row" onclick="App._openCameraConfig('${this._escAttr(cam.camera_id)}')">
                     <span class="ios-icon">📷</span>
                     <div class="ios-row-main">
                         <div class="ios-row-title">Ajustes de cámara</div>
@@ -2298,7 +2305,7 @@ async _saveCooldown(camId, btn) {
             </div>`;
 
         const vigilanceRows = cams.length > 0 ? cams.map(cam => `
-            <button class="ios-row" onclick="App._openVigilanceSettings('${cam.camera_id}')">
+            <button class="ios-row" onclick="App._openVigilanceSettings('${this._escAttr(cam.camera_id)}')">
                 <span class="ios-icon">🛡️</span>
                 <div class="ios-row-main">
                     <div class="ios-row-title">${cam.name || cam.camera_id}</div>
@@ -3254,8 +3261,8 @@ async _saveCooldown(camId, btn) {
                     </div>
                 </div>
                 <div class="zone-drawer-footer">
-                    <button class="btn btn-sm btn-outline" onclick="App._clearAllZones('${camId}')">🗑️ Borrar todas</button>
-                    <button class="btn btn-sm btn-primary" style="flex:1" onclick="App._saveZoneDrawer('${camId}')">💾 Guardar</button>
+                    <button class="btn btn-sm btn-outline" onclick="App._clearAllZones('${this._escAttr(camId)}')">🗑️ Borrar todas</button>
+                    <button class="btn btn-sm btn-primary" style="flex:1" onclick="App._saveZoneDrawer('${this._escAttr(camId)}')">💾 Guardar</button>
                 </div>
             </div>
         </div>`;
