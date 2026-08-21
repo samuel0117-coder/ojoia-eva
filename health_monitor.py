@@ -77,11 +77,12 @@ SERVICES = [
     # (visible en megapanel) pero NO intenta reiniciarlos.
     ServiceDef("api-eva.service", 8005, "system", -1, "/health", critical=True, disabled_restart=True),
     ServiceDef("yolo-server.service", 8002, "system", 1, "", critical=False),
-    # GPU 0 - Qwen 7B VL
-    ServiceDef("qwen.service", 8004, "system", 0, "/v1/models", critical=True, disabled_restart=True),
-    # GPU 1 - Whisper + Qwen 14B
+    # GPU 0 - Qwen 9B (vLLM) + Whisper
+    ServiceDef("qwen9b.service", 8018, "system", 0, "/v1/models", critical=True, disabled_restart=True),
     ServiceDef("whisper.service", 8008, "system", 1, "/health", critical=True),
-    ServiceDef("qwen14b.service", 8015, "user", 1, "/v1/models", critical=True),
+    # GPU 1 - Qwen 7B (sglang) + Qwen 35B (llama.cpp)
+    ServiceDef("qwen.service", 8004, "system", 1, "/v1/models", critical=True, disabled_restart=True),
+    ServiceDef("qwen35b.service", 8019, "system", 1, "/health", critical=True, disabled_restart=True),
     # CPU - ChatRD
     ServiceDef("chatrd.service", 8010, "user", -1, "/health", critical=True),
     ServiceDef("admin_panel.service", 8030, "user", -1, "/health", critical=False),

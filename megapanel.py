@@ -28,11 +28,15 @@ from datetime import datetime
 from pathlib import Path
 
 import hmac
-from fastapi import FastAPI, HTTPException, Request
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).parent))
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 import httpx
+from billing import BillingStore
 
 app = FastAPI(title="OjoIA Server Megapanel", version="1.1")
 
@@ -109,10 +113,11 @@ async def _require_auth(request: Request, call_next):
 SERVICES = [
     {"id": "tunnel.service", "port": 0, "level": "system", "gpu": -1, "name": "Cloudflare Tunnel", "kind": "network"},
     {"id": "api-eva.service", "port": 8005, "level": "system", "gpu": -1, "name": "OjoIA API Eva", "kind": "api"},
-    {"id": "qwen.service", "port": 8004, "level": "system", "gpu": 0, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
+    {"id": "qwen9b.service", "port": 8018, "level": "system", "gpu": 0, "name": "Qwen VL-9B (vLLM)", "kind": "llm"},
+    {"id": "qwen.service", "port": 8004, "level": "system", "gpu": 1, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
+    {"id": "qwen35b.service", "port": 8019, "level": "system", "gpu": 1, "name": "Qwen 35B (llama.cpp)", "kind": "llm"},
     {"id": "whisper.service", "port": 8008, "level": "system", "gpu": 1, "name": "Whisper Turbo ASR", "kind": "asr"},
     {"id": "yolo-server.service", "port": 8002, "level": "system", "gpu": 1, "name": "YOLO Pose", "kind": "vision"},
-    {"id": "qwen14b.service", "port": 8015, "level": "user", "gpu": 1, "name": "Qwen 14B (SGLang)", "kind": "llm"},
     {"id": "chatrd.service", "port": 8010, "level": "user", "gpu": -1, "name": "ChatRD API", "kind": "api"},
     {"id": "admin_panel.service", "port": 8030, "level": "user", "gpu": -1, "name": "ChatRD Admin (legacy)", "kind": "api"},
     {"id": "comfyui.service", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "kind": "image", "managed": True},
@@ -382,7 +387,70 @@ async def tunnel_status():
     }
 
 
-# ─── UI HTML embebida ─────────────────────────────────────────────────────────
+# ─── Billing / API Keys (admin) ──────────────────────────────────────────────
+
+class KeyCmd(BaseModel):
+    client_id: str
+    label: str = ""
+    plan: str = "free"
+
+
+class RevokeCmd(BaseModel):
+    key: str
+
+
+_billing = None
+try:
+    _billing = BillingStore.instance()
+except Exception as e:
+    print(f"[megapanel] billing no disponible: {e}")
+
+
+@app.get("/api/billing/clients")
+async def billing_clients():
+    """Lista el uso de todos los clientes (admin)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    out = _billing.get_all_clients_usage("month")
+    # Enriquecer con quota
+    for c in out:
+        cid = c["client_id"]
+        # Obtener plan del primer key del cliente
+        keys = _billing.list_keys(cid)
+        plan = keys[0]["plan"] if keys else "free"
+        q = _billing.get_quota_status(cid, plan)
+        c["plan"] = plan
+        c["quota"] = q
+    return {"count": len(out), "clients": out}
+
+
+@app.post("/admin/keys")
+async def admin_create_key(cmd: KeyCmd):
+    """Crea una API key para un cliente (admin)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    if cmd.plan not in ("free", "dev", "pro", "enterprise"):
+        return JSONResponse({"error": "plan invalido"}, status_code=400)
+    r = _billing.create_key(cmd.client_id, cmd.label, cmd.plan)
+    return {"key": r["key"], "client_id": r["client_id"], "plan": r["plan"],
+            "label": r["label"], "created_at": r["created_at"]}
+
+
+@app.get("/admin/keys")
+async def admin_list_keys():
+    """Lista todas las API keys (admin)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    return {"keys": _billing.list_keys()}
+
+
+@app.post("/admin/keys/revoke")
+async def admin_revoke_key(cmd: RevokeCmd):
+    """Revoca una API key (admin)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    ok = _billing.revoke_key(cmd.key)
+    return {"revoked": ok}
 
 @app.get("/", response_class=HTMLResponse)
 async def ui():
@@ -441,6 +509,12 @@ input { background: var(--border); color: var(--text); border:0; padding:6px; bo
 .pill.L1 { background: rgba(63,185,80,.15); color: var(--green); }
 .pill.L5 { background: rgba(210,153,34,.15); color: var(--yellow); }
 .pill.L15{ background: rgba(248,81,73,.15); color: var(--red); }
+.billing-card { margin-top:16px; }
+.billing-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.usage-bar { background: var(--border); height: 6px; border-radius: 3px; margin: 4px 0 8px; overflow: hidden; }
+.usage-bar > div { height: 100%; background: linear-gradient(90deg, var(--blue), var(--purple)); }
+.key-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.copy-btn { font-size: 10px; padding: 2px 6px; }
 </style>
 </head>
 <body>
@@ -482,6 +556,37 @@ input { background: var(--border); color: var(--text); border:0; padding:6px; bo
       <thead><tr><th>Servicio</th><th>Puerto</th><th>GPU</th><th>Estado</th><th>Enabled</th><th></th></tr></thead>
       <tbody id="services"></tbody>
     </table>
+  </div>
+
+  <div class="card billing-card">
+    <h2>Billing & API Gateway</h2>
+    <div style="margin-bottom:12px">
+      <button onclick="loadBilling()">⟳ Actualizar uso</button>
+      <button onclick="showCreateKey()">+ Crear API Key</button>
+    </div>
+    <div id="key-create" style="display:none; margin-bottom:12px; padding:10px; border:1px solid var(--border); border-radius:6px">
+      <input id="kc-client" placeholder="client_id (ej: acme_corp)" style="width:30%">
+      <input id="kc-label" placeholder="label (ej: produccion)" style="width:25%">
+      <select id="kc-plan" style="background:var(--border);color:var(--text);border:0;padding:6px;border-radius:4px">
+        <option value="free">free (1M tok/mes)</option>
+        <option value="dev">dev (10M tok/mes)</option>
+        <option value="pro">pro (100M tok/mes)</option>
+        <option value="enterprise">enterprise (1B tok/mes)</option>
+      </select>
+      <button class="s" onclick="createKey()">Crear</button>
+      <button onclick="document.getElementById('key-create').style.display='none'">Cancelar</button>
+      <div id="kc-result" style="margin-top:8px;font-size:12px;color:var(--green)"></div>
+    </div>
+    <div class="billing-grid">
+      <div>
+        <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">Clientes (uso mensual)</h3>
+        <div id="billing-clients"></div>
+      </div>
+      <div>
+        <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">API Keys</h3>
+        <div id="billing-keys"></div>
+      </div>
+    </div>
   </div>
 
   <div class="grid" style="margin-top:16px">
@@ -598,8 +703,70 @@ async function toggleMaint(enable){
   await post('/api/maintenance', {enable, external_api_url: ext});
   refresh();
 }
+// ── Billing / API Gateway UI ───────────────────────────────────────────────
+function showCreateKey(){
+  const el = document.getElementById('key-create');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+  document.getElementById('kc-result').textContent = '';
+}
+async function createKey(){
+  const client = document.getElementById('kc-client').value.trim();
+  const label = document.getElementById('kc-label').value.trim();
+  const plan = document.getElementById('kc-plan').value;
+  if(!client){ alert('client_id requerido'); return; }
+  const r = await post('/admin/keys', {client_id: client, label, plan});
+  if(r.key){
+    document.getElementById('kc-result').innerHTML =
+      `Key creada: <code style="color:var(--green)">${r.key}</code> ` +
+      `<button class="copy-btn" onclick="navigator.clipboard.writeText('${r.key}')">copiar</button>`;
+    loadBilling();
+  } else {
+    document.getElementById('kc-result').innerHTML =
+      `<span style="color:var(--red)">Error: ${JSON.stringify(r)}</span>`;
+  }
+}
+async function revokeKey(key){
+  if(!confirm('Revocar key ' + key.slice(0,20) + '...?')) return;
+  const r = await post('/admin/keys/revoke', {key});
+  loadBilling();
+}
+async function loadBilling(){
+  // Clientes
+  try {
+    const c = await get('/api/billing/clients');
+    const html = (c.clients || []).map(cl => {
+      const q = cl.quota || {};
+      const pctUsed = q.pct_used || 0;
+      const models = Object.entries(cl.usage?.by_model || {})
+        .map(([m,t]) => `<span class="tag g1">${m}: ${t.tokens} tok</span>`).join(' ');
+      return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+        <div><b>${cl.client_id}</b> <span class="tag cpu">${cl.plan}</span></div>
+        <div style="font-size:12px;color:var(--muted)">${cl.tokens.toLocaleString()} tokens · $${cl.cost_usd.toFixed(4)} · ${cl.requests} reqs</div>
+        <div class="usage-bar"><div style="width:${Math.min(100,pctUsed)}%"></div></div>
+        <div style="font-size:11px;color:var(--muted)">${pctUsed}% de ${(q.tokens_quota||0).toLocaleString()} tok · ${((q.tokens_remaining||0)).toLocaleString()} libres</div>
+        <div style="margin-top:4px">${models}</div>
+      </div>`;
+    }).join('') || '<span style="color:var(--muted)">Sin clientes con uso</span>';
+    document.getElementById('billing-clients').innerHTML = html;
+  } catch(e) { document.getElementById('billing-clients').innerHTML = '<span style="color:var(--red)">Error</span>'; }
+  // Keys
+  try {
+    const k = await get('/admin/keys');
+    const html = (k.keys || []).map(rec => `
+      <div class="key-row">
+        <div>
+          <div><b>${rec.client_id}</b> <span class="tag cpu">${rec.plan}</span> ${rec.revoked?'<span class="pill L15">REVOKED</span>':''}</div>
+          <div style="font-size:11px;color:var(--muted)">${rec.key_masked} ${rec.label?'· '+rec.label:''}</div>
+        </div>
+        ${rec.revoked?'':`<button class="r copy-btn" onclick="revokeKey('${rec.key}')">revocar</button>`}
+      </div>`).join('') || '<span style="color:var(--muted)">Sin keys</span>';
+    document.getElementById('billing-keys').innerHTML = html;
+  } catch(e) { document.getElementById('billing-keys').innerHTML = '<span style="color:var(--red)">Error</span>'; }
+}
 refresh();
+loadBilling();
 setInterval(refresh, 5000);
+
 </script>
 </body>
 </html>
