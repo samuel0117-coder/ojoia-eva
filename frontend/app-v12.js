@@ -331,7 +331,17 @@ c.style.display = '';
         ({ home: () => this._pageHome(c), cameras: () => this._pageHome(c), eva: () => this._pageEva(c), events: () => this._pageEvents(c, eventId), settings: () => this._pageSettings(c) })[page]?.();
     },
 
-    _clearAllPolls() { Object.values(this._polls).forEach(id => clearInterval(id)); this._polls = {}; if (this._configViewerPoll) { clearInterval(this._configViewerPoll); this._configViewerPoll = null; } },
+    _clearAllPolls() { Object.values(this._polls).forEach(id => clearInterval(id)); this._polls = {}; if (this._configViewerPoll) { clearInterval(this._configViewerPoll); this._configViewerPoll = null; }
+        // P0 (Bug #2): reset de caches per-camara. Sin esto, al volver a Home
+        // despues de navegar a otra pagina, _homeStreamStarted[key] sigue en
+        // true y el stream MJPEG NO se reinicia => imagen en negro silenciosa.
+        // Tambien limpiamos _homeFrameInFlight para evitar deadlock de fetch.
+        this._homeStreamStarted = {};
+        this._homeFrameInFlight = {};
+        // Nota: NO limpiamos _homeLastDetectionsByCam ni _homeWatermarkTextByCam
+        // porque el primer frame de la Nueva carga usara el cache anterior
+        // mientras llega uno fresco — mejor UX que placeholder vacio.
+    },
     _resetScrollContent(c) {
         if (!c) return;
         c.style.display = 'block';
