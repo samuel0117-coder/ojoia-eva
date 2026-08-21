@@ -387,8 +387,8 @@ Items que estaban pendientes en planes anteriores y SÍ necesitan acción (los q
 - Queda P1. No es P0 — el sistema aguanta 1-2 cámaras concurrentes hoy.
 
 ### T1 — `--edge-ip-version 4` en cloudflared
-- Editar `/etc/cloudflared/config.yml`. Queda P1-fácil (no rompe nada).
-- **Acción rápida:** `sed -i 's/^tunnel: /tunnel:\n  edge-ip-version: 4/' /etc/cloudflared/config.yml && systemctl restart cloudflared`
+- **Estado:** ✅ APLICADO 2026-08-21 11:09. Editado `/etc/cloudflared/config.yml` con `edge-ip-version: "4"` (necesita comillas — cloudflared rechaza int). Backup en `/etc/cloudflared/config.yml.bak.20260821`. Reiniciado `tunnel.service` correctamente. Verificado en logs: `Settings: ... edge-ip-version:4 p:http2 ...`. Tunnel conectado a 4 regiones Cloudflare (atl06, tpa01, atl11, mia01). `api.ojoia.com.do/health` responde 200 (1.4s). `ui` y `admin` devuelven 530 porque sus backends (`:8080`, `:8030`) no están corriendo en este host — pre-existente, no del tunnel.
+- **Acción rápida:** `sed -i 's/^tunnel: /tunnel:\n  edge-ip-version: 4/' /etc/cloudflared/config.yml && systemctl restart cloudflared` (nota: necesita comillas para evitar `expected string found int`)
 - **Tiempo:** 5 min.
 
 ### C2.2-C2.5, C3.2, C3.4, C4.1-C4.2 — Funcionalidades del wizard de zonas
@@ -415,7 +415,7 @@ Items que estaban pendientes en planes anteriores y SÍ necesitan acción (los q
 ### Sprint 3 — "Mejor diagnóstico" (opcional, 1 día)
 11. ⏳ Sección #8 — 8-10 `except pass` → loggeo — 2h
 12. ⏳ B5 — cron de cleanup_frames.py — 10 min
-13. ⏳ T1 — edge-ip-version 4 — 5 min
+13. ✅ T1 — edge-ip-version 4 — 5 min
 
 **Sprint 1 total: ~2h (vs 2 días estimado). Bugs de crashes y UX + fugas más graves cubiertos.**
 **Total P0:** ~6 días-hombre. Deja el sistema sin crashes ni fugas conocidas.
