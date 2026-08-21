@@ -693,21 +693,38 @@ async def register_push_token(request: Request):
 @app.post("/api/auth/token")
 async def issue_user_token(request: dict):
     """
-    Emite un Bearer token para el usuario identificado por user_id.
-    Soft rollout: NO requiere login previo (la validacion fuerte llegara en
-    Fase 2 con Firebase ID Token). Por ahora, basta con que el user_id exista.
+    Emite un Bearer OjoIA para el usuario identificado por user_id.
+
+    P0 (Bug #5): AHORA REQUIERE firebase_token (o un Authorization: Bearer
+    con el Firebase ID Token) que al ser verificado matchee el user_id del
+    body. Antes se emitía a cualquier user_id con solo nombrarlo — privilege
+    escalation completo. Ver PLAN_CONSOLIDADO_P0.
 
     Body:
-        user_id: str (requerido)
-        device: str (opcional,-info de tracking)
+        user_id: str (requerido) — Firebase UID del usuario
+        firebase_token: str (requerido) — Firebase ID Token a verificar
+        device: str (opcional) — info de tracking
     Devuelve:
         token: str
         expires_at: int (epoch)
     """
     user_id = (request.get("user_id") or "").strip()
     device = request.get("device")
+    firebase_token = (request.get("firebase_token") or "").strip()
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id requerido")
+    if not firebase_token:
+        raise HTTPException(status_code=401, detail="firebase_token requerido para emitir API token")
+    # Verificar Firebase ID Token en thread aparte (I/O bloqueante a Google)
+    try:
+        decoded = await asyncio.to_thread(auth.verify_id_token, firebase_token)
+    except Exception as e:
+        logger.warning(f"[auth] firebase_token inválido al emitir token: {e}")
+        raise HTTPException(status_code=401, detail=f"Firebase token inválido: {e}")
+    firebase_uid = decoded.get("uid", "")
+    if firebase_uid != user_id:
+        logger.warning(f"[auth] user_id mismatch: pidió {user_id} pero token es de {firebase_uid}")
+        raise HTTPException(status_code=403, detail="user_id no corresponde al Firebase token")
     uf = find_user_json(user_id)
     if not uf or not uf.exists():
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -1100,7 +1117,7 @@ def _validate_safe_path(value: str, name: str = "param") -> str:
 PUBLIC_USER_PATHS = {
     "/health", "/api/support-info", "/api/zone-types",
     # token generation/verify: el primero crea el token, el segundo usa Firebase
-    "/api/auth/token",  # POST crea token (requiere FIR verificacion separada mas adelante)
+    "/api/auth/token",  # P0 (Bug #5): ahora valida firebase_token internamente vs user_id
     "/auth/firebase/verify",  # Firebase hace su propia verificacion
     "/api/support-info",
     # /ingest/* y /frames/ingest: las camaras ESP32 no portan Bearer (doc linea 178)
