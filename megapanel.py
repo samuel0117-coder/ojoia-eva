@@ -588,15 +588,27 @@ HTML_FILE = """<!DOCTYPE html>
 }
 * { box-sizing: border-box; }
 body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, monospace; margin: 0; }
-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-header h1 { margin: 0; font-size: 18px; }
-.badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; }
+/* Header compacto */
+header { padding: 10px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+header h1 { margin: 0; font-size: 16px; }
+.header-auth { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.badge { padding: 3px 8px; border-radius: 12px; font-size: 11px; cursor: pointer; }
 .badge-ok { background: rgba(63,185,80,.2); color: var(--green); }
 .badge-err { background: rgba(248,81,73,.2); color: var(--red); }
-.container { padding: 20px; max-width: 1400px; margin: 0 auto; }
+/* Nav top-level */
+.main-nav { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 20px; overflow-x: auto; }
+.nav-btn { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 12px 16px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+.nav-btn:hover { color: var(--text); background: rgba(255,255,255,.03); }
+.nav-btn.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
+.nav-btn.err-dot::after { content:''; display:inline-block; width:7px; height:7px; background:var(--red); border-radius:50%; margin-left:6px; vertical-align:middle; }
+/* Contenido */
+.page { padding: 20px; max-width: 1500px; margin: 0 auto; display: none; }
+.page.active { display: block; }
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.grid2 { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
 .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.card h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
 .gpu-bar { background: var(--border); height: 8px; border-radius: 4px; margin: 4px 0 12px; overflow: hidden; }
 .gpu-bar > div { height: 100%; background: linear-gradient(90deg, var(--green), var(--yellow), var(--red)); }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -611,269 +623,261 @@ th { color: var(--muted); font-weight: normal; font-size: 11px; text-transform: 
 .tag.g1 { background: rgba(63,185,80,.15); color: var(--green); }
 .tag.g2 { background: rgba(210,153,34,.15); color: var(--yellow); }
 .tag.cpu { background: rgba(139,148,158,.15); color: var(--muted); }
-button { background: var(--border); color: var(--text); border: 0; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; margin: 2px; }
+button { background: var(--border); color: var(--text); border: 0; padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 12px; margin: 2px; }
 button:hover { background: #444c56; }
 button.r { color: var(--red); }
 button.s { color: var(--green); }
 .maint { border: 1px solid var(--yellow); color: var(--yellow); }
+.mono { font-family: monospace; }
 .log { background: #010409; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 11px; max-height: 300px; overflow: auto; white-space: pre; }
 input { background: var(--border); color: var(--text); border:0; padding:6px; border-radius:4px; }
+select { background: var(--border); color: var(--text); border:0; padding:6px; border-radius:4px; }
 .pill { padding: 1px 6px; border-radius: 3px; font-size: 11px; }
 .pill.L1 { background: rgba(63,185,80,.15); color: var(--green); }
 .pill.L5 { background: rgba(210,153,34,.15); color: var(--yellow); }
 .pill.L15{ background: rgba(248,81,73,.15); color: var(--red); }
-.billing-card { margin-top:16px; }
-.billing-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
 .usage-bar { background: var(--border); height: 6px; border-radius: 3px; margin: 4px 0 8px; overflow: hidden; }
 .usage-bar > div { height: 100%; background: linear-gradient(90deg, var(--blue), var(--purple)); }
 .key-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
 .copy-btn { font-size: 10px; padding: 2px 6px; }
-.tab-btn { background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
-.tab-btn.active { background: var(--blue); color: #00264d; border-color: var(--blue); font-weight: 600; }
-.tab-btn:hover { border-color: var(--blue); }
 .kpi { font-size: 26px; font-weight: 700; color: var(--blue); }
-#log-table { font-size: 12px; }
-#log-table td, #log-table th { padding: 5px 8px; }
+.kpi-grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:16px; }
+.kpi-card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:12px; text-align:center; }
+.kpi-label { font-size:11px; color:var(--muted); margin-top:2px; }
 .row-err { color: var(--red); }
 .rating-up { color: var(--green); } .rating-down { color: var(--red); } .rating-none { color: var(--muted); }
-.price-row { display:flex; gap:6px; align-items:center; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; }
+.price-row { display:flex; gap:6px; align-items:center; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; flex-wrap:wrap; }
 .price-row input { width: 70px; }
 canvas { max-width: 100%; }
+.toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
 <body>
 <header>
-  <h1>OjoIA Server Control — <span id="host"></span></h1>
-  <div>
+  <h1>🖥️ OjoIA Control — <span id="host" style="color:var(--muted);font-size:13px"></span></h1>
+  <div class="header-auth">
+    <input id="tok" type="password" placeholder="Bearer token..." style="width:200px;font-size:12px">
+    <button onclick="saveTok()">Guardar</button>
+    <span id="tok-status" style="color:var(--muted);font-size:11px"></span>
     <span id="maint-badge" class="badge badge-ok">NORMAL</span>
-    <button class="maint" onclick="toggleMaint(true)">Modo Mantenimiento</button>
-    <button onclick="toggleMaint(false)">Salir Mantenimiento</button>
-    <button onclick="refresh()">⟳</button>
+    <button class="maint" onclick="toggleMaint(true)" style="font-size:11px">🔧 Mant.</button>
+    <button onclick="toggleMaint(false)" style="font-size:11px">▶ Salir</button>
+    <button onclick="refreshAll()">⟳</button>
   </div>
 </header>
-<div class="card" style="margin-bottom:16px">
-  <h2>Auth</h2>
-  <input id="tok" type="password" placeholder="Bearer token (MEGAPANEL_TOKEN)" style="width:60%">
-  <button onclick="saveTok()">Guardar</button>
-  <span id="tok-status" style="color:var(--muted);font-size:12px;margin-left:8px"></span>
+
+<nav class="main-nav">
+  <button class="nav-btn active" onclick="goPage('overview')">📊 Overview</button>
+  <button class="nav-btn" onclick="goPage('infra')">🏗 Infraestructura</button>
+  <button class="nav-btn" onclick="goPage('billing')">💳 Billing</button>
+  <button class="nav-btn" onclick="goPage('clients')">👥 Clientes</button>
+  <button class="nav-btn" onclick="goPage('reqlog')">📋 Request Log</button>
+  <button class="nav-btn" onclick="goPage('prices')">⚙ Precios/Planes</button>
+</nav>
+
+<!-- ═══ Overview: resumen rápido de todo ═══ -->
+<div id="page-overview" class="page active">
+  <div class="kpi-grid">
+    <div class="kpi-card"><div class="kpi" id="ov-reqs">—</div><div class="kpi-label">Requests 24h</div></div>
+    <div class="kpi-card"><div class="kpi" id="ov-tokens">—</div><div class="kpi-label">Tokens 24h</div></div>
+    <div class="kpi-card"><div class="kpi" id="ov-cost">—</div><div class="kpi-label">Costo 24h</div></div>
+    <div class="kpi-card"><div class="kpi" id="ov-errs">—</div><div class="kpi-label">Errores 24h</div></div>
+    <div class="kpi-card"><div class="kpi" id="ov-svcs">—</div><div class="kpi-label">Servicios OK</div></div>
+    <div class="kpi-card"><div class="kpi" id="ov-storage">—</div><div class="kpi-label">DB Log size</div></div>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>GPUs</h2><div id="ov-gpus"></div></div>
+    <div class="card"><h2>Servicios críticos</h2><div id="ov-svcs-list" style="font-size:12px;line-height:1.8"></div></div>
+    <div class="card"><h2>Tokens por modelo (24h)</h2><div id="ov-models" style="font-size:12px;line-height:1.8"></div></div>
+  </div>
 </div>
 
-<div class="container">
+<!-- ═══ Infraestructura ═══ -->
+<div id="page-infra" class="page">
   <div class="grid">
-    <div class="card">
-      <h2>GPUs</h2>
-      <div id="gpus"></div>
-    </div>
-    <div class="card">
-      <h2>Sistema</h2>
-      <div id="sys"></div>
-    </div>
-    <div class="card">
-      <h2>Colas CineIA</h2>
-      <div id="queues"></div>
-    </div>
+    <div class="card"><h2>GPUs</h2><div id="gpus"></div></div>
+    <div class="card"><h2>Sistema</h2><div id="sys"></div></div>
+    <div class="card"><h2>Colas CineIA</h2><div id="queues"></div></div>
   </div>
-
   <div class="card" style="margin-top:16px">
     <h2>Servicios <span id="svc-count"></span></h2>
-    <table>
-      <thead><tr><th>Servicio</th><th>Puerto</th><th>GPU</th><th>Estado</th><th>Enabled</th><th></th></tr></thead>
-      <tbody id="services"></tbody>
-    </table>
+    <table><thead><tr><th>Servicio</th><th>Puerto</th><th>GPU</th><th>Estado</th><th>Enabled</th><th></th></tr></thead>
+    <tbody id="services"></tbody></table>
   </div>
-
-  <div class="card billing-card">
-    <h2>Billing & API Gateway</h2>
-    <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
-      <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
-      <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">👥 Clientes</button>
-      <button class="tab-btn" data-tab="log" onclick="switchTab('log')">📋 Request Log</button>
-      <button class="tab-btn" data-tab="prices" onclick="switchTab('prices')">💳 Precios y Planes</button>
-    </div>
-
-    <div id="tab-dashboard" class="billing-tab">
-      <div style="margin-bottom:12px">
-        <button onclick="loadDashboard()">⟳ Actualizar</button>
-        <select id="dash-hours" onchange="loadDashboard()" style="background:var(--border);color:var(--text);border:0;padding:6px;border-radius:4px">
-          <option value="1">1h</option>
-          <option value="6">6h</option>
-          <option value="24" selected>24h</option>
-          <option value="168">7d</option>
-          <option value="720">30d</option>
-        </select>
-      </div>
-      <div class="billing-grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:12px">
-        <div class="card" style="padding:12px;text-align:center">
-          <div class="kpi" id="kpi-reqs">0</div><div style="font-size:11px;color:var(--muted)">Requests</div>
-        </div>
-        <div class="card" style="padding:12px;text-align:center">
-          <div class="kpi" id="kpi-tokens">0</div><div style="font-size:11px;color:var(--muted)">Tokens</div>
-        </div>
-        <div class="card" style="padding:12px;text-align:center">
-          <div class="kpi" id="kpi-cost">$0</div><div style="font-size:11px;color:var(--muted)">Costo</div>
-        </div>
-        <div class="card" style="padding:12px;text-align:center">
-          <div class="kpi" id="kpi-lat">0ms</div><div style="font-size:11px;color:var(--muted)">Lat avg</div>
-        </div>
-        <div class="card" style="padding:12px;text-align:center">
-          <div class="kpi" id="kpi-err">0</div><div style="font-size:11px;color:var(--muted)">Errores</div>
-        </div>
-        <div class="card" style="padding:12px;text-align:center">
-          <div class="kpi" id="kpi-rating">—</div><div style="font-size:11px;color:var(--muted)">👍/👎</div>
-        </div>
-      </div>
-      <div class="billing-grid">
-        <div class="card"><h3 style="font-size:12px;color:var(--muted)">Uso por hora (tokens)</h3><canvas id="chart-hours" height="120"></canvas></div>
-        <div class="card"><h3 style="font-size:12px;color:var(--muted)">Tokens por modelo</h3><div id="by-model"></div></div>
-        <div class="card"><h3 style="font-size:12px;color:var(--muted)">Tokens por cliente</h3><div id="by-client"></div></div>
-      </div>
-      <div class="card" style="margin-top:12px">
-        <h3 style="font-size:12px;color:var(--muted)">Almacenamiento del log</h3>
-        <div id="storage-info" style="font-size:12px;color:var(--muted)"></div>
-        <button class="r" style="margin-top:8px" onclick="purgeLog()">🗑 Purge manual (>30 dias)</button>
-      </div>
-    </div>
-
-    <div id="tab-clients" class="billing-tab" style="display:none">
-      <div style="margin-bottom:12px">
-        <button onclick="loadBilling()">⟳ Actualizar uso</button>
-        <button onclick="showCreateKey()">+ Crear API Key</button>
-      </div>
-      <div id="key-create" style="display:none; margin-bottom:12px; padding:10px; border:1px solid var(--border); border-radius:6px">
-        <input id="kc-client" placeholder="client_id (ej: acme_corp)" style="width:30%">
-        <input id="kc-label" placeholder="label (ej: produccion)" style="width:25%">
-        <select id="kc-plan" style="background:var(--border);color:var(--text);border:0;padding:6px;border-radius:4px">
-          <option value="free">free (1M tok/mes)</option>
-          <option value="dev">dev (10M tok/mes)</option>
-          <option value="pro">pro (100M tok/mes)</option>
-          <option value="enterprise">enterprise (1B tok/mes)</option>
-        </select>
-        <button class="s" onclick="createKey()">Crear</button>
-        <button onclick="document.getElementById('key-create').style.display='none'">Cancelar</button>
-        <div id="kc-result" style="margin-top:8px;font-size:12px;color:var(--green)"></div>
-      </div>
-      <div class="billing-grid">
-        <div>
-          <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">Clientes (uso mensual)</h3>
-          <div id="billing-clients"></div>
-        </div>
-        <div>
-          <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">API Keys</h3>
-          <div id="billing-keys"></div>
-        </div>
-      </div>
-    </div>
-
-    <div id="tab-log" class="billing-tab" style="display:none">
-      <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <input id="log-filter-client" placeholder="cliente" style="width:15%">
-        <input id="log-filter-model" placeholder="modelo" style="width:15%">
-        <label style="font-size:13px;display:flex;align-items:center;gap:4px">
-          <input type="checkbox" id="log-filter-errors"> Solo errores
-        </label>
-        <button onclick="loadLog(0)">Buscar</button>
-        <button onclick="loadLog(offset-50)">← Anterior</button>
-        <button onclick="loadLog(offset+50)">Siguiente →</button>
-        <span id="log-page" style="font-size:12px;color:var(--muted);align-self:center"></span>
-      </div>
-      <table id="log-table">
-        <thead><tr><th>Hora</th><th>Cliente</th><th>Modelo</th><th>Tokens</th><th>Costo</th><th>Lat</th><th>Status</th><th>Rating</th><th></th></tr></thead>
-        <tbody id="log-body"></tbody>
-      </table>
-    </div>
-
-    <div id="tab-prices" class="billing-tab" style="display:none">
-      <div style="margin-bottom:12px"><button onclick="loadConfig()">⟳ Recargar</button></div>
-      <div class="billing-grid">
-        <div>
-          <h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Precios por modelo (por 1M tokens)</h3>
-          <div id="prices-editor"></div>
-        </div>
-        <div>
-          <h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Planes</h3>
-          <div id="plans-editor"></div>
-          <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px">
-            <h3 style="font-size:11px;color:var(--muted)">Nuevo plan</h3>
-            <input id="np-name" placeholder="plan (ej: trial)" style="width:20%">
-            <input id="np-display" placeholder="display" style="width:20%">
-            <input id="np-quota" type="number" placeholder="quota tokens" style="width:20%">
-            <input id="np-rpm" type="number" placeholder="rpm" style="width:10%">
-            <button class="s" onclick="createPlan()">+ Crear plan</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Modal de detalle de request -->
-  <div id="req-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100;padding:40px">
-    <div class="card" style="max-width:800px;margin:0 auto;max-height:80vh;overflow:auto">
-      <div style="display:flex;justify-content:space-between;margin-bottom:12px">
-        <h2 style="margin:0">Request #<span id="md-id"></span></h2>
-        <div>
-          <button class="s" onclick="rateReq(1)">👍 Up</button>
-          <button class="r" onclick="rateReq(-1)">👎 Down</button>
-          <button onclick="document.getElementById('req-modal').style.display='none'">✕ Cerrar</button>
-        </div>
-      </div>
-      <div id="md-meta" style="font-size:12px;color:var(--muted);margin-bottom:12px"></div>
-      <h3 style="font-size:12px;color:var(--muted)">Prompt</h3>
-      <div id="md-prompt" class="log" style="white-space:pre-wrap;margin-bottom:12px"></div>
-      <h3 style="font-size:12px;color:var(--muted)">Response</h3>
-      <div id="md-response" class="log" style="white-space:pre-wrap"></div>
-    </div>
-  </div>
-
   <div class="grid" style="margin-top:16px">
-    <div class="card">
-      <h2>Incidentes recientes (Health Monitor)</h2>
-      <div id="incidents" class="log"></div>
+    <div class="card"><h2>Incidentes (Health Monitor)</h2><div id="incidents" class="log"></div></div>
+    <div class="card"><h2>Logs <select id="log-svc" onchange="loadSvcLog()"></select></h2><div id="svc-logs" class="log"></div></div>
+  </div>
+</div>
+
+<!-- ═══ Billing Dashboard ═══ -->
+<div id="page-billing" class="page">
+  <div class="toolbar">
+    <button onclick="loadDashboard()">⟳ Actualizar</button>
+    <select id="dash-hours" onchange="loadDashboard()">
+      <option value="1">1h</option><option value="6">6h</option>
+      <option value="24" selected>24h</option><option value="168">7d</option><option value="720">30d</option>
+    </select>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi-card"><div class="kpi" id="kpi-reqs">0</div><div class="kpi-label">Requests</div></div>
+    <div class="kpi-card"><div class="kpi" id="kpi-tokens">0</div><div class="kpi-label">Tokens</div></div>
+    <div class="kpi-card"><div class="kpi" id="kpi-cost">$0</div><div class="kpi-label">Costo</div></div>
+    <div class="kpi-card"><div class="kpi" id="kpi-lat">0ms</div><div class="kpi-label">Lat avg</div></div>
+    <div class="kpi-card"><div class="kpi" id="kpi-err">0</div><div class="kpi-label">Errores</div></div>
+    <div class="kpi-card"><div class="kpi" id="kpi-rating">—</div><div class="kpi-label">👍/👎</div></div>
+  </div>
+  <div class="grid2">
+    <div class="card"><h3>Uso por hora (tokens)</h3><canvas id="chart-hours" height="120"></canvas></div>
+    <div class="card"><h3>Tokens por modelo</h3><div id="by-model"></div></div>
+    <div class="card"><h3>Tokens por cliente</h3><div id="by-client"></div></div>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <h3>Almacenamiento del log</h3>
+    <div id="storage-info" style="font-size:12px;color:var(--muted)"></div>
+    <button class="r" style="margin-top:8px" onclick="purgeLog()">🗑 Purge manual (>30 dias)</button>
+  </div>
+</div>
+
+<!-- ═══ Clientes + Keys ═══ -->
+<div id="page-clients" class="page">
+  <div class="toolbar">
+    <button onclick="loadBilling()">⟳ Actualizar uso</button>
+    <button onclick="showCreateKey()">+ Crear API Key</button>
+  </div>
+  <div id="key-create" style="display:none; margin-bottom:12px; padding:10px; border:1px solid var(--border); border-radius:6px">
+    <input id="kc-client" placeholder="client_id (ej: acme_corp)" style="width:30%">
+    <input id="kc-label" placeholder="label (ej: produccion)" style="width:25%">
+    <select id="kc-plan"></select>
+    <button class="s" onclick="createKey()">Crear</button>
+    <button onclick="document.getElementById('key-create').style.display='none'">Cancelar</button>
+    <div id="kc-result" style="margin-top:8px;font-size:12px;color:var(--green)"></div>
+  </div>
+  <div class="grid2">
+    <div><h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">Clientes (uso mensual)</h3><div id="billing-clients"></div></div>
+    <div><h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">API Keys</h3><div id="billing-keys"></div></div>
+  </div>
+</div>
+
+<!-- ═══ Request Log ═══ -->
+<div id="page-reqlog" class="page">
+  <div class="toolbar">
+    <input id="log-filter-client" placeholder="cliente" style="width:15%">
+    <input id="log-filter-model" placeholder="modelo" style="width:15%">
+    <label style="font-size:13px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-filter-errors"> Solo errores</label>
+    <button onclick="loadReqLog(0)">Buscar</button>
+    <button onclick="loadReqLog(offset-50)">← Anterior</button>
+    <button onclick="loadReqLog(offset+50)">Siguiente →</button>
+    <span id="log-page" style="font-size:12px;color:var(--muted)"></span>
+  </div>
+  <table id="log-table">
+    <thead><tr><th>Hora</th><th>Cliente</th><th>Modelo</th><th>Tokens</th><th>Costo</th><th>Lat</th><th>Status</th><th>Rating</th><th></th></tr></thead>
+    <tbody id="log-body"></tbody>
+  </table>
+</div>
+
+<!-- ═══ Precios y Planes ═══ -->
+<div id="page-prices" class="page">
+  <div class="toolbar"><button onclick="loadConfig()">⟳ Recargar</button></div>
+  <div class="grid2">
+    <div><h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Precios por modelo (por 1M tokens)</h3><div id="prices-editor"></div></div>
+    <div>
+      <h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Planes</h3>
+      <div id="plans-editor"></div>
+      <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px">
+        <h3 style="font-size:11px;color:var(--muted)">Nuevo plan</h3>
+        <input id="np-name" placeholder="plan (ej: trial)" style="width:20%">
+        <input id="np-display" placeholder="display" style="width:20%">
+        <input id="np-quota" type="number" placeholder="quota tokens" style="width:20%">
+        <input id="np-rpm" type="number" placeholder="rpm" style="width:10%">
+        <button class="s" onclick="createPlan()">+ Crear plan</button>
+      </div>
     </div>
-    <div class="card">
-      <h2>Logs <select id="log-svc" onchange="loadLog()"></select></h2>
-      <div id="logs" class="log"></div>
+  </div>
+</div>
+
+<!-- ═══ Modal de detalle de request ═══ -->
+<div id="req-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100;padding:40px">
+  <div class="card" style="max-width:800px;margin:0 auto;max-height:80vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+      <h2 style="margin:0">Request #<span id="md-id"></span></h2>
+      <div>
+        <button class="s" onclick="rateReq(1)">👍 Up</button>
+        <button class="r" onclick="rateReq(-1)">👎 Down</button>
+        <button onclick="document.getElementById('req-modal').style.display='none'">✕ Cerrar</button>
+      </div>
     </div>
+    <div id="md-meta" style="font-size:12px;color:var(--muted);margin-bottom:12px"></div>
+    <h3 style="font-size:12px;color:var(--muted)">Prompt</h3>
+    <div id="md-prompt" class="log" style="white-space:pre-wrap;margin-bottom:12px"></div>
+    <h3 style="font-size:12px;color:var(--muted)">Response</h3>
+    <div id="md-response" class="log" style="white-space:pre-wrap"></div>
   </div>
 </div>
 
 <script>
-// Auth: token persistido en localStorage, enviado como Authorization: Bearer.
 const API = '';
 let TOKEN = localStorage.getItem('megapanel_token') || '';
+let _currentStatus = null;
 function saveTok(){
   TOKEN = document.getElementById('tok').value.trim();
   localStorage.setItem('megapanel_token', TOKEN);
   document.getElementById('tok-status').textContent = TOKEN ? 'guardado ✓' : 'vacio';
-  refresh();
+  refreshAll();
 }
-if(TOKEN) document.getElementById('tok-status').textContent = 'cargado de memoria';
+if(TOKEN) document.getElementById('tok-status').textContent = 'cargado ✓';
 async function get(url){
   const r = await fetch(API + url, {headers: TOKEN ? {'Authorization':'Bearer '+TOKEN} : {}});
-  if(r.status === 401){ document.getElementById('tok-status').textContent = 'token invalido/falta'; }
+  if(r.status === 401){ document.getElementById('tok-status').textContent = '⚠ token invalido/falta'; }
   return await r.json();
 }
 async function post(url, body){
   const r = await fetch(API + url, {method:'POST',
     headers:{'Content-Type':'application/json', ...(TOKEN ? {'Authorization':'Bearer '+TOKEN} : {})},
     body: body ? JSON.stringify(body) : undefined});
-  if(r.status === 401){ document.getElementById('tok-status').textContent = 'token invalido/falta'; }
+  if(r.status === 401){ document.getElementById('tok-status').textContent = '⚠ token invalido/falta'; }
   return await r.json();
+}
+async function putJSON(url, body){
+  const r = await fetch(API + url, {method:'PUT',
+    headers:{'Content-Type':'application/json', ...(TOKEN ? {'Authorization':'Bearer '+TOKEN} : {})},
+    body: body ? JSON.stringify(body) : undefined});
+  if(r.status === 401){ document.getElementById('tok-status').textContent = '⚠ token invalido/falta'; }
+  return {ok:r.ok, data: await r.json()};
 }
 function pct(p){ return `<span class="pill ${p<70?'L1':p<90?'L5':'L15'}">${p}%</span>`; }
 function gpuTag(g){ if(g<0) return '<span class="tag cpu">CPU</span>'; return `<span class="tag g${g}">GPU ${g}</span>`; }
 
+// ── Navegación top-level ───────────────────────────────────────────────────
+function goPage(name){
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  event && event.target && event.target.classList.add('active');
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  if(name==='overview') loadOverview();
+  if(name==='billing') loadDashboard();
+  if(name==='clients') loadBilling();
+  if(name==='reqlog') loadReqLog(0);
+  if(name==='prices') loadConfig();
+}
+function refreshAll(){ refresh(); loadOverview(); }
+
+// ── Infraestructura: refresh ────────────────────────────────────────────────
 async function refresh(){
   try {
     const s = await get('/api/status');
+    _currentStatus = s;
     document.getElementById('host').textContent = s.hostname + ' · uptime ' + Math.floor(s.uptime_s/3600) + 'h';
-    // gpus
-    document.getElementById('gpus').innerHTML = s.gpus.map(g=>`
+    // gpus (infra + overview comparten elemento gpus)
+    const gpuHtml = s.gpus.map(g=>`
       <div><b>GPU ${g.index}</b> ${g.name} · ${pct(g.mem_pct)} · ${g.util_pct}% util · ${g.temp_c}°C
       ${g.power_w?'· '+g.power_w+'W':''}</div>
       <div class="gpu-bar"><div style="width:${g.mem_pct}%"></div></div>
       <div style="color:var(--muted);font-size:12px">${g.mem_used_mb}/${g.mem_total_mb} MB · ${g.mem_free_mb} free</div>
     `).join('');
+    document.getElementById('gpus').innerHTML = gpuHtml;
+    if(document.getElementById('ov-gpus')) document.getElementById('ov-gpus').innerHTML = gpuHtml;
     // system
     document.getElementById('sys').innerHTML = `
       <div>Load: ${s.load['1'].toFixed(1)} / ${s.load['5'].toFixed(1)} / ${s.load['15'].toFixed(1)}</div>
@@ -894,23 +898,26 @@ async function refresh(){
           <button class="s" onclick="control('${sv.id}','start')">▶</button>
           <button class="r" onclick="control('${sv.id}','stop')">■</button>
           <button onclick="control('${sv.id}','restart')">↻</button>
-          <button onclick="loadLog('${sv.id}')">logs</button>
+          <button onclick="loadSvcLog('${sv.id}')">logs</button>
         </td>
       </tr>`).join('');
+    // overview: servicios criticos resumidos
+    if(document.getElementById('ov-svcs-list')){
+      const crit = s.services.filter(sv=>sv.id.includes('qwen')||sv.id.includes('tunnel')||sv.id.includes('eva'));
+      document.getElementById('ov-svcs').textContent = s.services.filter(x=>x.active).length + '/' + s.services.length;
+      document.getElementById('ov-svcs-list').innerHTML = crit.map(sv=>
+        `<div><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.name}</div>`).join('');
+    }
     // log svc select
     const sel = document.getElementById('log-svc');
-    if(sel.options.length === 0){
-      s.services.forEach(sv => sel.add(new Option(sv.name, sv.id)));
-    }
+    if(sel.options.length === 0){ s.services.forEach(sv => sel.add(new Option(sv.name, sv.id))); }
     // maintenance
     const m = document.getElementById('maint-badge');
     if(s.maintenance_mode){ m.className='badge badge-err'; m.textContent='MANTENIMIENTO'; }
     else { m.className='badge badge-ok'; m.textContent='NORMAL'; }
     // incidents
     document.getElementById('incidents').textContent = s.incidents.map(i=>`[${i.t}] [${i.level}] ${i.msg}`).join('\\n');
-  } catch(e) {
-    console.error(e);
-  }
+  } catch(e) { console.error(e); }
   // queues
   try {
     const q = await get('/api/queues');
@@ -922,24 +929,76 @@ async function refresh(){
     document.getElementById('queues').innerHTML = html;
   } catch(e) { document.getElementById('queues').innerHTML = `<span style="color:var(--muted)">Sin datos</span>`; }
 }
-async function control(id, action){
-  const r = await post(`/api/control/${id}/${action}`);
-  setTimeout(refresh, 800);
-}
-async function loadLog(svc){
+async function control(id, action){ await post(`/api/control/${id}/${action}`); setTimeout(refresh, 800); }
+async function loadSvcLog(svc){
   svc = svc || document.getElementById('log-svc').value;
   if(!svc) return;
   const r = await get(`/api/logs/${svc.replace('.service','')}?lines=80`);
-  document.getElementById('logs').textContent = r.lines.join('\\n');
-  document.getElementById('logs').scrollTop = 9999;
+  document.getElementById('svc-logs').textContent = r.lines.join('\\n');
+  document.getElementById('svc-logs').scrollTop = 9999;
 }
 async function toggleMaint(enable){
-  let ext = '';
   if(enable){ ext = prompt('URL de API externa para fallback (dejar vacío si ninguna):') || ''; }
-  await post('/api/maintenance', {enable, external_api_url: ext});
+  await post('/api/maintenance', {enable, external_api_url: ext||''});
   refresh();
 }
-// ── Billing / API Gateway UI ───────────────────────────────────────────────
+
+// ── Overview: KPIs rápidos ──────────────────────────────────────────────────
+async function loadOverview(){
+  try {
+    const s = await get('/api/billing/stats?hours=24');
+    document.getElementById('ov-reqs').textContent = (s.total_requests||0).toLocaleString();
+    document.getElementById('ov-tokens').textContent = (s.total_tokens||0).toLocaleString();
+    document.getElementById('ov-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
+    document.getElementById('ov-errs').textContent = (s.errors||0);
+    const byM = Object.entries(s.by_model||{}).map(([m,v])=>
+      `<div><span class="tag g1">${m}</span> <b>${v.tokens.toLocaleString()}</b> tok · ${v.requests} req</div>`).join('');
+    if(document.getElementById('ov-models')) document.getElementById('ov-models').innerHTML = byM || '<span style="color:var(--muted)">sin datos</span>';
+  } catch(e) { console.error('overview billing',e); }
+  try {
+    const st = await get('/api/billing/storage');
+    if(document.getElementById('ov-storage')) document.getElementById('ov-storage').textContent = st.db_size_mb + 'MB';
+    if(document.getElementById('storage-info')) document.getElementById('storage-info').innerHTML =
+      `DB: <b>${st.db_size_mb} MB</b> · ${st.total_records.toLocaleString()} registros · Free: <b>${st.disk_free_mb.toLocaleString()} MB</b> · Retención: <b>${st.retention_days} dias</b><br><span style="font-size:11px">${st.db_path}</span>`;
+  } catch(e) {}
+}
+
+// ── Dashboard billing completo ─────────────────────────────────────────────
+let _chart = null;
+async function loadDashboard(){
+  const h = parseInt(document.getElementById('dash-hours').value);
+  try {
+    const s = await get('/api/billing/stats?hours='+h);
+    document.getElementById('kpi-reqs').textContent = (s.total_requests||0).toLocaleString();
+    document.getElementById('kpi-tokens').textContent = (s.total_tokens||0).toLocaleString();
+    document.getElementById('kpi-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
+    document.getElementById('kpi-lat').textContent = (s.avg_latency_ms||0)+'ms';
+    document.getElementById('kpi-err').textContent = (s.errors||0);
+    document.getElementById('kpi-rating').textContent = `${s.up_votes||0}/${s.down_votes||0}`;
+    const byM = Object.entries(s.by_model||{}).map(([m,v])=>
+      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span><span class="tag g1">${m}</span></span><span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
+    document.getElementById('by-model').innerHTML = byM || '<span style="color:var(--muted)">sin datos</span>';
+    const byC = Object.entries(s.by_client||{}).map(([c,v])=>
+      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span><b>${c}</b></span><span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
+    document.getElementById('by-client').innerHTML = byC || '<span style="color:var(--muted)">sin datos</span>';
+    const labels = (s.hourly||[]).map(h=>new Date(h.ts*1000).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}));
+    const tokens = (s.hourly||[]).map(h=>h.tokens);
+    if(_chart) _chart.destroy();
+    const ctx = document.getElementById('chart-hours');
+    if(ctx && labels.length){
+      _chart = new Chart(ctx, {type:'line', data:{labels,datasets:[{label:'Tokens',data:tokens,borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,.1)',fill:true}]},
+        options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',maxTicksLimit:8}},y:{ticks:{color:'#8b949e'}}}}});
+    }
+  } catch(e) { console.error('dashboard',e); }
+}
+async function purgeLog(){
+  if(!confirm('Purgar registros >30 dias?')) return;
+  const r = await post('/api/billing/purge', {});
+  alert('Purgados: '+r.purged);
+  loadDashboard();
+}
+
+// ── Clientes + Keys ─────────────────────────────────────────────────────────
 function showCreateKey(){
   const el = document.getElementById('key-create');
   el.style.display = el.style.display === 'none' ? 'block' : 'none';
@@ -952,129 +1011,47 @@ async function createKey(){
   if(!client){ alert('client_id requerido'); return; }
   const r = await post('/admin/keys', {client_id: client, label, plan});
   if(r.key){
-    document.getElementById('kc-result').innerHTML =
-      `Key creada: <code style="color:var(--green)">${r.key}</code> ` +
-      `<button class="copy-btn" onclick="navigator.clipboard.writeText('${r.key}')">copiar</button>`;
+    document.getElementById('kc-result').innerHTML = `Key creada: <code style="color:var(--green)">${r.key}</code> <button class="copy-btn" onclick="navigator.clipboard.writeText('${r.key}')">copiar</button>`;
     loadBilling();
-  } else {
-    document.getElementById('kc-result').innerHTML =
-      `<span style="color:var(--red)">Error: ${JSON.stringify(r)}</span>`;
-  }
+  } else { document.getElementById('kc-result').innerHTML = `<span style="color:var(--red)">Error: ${JSON.stringify(r)}</span>`; }
 }
 async function revokeKey(key){
   if(!confirm('Revocar key ' + key.slice(0,20) + '...?')) return;
-  const r = await post('/admin/keys/revoke', {key});
+  await post('/admin/keys/revoke', {key});
   loadBilling();
 }
 async function loadBilling(){
-  // Cargar plans dinamicamente en el select
-  try {
-    const cfg = await get('/api/billing/config');
+  try { const cfg = await get('/api/billing/config');
     const sel = document.getElementById('kc-plan');
-    if(sel && cfg.plans){
-      sel.innerHTML = Object.entries(cfg.plans).map(([k,v])=>
-        `<option value="${k}">${k} (${(v.tokens_quota/1e6).toFixed(0)}M tok/mes)</option>`).join('');
-    }
+    if(sel && cfg.plans) sel.innerHTML = Object.entries(cfg.plans).map(([k,v])=>`<option value="${k}">${k} (${(v.tokens_quota/1e6).toFixed(0)}M tok/mes)</option>`).join('');
   } catch(e) {}
-  // Clientes
   try {
     const c = await get('/api/billing/clients');
     const html = (c.clients || []).map(cl => {
-      const q = cl.quota || {};
-      const pctUsed = q.pct_used || 0;
-      const models = Object.entries(cl.usage?.by_model || {})
-        .map(([m,t]) => `<span class="tag g1">${m}: ${t.tokens} tok</span>`).join(' ');
+      const q = cl.quota || {}; const pctUsed = q.pct_used || 0;
+      const models = Object.entries(cl.usage?.by_model || {}).map(([m,t]) => `<span class="tag g1">${m}: ${t.tokens} tok</span>`).join(' ');
       return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
         <div><b>${cl.client_id}</b> <span class="tag cpu">${cl.plan}</span></div>
         <div style="font-size:12px;color:var(--muted)">${cl.tokens.toLocaleString()} tokens · $${cl.cost_usd.toFixed(4)} · ${cl.requests} reqs</div>
         <div class="usage-bar"><div style="width:${Math.min(100,pctUsed)}%"></div></div>
         <div style="font-size:11px;color:var(--muted)">${pctUsed.toFixed(1)}% de ${(q.tokens_quota||0).toLocaleString()} tok · ${(q.tokens_remaining||0).toLocaleString()} libres</div>
-        <div style="margin-top:4px">${models}</div>
-      </div>`;
+        <div style="margin-top:4px">${models}</div></div>`;
     }).join('') || '<span style="color:var(--muted)">Sin clientes con uso</span>';
     document.getElementById('billing-clients').innerHTML = html;
   } catch(e) { document.getElementById('billing-clients').innerHTML = '<span style="color:var(--red)">Error</span>'; }
-  // Keys
   try {
     const k = await get('/admin/keys');
-    const html = (k.keys || []).map(rec => `
-      <div class="key-row">
-        <div>
-          <div><b>${rec.client_id}</b> <span class="tag cpu">${rec.plan}</span> ${rec.revoked?'<span class="pill L15">REVOKED</span>':''}</div>
-          <div style="font-size:11px;color:var(--muted)">${rec.key_masked} ${rec.label?'· '+rec.label:''}</div>
-        </div>
-        ${rec.revoked?'':`<button class="r copy-btn" onclick="revokeKey('${rec.key}')">revocar</button>`}
-      </div>`).join('') || '<span style="color:var(--muted)">Sin keys</span>';
+    const html = (k.keys || []).map(rec => `<div class="key-row">
+      <div><div><b>${rec.client_id}</b> <span class="tag cpu">${rec.plan}</span> ${rec.revoked?'<span class="pill L15">REVOKED</span>':''}</div>
+      <div style="font-size:11px;color:var(--muted)">${rec.key_masked} ${rec.label?'· '+rec.label:''}</div></div>
+      ${rec.revoked?'':`<button class="r copy-btn" onclick="revokeKey('${rec.key}')">revocar</button>`}</div>`).join('') || '<span style="color:var(--muted)">Sin keys</span>';
     document.getElementById('billing-keys').innerHTML = html;
   } catch(e) { document.getElementById('billing-keys').innerHTML = '<span style="color:var(--red)">Error</span>'; }
 }
 
-// ── Tabs ──────────────────────────────────────────────────────────────────
-function switchTab(name){
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-  document.querySelector(`[data-tab="${name}"]`).classList.add('active');
-  document.querySelectorAll('.billing-tab').forEach(t=>t.style.display='none');
-  document.getElementById('tab-'+name).style.display='block';
-  if(name==='dashboard') loadDashboard();
-  if(name==='clients') loadBilling();
-  if(name==='log') loadLog(0);
-  if(name==='prices') loadConfig();
-}
-
-// ── Dashboard ──────────────────────────────────────────────────────────────
-let _chart = null;
-async function loadDashboard(){
-  const h = parseInt(document.getElementById('dash-hours').value);
-  try {
-    const s = await get('/api/billing/stats?hours='+h);
-    document.getElementById('kpi-reqs').textContent = (s.total_requests||0).toLocaleString();
-    document.getElementById('kpi-tokens').textContent = (s.total_tokens||0).toLocaleString();
-    document.getElementById('kpi-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
-    document.getElementById('kpi-lat').textContent = (s.avg_latency_ms||0)+'ms';
-    document.getElementById('kpi-err').textContent = (s.errors||0);
-    document.getElementById('kpi-rating').textContent = `${s.up_votes||0}/${s.down_votes||0}`;
-    // by model
-    const byM = Object.entries(s.by_model||{}).map(([m,v])=>
-      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
-        <span><span class="tag g1">${m}</span></span>
-        <span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
-    document.getElementById('by-model').innerHTML = byM || '<span style="color:var(--muted)">sin datos</span>';
-    // by client
-    const byC = Object.entries(s.by_client||{}).map(([c,v])=>
-      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
-        <span><b>${c}</b></span>
-        <span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
-    document.getElementById('by-client').innerHTML = byC || '<span style="color:var(--muted)">sin datos</span>';
-    // chart horario
-    const labels = (s.hourly||[]).map(h=>new Date(h.ts*1000).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}));
-    const tokens = (s.hourly||[]).map(h=>h.tokens);
-    if(_chart) _chart.destroy();
-    const ctx = document.getElementById('chart-hours');
-    if(ctx && labels.length){
-      _chart = new Chart(ctx, {type:'line',
-        data:{labels,datasets:[{label:'Tokens',data:tokens,borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,.1)',fill:true}]},
-        options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',maxTicksLimit:8}},y:{ticks:{color:'#8b949e'}}}}});
-    }
-  } catch(e) { console.error('dashboard',e); }
-  // storage
-  try {
-    const st = await get('/api/billing/storage');
-    document.getElementById('storage-info').innerHTML =
-      `DB: <b>${st.db_size_mb} MB</b> · ${st.total_records.toLocaleString()} registros · `+
-      `Free: <b>${st.disk_free_mb.toLocaleString()} MB</b> · Retención: <b>${st.retention_days} dias</b><br>`+
-      `<span style="font-size:11px">${st.db_path}</span>`;
-  } catch(e) {}
-}
-async function purgeLog(){
-  if(!confirm('Purgar registros >30 dias?')) return;
-  const r = await post('/api/billing/purge', {});
-  alert('Purgados: '+r.purged);
-  loadDashboard();
-}
-
-// ── Request Log ────────────────────────────────────────────────────────────
+// ── Request Log ─────────────────────────────────────────────────────────────
 let offset = 0;
-async function loadLog(off){
+async function loadReqLog(off){
   offset = Math.max(0, off||0);
   const client = document.getElementById('log-filter-client').value.trim();
   const model = document.getElementById('log-filter-model').value.trim();
@@ -1089,17 +1066,7 @@ async function loadLog(off){
       const ts = new Date(req.ts*1000).toLocaleString('es',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
       const errCls = req.status_code>=400 ? 'row-err' : '';
       const rat = req.rating>0?'👍':req.rating<0?'👎':'<span class="rating-none">—</span>';
-      return `<tr class="${errCls}">
-        <td style="font-size:11px;color:var(--muted)">${ts}</td>
-        <td>${req.client_id}</td>
-        <td><span class="tag g1">${req.model}</span></td>
-        <td>${(req.prompt_tokens+req.completion_tokens).toLocaleString()}</td>
-        <td>$${req.cost_usd.toFixed(6)}</td>
-        <td>${req.latency_ms}ms</td>
-        <td>${req.status_code}</td>
-        <td>${rat}</td>
-        <td><button onclick="showReq(${req.id})">ver</button></td>
-      </tr>`;
+      return `<tr class="${errCls}"><td style="font-size:11px;color:var(--muted)">${ts}</td><td>${req.client_id}</td><td><span class="tag g1">${req.model}</span></td><td>${(req.prompt_tokens+req.completion_tokens).toLocaleString()}</td><td>$${req.cost_usd.toFixed(6)}</td><td>${req.latency_ms}ms</td><td>${req.status_code}</td><td>${rat}</td><td><button onclick="showReq(${req.id})">ver</button></td></tr>`;
     }).join('');
     document.getElementById('log-body').innerHTML = rows || '<tr><td colspan="9" style="color:var(--muted)">sin resultados</td></tr>';
     document.getElementById('log-page').textContent = `offset ${offset}`;
@@ -1109,11 +1076,7 @@ async function showReq(id){
   try {
     const r = await get(`/api/billing/log/${id}`);
     document.getElementById('md-id').textContent = id;
-    document.getElementById('md-meta').innerHTML =
-      `Cliente: <b>${r.client_id}</b> · Modelo: <b>${r.model}</b> · `+
-      `Tokens: ${r.prompt_tokens}+${r.completion_tokens} · Costo: $${r.cost_usd.toFixed(6)} · `+
-      `Lat: ${r.latency_ms}ms · Status: ${r.status_code} · ${r.stream?'stream':'non-stream'} · `+
-      `Rating: ${r.rating>0?'👍 up':r.rating<0?'👎 down':'—'}`;
+    document.getElementById('md-meta').innerHTML = `Cliente: <b>${r.client_id}</b> · Modelo: <b>${r.model}</b> · Tokens: ${r.prompt_tokens}+${r.completion_tokens} · Costo: $${r.cost_usd.toFixed(6)} · Lat: ${r.latency_ms}ms · Status: ${r.status_code} · ${r.stream?'stream':'non-stream'} · Rating: ${r.rating>0?'👍 up':r.rating<0?'👎 down':'—'}`;
     document.getElementById('md-prompt').textContent = r.prompt || '(vacio)';
     document.getElementById('md-response').textContent = r.response || '(vacio)';
     document.getElementById('req-modal').style.display = 'block';
@@ -1121,37 +1084,19 @@ async function showReq(id){
 }
 async function rateReq(rating){
   const id = document.getElementById('md-id').textContent;
-  await fetch(`/api/billing/log/${id}/rating`, {method:'PUT',
-    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
-    body:JSON.stringify({rating})});
-  showReq(parseInt(id));
-  loadLog(offset);
+  await putJSON(`/api/billing/log/${id}/rating`, {rating});
+  showReq(parseInt(id)); loadReqLog(offset);
 }
 
-// ── Precios y Planes ───────────────────────────────────────────────────────
+// ── Precios y Planes ─────────────────────────────────────────────────────────
 async function loadConfig(){
   try {
     const cfg = await get('/api/billing/config');
-    // precios
     const prices = Object.entries(cfg.prices||{}).map(([m,p])=>
-      `<div class="price-row">
-        <span class="tag g1" style="min-width:80px">${m}</span>
-        <input type="number" step="0.01" value="${p.input}" id="pr-in-${m}" placeholder="in">
-        <input type="number" step="0.01" value="${p.output}" id="pr-out-${m}" placeholder="out">
-        <input type="text" value="${p.unit}" id="pr-unit-${m}" style="width:60px" placeholder="unit">
-        <button class="s" onclick="savePrice('${m}')">guardar</button>
-      </div>`).join('');
+      `<div class="price-row"><span class="tag g1" style="min-width:80px">${m}</span><input type="number" step="0.01" value="${p.input}" id="pr-in-${m}" placeholder="in"><input type="number" step="0.01" value="${p.output}" id="pr-out-${m}" placeholder="out"><input type="text" value="${p.unit}" id="pr-unit-${m}" style="width:60px" placeholder="unit"><button class="s" onclick="savePrice('${m}')">guardar</button></div>`).join('');
     document.getElementById('prices-editor').innerHTML = prices || '<span style="color:var(--muted)">sin modelos</span>';
-    // planes
     const plans = Object.entries(cfg.plans||{}).map(([k,v])=>
-      `<div class="price-row">
-        <span class="tag cpu" style="min-width:80px">${k}</span>
-        <input type="text" value="${v.name}" id="pl-name-${k}" style="width:80px">
-        <input type="number" value="${v.tokens_quota}" id="pl-quota-${k}" placeholder="quota">
-        <input type="number" value="${v.rpm}" id="pl-rpm-${k}" style="width:60px" placeholder="rpm">
-        <button class="s" onclick="savePlan('${k}')">guardar</button>
-        <button class="r" onclick="deletePlan('${k}')">eliminar</button>
-      </div>`).join('');
+      `<div class="price-row"><span class="tag cpu" style="min-width:80px">${k}</span><input type="text" value="${v.name}" id="pl-name-${k}" style="width:80px"><input type="number" value="${v.tokens_quota}" id="pl-quota-${k}" placeholder="quota"><input type="number" value="${v.rpm}" id="pl-rpm-${k}" style="width:60px" placeholder="rpm"><button class="s" onclick="savePlan('${k}')">guardar</button><button class="r" onclick="deletePlan('${k}')">eliminar</button></div>`).join('');
     document.getElementById('plans-editor').innerHTML = plans || '<span style="color:var(--muted)">sin planes</span>';
   } catch(e) { console.error('config',e); }
 }
@@ -1159,21 +1104,13 @@ async function savePrice(model){
   const inp = document.getElementById('pr-in-'+model).value;
   const out = document.getElementById('pr-out-'+model).value;
   const unit = document.getElementById('pr-unit-'+model).value;
-  const r = await fetch('/api/billing/prices', {method:'PUT',
-    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
-    body:JSON.stringify({model, input_price:parseFloat(inp), output_price:parseFloat(out), unit})});
-  const d = await r.json();
-  if(r.ok) alert('Precio actualizado'); else alert('Error: '+JSON.stringify(d));
+  const r = await putJSON('/api/billing/prices', {model, input_price:parseFloat(inp), output_price:parseFloat(out), unit});
+  if(r.ok) alert('Precio actualizado'); else alert('Error: '+JSON.stringify(r.data));
 }
 async function savePlan(plan){
-  const name = document.getElementById('pl-name-'+plan).value;
-  const quota = document.getElementById('pl-quota-'+plan).value;
-  const rpm = document.getElementById('pl-rpm-'+plan).value;
-  const r = await fetch('/api/billing/plans', {method:'PUT',
-    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
-    body:JSON.stringify({plan, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name})});
-  const d = await r.json();
-  if(r.ok) alert('Plan actualizado'); else alert('Error: '+JSON.stringify(d));
+  const name = document.getElementById('pl-name-'+plan).value, quota = document.getElementById('pl-quota-'+plan).value, rpm = document.getElementById('pl-rpm-'+plan).value;
+  const r = await putJSON('/api/billing/plans', {plan, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name});
+  if(r.ok) alert('Plan actualizado'); else alert('Error: '+JSON.stringify(r.data));
 }
 async function deletePlan(plan){
   if(!confirm('Eliminar plan '+plan+'? (solo si no tiene keys)')) return;
@@ -1181,21 +1118,15 @@ async function deletePlan(plan){
   if(r.deleted) loadConfig(); else alert('Error: '+JSON.stringify(r));
 }
 async function createPlan(){
-  const name = document.getElementById('np-name').value.trim();
-  const display = document.getElementById('np-display').value.trim();
-  const quota = document.getElementById('np-quota').value;
-  const rpm = document.getElementById('np-rpm').value;
+  const name = document.getElementById('np-name').value.trim(), display = document.getElementById('np-display').value.trim(), quota = document.getElementById('np-quota').value, rpm = document.getElementById('np-rpm').value;
   if(!name||!quota||!rpm){ alert('Completa todos los campos'); return; }
-  const r = await fetch('/api/billing/plans', {method:'PUT',
-    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
-    body:JSON.stringify({plan:name, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name:display||name})});
-  const d = await r.json();
-  if(r.ok){ document.getElementById('np-name').value=''; loadConfig(); }
-  else alert('Error: '+JSON.stringify(d));
+  const r = await putJSON('/api/billing/plans', {plan:name, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name:display||name});
+  if(r.ok){ document.getElementById('np-name').value=''; loadConfig(); } else alert('Error: '+JSON.stringify(r.data));
 }
-refresh();
-loadBilling();
-setInterval(refresh, 5000);
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+refresh(); loadOverview();
+setInterval(()=>{ refresh(); if(document.getElementById('page-overview').classList.contains('active')) loadOverview(); }, 10000);
 
 </script>
 </body>
