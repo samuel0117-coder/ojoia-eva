@@ -15,6 +15,12 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 
+// P0 (Sección #9): apiFetch ahora detecta 401 y dispara un evento global.
+// Antes: un 401 respondía {"detail":"..."} (JSON válido) y `await r.json()` no throw,
+// pero la UI mostraba "vacío" en lugar de "sesión expirada".
+// Ahora: en 401, limpiamos token + userId y disparamos `ojoia:auth-expired` para que
+// App._handleAuthExpired redirija a login. La promise rechaza para que el caller
+// no siga procesando data corrupta/undefined.
 function apiFetch(url, opts = {}) {
     const headers = { ...opts.headers };
     if (opts.body && typeof opts.body === 'string') {
@@ -25,7 +31,25 @@ function apiFetch(url, opts = {}) {
     if (App.accessToken) {
         headers['Authorization'] = 'Bearer ' + App.accessToken;
     }
-    return fetch(url, { mode: 'cors', ...opts, headers });
+    return fetch(url, { mode: 'cors', ...opts, headers }).then(r => {
+        if (r.status === 401) {
+            // Sesión expirada o token inválido. Limpia y notifica.
+            try {
+                sessionStorage.removeItem('ojoia_token');
+                localStorage.removeItem('ojoia_token');
+                if (typeof App !== 'undefined') {
+                    App.accessToken = null;
+                    App.userId = null;
+                }
+                // Dispara evento; App._handleAuthExpired lo escucha
+                window.dispatchEvent(new CustomEvent('ojoia:auth-expired', {
+                    detail: { url, status: 401 }
+                }));
+            } catch (e) { console.warn('[apiFetch] 401 cleanup error:', e); }
+            throw new Error('Sesión expirada (401)');
+        }
+        return r;
+    });
 }
 
 const App = {
@@ -131,6 +155,33 @@ const App = {
             const el = document.getElementById(id);
             if (el) el.addEventListener('keypress', e => { if (e.key === 'Enter') this.doLogin(); });
         });
+        // P0 (Sección #9): listener global para 401 desde apiFetch.
+        // Dispara una sola redirección a login (evitar storms si hay N requests en paralelo).
+        this._authExpiredHandled = false;
+        window.addEventListener('ojoia:auth-expired', () => {
+            if (this._authExpiredHandled) return;
+            this._authExpiredHandled = true;
+            this._handleAuthExpired();
+        });
+    },
+
+    // P0 (Sección #9): cuando apiFetch detecta 401, ejecuta esto.
+    // Limpia estado, muestra mensaje, y redirige a login.
+    _handleAuthExpired() {
+        console.warn('[App] Sesión expirada — redirigiendo a login');
+        // Cierra el modal de chat por si está abierto
+        try { if (typeof EvaChat !== 'undefined' && EvaChat._teardown) EvaChat._teardown(); } catch(e) {}
+        // Limpia caches de Eva
+        try { sessionStorage.removeItem('ojoia_token'); localStorage.removeItem('ojoia_token'); } catch(e) {}
+        // Firebase signOut para que onAuthStateChanged dispare de nuevo con usuario limpio
+        try { if (firebase && firebase.auth && firebase.auth().currentUser) firebase.auth().signOut(); } catch(e) {}
+        this.accessToken = null;
+        this.userId = null;
+        // Reset flag después de un rato para permitir re-handling
+        setTimeout(() => { this._authExpiredHandled = false; }, 5000);
+        // Redirige a login (la UI de login se mostrará via onAuthStateChanged)
+        this._showLogin();
+        this._err('Tu sesión expiró. Por favor inicia sesión de nuevo.');
     },
 
     _showLogin() {
