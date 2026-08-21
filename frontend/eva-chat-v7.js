@@ -514,9 +514,26 @@ const EvaChat = {
                 let extraHtml = '';
                 
                 if (nextPhase === 'WIZARD_QR' && data.claim_token) {
-                    // Mostrar QR y código
-                    const qrUrl = `https://api.ojoia.com.do/api/claim-qr?token=${data.claim_token}`;
-                    extraHtml = `<div style="margin-top:12px;text-align:center"><div style="background:#fff;padding:12px;border-radius:12px;display:inline-block"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrUrl)}" style="width:200px;height:200px"></div><div style="margin-top:8px;font-weight:600">Código: <span style="font-family:monospace;font-size:1.1rem">${data.claim_token}</span></div><div class="meta">Escanea el QR o escribe el código en el portal del ESP32</div></div>`;
+                    // P0 (Fuga #7.3): QR generado localmente. Antes se llamaba a
+                    // api.qrserver.com pasando el claim_token por URL — el secret de
+                    // pairing ESP32 se filtraba a un servicio externo via HTTP.
+                    // Usar qrcodejs (cargado desde CDN en index.html) que genera un
+                    // canvas en el DOM sin ninguna request externa.
+                    const qrUrl = `https://api.ojoia.com.do/api/claim-qr?token=${encodeURIComponent(data.claim_token)}`;
+                    const qrContainerId = `qr-box-${Date.now()}`;
+                    extraHtml = `<div style="margin-top:12px;text-align:center"><div id="${qrContainerId}" style="background:#fff;padding:12px;border-radius:12px;display:inline-block"></div><div style="margin-top:8px;font-weight:600">Código: <span style="font-family:monospace;font-size:1.1rem">${data.claim_token}</span></div><div class="meta">Escanea el QR o escribe el código en el portal del ESP32</div></div>`;
+                    // El QRCode se renderiza post-injection del HTML. setTimeout(0)
+                    // asegura que el DOM ya tiene el contenedor.
+                    setTimeout(() => {
+                        const el = document.getElementById(qrContainerId);
+                        if (el && typeof QRCode !== 'undefined') {
+                            try {
+                                new QRCode(el, { text: qrUrl, width: 200, height: 200,
+                                    colorDark: '#000000', colorLight: '#ffffff',
+                                    correctLevel: QRCode.CorrectLevel.H });
+                            } catch (e) { console.error('QR local fallo:', e); }
+                        }
+                    }, 0);
                 }
                 
                 if (nextPhase === 'WIZARD_ZONES_DRAW' && camId) {
