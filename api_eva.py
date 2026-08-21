@@ -2381,9 +2381,34 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
             logger.exception(f"[EVA] handle_eva_v2 falló: {e1}")
             logger.error(f"[EVA] TRACEBACK: {traceback.format_exc()}")
             from eva_v2 import _make_os_session, _load_session, _mk_resp as _eva_mk_resp
-            session = _load_session(session_id)
-            if not session or session.get("user_id") != user_id:
-                session = _make_os_session(user_id, session_id)
+            # P0 (Bug #1): _load_session PUEDE retornar None si user.json está
+            # corrupto/ausente o si la sesión en disco falla el parseo. Antes
+            # pasábamos `session` (potencialmente None) a _eva_mk_resp, que
+            # entonces crasheaba con TypeError: 'NoneType' object does not
+            # support item assignment en eva_v2._mk_resp (session["image_url"]).
+            # Ahora garantizamos que `session` SIEMPRE sea un dict válido.
+            session = None
+            try:
+                session = _load_session(session_id)
+            except Exception as e_ls:
+                logger.error(f"[EVA] _load_session falló en fallback: {e_ls}")
+                session = None
+            if not isinstance(session, dict) or (session and session.get("user_id") != user_id):
+                try:
+                    session = _make_os_session(user_id, session_id)
+                except Exception as e_mk:
+                    logger.error(f"[EVA] _make_os_session falló en fallback: {e_mk}")
+                    session = None
+            if not isinstance(session, dict) or not session:
+                # Última barrera: sesión sintética mínima. NO usar None.
+                session = {
+                    "session_id": session_id, "user_id": user_id, "phase": "os",
+                    "owner_name": "amigo", "msgs": [],
+                    "image_b64": "", "image_url": "", "image_sent": True,
+                    "last_event_id": None, "last_event_camera_id": "",
+                    "zone": "", "has_image": False, "camera_id": "",
+                    "business_name": "", "business_type": "", "owner": "",
+                }
             try:
                 from eva_v2 import _sessions
                 _sessions[session_id] = session
@@ -2391,7 +2416,7 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
                 pass
             result = _eva_mk_resp(
                 session,
-                f"Lo siento {user_id[:8]}, tuve un problema técnico procesando eso. Intenta reformularlo, por favor.",
+                f"Lo siento, tuve un problema técnico procesando eso. Intenta reformularlo, por favor.",
                 suggestions=["Qué ha pasado hoy", "Cuántas personas han venido hoy", "Muéstrame el pico"]
             )
             result["sessionId"] = session_id

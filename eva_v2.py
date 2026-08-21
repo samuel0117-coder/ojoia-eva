@@ -3794,6 +3794,18 @@ async def _extract_business_data(user_id, message, session):
 # =============================================================================
 
 def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=False, suggestions=None, force_image=False, events_found=None, heatmap=None, heatmap_meta=None):
+    # P0 (Bug #1): Guard centralizado. _load_session puede retornar None (era
+    # la causa original de "NoneType object does not support item assignment").
+    # Sin este guard, cualquier llamador que pase session=None crashea aquí.
+    if not isinstance(session, dict):
+        logger.error("[_mk_resp] session no es dict: %r — devolviendo resp segura", type(session).__name__)
+        return {
+            "success": False, "error": "Sesión inválida. Escribe «Quiero instalar una cámara nueva» para empezar de nuevo.",
+            "response": text, "image_url": "", "session_id": "", "phase": "os",
+            "zone": "", "has_image": False, "ready_to_confirm": False,
+            "camera_saved": False, "suggestions": suggestions or [],
+            "events_found": events_found or [], "heatmap": None, "heatmap_meta": None,
+        }
     img_url = ""
     # v16: force_image=True significa que el usuario pidió ver la imagen otra vez.
     # Usamos el image_url ya guardado en la session (relativo /eva-frame/...)
