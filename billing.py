@@ -48,8 +48,8 @@ REDIS_URL = os.environ.get(
     "redis://:hq1V4pQr1c99AWYYAIGBnCu7695jL75@127.0.0.1:6379/0",
 )
 
-# Precios por 1M tokens (USD)
-MODEL_PRICES = {
+# Precios por 1M tokens (USD) — defaults (se sobreescriben con Redis si existen)
+DEFAULT_MODEL_PRICES = {
     "qwen7b": {"input": 0.30, "output": 0.50, "unit": "tokens"},
     "qwen9b": {"input": 1.50, "output": 2.00, "unit": "tokens"},
     "qwen35b": {"input": 8.00, "output": 10.00, "unit": "tokens"},
@@ -57,13 +57,17 @@ MODEL_PRICES = {
     "yolo":    {"input": 0.05, "output": 0.05, "unit": "images"},
 }
 
-# Planes: tokens mensuales incluidos
-PLANS = {
+# Planes: tokens mensuales incluidos — defaults
+DEFAULT_PLANS = {
     "free":       {"tokens_quota": 1_000_000,    "rpm": 60,  "name": "Free"},
     "dev":        {"tokens_quota": 10_000_000,   "rpm": 300, "name": "Developer"},
     "pro":        {"tokens_quota": 100_000_000,  "rpm": 1000,"name": "Pro"},
     "enterprise": {"tokens_quota": 1_000_000_000, "rpm": 5000,"name": "Enterprise"},
 }
+
+# réféncias vivas (cargadas desde Redis o defaults) — usadas por todo el sistema
+MODEL_PRICES = dict(DEFAULT_MODEL_PRICES)
+PLANS = dict(DEFAULT_PLANS)
 
 REDIS_PREFIX = "ojoia_billing"
 
@@ -77,6 +81,66 @@ class BillingStore:
         if not HAS_REDIS:
             raise RuntimeError("redis module not installed")
         self.r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        self._load_config()
+
+    def _load_config(self):
+        """Carga precios y planes desde Redis (si existen), sino usa defaults."""
+        global MODEL_PRICES, PLANS
+        try:
+            raw_prices = self.r.get(f"{REDIS_PREFIX}:config:prices")
+            if raw_prices:
+                MODEL_PRICES.clear()
+                MODEL_PRICES.update(json.loads(raw_prices))
+            raw_plans = self.r.get(f"{REDIS_PREFIX}:config:plans")
+            if raw_plans:
+                PLANS.clear()
+                PLANS.update(json.loads(raw_plans))
+        except Exception:
+            pass
+
+    # ── Configuracion editable en caliente ──────────────────────────────────
+
+    def get_config(self) -> dict:
+        """Retorna precios y planes actuales (live)."""
+        self._load_config()
+        return {"prices": MODEL_PRICES, "plans": PLANS}
+
+    def update_price(self, model: str, input_price: float,
+                     output_price: float, unit: str = "tokens") -> dict:
+        """Actualiza el precio de un modelo (live, persiste en Redis)."""
+        global MODEL_PRICES
+        MODEL_PRICES[model] = {"input": float(input_price),
+                               "output": float(output_price),
+                               "unit": unit}
+        self.r.set(f"{REDIS_PREFIX}:config:prices", json.dumps(MODEL_PRICES))
+        return MODEL_PRICES[model]
+
+    def update_plan(self, plan: str, tokens_quota: int,
+                    rpm: int, name: str = "") -> dict:
+        """Actualiza un plan (live, persiste en Redis). Crea si no existe."""
+        global PLANS
+        if not name:
+            name = PLANS.get(plan, {}).get("name", plan.capitalize())
+        PLANS[plan] = {"tokens_quota": int(tokens_quota), "rpm": int(rpm),
+                       "name": name}
+        self.r.set(f"{REDIS_PREFIX}:config:plans", json.dumps(PLANS))
+        return PLANS[plan]
+
+    def delete_plan(self, plan: str) -> bool:
+        """Elimina un plan (no se puede eliminar si hay keys que lo usan)."""
+        global PLANS
+        if plan not in PLANS:
+            return False
+        # Verificar que no haya keys con ese plan
+        for k in self.r.scan_iter(match=f"{REDIS_PREFIX}:apikey:*"):
+            raw = self.r.get(k)
+            if raw:
+                rec = json.loads(raw)
+                if rec.get("plan") == plan:
+                    return False
+        del PLANS[plan]
+        self.r.set(f"{REDIS_PREFIX}:config:plans", json.dumps(PLANS))
+        return True
 
     @classmethod
     def instance(cls) -> "BillingStore":

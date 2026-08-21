@@ -37,6 +37,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 import httpx
 from billing import BillingStore
+from billing_log import (get_requests, get_request_detail, set_rating,
+                          get_stats, get_storage_info, purge_old)
 
 app = FastAPI(title="OjoIA Server Megapanel", version="1.1")
 
@@ -399,6 +401,28 @@ class RevokeCmd(BaseModel):
     key: str
 
 
+class PriceCmd(BaseModel):
+    model: str
+    input_price: float
+    output_price: float
+    unit: str = "tokens"
+
+
+class PlanCmd(BaseModel):
+    plan: str
+    tokens_quota: int
+    rpm: int
+    name: str = ""
+
+
+class RatingCmd(BaseModel):
+    rating: int  # 1=up, -1=down, 0=neutral
+
+
+class PlanDeleteCmd(BaseModel):
+    plan: str
+
+
 _billing = None
 try:
     _billing = BillingStore.instance()
@@ -451,6 +475,95 @@ async def admin_revoke_key(cmd: RevokeCmd):
         return JSONResponse({"error": "billing no disponible"}, status_code=503)
     ok = _billing.revoke_key(cmd.key)
     return {"revoked": ok}
+
+
+# ─── Billing config: precios y planes editables en caliente ─────────────────
+
+@app.get("/api/billing/config")
+async def billing_config():
+    """Retorna precios y planes actuales (live)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    return _billing.get_config()
+
+
+@app.put("/api/billing/prices")
+async def billing_update_price(cmd: PriceCmd):
+    """Actualiza el precio de un modelo (live)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    return {"updated": _billing.update_price(
+        cmd.model, cmd.input_price, cmd.output_price, cmd.unit)}
+
+
+@app.put("/api/billing/plans")
+async def billing_update_plan(cmd: PlanCmd):
+    """Actualiza o crea un plan (live)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    return {"updated": _billing.update_plan(
+        cmd.plan, cmd.tokens_quota, cmd.rpm, cmd.name)}
+
+
+@app.post("/api/billing/plans/delete")
+async def billing_delete_plan(cmd: PlanDeleteCmd):
+    """Elimina un plan (si no tiene keys asignadas)."""
+    if not _billing:
+        return JSONResponse({"error": "billing no disponible"}, status_code=503)
+    ok = _billing.delete_plan(cmd.plan)
+    if not ok:
+        return JSONResponse({"error": "no se pudo eliminar (tiene keys o no existe)"},
+                            status_code=400)
+    return {"deleted": True}
+
+
+# ─── Request log (SQLite) ───────────────────────────────────────────────────
+
+@app.get("/api/billing/log")
+async def billing_log(limit: int = 50, offset: int = 0,
+                      client_id: str = "", model: str = "",
+                      only_errors: bool = False, min_cost: float = 0.0):
+    """Lista requests del log con filtros."""
+    return {"requests": get_requests(
+        limit=limit, offset=offset, client_id=client_id, model=model,
+        only_errors=only_errors, min_cost=min_cost)}
+
+
+@app.get("/api/billing/log/{request_id}")
+async def billing_log_detail(request_id: int):
+    """Detalle de un request (prompt + response completos)."""
+    d = get_request_detail(request_id)
+    if not d:
+        return JSONResponse({"error": "request no encontrado"}, status_code=404)
+    return d
+
+
+@app.put("/api/billing/log/{request_id}/rating")
+async def billing_log_rating(request_id: int, cmd: RatingCmd):
+    """Setea el rating de un request (1=up, -1=down, 0=neutral)."""
+    ok = set_rating(request_id, cmd.rating)
+    return {"updated": ok}
+
+
+# ─── Stats y storage ────────────────────────────────────────────────────────
+
+@app.get("/api/billing/stats")
+async def billing_stats(hours: int = 24):
+    """Estadisticas agregadas para el dashboard."""
+    return get_stats(hours)
+
+
+@app.get("/api/billing/storage")
+async def billing_storage():
+    """Info de almacenamiento del log SQLite."""
+    return get_storage_info()
+
+
+@app.post("/api/billing/purge")
+async def billing_purge():
+    """Purge manual del log (registros >retention_days)."""
+    n = purge_old()
+    return {"purged": n, "storage": get_storage_info()}
 
 @app.get("/", response_class=HTMLResponse)
 async def ui():
@@ -515,7 +628,19 @@ input { background: var(--border); color: var(--text); border:0; padding:6px; bo
 .usage-bar > div { height: 100%; background: linear-gradient(90deg, var(--blue), var(--purple)); }
 .key-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
 .copy-btn { font-size: 10px; padding: 2px 6px; }
+.tab-btn { background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+.tab-btn.active { background: var(--blue); color: #00264d; border-color: var(--blue); font-weight: 600; }
+.tab-btn:hover { border-color: var(--blue); }
+.kpi { font-size: 26px; font-weight: 700; color: var(--blue); }
+#log-table { font-size: 12px; }
+#log-table td, #log-table th { padding: 5px 8px; }
+.row-err { color: var(--red); }
+.rating-up { color: var(--green); } .rating-down { color: var(--red); } .rating-none { color: var(--muted); }
+.price-row { display:flex; gap:6px; align-items:center; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; }
+.price-row input { width: 70px; }
+canvas { max-width: 100%; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
 <body>
 <header>
@@ -560,32 +685,143 @@ input { background: var(--border); color: var(--text); border:0; padding:6px; bo
 
   <div class="card billing-card">
     <h2>Billing & API Gateway</h2>
-    <div style="margin-bottom:12px">
-      <button onclick="loadBilling()">⟳ Actualizar uso</button>
-      <button onclick="showCreateKey()">+ Crear API Key</button>
+    <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
+      <button class="tab-btn" data-tab="clients" onclick="switchTab('clients')">👥 Clientes</button>
+      <button class="tab-btn" data-tab="log" onclick="switchTab('log')">📋 Request Log</button>
+      <button class="tab-btn" data-tab="prices" onclick="switchTab('prices')">💳 Precios y Planes</button>
     </div>
-    <div id="key-create" style="display:none; margin-bottom:12px; padding:10px; border:1px solid var(--border); border-radius:6px">
-      <input id="kc-client" placeholder="client_id (ej: acme_corp)" style="width:30%">
-      <input id="kc-label" placeholder="label (ej: produccion)" style="width:25%">
-      <select id="kc-plan" style="background:var(--border);color:var(--text);border:0;padding:6px;border-radius:4px">
-        <option value="free">free (1M tok/mes)</option>
-        <option value="dev">dev (10M tok/mes)</option>
-        <option value="pro">pro (100M tok/mes)</option>
-        <option value="enterprise">enterprise (1B tok/mes)</option>
-      </select>
-      <button class="s" onclick="createKey()">Crear</button>
-      <button onclick="document.getElementById('key-create').style.display='none'">Cancelar</button>
-      <div id="kc-result" style="margin-top:8px;font-size:12px;color:var(--green)"></div>
+
+    <div id="tab-dashboard" class="billing-tab">
+      <div style="margin-bottom:12px">
+        <button onclick="loadDashboard()">⟳ Actualizar</button>
+        <select id="dash-hours" onchange="loadDashboard()" style="background:var(--border);color:var(--text);border:0;padding:6px;border-radius:4px">
+          <option value="1">1h</option>
+          <option value="6">6h</option>
+          <option value="24" selected>24h</option>
+          <option value="168">7d</option>
+          <option value="720">30d</option>
+        </select>
+      </div>
+      <div class="billing-grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:12px">
+        <div class="card" style="padding:12px;text-align:center">
+          <div class="kpi" id="kpi-reqs">0</div><div style="font-size:11px;color:var(--muted)">Requests</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div class="kpi" id="kpi-tokens">0</div><div style="font-size:11px;color:var(--muted)">Tokens</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div class="kpi" id="kpi-cost">$0</div><div style="font-size:11px;color:var(--muted)">Costo</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div class="kpi" id="kpi-lat">0ms</div><div style="font-size:11px;color:var(--muted)">Lat avg</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div class="kpi" id="kpi-err">0</div><div style="font-size:11px;color:var(--muted)">Errores</div>
+        </div>
+        <div class="card" style="padding:12px;text-align:center">
+          <div class="kpi" id="kpi-rating">—</div><div style="font-size:11px;color:var(--muted)">👍/👎</div>
+        </div>
+      </div>
+      <div class="billing-grid">
+        <div class="card"><h3 style="font-size:12px;color:var(--muted)">Uso por hora (tokens)</h3><canvas id="chart-hours" height="120"></canvas></div>
+        <div class="card"><h3 style="font-size:12px;color:var(--muted)">Tokens por modelo</h3><div id="by-model"></div></div>
+        <div class="card"><h3 style="font-size:12px;color:var(--muted)">Tokens por cliente</h3><div id="by-client"></div></div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h3 style="font-size:12px;color:var(--muted)">Almacenamiento del log</h3>
+        <div id="storage-info" style="font-size:12px;color:var(--muted)"></div>
+        <button class="r" style="margin-top:8px" onclick="purgeLog()">🗑 Purge manual (>30 dias)</button>
+      </div>
     </div>
-    <div class="billing-grid">
-      <div>
-        <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">Clientes (uso mensual)</h3>
-        <div id="billing-clients"></div>
+
+    <div id="tab-clients" class="billing-tab" style="display:none">
+      <div style="margin-bottom:12px">
+        <button onclick="loadBilling()">⟳ Actualizar uso</button>
+        <button onclick="showCreateKey()">+ Crear API Key</button>
       </div>
-      <div>
-        <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">API Keys</h3>
-        <div id="billing-keys"></div>
+      <div id="key-create" style="display:none; margin-bottom:12px; padding:10px; border:1px solid var(--border); border-radius:6px">
+        <input id="kc-client" placeholder="client_id (ej: acme_corp)" style="width:30%">
+        <input id="kc-label" placeholder="label (ej: produccion)" style="width:25%">
+        <select id="kc-plan" style="background:var(--border);color:var(--text);border:0;padding:6px;border-radius:4px">
+          <option value="free">free (1M tok/mes)</option>
+          <option value="dev">dev (10M tok/mes)</option>
+          <option value="pro">pro (100M tok/mes)</option>
+          <option value="enterprise">enterprise (1B tok/mes)</option>
+        </select>
+        <button class="s" onclick="createKey()">Crear</button>
+        <button onclick="document.getElementById('key-create').style.display='none'">Cancelar</button>
+        <div id="kc-result" style="margin-top:8px;font-size:12px;color:var(--green)"></div>
       </div>
+      <div class="billing-grid">
+        <div>
+          <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">Clientes (uso mensual)</h3>
+          <div id="billing-clients"></div>
+        </div>
+        <div>
+          <h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">API Keys</h3>
+          <div id="billing-keys"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-log" class="billing-tab" style="display:none">
+      <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <input id="log-filter-client" placeholder="cliente" style="width:15%">
+        <input id="log-filter-model" placeholder="modelo" style="width:15%">
+        <label style="font-size:13px;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="log-filter-errors"> Solo errores
+        </label>
+        <button onclick="loadLog(0)">Buscar</button>
+        <button onclick="loadLog(offset-50)">← Anterior</button>
+        <button onclick="loadLog(offset+50)">Siguiente →</button>
+        <span id="log-page" style="font-size:12px;color:var(--muted);align-self:center"></span>
+      </div>
+      <table id="log-table">
+        <thead><tr><th>Hora</th><th>Cliente</th><th>Modelo</th><th>Tokens</th><th>Costo</th><th>Lat</th><th>Status</th><th>Rating</th><th></th></tr></thead>
+        <tbody id="log-body"></tbody>
+      </table>
+    </div>
+
+    <div id="tab-prices" class="billing-tab" style="display:none">
+      <div style="margin-bottom:12px"><button onclick="loadConfig()">⟳ Recargar</button></div>
+      <div class="billing-grid">
+        <div>
+          <h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Precios por modelo (por 1M tokens)</h3>
+          <div id="prices-editor"></div>
+        </div>
+        <div>
+          <h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Planes</h3>
+          <div id="plans-editor"></div>
+          <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px">
+            <h3 style="font-size:11px;color:var(--muted)">Nuevo plan</h3>
+            <input id="np-name" placeholder="plan (ej: trial)" style="width:20%">
+            <input id="np-display" placeholder="display" style="width:20%">
+            <input id="np-quota" type="number" placeholder="quota tokens" style="width:20%">
+            <input id="np-rpm" type="number" placeholder="rpm" style="width:10%">
+            <button class="s" onclick="createPlan()">+ Crear plan</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal de detalle de request -->
+  <div id="req-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100;padding:40px">
+    <div class="card" style="max-width:800px;margin:0 auto;max-height:80vh;overflow:auto">
+      <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+        <h2 style="margin:0">Request #<span id="md-id"></span></h2>
+        <div>
+          <button class="s" onclick="rateReq(1)">👍 Up</button>
+          <button class="r" onclick="rateReq(-1)">👎 Down</button>
+          <button onclick="document.getElementById('req-modal').style.display='none'">✕ Cerrar</button>
+        </div>
+      </div>
+      <div id="md-meta" style="font-size:12px;color:var(--muted);margin-bottom:12px"></div>
+      <h3 style="font-size:12px;color:var(--muted)">Prompt</h3>
+      <div id="md-prompt" class="log" style="white-space:pre-wrap;margin-bottom:12px"></div>
+      <h3 style="font-size:12px;color:var(--muted)">Response</h3>
+      <div id="md-response" class="log" style="white-space:pre-wrap"></div>
     </div>
   </div>
 
@@ -731,6 +967,15 @@ async function revokeKey(key){
   loadBilling();
 }
 async function loadBilling(){
+  // Cargar plans dinamicamente en el select
+  try {
+    const cfg = await get('/api/billing/config');
+    const sel = document.getElementById('kc-plan');
+    if(sel && cfg.plans){
+      sel.innerHTML = Object.entries(cfg.plans).map(([k,v])=>
+        `<option value="${k}">${k} (${(v.tokens_quota/1e6).toFixed(0)}M tok/mes)</option>`).join('');
+    }
+  } catch(e) {}
   // Clientes
   try {
     const c = await get('/api/billing/clients');
@@ -743,7 +988,7 @@ async function loadBilling(){
         <div><b>${cl.client_id}</b> <span class="tag cpu">${cl.plan}</span></div>
         <div style="font-size:12px;color:var(--muted)">${cl.tokens.toLocaleString()} tokens · $${cl.cost_usd.toFixed(4)} · ${cl.requests} reqs</div>
         <div class="usage-bar"><div style="width:${Math.min(100,pctUsed)}%"></div></div>
-        <div style="font-size:11px;color:var(--muted)">${pctUsed}% de ${(q.tokens_quota||0).toLocaleString()} tok · ${((q.tokens_remaining||0)).toLocaleString()} libres</div>
+        <div style="font-size:11px;color:var(--muted)">${pctUsed.toFixed(1)}% de ${(q.tokens_quota||0).toLocaleString()} tok · ${(q.tokens_remaining||0).toLocaleString()} libres</div>
         <div style="margin-top:4px">${models}</div>
       </div>`;
     }).join('') || '<span style="color:var(--muted)">Sin clientes con uso</span>';
@@ -762,6 +1007,191 @@ async function loadBilling(){
       </div>`).join('') || '<span style="color:var(--muted)">Sin keys</span>';
     document.getElementById('billing-keys').innerHTML = html;
   } catch(e) { document.getElementById('billing-keys').innerHTML = '<span style="color:var(--red)">Error</span>'; }
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────
+function switchTab(name){
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelector(`[data-tab="${name}"]`).classList.add('active');
+  document.querySelectorAll('.billing-tab').forEach(t=>t.style.display='none');
+  document.getElementById('tab-'+name).style.display='block';
+  if(name==='dashboard') loadDashboard();
+  if(name==='clients') loadBilling();
+  if(name==='log') loadLog(0);
+  if(name==='prices') loadConfig();
+}
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
+let _chart = null;
+async function loadDashboard(){
+  const h = parseInt(document.getElementById('dash-hours').value);
+  try {
+    const s = await get('/api/billing/stats?hours='+h);
+    document.getElementById('kpi-reqs').textContent = (s.total_requests||0).toLocaleString();
+    document.getElementById('kpi-tokens').textContent = (s.total_tokens||0).toLocaleString();
+    document.getElementById('kpi-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
+    document.getElementById('kpi-lat').textContent = (s.avg_latency_ms||0)+'ms';
+    document.getElementById('kpi-err').textContent = (s.errors||0);
+    document.getElementById('kpi-rating').textContent = `${s.up_votes||0}/${s.down_votes||0}`;
+    // by model
+    const byM = Object.entries(s.by_model||{}).map(([m,v])=>
+      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+        <span><span class="tag g1">${m}</span></span>
+        <span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
+    document.getElementById('by-model').innerHTML = byM || '<span style="color:var(--muted)">sin datos</span>';
+    // by client
+    const byC = Object.entries(s.by_client||{}).map(([c,v])=>
+      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+        <span><b>${c}</b></span>
+        <span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
+    document.getElementById('by-client').innerHTML = byC || '<span style="color:var(--muted)">sin datos</span>';
+    // chart horario
+    const labels = (s.hourly||[]).map(h=>new Date(h.ts*1000).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}));
+    const tokens = (s.hourly||[]).map(h=>h.tokens);
+    if(_chart) _chart.destroy();
+    const ctx = document.getElementById('chart-hours');
+    if(ctx && labels.length){
+      _chart = new Chart(ctx, {type:'line',
+        data:{labels,datasets:[{label:'Tokens',data:tokens,borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,.1)',fill:true}]},
+        options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',maxTicksLimit:8}},y:{ticks:{color:'#8b949e'}}}}});
+    }
+  } catch(e) { console.error('dashboard',e); }
+  // storage
+  try {
+    const st = await get('/api/billing/storage');
+    document.getElementById('storage-info').innerHTML =
+      `DB: <b>${st.db_size_mb} MB</b> · ${st.total_records.toLocaleString()} registros · `+
+      `Free: <b>${st.disk_free_mb.toLocaleString()} MB</b> · Retención: <b>${st.retention_days} dias</b><br>`+
+      `<span style="font-size:11px">${st.db_path}</span>`;
+  } catch(e) {}
+}
+async function purgeLog(){
+  if(!confirm('Purgar registros >30 dias?')) return;
+  const r = await post('/api/billing/purge', {});
+  alert('Purgados: '+r.purged);
+  loadDashboard();
+}
+
+// ── Request Log ────────────────────────────────────────────────────────────
+let offset = 0;
+async function loadLog(off){
+  offset = Math.max(0, off||0);
+  const client = document.getElementById('log-filter-client').value.trim();
+  const model = document.getElementById('log-filter-model').value.trim();
+  const errors = document.getElementById('log-filter-errors').checked;
+  let url = `/api/billing/log?limit=50&offset=${offset}`;
+  if(client) url += `&client_id=${encodeURIComponent(client)}`;
+  if(model) url += `&model=${encodeURIComponent(model)}`;
+  if(errors) url += `&only_errors=true`;
+  try {
+    const r = await get(url);
+    const rows = (r.requests||[]).map(req=>{
+      const ts = new Date(req.ts*1000).toLocaleString('es',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+      const errCls = req.status_code>=400 ? 'row-err' : '';
+      const rat = req.rating>0?'👍':req.rating<0?'👎':'<span class="rating-none">—</span>';
+      return `<tr class="${errCls}">
+        <td style="font-size:11px;color:var(--muted)">${ts}</td>
+        <td>${req.client_id}</td>
+        <td><span class="tag g1">${req.model}</span></td>
+        <td>${(req.prompt_tokens+req.completion_tokens).toLocaleString()}</td>
+        <td>$${req.cost_usd.toFixed(6)}</td>
+        <td>${req.latency_ms}ms</td>
+        <td>${req.status_code}</td>
+        <td>${rat}</td>
+        <td><button onclick="showReq(${req.id})">ver</button></td>
+      </tr>`;
+    }).join('');
+    document.getElementById('log-body').innerHTML = rows || '<tr><td colspan="9" style="color:var(--muted)">sin resultados</td></tr>';
+    document.getElementById('log-page').textContent = `offset ${offset}`;
+  } catch(e) { console.error('log',e); }
+}
+async function showReq(id){
+  try {
+    const r = await get(`/api/billing/log/${id}`);
+    document.getElementById('md-id').textContent = id;
+    document.getElementById('md-meta').innerHTML =
+      `Cliente: <b>${r.client_id}</b> · Modelo: <b>${r.model}</b> · `+
+      `Tokens: ${r.prompt_tokens}+${r.completion_tokens} · Costo: $${r.cost_usd.toFixed(6)} · `+
+      `Lat: ${r.latency_ms}ms · Status: ${r.status_code} · ${r.stream?'stream':'non-stream'} · `+
+      `Rating: ${r.rating>0?'👍 up':r.rating<0?'👎 down':'—'}`;
+    document.getElementById('md-prompt').textContent = r.prompt || '(vacio)';
+    document.getElementById('md-response').textContent = r.response || '(vacio)';
+    document.getElementById('req-modal').style.display = 'block';
+  } catch(e) { console.error('showReq',e); }
+}
+async function rateReq(rating){
+  const id = document.getElementById('md-id').textContent;
+  await fetch(`/api/billing/log/${id}/rating`, {method:'PUT',
+    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
+    body:JSON.stringify({rating})});
+  showReq(parseInt(id));
+  loadLog(offset);
+}
+
+// ── Precios y Planes ───────────────────────────────────────────────────────
+async function loadConfig(){
+  try {
+    const cfg = await get('/api/billing/config');
+    // precios
+    const prices = Object.entries(cfg.prices||{}).map(([m,p])=>
+      `<div class="price-row">
+        <span class="tag g1" style="min-width:80px">${m}</span>
+        <input type="number" step="0.01" value="${p.input}" id="pr-in-${m}" placeholder="in">
+        <input type="number" step="0.01" value="${p.output}" id="pr-out-${m}" placeholder="out">
+        <input type="text" value="${p.unit}" id="pr-unit-${m}" style="width:60px" placeholder="unit">
+        <button class="s" onclick="savePrice('${m}')">guardar</button>
+      </div>`).join('');
+    document.getElementById('prices-editor').innerHTML = prices || '<span style="color:var(--muted)">sin modelos</span>';
+    // planes
+    const plans = Object.entries(cfg.plans||{}).map(([k,v])=>
+      `<div class="price-row">
+        <span class="tag cpu" style="min-width:80px">${k}</span>
+        <input type="text" value="${v.name}" id="pl-name-${k}" style="width:80px">
+        <input type="number" value="${v.tokens_quota}" id="pl-quota-${k}" placeholder="quota">
+        <input type="number" value="${v.rpm}" id="pl-rpm-${k}" style="width:60px" placeholder="rpm">
+        <button class="s" onclick="savePlan('${k}')">guardar</button>
+        <button class="r" onclick="deletePlan('${k}')">eliminar</button>
+      </div>`).join('');
+    document.getElementById('plans-editor').innerHTML = plans || '<span style="color:var(--muted)">sin planes</span>';
+  } catch(e) { console.error('config',e); }
+}
+async function savePrice(model){
+  const inp = document.getElementById('pr-in-'+model).value;
+  const out = document.getElementById('pr-out-'+model).value;
+  const unit = document.getElementById('pr-unit-'+model).value;
+  const r = await fetch('/api/billing/prices', {method:'PUT',
+    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
+    body:JSON.stringify({model, input_price:parseFloat(inp), output_price:parseFloat(out), unit})});
+  const d = await r.json();
+  if(r.ok) alert('Precio actualizado'); else alert('Error: '+JSON.stringify(d));
+}
+async function savePlan(plan){
+  const name = document.getElementById('pl-name-'+plan).value;
+  const quota = document.getElementById('pl-quota-'+plan).value;
+  const rpm = document.getElementById('pl-rpm-'+plan).value;
+  const r = await fetch('/api/billing/plans', {method:'PUT',
+    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
+    body:JSON.stringify({plan, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name})});
+  const d = await r.json();
+  if(r.ok) alert('Plan actualizado'); else alert('Error: '+JSON.stringify(d));
+}
+async function deletePlan(plan){
+  if(!confirm('Eliminar plan '+plan+'? (solo si no tiene keys)')) return;
+  const r = await post('/api/billing/plans/delete', {plan});
+  if(r.deleted) loadConfig(); else alert('Error: '+JSON.stringify(r));
+}
+async function createPlan(){
+  const name = document.getElementById('np-name').value.trim();
+  const display = document.getElementById('np-display').value.trim();
+  const quota = document.getElementById('np-quota').value;
+  const rpm = document.getElementById('np-rpm').value;
+  if(!name||!quota||!rpm){ alert('Completa todos los campos'); return; }
+  const r = await fetch('/api/billing/plans', {method:'PUT',
+    headers:{'Content-Type':'application/json',...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{})},
+    body:JSON.stringify({plan:name, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name:display||name})});
+  const d = await r.json();
+  if(r.ok){ document.getElementById('np-name').value=''; loadConfig(); }
+  else alert('Error: '+JSON.stringify(d));
 }
 refresh();
 loadBilling();
