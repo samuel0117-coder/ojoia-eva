@@ -140,6 +140,13 @@ const EvaChat = {
             try { window.removeEventListener('storage', this._storageHandler); } catch (e) {}
             this._storageHandler = null;
         }
+        // P0 (Bug #3): remove el listener visibilitychange que _startRemoteSync
+        // agrego. Sin esto, cada logout/login acumula un handler sobre el
+        // document, disparando N polls paralelos cada 10s.
+        if (this._visibilityHandler) {
+            try { document.removeEventListener('visibilitychange', this._visibilityHandler); } catch (e) {}
+            this._visibilityHandler = null;
+        }
         if (this._remoteSyncInterval) {
             clearInterval(this._remoteSyncInterval);
             this._remoteSyncInterval = null;
@@ -1172,11 +1179,19 @@ const EvaChat = {
         // Polling cada 10s
         this._remoteSyncInterval = setInterval(poll, 10000);
         // Poll inmediato cuando la pestana vuelve a ser visible
-        document.addEventListener('visibilitychange', () => {
+        // P0 (Bug #3): guardar la referencia al handler para poder removerlo
+        // en teardown(). Antes se hacia addEventListener con una closure nueva
+        // en cada init() y nunca se removia => tras logout/login habia N
+        // handlers disparandose en paralelo, cada uno llamando poll().
+        if (this._visibilityHandler) {
+            try { document.removeEventListener('visibilitychange', this._visibilityHandler); } catch (e) {}
+        }
+        this._visibilityHandler = () => {
             if (document.visibilityState === 'visible') {
                 setTimeout(poll, 300);
             }
-        });
+        };
+        document.addEventListener('visibilitychange', this._visibilityHandler);
     },
 
     _saveConversation() {
