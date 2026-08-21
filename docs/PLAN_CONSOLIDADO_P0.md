@@ -413,9 +413,9 @@ Items que estaban pendientes en planes anteriores y SÍ necesitan acción (los q
 10. ✅ Sección #9 — apiFetch 401 handler — commit `eff8a4a`
 
 ### Sprint 3 — "Mejor diagnóstico" (opcional, 1 día)
-11. ⏳ Sección #8 — 8-10 `except pass` → loggeo — 2h
-12. ⏳ B5 — cron de cleanup_frames.py — 10 min
-13. ✅ T1 — edge-ip-version 4 — 5 min
+11. ✅ Sección #8 — 12 except pass backend + 15 catch vacíos frontend → loggeo — commit `21c6ef4`
+12. ✅ B5 — cron de cleanup_frames.py (diario 3 AM) — commit `21c6ef4`
+13. ✅ T1 — edge-ip-version 4 — commit `201b026`
 
 **Sprint 1 total: ~2h (vs 2 días estimado). Bugs de crashes y UX + fugas más graves cubiertos.**
 **Total P0:** ~6 días-hombre. Deja el sistema sin crashes ni fugas conocidas.
