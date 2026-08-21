@@ -90,7 +90,7 @@ const App = {
             if (u) {
                 await this._waitForAPI();
                 // Restore access_token from localStorage if available
-                const storedToken = localStorage.getItem('ojoia_token');
+                const storedToken = sessionStorage.getItem('ojoia_token') || localStorage.getItem('ojoia_token');
                 if (storedToken) {
                     this.accessToken = storedToken;
                 }
@@ -105,8 +105,9 @@ const App = {
                 if (d.success) {
                     this.userId = d.user_id;
                     this.accessToken = d.access_token;
+                    // P0 (Fuga #7.2): sessionStorage no localStorage (ver comentario en doLogin)
                     localStorage.setItem('ojoia_uid', this.userId);
-                    localStorage.setItem('ojoia_token', this.accessToken);
+                    sessionStorage.setItem('ojoia_token', this.accessToken);
                     this._showApp();
                 } else {
                     // Usuario Firebase OK pero sin registro completo en backend
@@ -200,8 +201,9 @@ const App = {
                 if (d.success) {
                     this.userId = d.user_id;
                     this.accessToken = d.access_token;
+                    // P0 (Fuga #7.2): sessionStorage no localStorage (ver comentario en doLogin)
                     localStorage.setItem('ojoia_uid', this.userId);
-                    localStorage.setItem('ojoia_token', this.accessToken);
+                    sessionStorage.setItem('ojoia_token', this.accessToken);
                     this._showApp();
                 } else {
                     // Usuario no registrado en backend — cambiar a registro
@@ -242,8 +244,9 @@ const App = {
         if (d.success) {
             this.userId = d.user_id;
             this.accessToken = d.access_token;
+            // P0 (Fuga #7.2): sessionStorage no localStorage (ver comentario en doLogin)
             localStorage.setItem('ojoia_uid', this.userId);
-            localStorage.setItem('ojoia_token', this.accessToken);
+            sessionStorage.setItem('ojoia_token', this.accessToken);
             this._showApp();
             return d;
         } else {
@@ -261,7 +264,10 @@ const App = {
 
     logout() {
         this._clearAllPolls();
+        // P0 (Fuga #7.2): limpiar token de sessionStorage Y localStorage
+        // (migra tokens legacy que estaban en localStorage)
         localStorage.removeItem('ojoia_uid');
+        sessionStorage.removeItem('ojoia_token');
         localStorage.removeItem('ojoia_token');
         this.userId = null;
         this.accessToken = null;
