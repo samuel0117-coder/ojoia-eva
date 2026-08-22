@@ -112,23 +112,29 @@ async def _require_auth(request: Request, call_next):
 
 # ─── Tabla maestra de servicios (idéntica al health_monitor) ─────────────────
 
+# ── Config multi-nodo ──────────────────────────────────────────
+NODE_ID = os.environ.get("NODE_ID", "ojoia")
+CINEIA_AGENT_URL = os.environ.get("CINEIA_AGENT_URL", "http://10.0.0.44:8300")
+
 SERVICES = [
-    {"id": "tunnel.service", "port": 0, "level": "system", "gpu": -1, "name": "Cloudflare Tunnel", "kind": "network"},
-    {"id": "api-eva.service", "port": 8005, "level": "system", "gpu": -1, "name": "OjoIA API Eva", "kind": "api"},
-    {"id": "qwen9b.service", "port": 8018, "level": "system", "gpu": 0, "name": "Qwen VL-9B (vLLM)", "kind": "llm"},
-    {"id": "qwen.service", "port": 8004, "level": "system", "gpu": 1, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
-    {"id": "qwen35b.service", "port": 8019, "level": "system", "gpu": 1, "name": "Qwen 35B (llama.cpp)", "kind": "llm"},
-    {"id": "whisper.service", "port": 8008, "level": "system", "gpu": 1, "name": "Whisper Turbo ASR", "kind": "asr"},
-    {"id": "yolo-server.service", "port": 8002, "level": "system", "gpu": 1, "name": "YOLO Pose", "kind": "vision"},
-    {"id": "chatrd.service", "port": 8010, "level": "user", "gpu": -1, "name": "ChatRD API", "kind": "api"},
-    {"id": "admin_panel.service", "port": 8030, "level": "user", "gpu": -1, "name": "ChatRD Admin (legacy)", "kind": "api"},
-    {"id": "comfyui.service", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "kind": "image", "managed": True},
-    {"id": "movie_server.service", "port": 8090, "level": "user", "gpu": 2, "name": "CineIA Movie Server", "kind": "video"},
-    {"id": "cineia_studio_server.service", "port": 8095, "level": "user", "gpu": -1, "name": "CineIA Studio API", "kind": "api"},
-    {"id": "post_server.service", "port": 8014, "level": "user", "gpu": 2, "name": "Post-Production (RIFE/Lipsync)", "kind": "post"},
-    {"id": "audio_server.service", "port": 8013, "level": "user", "gpu": 2, "name": "Audio Server (MusicGen)", "kind": "audio"},
-    {"id": "f5_tts_server.service", "port": 8017, "level": "user", "gpu": 2, "name": "F5-TTS", "kind": "audio"},
-    {"id": "health-monitor.service", "port": 9000, "level": "user", "gpu": -1, "name": "Health Monitor (this)", "kind": "infra"},
+    # ── Nodo OJOIA (master) ──
+    {"id": "tunnel.service", "node": "ojoia", "port": 0, "level": "system", "gpu": -1, "name": "Cloudflare Tunnel", "kind": "network"},
+    {"id": "api-eva.service", "node": "ojoia", "port": 8005, "level": "system", "gpu": -1, "name": "OjoIA API Eva", "kind": "api"},
+    {"id": "qwen9b.service", "node": "ojoia", "port": 8018, "level": "system", "gpu": 0, "name": "Qwen VL-9B (vLLM)", "kind": "llm"},
+    {"id": "qwen.service", "node": "ojoia", "port": 8004, "level": "system", "gpu": 1, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
+    {"id": "qwen35b.service", "node": "ojoia", "port": 8019, "level": "system", "gpu": 1, "name": "Qwen 35B (llama.cpp)", "kind": "llm"},
+    {"id": "whisper.service", "node": "ojoia", "port": 8008, "level": "system", "gpu": 1, "name": "Whisper Turbo ASR", "kind": "asr"},
+    {"id": "yolo-server.service", "node": "ojoia", "port": 8002, "level": "system", "gpu": 1, "name": "YOLO Pose", "kind": "vision"},
+    {"id": "chatrd.service", "node": "ojoia", "port": 8010, "level": "user", "gpu": -1, "name": "ChatRD API", "kind": "api"},
+    {"id": "health-monitor.service", "node": "ojoia", "port": 9000, "level": "user", "gpu": -1, "name": "Health Monitor (this)", "kind": "infra"},
+    # ── Nodo CINEIA (worker) ──
+    {"id": "comfyui.service", "node": "cineia", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "kind": "image", "managed": True},
+    {"id": "movie_server.service", "node": "cineia", "port": 8090, "level": "user", "gpu": 2, "name": "CineIA Movie Server", "kind": "video"},
+    {"id": "cineia_studio_server.service", "node": "cineia", "port": 8095, "level": "user", "gpu": -1, "name": "CineIA Studio API", "kind": "api"},
+    {"id": "post_server.service", "node": "cineia", "port": 8014, "level": "user", "gpu": 2, "name": "Post-Production (RIFE/Lipsync)", "kind": "post"},
+    {"id": "audio_server.service", "node": "cineia", "port": 8013, "level": "user", "gpu": 2, "name": "Audio Server", "kind": "audio"},
+    {"id": "f5_tts_server.service", "node": "cineia", "port": 8017, "level": "user", "gpu": 2, "name": "F5-TTS", "kind": "audio"},
+    {"id": "admin_panel.service", "node": "cineia", "port": 8030, "level": "user", "gpu": -1, "name": "ChatRD Admin", "kind": "api"},
 ]
 
 
@@ -288,10 +294,21 @@ async def control(service_id: str, action: str):
     if not service_id.endswith(".service"):
         service_id += ".service"
     level = "user"
+    node = "ojoia"
     for s in SERVICES:
         if s["id"] == service_id:
             level = s["level"]
+            node = s.get("node", "ojoia")
             break
+    # Si el servicio vive en CINEIA, proxy al agente remoto
+    if node == "cineia":
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"{CINEIA_AGENT_URL}/api/control",
+                                 json={"service": service_id, "action": action})
+                return r.json()
+        except Exception as e:
+            return {"service": service_id, "action": action, "result": f"ERROR agente cineia: {e}"}
     # level=system: el recovery lo hace systemd solo (Restart=on-failure). No intentamos
     # reiniciar desde el panel (requeriria sudo/polkit -> popup molesto). Se informa al
     # operador para que lo haga via SSH si es necesario forzar un reinicio manual.
@@ -311,8 +328,24 @@ async def control(service_id: str, action: str):
     return {"service": service_id, "action": action, "result": out or "ok"}
 
 
-@app.get("/api/gpu")
-async def gpu_detail():
+@app.get("/api/nodes")
+async def nodes():
+    """Estado de todos los nodos (ojoia local + cineia remoto)."""
+    result = {"ojoia": None, "cineia": None}
+    # local
+    try:
+        result["ojoia"] = {"status": "online", "host": "localhost"}
+    except Exception:
+        pass
+    # remoto cineia
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{CINEIA_AGENT_URL}/api/metrics")
+            if r.status_code == 200:
+                result["cineia"] = r.json()
+    except Exception as e:
+        result["cineia"] = {"status": "offline", "error": str(e)}
+    return result
     out = run_cmd("nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory,process_name --format=csv")
     procs = []
     if out and "ERROR" not in out:
