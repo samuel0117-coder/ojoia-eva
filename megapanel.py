@@ -303,9 +303,14 @@ async def control(service_id: str, action: str):
     # Si el servicio vive en CINEIA, proxy al agente remoto
     if node == "cineia":
         try:
+            headers = {}
+            agent_tok = os.environ.get("CINEIA_AGENT_TOKEN", "")
+            if agent_tok:
+                headers["Authorization"] = f"Bearer {agent_tok}"
             async with httpx.AsyncClient(timeout=30) as c:
                 r = await c.post(f"{CINEIA_AGENT_URL}/api/control",
-                                 json={"service": service_id, "action": action})
+                                 json={"service": service_id, "action": action},
+                                 headers=headers)
                 return r.json()
         except Exception as e:
             return {"service": service_id, "action": action, "result": f"ERROR agente cineia: {e}"}
@@ -346,6 +351,10 @@ async def nodes():
     except Exception as e:
         result["cineia"] = {"status": "offline", "error": str(e)}
     return result
+
+
+@app.get("/api/gpu")
+async def gpu_detail():
     out = run_cmd("nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory,process_name --format=csv")
     procs = []
     if out and "ERROR" not in out:
