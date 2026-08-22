@@ -1845,28 +1845,6 @@ c.style.display = '';
         }
     },
 
-async _saveCooldown(camId, btn) {
-        this._setConfigButtonBusy(btn, true);
-        try {
-            const el = document.getElementById('cfg_cooldown_min');
-            const val = Math.max(5, Math.min(60, parseInt(el?.value) || 5));
-            const r = await apiFetch(`${this.API}/api/cameras/${camId}/cooldown`, {
-                method: 'POST',
-                body: JSON.stringify({cooldown_min: val})
-            });
-            const d = await r.json();
-            if (d.ok || d.success) {
-                this._toast('', `Cooldown: ${val} min`, 'success');
-            } else {
-                this._toast('', d.error || 'Error', 'danger');
-            }
-        } catch(e) {
-            this._toast('', 'Error de red', 'danger');
-        } finally {
-            this._setConfigButtonBusy(btn, false);
-        }
-    },
-
     async _exportVideo(camId, minutes = 45, btn = null) {
         if (btn) this._setConfigButtonBusy(btn, true);
         this._toast('', `Generando video de últimos ${minutes} min...`, 'info');
@@ -3685,6 +3663,28 @@ async _saveCooldown(camId, btn) {
     _isPWAInstalled() {
         return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
     },
+
+    async _saveCooldown(camId, btn) {
+            this._setConfigButtonBusy(btn, true);
+            try {
+                const el = document.getElementById('cfg_cooldown_min');
+                const val = Math.max(5, Math.min(60, parseInt(el?.value) || 5));
+                const r = await apiFetch(`${this.API}/api/cameras/${camId}/cooldown`, {
+                    method: 'POST',
+                    body: JSON.stringify({cooldown_min: val})
+                });
+                const d = await r.json();
+                if (d.ok || d.success) {
+                    this._toast('', `Cooldown: ${val} min`, 'success');
+                } else {
+                    this._toast('', d.error || 'Error', 'danger');
+                }
+            } catch(e) {
+                this._toast('', 'Error de red', 'danger');
+            } finally {
+                this._setConfigButtonBusy(btn, false);
+            }
+        },
 };
 
 // Init PWA install handler

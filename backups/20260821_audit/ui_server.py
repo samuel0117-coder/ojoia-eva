@@ -205,6 +205,83 @@ async def flux_status(prompt_id: str):
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SDXL /generate — usa el pipe cargado en GPU 1
+# ═══════════════════════════════════════════════════════════════════════════
+@APP.post("/api/sdxl/generate")
+async def sdxl_generate(request: Request):
+    body = await request.json()
+    prompt = body.get("prompt", "")
+    if not prompt.strip():
+        return JSONResponse({"error": "prompt vacío"}, status_code=400)
+    
+    width = body.get("width", 768)
+    height = body.get("height", 768)
+    steps = body.get("num_inference_steps", 4)
+    cfg = body.get("guidance_scale", 1.5)
+    negative = body.get("negative_prompt", "blurry, bad quality")
+    model = body.get("model", "turbo")  # turbo o juggernaut
+
+    # Elegir checkpoint según modelo
+    if model == "juggernaut":
+        ckpt = "JuggernautXL_v10.safetensors"
+        steps = max(steps, 25)
+        cfg = max(cfg, 5.0)
+    else:
+        ckpt = "sd_xl_turbo_1.0_fp16.safetensors"
+        steps = min(steps, 8)
+        cfg = min(cfg, 2.0)
+
+    workflow = {
+        "prompt": {
+            "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+            "4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["3", 1]}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["3", 1]}},
+            "7": {"class_type": "KSampler", "inputs": {"seed": random.randint(1, 2**31), "steps": steps, "cfg": cfg, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": ["3", 0], "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["4", 0]}},
+            "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 2]}},
+            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "sdxl_gen", "images": ["8", 0]}}
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{_ComfyUI}/prompt", json=workflow)
+            if resp.status_code >= 400:
+                return JSONResponse({"error": f"ComfyUI error: {resp.text[:200]}"}, status_code=502)
+            result = resp.json()
+            prompt_id = result.get("prompt_id")
+            if not prompt_id:
+                return JSONResponse({"error": str(result)}, status_code=502)
+
+            # Poll hasta 120s
+            for _ in range(60):
+                await asyncio.sleep(2)
+                try:
+                    hist = await client.get(f"{_ComfyUI}/history/{prompt_id}")
+                    hist_data = hist.json()
+                    if prompt_id in hist_data:
+                        outputs = hist_data[prompt_id].get("outputs", {})
+                        for node_out in outputs.values():
+                            images = node_out.get("images", [])
+                            if images:
+                                img_filename = images[0].get("filename")
+                                img_resp = await client.get(f"{_ComfyUI}/view", params={"filename": img_filename})
+                                return Response(content=img_resp.content, media_type="image/png")
+                except Exception:
+                    continue
+
+            return JSONResponse({"error": "timeout SDXL"}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@APP.get("/api/sdxl/models")
+async def sdxl_models():
+    return {
+        "models": {
+            "turbo": {"ckpt": "sd_xl_turbo_1.0_fp16.safetensors", "steps": 4, "cfg": 1.5, "vram_gb": 6.5},
+            "juggernaut": {"ckpt": "JuggernautXL_v10.safetensors", "steps": 30, "cfg": 5.5, "vram_gb": 6.7}
+        }
+    }
+
 @APP.post("/api/sdxl/switch")
 async def sdxl_switch(request: Request):
     """Cambiar modelo SDXL: turbo o juggernaut"""

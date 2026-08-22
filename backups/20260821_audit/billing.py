@@ -43,14 +43,10 @@ try:
 except ImportError:
     HAS_REDIS = False
 
-# H4 (AUDITORÍA): Redis URL debe venir SIEMPRE de env var. Si no está, falla
-# ruidosamente en lugar de usar un secreto hardcoded.
-REDIS_URL = os.environ.get("REDIS_URL")
-if not REDIS_URL:
-    raise RuntimeError(
-        "REDIS_URL no está configurada. Define la variable de entorno antes de iniciar. "
-        "Ejemplo: export REDIS_URL='redis://:password@host:6379/0'"
-    )
+REDIS_URL = os.environ.get(
+    "REDIS_URL",
+    "redis://:hq1V4pQr1c99AWYYAIGBnCu7695jL75@127.0.0.1:6379/0",
+)
 
 # Precios por 1M tokens (USD) — defaults (se sobreescriben con Redis si existen)
 DEFAULT_MODEL_PRICES = {

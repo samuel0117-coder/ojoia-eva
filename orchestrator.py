@@ -13,7 +13,7 @@ import re
 from typing import Optional, List, Dict, Any
 from gateway_resize import resize_image, image_to_base64, create_grid_image, create_panels_2x2
 from eva.camera_builder import normalize_camera_vigilance_config, build_witness_prompt
-from face_pipeline import identify_from_frame, extract_face_from_frame
+# H5 (AUDITORÍA): face_pipeline import eliminado — funciones nunca llamadas (InsightFace 600MB sin uso).
 import threading
 
 logger = logging.getLogger(__name__)
