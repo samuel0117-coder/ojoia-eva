@@ -9,6 +9,34 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
+<script>
+// P0: Limpia caches y Service Workers viejos antes de cargar la app.
+// Si el navegador tiene un SW viejo cacheado con archivos corruptos,
+// este script lo desregistra y limpia todos los caches antes de que
+// se cargue la app. Después recarga la página una sola vez.
+(function() {
+    if (!('serviceWorker' in navigator)) return;
+    if (window.__SW_CLEANED) return;
+    window.__SW_CLEANED = true;
+    // Limpia todos los caches
+    if ('caches' in window) {
+        caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))))
+            .then(() => console.log('[cleanup] caches cleared'));
+    }
+    // Desregistra todos los SW viejos
+    navigator.serviceWorker.getRegistrations().then(regs => {
+        if (regs.length === 0) return;
+        Promise.all(regs.map(r => r.unregister())).then(() => {
+            console.log('[cleanup] SW unregistered, reloading...');
+            // Recarga SOLO una vez para tomar la versión limpia
+            if (!sessionStorage.getItem('__sw_cleaned_reloaded')) {
+                sessionStorage.setItem('__sw_cleaned_reloaded', '1');
+                window.location.reload();
+            }
+        });
+    });
+})();
+</script>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="img/icon-192.png">
 <link rel="icon" href="favicon.ico">
