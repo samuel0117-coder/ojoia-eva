@@ -64,3 +64,16 @@ node_modules/
 *.crt
 *.key
 *.p12
+
+# Archivos de backup — NUNCA trackear (riesgo de secrets)
+*.bak
+*.backup
+*.backup2
+*~
+*.swp
+
+# Archivos con modelos pesados / caches
+.cache/
+*.gguf
+*.bin
+*.safetensors
