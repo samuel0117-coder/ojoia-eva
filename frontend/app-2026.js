@@ -143,8 +143,12 @@ const App = {
         firebase.auth().onAuthStateChanged(async u => {
             if (u) {
                 await this._waitForAPI();
-                // Restore access_token from localStorage if available
-                const storedToken = sessionStorage.getItem('ojoia_token') || localStorage.getItem('ojoia_token');
+                // Restore access_token SOLO de sessionStorage. sessionStorage se
+                // borra al cerrar la pestaña/pestaña del navegador, lo que reduce
+                // la ventana de exposicion si el dispositivo es compartido.
+                // ANTES: fallback a localStorage (persistente, riesgo de robo
+                // de token via XSS persistente). Quitado por seguridad.
+                const storedToken = sessionStorage.getItem('ojoia_token');
                 if (storedToken) {
                     this.accessToken = storedToken;
                 }
@@ -194,7 +198,9 @@ const App = {
         console.warn('[App] Sesión expirada — redirigiendo a login');
         // Cierra el modal de chat por si está abierto
         try { if (typeof EvaChat !== 'undefined' && EvaChat._teardown) EvaChat._teardown(); } catch(e) {}
-        // Limpia caches de Eva
+        // Limpia el token de sessionStorage. Tambien limpia localStorage
+        // por si quedo un token legacy de versiones anteriores (migración
+        // segura — si no existe, removeItem no hace nada).
         try { sessionStorage.removeItem('ojoia_token'); localStorage.removeItem('ojoia_token'); } catch(e) {}
         // Detén todos los polls — si la sesión expiró, cada poll disparará 401
         // y desperdiciará requests hasta el redirect. Mejor cortar de raíz.

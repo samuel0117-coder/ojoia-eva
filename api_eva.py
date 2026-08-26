@@ -333,7 +333,8 @@ async def verify_user(
     try:
         user_id = request.query_params.get("user_id") or request.query_params.get("uid")
     except Exception:
-        pass
+        logger.debug("silent: {exc}", exc=Exception)
+
     # form params (POST sin JSON body)
     if not user_id:
         try:
@@ -344,7 +345,8 @@ async def verify_user(
             # por separado y debemos confiar en que el route body llama a
             # await _verify_user_token(authorization, user_id) explicitamente.
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
     # 2) path params {user_id} o {uid}
     if not user_id:
         path_params = getattr(request, "path_params", {}) or {}
@@ -356,7 +358,8 @@ async def verify_user(
             # Verificamos solo si el header Authorization viene; si no, 401.
             pass
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
 
     if not user_id:
         # si el endpoint no expone user_id de forma estandar, exigimos que traiga
@@ -1471,7 +1474,8 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
                     frame_bytes = latest_raw.read_bytes()
                     last_cam = camera_id
         except:
-            pass
+            logger.debug("silent except")
+
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
     yolo_count = grid.get_last_yolo_count()
     yolo_detections = grid.get_last_yolo_detections()
@@ -1487,7 +1491,8 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
                 yolo_detections = _yolo_data.get("detections", [])
                 yolo_count = _yolo_data.get("count", len(yolo_detections))
     except:
-        pass
+        logger.debug("silent except")
+
     return {
         "success": bool(frame_bytes),
         "image_b64": image_b64,
@@ -1515,7 +1520,8 @@ async def get_latest_frame_jpg(camera_id: Optional[str] = None, user_id: Optiona
                 if latest_raw.exists():
                     frame_bytes = latest_raw.read_bytes()
         except:
-            pass
+            logger.debug("silent except")
+
     if not frame_bytes:
         return Response(status_code=204)
     return Response(content=frame_bytes, media_type="image/jpeg", headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
@@ -1536,7 +1542,8 @@ async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[
                 "Cross-Origin-Resource-Policy": "cross-origin",
             })
     except:
-        pass
+        logger.debug("silent except")
+
     return Response(status_code=204)
 
 
@@ -2116,7 +2123,8 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
                 if chat_history_file.exists():
                     server_ts = int(chat_history_file.stat().st_mtime)
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
 
         return {
             "success": True,
@@ -2526,7 +2534,8 @@ async def chat_eva_message(request: dict, authorization: str = Header(None, alia
                             ud_fresh["eva_sessions"] = sessions
                             _atomic_write_user_json(uf, ud_fresh)
                     except Exception:
-                        pass
+                        logger.debug("silent: {exc}", exc=Exception)
+
                 import threading
                 threading.Thread(target=_save_async, daemon=True).start()
             except Exception as e:
@@ -2904,7 +2913,8 @@ async def suggest_zones_endpoint(camera_id: str, request: Request):
         try:
             body = await request.json()
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
         user_id = body.get("user_id", "")
         zone = body.get("zone", "")
         biz_type = body.get("business_type", "")
@@ -3536,7 +3546,8 @@ async def get_cameras(user_id: str):
                                     if _type in ("vigilance_alert", "violation", "attention_alert"):
                                         today_al += 1
                             except:
-                                pass
+                                logger.debug("silent except")
+
                 cam_copy["metrics"] = {
                     "total_events": total_ev,
                     "total_alerts": total_al,
@@ -3555,7 +3566,8 @@ async def get_cameras(user_id: str):
                 with open(user_file, "w") as f:
                     json.dump(ud_existing, f, indent=2)
             except Exception:
-                pass
+                logger.debug("silent: {exc}", exc=Exception)
+
         return {"cameras": result}
     return {"cameras": []}
 
@@ -3590,7 +3602,8 @@ async def cam_cmd(camera_id: str, request: dict = None):
                             target_ip = c.get("last_announce_ip") or ""
                             break
                 except Exception:
-                    pass
+                    logger.debug("silent: {exc}", exc=Exception)
+
                 if target_ip:
                     break
         if not target_ip:
@@ -3618,7 +3631,8 @@ def _save_cam_config_to_user(camera_id: str, body: dict):
     try:
         logger.info(f"[DIAG_SAVE] entry camera_id={camera_id} body={body}")
     except Exception:
-        pass
+        logger.debug("silent: {exc}", exc=Exception)
+
     try:
         users_dir = STORAGE_ROOT / "users"
         if not users_dir.is_dir():
@@ -3785,7 +3799,8 @@ async def save_camera_vigilance(camera_id: str, request: dict = None):
                 with open(cam_cfg_path, "w") as f:
                     json.dump(cam_cfg, f, indent=2)
             except Exception:
-                pass
+                logger.debug("silent: {exc}", exc=Exception)
+
     with open(uf, "w") as f:
         json.dump(ud, f, indent=2)
     system_prompt = ""
@@ -3939,7 +3954,8 @@ async def _resolve_unknown_camera(user_id: str, client_ip: str) -> str:
                 if cid and cid != "unknown":
                     return cid
     except Exception:
-        pass
+        logger.debug("silent: {exc}", exc=Exception)
+
     return "unknown"
 
 def _adjust_brightness(img_bytes: bytes, target_brightness: int = 80) -> bytes:
@@ -3959,7 +3975,8 @@ def _adjust_brightness(img_bytes: bytes, target_brightness: int = 80) -> bytes:
             img.save(buf, format="JPEG", quality=85)
             return buf.getvalue()
     except Exception:
-        pass
+        logger.debug("silent: {exc}", exc=Exception)
+
     return img_bytes
 
 
@@ -3979,7 +3996,8 @@ def _resolve_user_id_from_camera(camera_id: str) -> Optional[str]:
                         if cam.get("camera_id") == camera_id:
                             return ud.get("user_id", user_folder.name)
                 except:
-                    pass
+                    logger.debug("silent except")
+
     return None
 
 
@@ -4017,7 +4035,8 @@ def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night
                 if not vigilance:
                     vigilance = _ud.get("vigilance", {}) or {}
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
     
     if not schedule or not schedule.get("open") or not schedule.get("close"):
         # Sin schedule → asumir horario laboral default 07:00-23:59
@@ -4271,7 +4290,8 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                         _ud = json.load(_f)
                     schedule = _ud.get("schedule", {})
             except:
-                pass
+                logger.debug("silent except")
+
         current_time = now_dt.strftime("%H:%M")
         is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False), user_id=user_id, camera_id=camera_id)
         mode = "vigilante" if is_vigilante else "normal"
@@ -4798,7 +4818,8 @@ async def get_notifications(user_id: str, limit: int = 10):
                     "read": data.get("read", False)
                 })
             except:
-                pass
+                logger.debug("silent except")
+
         
         return {
             "success": True,
@@ -5228,7 +5249,8 @@ def _load_admin_config() -> dict:
             with open(ADMIN_CONFIG_FILE) as f:
                 return json.load(f)
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
     cfg = {
         "admin_token": "oj_admin_" + secrets.token_urlsafe(32),
         "admin_email": "admin@ojoia.com.do",
@@ -5566,7 +5588,8 @@ async def admin_users(authorization: str = Header(None)):
                 ud["_pending_payments"] = len([p for p in ud.get("payments", []) if p.get("status") == "pending"])
                 users.append(ud)
             except Exception:
-                pass
+                logger.debug("silent: {exc}", exc=Exception)
+
     return {"users": users}
 
 
@@ -5968,7 +5991,8 @@ async def admin_stats(authorization: str = Header(None)):
                         if _f.suffix == ".json":
                             events_count += 1
                 except Exception:
-                    pass
+                    logger.debug("silent: {exc}", exc=Exception)
+
     total_cameras = set()
     total_users = 0
     for disk in cfg.get("disks", []):
@@ -5985,7 +6009,8 @@ async def admin_stats(authorization: str = Header(None)):
                     for cam in udata.get("cameras", []):
                         total_cameras.add(cam.get("camera_id", ""))
                 except Exception:
-                    pass
+                    logger.debug("silent: {exc}", exc=Exception)
+
     storage_used_gb = sum(d.get("used_gb", 0) or 0 for d in cfg.get("disks", []))
     # [Fix] active_cameras NO debe depender de la grilla en memoria del orquestador:
     # esa grilla se vacía en cada reinicio del backend y devolvía 0 aunque las
@@ -6066,7 +6091,8 @@ async def admin_disks_autodetect(authorization: str = Header(None)):
                     if mp.is_mount() or (c.is_dir() and str(c) != base):
                         detected.append({"mount": str(mp), "label": c.name})
             except PermissionError:
-                pass
+                logger.debug("silent: {exc}", exc=PermissionError)
+
     return {"detected": detected}
 
 
@@ -6085,7 +6111,8 @@ async def admin_disks_scan(authorization: str = Header(None)):
                 disk["free_gb"] = round(free / (1024 ** 3), 1)
                 disk["used_gb"] = round((total - free) / (1024 ** 3), 1)
             except OSError:
-                pass
+                logger.debug("silent: {exc}", exc=OSError)
+
     save_disk_config(cfg)
     return {"success": True, "disks": cfg.get("disks", [])}
 
@@ -6139,9 +6166,11 @@ async def admin_logs(authorization: str = Header(None), limit: int = 200, tail: 
                         try:
                             audit.append(json.loads(line))
                         except Exception:
-                            pass
+                            logger.debug("silent: {exc}", exc=Exception)
+
             except Exception:
-                pass
+                logger.debug("silent: {exc}", exc=Exception)
+
     # Mas recientes primero
     audit.sort(key=lambda x: x.get("ts", ""), reverse=True)
     n_tail = max(1, tail)
@@ -6160,7 +6189,8 @@ async def admin_logs(authorization: str = Header(None), limit: int = 200, tail: 
                 data = f.read().decode("utf-8", errors="ignore")
             api_tail = data.splitlines()[-n_tail:]
         except Exception:
-            pass
+            logger.debug("silent: {exc}", exc=Exception)
+
     return {"audit_logs": audit, "api_tail": api_tail}
 
 
@@ -6201,7 +6231,8 @@ async def admin_storage_list(authorization: str = Header(None)):
                         "camera_count": len(ud.get("cameras", []))
                     })
                 except Exception:
-                    pass
+                    logger.debug("silent: {exc}", exc=Exception)
+
     return {"users": result}
 
 
@@ -6388,7 +6419,8 @@ async def admin_queue_status(authorization: str = Header(None)):
     try:
         frame_count = sum(g.get_frame_count() for g in orchestrator.grids.values())
     except Exception:
-        pass
+        logger.debug("silent: {exc}", exc=Exception)
+
     return {
         "queue_length": frame_count, "processing": 0, "done": 0, "error": 0,
         "queue_size_mb": 0, "oldest_item": None, "last_processed": None,
