@@ -1,14 +1,15 @@
 /**
- * eva-chat-v7.js — Chat con Eva (Sistema Operativo + Setup)
- * 
+ * chat-2026.js — Chat con Eva (Sistema Operativo + Setup)
+ *
  * FLUJO:
  * - Sin cámaras: Eva entra en modo setup (configuración determinista)
  * - Con cámaras: Eva entra en modo OS con sugerencias rápidas
- * 
+ *
  * Las sugerencias se muestran como botones clickeables arriba del input.
  * La conversación persiste al cambiar de tab.
- * 
+ *
  * BUILD 20260822-a: fuerza invalidación de cache Cloudflare (bug Content-Encoding).
+ * 2026-08-26: cabecera actualizada (era "eva-chat-v7.js" — ya no aplica).
  */
 
 const EvaChat = {

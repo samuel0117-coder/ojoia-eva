@@ -2,17 +2,16 @@
 """
 deploy_frontend.py — Deploy frontend a Firebase Hosting via REST API.
 
-Usa BROTLI en vez de gzip porque Firebase Hosting devuelve Content-Encoding: br
-cuando el navegador pide Accept-Encoding: br. Si subimos gzip, Firebase a veces
-miente con el header br pero envía bytes raw, causando SyntaxError en el navegador.
-
-Solución: subir contenido BROTLI-COMPRIMIDO (mismo formato que el navegador espera).
+Comprime cada archivo con gzip y lo sube. Firebase Hosting acepta gzip y
+lo sirve con Content-Encoding según el Accept-Encoding del cliente
+(br si lo pide, gzip si no). Por eso subimos gzip (no brotli): Firebase
+hace la transcodificación server-side y nunca envía headers mentirosos.
 
 Flujo (vía API REST v1beta1):
   1. POST /sites/{SITE_ID}/versions → crea version
   2. POST /sites/{SITE_ID}/versions/{VER}:populateFiles → registra paths+hashes
-     (hash = SHA256 del contenido BROTLI-COMPRIMIDO)
-  3. Para cada archivo en uploadRequiredHashes: POST uploadUrl/{hash} con contenido brotli
+     (hash = SHA256 del contenido GZIP-COMPRIMIDO)
+  3. Para cada archivo en uploadRequiredHashes: POST uploadUrl/{hash} con contenido gzip
   4. PATCH /sites/{SITE_ID}/versions/{VER} status=FINALIZED
   5. POST /sites/{SITE_ID}/channels/live/releases → activa en producción
 

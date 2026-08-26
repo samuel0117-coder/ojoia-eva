@@ -23,6 +23,12 @@ firebase.initializeApp(firebaseConfig);
 // Ahora: en 401, limpiamos token + userId y disparamos `ojoia:auth-expired` para que
 // App._handleAuthExpired redirija a login. La promise rechaza para que el caller
 // no siga procesando data corrupta/undefined.
+//
+// 2026-08-26: dedup de GETs idénticos en vuelo. Cuando dos partes de la app piden
+// el mismo recurso simultáneamente (p.ej. /api/cameras al abrir el home Y al
+// verificar el contador de alertas), evitamos 2 requests al backend. Solo aplica
+// a GETs sin body, y los POSTs/PUTs/DELETEs pasan siempre (pueden no ser idempotentes).
+const _getInflight = new Map();
 function apiFetch(url, opts = {}) {
     const headers = { ...opts.headers };
     if (opts.body && typeof opts.body === 'string') {
@@ -33,7 +39,16 @@ function apiFetch(url, opts = {}) {
     if (App.accessToken) {
         headers['Authorization'] = 'Bearer ' + App.accessToken;
     }
-    return fetch(url, { mode: 'cors', ...opts, headers }).then(r => {
+    const method = (opts.method || 'GET').toUpperCase();
+    // Dedup solo para GETs sin body: misma URL+método dentro de la misma ventana
+    // de inflight = misma Promise. Reduce latencia y carga del backend sin cambiar
+    // comportamiento (la response se entrega a todos los awaiters por separado).
+    if (method === 'GET' && !opts.body) {
+        const key = url;
+        const existing = _getInflight.get(key);
+        if (existing) return existing;
+    }
+    const p = fetch(url, { mode: 'cors', ...opts, headers }).then(r => {
         if (r.status === 401) {
             // Sesión expirada o token inválido. Limpia y notifica.
             try {
@@ -52,6 +67,12 @@ function apiFetch(url, opts = {}) {
         }
         return r;
     });
+    if (method === 'GET' && !opts.body) {
+        _getInflight.set(url, p);
+        // Limpia del map apenas termina (resuelta o rechazada) — un solo turno
+        p.finally(() => _getInflight.delete(url));
+    }
+    return p;
 }
 
 const App = {
@@ -175,6 +196,9 @@ const App = {
         try { if (typeof EvaChat !== 'undefined' && EvaChat._teardown) EvaChat._teardown(); } catch(e) {}
         // Limpia caches de Eva
         try { sessionStorage.removeItem('ojoia_token'); localStorage.removeItem('ojoia_token'); } catch(e) {}
+        // Detén todos los polls — si la sesión expiró, cada poll disparará 401
+        // y desperdiciará requests hasta el redirect. Mejor cortar de raíz.
+        try { this._clearAllPolls(); } catch(e) {}
         // Firebase signOut para que onAuthStateChanged dispare de nuevo con usuario limpio
         try { if (firebase && firebase.auth && firebase.auth().currentUser) firebase.auth().signOut(); } catch(e) {}
         this.accessToken = null;
@@ -1979,7 +2003,7 @@ c.style.display = '';
                     const el2 = document.getElementById(`evthumb-${evt.event_id}`);
                     if (el2) {
                         el2.style.background = '#222';
-                        el2.innerHTML = `<img src="${evt.thumb_url}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.style.display='none'" />`;
+                        el2.innerHTML = `<img src="${evt.thumb_url}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.style.display='none'" />`;
                     }
                 }
             }
@@ -2072,7 +2096,7 @@ c.style.display = '';
             const yoloCount = (evt.yolo?.count ?? evt.yolo_count ?? 0) || (Array.isArray(yolo.detections) ? yolo.detections.length : 0);
         const icon = violation ? '🚨' : '✓';
         const thumbHtml = evt.thumb_url
-            ? `<img src="${evt.thumb_url}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.style.display='none';this.parentElement.innerHTML='<span style=\'font-size:1.3rem\'>${icon}</span>'" />`
+            ? `<img src="${evt.thumb_url}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.style.display='none';this.parentElement.innerHTML='<span style=\'font-size:1.3rem\'>${icon}</span>'" />`
             : `<span style="font-size:1.3rem;">${icon}</span>`;
         const evtTime = evt.datetime || ts;
         return `<div class="event-row ${violation ? 'event-alert' : ''}" onclick="App._openEvent('${this._escAttr(evt.event_id)}')">
