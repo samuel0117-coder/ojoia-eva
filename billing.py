@@ -53,12 +53,18 @@ if not REDIS_URL:
     )
 
 # Precios por 1M tokens (USD) — defaults (se sobreescriben con Redis si existen)
+# Los nombres deben coincidir con los "model" del body OpenAI
 DEFAULT_MODEL_PRICES = {
-    "qwen7b": {"input": 0.30, "output": 0.50, "unit": "tokens"},
-    "qwen9b": {"input": 1.50, "output": 2.00, "unit": "tokens"},
-    "qwen35b": {"input": 8.00, "output": 10.00, "unit": "tokens"},
-    "whisper": {"input": 0.10, "output": 0.10, "unit": "minutes"},
-    "yolo":    {"input": 0.05, "output": 0.05, "unit": "images"},
+    "qwen3-7b":  {"input": 0.30, "output": 0.50, "unit": "tokens"},
+    "qwen35":     {"input": 1.50, "output": 2.00, "unit": "tokens"},
+    "qwen36-35b-a3b": {"input": 8.00, "output": 10.00, "unit": "tokens"},
+    # Aliases de backends legacy (compatibilidad hacia atrás)
+    "qwen7b":    {"input": 0.30, "output": 0.50, "unit": "tokens"},
+    "qwen9b":    {"input": 1.50, "output": 2.00, "unit": "tokens"},
+    "qwen35b":   {"input": 8.00, "output": 10.00, "unit": "tokens"},
+    "whisper":   {"input": 0.10, "output": 0.10, "unit": "minutes"},
+    "whisper-turbo": {"input": 0.10, "output": 0.10, "unit": "minutes"},
+    "yolo":      {"input": 0.05, "output": 0.05, "unit": "images"},
 }
 
 # Planes: tokens mensuales incluidos — defaults
@@ -335,8 +341,9 @@ class BillingStore:
                 f"{REDIS_PREFIX}:usage:{client_id}:day:{day}", "tokens") or 0)
             requests = int(self.r.hget(
                 f"{REDIS_PREFIX}:usage:{client_id}:day:{day}", "requests") or 0)
+            # Costo del día: sumar todos los requests del día desde SQLite
             cost = float(self.r.hget(
-                f"{REDIS_PREFIX}:cost:{client_id}:month", "usd") or 0)
+                f"{REDIS_PREFIX}:cost:{client_id}:total", "usd") or 0)
         else:  # month
             month = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m")
             tokens = int(self.r.hget(

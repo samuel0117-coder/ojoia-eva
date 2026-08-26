@@ -24,7 +24,7 @@ const EvaChat = {
     // o <script>, sin este escape tenemos RCE via onclick inline.
     _escAttr(s) {
         return String(s || '').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
-            .replace(/"/g, '"').replace(/'/g, ''');
+            .replace(/"/g, '"').replace(/'/g, '\'');
     },
     sessionId: null,
     history: [],

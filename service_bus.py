@@ -362,19 +362,21 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
             ct = headers.get("content-type", "")
             usage = extract_usage_from_response(name, content, ct)
             if usage["prompt_tokens"] or usage["completion_tokens"]:
+                # Registrar con el modelo REAL del request (no el backend interno)
+                model_for_tracking = request_model if request_model else name
                 billing.track_usage(
                     client_id=client_id,
-                    model=name,
+                    model=model_for_tracking,
                     prompt_tokens=usage["prompt_tokens"],
                     completion_tokens=usage["completion_tokens"],
                 )
                 # Log completo en SQLite
-                price = MODEL_PRICES.get(name, {"input": 0.0, "output": 0.0})
+                price = MODEL_PRICES.get(model_for_tracking, MODEL_PRICES.get(name, {"input": 0.0, "output": 0.0}))
                 cost = (usage["prompt_tokens"] / 1_000_000 * price["input"] +
                         usage["completion_tokens"] / 1_000_000 * price["output"])
                 resp_text = _extract_response_text_json(content)
                 log_request(
-                    client_id=client_id, model=name, backend=name,
+                    client_id=client_id, model=model_for_tracking, backend=name,
                     prompt_tokens=usage["prompt_tokens"],
                     completion_tokens=usage["completion_tokens"],
                     cost_usd=cost, latency_ms=int((time.monotonic()-t0)*1000),
@@ -455,14 +457,94 @@ async def bus_pricing():
 
 
 # ---------------------------------------------------------------------------
+# Modelos expuestos vía /v1/models (formato OpenAI).
+# Cada modelo mapea a un backend interno + su model_id real.
+MODELS_CATALOG = {
+    "qwen35": {
+        "id": "qwen35",
+        "backend": "qwen9b",
+        "model_id": "qwen35",
+        "name": "Qwen 3.5 9B",
+        "owned_by": "ojoia",
+        "description": "Qwen 3.5 9B - vllm, 128K contexto, multimodal (texto/imagen/video)",
+        "capabilities": ["text", "image", "video", "thinking"],
+        "context_length": 131072,
+    },
+    "qwen36-35b-a3b": {
+        "id": "qwen36-35b-a3b",
+        "backend": "qwen35b",
+        "model_id": "qwen36-35b-a3b",
+        "name": "Qwen 3.6 35B A3B",
+        "owned_by": "ojoia",
+        "description": "Qwen 3.6 35B A3B - llamacpp, 156K contexto, máxima calidad",
+        "capabilities": ["text", "image", "video", "thinking"],
+        "context_length": 156160,
+    },
+    "qwen3-7b": {
+        "id": "qwen3-7b",
+        "backend": "qwen7b",
+        "model_id": "qwen3-7b",
+        "name": "Qwen 3 7B",
+        "owned_by": "ojoia",
+        "description": "Qwen 3 7B - sglang, 16K contexto, ligero y rápido",
+        "capabilities": ["text", "image", "video", "thinking"],
+        "context_length": 16000,
+    },
+    "whisper-turbo": {
+        "id": "whisper-turbo",
+        "backend": "whisper",
+        "model_id": "whisper-turbo",
+        "name": "Whisper Turbo",
+        "owned_by": "ojoia",
+        "description": "Whisper Turbo - faster-whisper, transcripción de audio",
+        "capabilities": ["audio"],
+        "context_length": 0,
+    },
+}
+
+# Mapeo de modelos para inyectar en requests si no vienen
+MODEL_TO_BACKEND = {m["id"]: m["backend"] for m in MODELS_CATALOG.values()}
+# ---------------------------------------------------------------------------
+@app.get("/v1/models")
+async def list_models():
+    """Lista de modelos disponibles (formato OpenAI) para Kilo Code."""
+    models_list = []
+    for m in MODELS_CATALOG.values():
+        models_list.append({
+            "id": m["id"],
+            "object": "model",
+            "created": 1787428011,
+            "owned_by": m["owned_by"],
+            "capabilities": m.get("capabilities", ["text"]),
+            "name": m.get("name", m["id"]),
+        })
+    return {"object": "list", "data": models_list}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """Proxy de chat completions con routing por modelo."""
+    body = await request.body()
+    model_id = ""
+    if body:
+        try:
+            payload = json.loads(body)
+            model_id = payload.get("model", "")
+        except Exception:
+            pass
+
+    # Determinar backend según el modelo solicitado
+    if model_id in MODEL_TO_BACKEND:
+        backend = MODEL_TO_BACKEND[model_id]
+    else:
+        backend = "qwen9b"
+
+    return await proxy_route(backend, "v1/chat/completions", request)
+
+
 # Endpoints OpenAI-compatible en la raíz (para Kilo Code / VS Code).
 # Routean /v1/* al backend por defecto (qwen9b) con el mismo flujo de billing.
 # El campo "model" del body se respeta, pero el backend se fija aquí.
-# ---------------------------------------------------------------------------
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_v1_root(path: str, request: Request):
-    """Proxy /v1/* al backend default (qwen9b) con billing completo."""
-    return await proxy_route("qwen9b", f"v1/{path}", request)
 
 
 # Serving estático de la página de test de modelos (chatrd-test.ojoia.com.do)

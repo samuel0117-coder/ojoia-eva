@@ -1239,8 +1239,6 @@ def _add_cors_to_response(request: Request, response):
 async def add_security_headers(request: Request, call_next):
     try:
         if request.method == "OPTIONS":
-            # Dejar que CORSMiddleware de FastAPI genere la respuesta
-            # preflight con los headers correctos (incluye Authorization).
             response = await call_next(request)
         else:
             response = await call_next(request)
@@ -1580,7 +1578,26 @@ async def get_eva_frame_endpoint(user_id: str, camera_id: str):
             })
     except Exception as e:
         logger.error(f"Error sirviendo eva-frame: {e}")
-    return Response(status_code=204)
+    # P0 (2026-08-22): devolver PNG 1x1 transparente en vez de 204.
+    # Chrome 117+ bloquea respuestas opacas 204 (OpaqueResponseBlocking / ORB)
+    # cuando se cargan como <img src>, disparando NS_ERROR_DOM_NETWORK_ERR.
+    # Fix (2026-08-26): bytes validados con PIL — el PNG anterior
+    # decia "broken data stream" en Firefox ("Image corrupt or truncated").
+    transparent_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452"
+        "000000010000000108060000001f15c489"
+        "0000000d49444154789c63606060600000"
+        "00050001a5f645400000000049454e44ae426082"
+    )
+    return Response(
+        content=transparent_png,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Access-Control-Allow-Origin": "*",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+        },
+    )
 
 @app.get("/grid/latest")
 async def get_latest_grid(partial: int = 1, camera_id: Optional[str] = None, user_id: Optional[str] = None):

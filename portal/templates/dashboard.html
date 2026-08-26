@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 20px;">Dashboard</h2>
+<p style="color: #8b949e; margin-bottom: 20px;">Bienvenido, {{ user.name }}</p>
+
+<div class="stats">
+    <div class="stat">
+        <div class="value">{{ "{:,.0f}".format(usage.tokens) }}</div>
+        <div class="label">Tokens usados</div>
+    </div>
+    <div class="stat">
+        <div class="value">{{ usage.requests }}</div>
+        <div class="label">Requests</div>
+    </div>
+    <div class="stat">
+        <div class="value">${{ "%.4f".format(usage.cost_usd) }}</div>
+        <div class="label">Costo</div>
+    </div>
+    <div class="stat">
+        <div class="value">{{ user.plan }}</div>
+        <div class="label">Plan</div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Tu API Key</h2>
+    {% if keys %}
+        <code style="background: #0d1117; padding: 12px; display: block; border-radius: 8px; word-break: break-all;">{{ keys[0].key }}</code>
+    {% else %}
+        <p style="color: #8b949e;">No tienes API keys. Crea una para acceder a los modelos.</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>Uso por modelo</h2>
+    {% if usage.by_model %}
+        {% for model, data in usage.by_model.items() %}
+            <div class="model-card">
+                <div>
+                    <div class="model-name">{{ model }}</div>
+                    <div class="model-desc">{{ data.requests }} requests</div>
+                </div>
+                <div>{{ "{:,.0f}".format(data.tokens) }} tokens</div>
+            </div>
+        {% endfor %}
+    {% else %}
+        <p style="color: #8b949e;">Sin uso todavía</p>
+    {% endif %}
+</div>
+{% endblock %}

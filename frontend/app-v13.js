@@ -60,7 +60,7 @@ const App = {
     // con ' o " o <script>, sin este escape tenemos RCE via XSS.
     _escAttr(s) {
         return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
-            .replace(/"/g, '"').replace(/'/g, ''');
+            .replace(/"/g, '"').replace(/'/g, '\'');
     },
     userId: null,
     accessToken: null,

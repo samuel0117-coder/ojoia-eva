@@ -1,0 +1,14 @@
+[Unit]
+Description=OjoIA Models - Arranque ordenado (qwen-7b primero, qwen-35b después)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=sam
+Group=sam
+ExecStart=/opt/ojoia/code/start-models.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

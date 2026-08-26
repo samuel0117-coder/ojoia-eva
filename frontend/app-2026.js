@@ -3693,4 +3693,4 @@ c.style.display = '';
 document.addEventListener('DOMContentLoaded', () => {
     App._initPWAInstall();
     App.init();
-});
+});// cache-bust-fingerprint: 20260822-z

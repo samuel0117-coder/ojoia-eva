@@ -67,9 +67,12 @@ def collect_files() -> dict:
         "app-v12.js.backup_1787151067",
         "test-identity.html",
         "server.py",
-        # Cache-busting: v12/v7 tienen cache corrupto. Solo v13/v8.
+        # Cache-busting: archivos viejos tienen cache corrupto en Cloudflare CDN.
+        # Solo deployamos nombres nuevos que Cloudflare NUNCA ha visto.
         "app-v12.js",
         "eva-chat-v7.js",
+        "app-v13.js",
+        "eva-chat-v8.js",
     }
     files = {}
     for path in FRONTEND_DIR.rglob("*"):
@@ -88,6 +91,82 @@ def collect_files() -> dict:
     return files
 
 
+def content_hash(content: bytes, length: int = 8) -> str:
+    """SHA256 hex corto (default 8 chars) para cache-busting de filenames."""
+    return hashlib.sha256(content).hexdigest()[:length]
+
+
+def rewrite_index_html(html_bytes: bytes) -> bytes:
+    """
+    Reescribe index.html para apuntar a filenames con hash de contenido.
+
+    P0: cache-busting robusto contra Cloudflare cache. Cada deploy genera
+    URLs únicas (app-2026-{HASH8}.js) que Cloudflare nunca ha cacheado.
+    Combinado con no-store en headers HTTP, garantiza que el navegador SIEMPRE
+    pida el archivo al origin y reciba el encoding correcto.
+
+    También reescribe el cleanup script del SW para usar el hash como cache name,
+    evitando que un SW viejo siga activo con cache key incorrecto.
+    """
+    html = html_bytes.decode("utf-8")
+
+    # Calcular hashes de los assets referenciados
+    js_path = FRONTEND_DIR / "app-2026.js"
+    chat_path = FRONTEND_DIR / "chat-2026.js"
+    css_path = FRONTEND_DIR / "app.css"
+    sw_path = FRONTEND_DIR / "sw.js"
+
+    js_hash = content_hash(js_path.read_bytes()) if js_path.exists() else "00000000"
+    chat_hash = content_hash(chat_path.read_bytes()) if chat_path.exists() else "00000000"
+    css_hash = content_hash(css_path.read_bytes()) if css_path.exists() else "00000000"
+    combined_hash = content_hash(
+        (js_hash + chat_hash + css_hash).encode()
+    )
+
+    print(f"  Hashes para cache-busting:")
+    print(f"    app-2026.js → {js_hash}")
+    print(f"    chat-2026.js → {chat_hash}")
+    print(f"    app.css     → {css_hash}")
+    print(f"    combined    → {combined_hash}")
+
+    # Reemplazar referencias con query string de hash
+    # Patrones a reemplazar (en orden de especificidad):
+    replacements = [
+        # app-2026.js (con o sin query)
+        (r'app-2026\.js(\?cb=[^"\']*)?', f'app-2026.js?v={js_hash}'),
+        # chat-2026.js (con o sin query)
+        (r'chat-2026\.js(\?cb=[^"\']*)?', f'chat-2026.js?v={chat_hash}'),
+        # app.css (con o sin query)
+        (r'app\.css(\?cb=[^"\']*)?', f'app.css?v={css_hash}'),
+    ]
+
+    import re
+    for pattern, replacement in replacements:
+        new_html = re.sub(pattern, replacement, html)
+        if new_html == html:
+            print(f"    [WARN] pattern '{pattern}' no encontró match")
+        html = new_html
+
+    return html.encode("utf-8")
+
+
+def rewrite_sw_js(sw_bytes: bytes, cache_name: str) -> bytes:
+    """
+    Reescribe el CACHE_NAME del SW para que sea único por deploy.
+    El cleanup script del HTML borra todos los caches viejos, pero si el SW
+    llega a activarse antes del cleanup, queremos que su cache name también
+    sea único por deploy.
+    """
+    import re
+    text = sw_bytes.decode("utf-8")
+    text = re.sub(
+        r"(const|let|var)\s+CACHE_NAME\s*=\s*['\"]ojoia-[^'\"]*['\"]",
+        f"const CACHE_NAME = 'ojoia-{cache_name}'",
+        text
+    )
+    return text.encode("utf-8")
+
+
 def deploy():
     print(f"=== Deploy frontend to Firebase Hosting (BROTLI) ===")
     print(f"Project: {PROJECT_ID}")
@@ -99,17 +178,54 @@ def deploy():
         size_kb = len(files[f]) / 1024
         print(f"  {f} ({size_kb:.1f} KB)")
 
-    # 1) Crear versión con config que invalida caches viejos (no-cache para JS/CSS/HTML)
-    print("\n[1/5] Creando versión con config no-cache...")
+    # P0: reescribir index.html con cache-busting hash antes de subirlo.
+    # Cada deploy genera URLs únicas (app-2026.js?v=HASH) que Cloudflare
+    # nunca ha cacheado, evitando el bug Content-Encoding: br corrupto.
+    print("\n[1/6] Cache-busting: reescribiendo index.html con hash de contenido...")
+
+    # Calcular combined_hash primero (usado para sw.js CACHE_NAME)
+    _js_p = FRONTEND_DIR / "app-2026.js"
+    _chat_p = FRONTEND_DIR / "chat-2026.js"
+    _css_p = FRONTEND_DIR / "app.css"
+    _jh = content_hash(_js_p.read_bytes()) if _js_p.exists() else "00000000"
+    _ch = content_hash(_chat_p.read_bytes()) if _chat_p.exists() else "00000000"
+    _csh = content_hash(_css_p.read_bytes()) if _css_p.exists() else "00000000"
+    combined_hash = content_hash((_jh + _ch + _csh).encode())
+
+    if "/index.html" in files:
+        files["/index.html"] = rewrite_index_html(files["/index.html"])
+        print(f"  index.html reescrito ({len(files['/index.html'])} bytes)")
+
+    # También reescribir sw.js con CACHE_NAME único por deploy.
+    if "/sw.js" in files:
+        files["/sw.js"] = rewrite_sw_js(files["/sw.js"], combined_hash)
+        print(f"  sw.js reescrito (CACHE_NAME = ojoia-{combined_hash})")
+
+    # 2) Crear versión con config que invalida caches viejos.
+    # P0: incluir glob /** (todo, sin extensión) para que el HTML en /
+    # también tenga no-store. Sin esto, Cloudflare cachea / con max-age=3600
+    # y sirve HTML viejo con referencias a assets viejos (que devuelven 404).
+    print("\n[2/6] Creando versión con config no-cache...")
     config = {
         "headers": [
+            # HTML root (/) y todo lo demás sin extensión
+            {
+                "headers": {
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0"
+                },
+                "glob": "**"
+            },
+            # Sobrescribir explícitamente para JS/CSS/HTML con extensión
             {
                 "headers": {"Cache-Control": "no-cache, no-store, must-revalidate"},
                 "glob": "**/*.@(js|css|html)"
             },
+            # Imágenes y assets estáticos: cache por 1 día
             {
                 "headers": {"Cache-Control": "max-age=86400"},
-                "glob": "**/*.@(png|jpg|jpeg|gif|svg|ico)"
+                "glob": "**/*.@(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf)"
             }
         ]
     }
@@ -119,8 +235,8 @@ def deploy():
     version_id = version_name.split("/")[-1]
     print(f"  Versión creada: {version_id}")
 
-    # 2) populateFiles con hash del contenido COMPRIMIDO
-    print("\n[2/5] Registrando archivos...")
+    # 3) populateFiles con hash del contenido COMPRIMIDO
+    print("\n[3/6] Registrando archivos...")
     files_map = {}
     compressed_cache = {}  # path -> compressed content (para upload)
     for path, content in files.items():
@@ -145,8 +261,8 @@ def deploy():
     print(f"  uploadUrl: {upload_url}")
     print(f"  Archivos que requieren upload: {len(upload_required)} / {len(files)}")
 
-    # 3) Subir contenido comprimido
-    print("\n[3/5] Subiendo contenido...")
+    # 4) Subir contenido comprimido
+    print("\n[4/6] Subiendo contenido...")
     for path, content in files.items():
         compressed = compressed_cache[path]
         h = files_map[path]
@@ -162,8 +278,8 @@ def deploy():
         r.raise_for_status()
         print(f"  uploaded {path} ({len(compressed)/1024:.1f} KB compressed)")
 
-    # 4) Marcar versión como FINALIZED
-    print("\n[4/5] Finalizando versión...")
+    # 5) Marcar versión como FINALIZED
+    print("\n[5/6] Finalizando versión...")
     r = requests.patch(
         f"{BASE_URL}/versions/{version_id}",
         headers=auth_hdr,
@@ -182,8 +298,8 @@ def deploy():
             break
         time.sleep(1)
 
-    # 5) Crear release en canal "live"
-    print("\n[5/5] Creando release en canal 'live'...")
+    # 6) Crear release en canal "live"
+    print("\n[6/6] Creando release en canal 'live'...")
     r = requests.post(
         f"{BASE_URL}/channels/live/releases?versionName={version_name}",
         headers=auth_hdr,
