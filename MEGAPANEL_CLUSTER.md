@@ -39,7 +39,10 @@ El **panel web** (SPA en Firebase Hosting) lee todos los nodos y escribe comando
 ### 1) Traer el código actualizado
 ```bash
 cd /opt/ojoia
-git clone https://github.com/samuel0117-coder/ojoia-eva.git code 2>/dev/null || (cd code && git pull origin main)
+# La rama por defecto del repo es `master` (origin/HEAD -> origin/master).
+# La integración del megapanel cluster vive en master, NO en main.
+git clone https://github.com/samuel0117-coder/ojoia-eva.git code 2>/dev/null || \
+  (cd code && git fetch && git pull --rebase origin master)
 ```
 
 ### 2) Configurar `ojoia.env`
