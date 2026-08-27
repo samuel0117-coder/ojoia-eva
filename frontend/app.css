@@ -120,11 +120,6 @@ body {
 .tab-icon { font-size: 1.3rem; line-height: 1.2; }
 .tab-label { font-size: 0.65rem; margin-top: 2px; font-weight: 500; }
 
-/* Ocultar tabs cuando el teclado móvil está abierto */
-body.keyboard-open .bottom-tabs { display: none !important; }
-body.keyboard-open #app-content { padding-bottom: 8px !important; }
-body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
-
 /* ========== CARDS ========== */
 .card { background: var(--bg-secondary); border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid var(--border); }
 .card-title { font-size: 0.8rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
@@ -218,8 +213,6 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
 .prompt-section { animation: fadeIn 0.2s ease; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-@keyframes slideUp { from { opacity: 0; transform: translateY(40px); } to { opacity: 1; transform: translateY(0); } }
-
 /* ========== FILTERS ========== */
 .filters { display: flex; gap: 8px; margin: 2px 0 14px; overflow-x: auto; padding: 8px 0 10px; position: sticky; top: 0; z-index: 10; background: var(--bg-primary); }
 .filter-btn { min-height: 36px; padding: 8px 14px; border-radius: 16px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary); font-size: 0.82rem; white-space: nowrap; cursor: pointer; }
@@ -245,7 +238,6 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
     background: var(--bg-primary); border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
 .header-logo { width: 32px; height: 32px; border-radius: 8px; }
-.header-logo-svg { display: inline-flex; align-items: center; justify-content: center; }
 #app-content { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; padding: 16px; padding-bottom: 190px; scroll-padding-bottom: 190px; }
 #app-content.events-page { padding-top: 22px; padding-bottom: 190px; scroll-padding-bottom: 190px; }
 .loading { text-align: center; padding: 40px; color: var(--text-secondary); }
@@ -268,18 +260,6 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
 
 /* ========== LAST ALERT ========== */
 .last-alert { background:rgba(255,69,58,0.1);border-left:3px solid var(--danger);padding:12px;border-radius:8px;margin-bottom:12px;cursor:pointer; }
-
-/* Fase 1: banner de alerta parpadeante (rojo on/off) */
-.last-alert.alert-blink {
-    animation: alertBlink 1.4s ease-in-out infinite;
-}
-@keyframes alertBlink {
-    0%, 100% { border-color: var(--danger); box-shadow: 0 0 0 0 rgba(255,59,48,0.0); }
-    50% { border-color: rgba(255,59,48,0.25); box-shadow: 0 0 14px 0 rgba(255,59,48,0.18); }
-}
-@media (prefers-reduced-motion: reduce) {
-    .last-alert.alert-blink { animation: none; }
-}
 
 /* ========== CAMERA CONFIG ========== */
 .camera-config-page { display:flex;flex-direction:column;gap:14px;padding:16px 0 28px;max-width:760px;margin:0 auto;width:100%; }
@@ -420,16 +400,6 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
 .settings-stats span { display:block;font-size:.75rem;color:var(--text-secondary);margin-top:2px; }
 .ios-group { margin-bottom:22px; }
 .ios-group-title { padding:0 14px 7px;font-size:.76rem;font-weight:700;color:var(--text-secondary);letter-spacing:.04em;text-transform:uppercase; }
-.ios-group-header { display:flex;align-items:center;gap:10px;width:100%;padding:13px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:18px;margin-bottom:8px;text-align:left;font:inherit;cursor:pointer;transition:background .16s; }
-.ios-group-header:active { background:var(--bg-tertiary); }
-.ios-group-header-icon { width:32px;height:32px;border-radius:11px;display:flex;align-items:center;justify-content:center;background:rgba(10,132,255,.12);font-size:1rem;flex-shrink:0; }
-.ios-group-header-title { flex:1;font-size:.8rem;font-weight:700;color:var(--text-secondary);letter-spacing:.04em;text-transform:uppercase; }
-.ios-group-header-badge { font-size:.72rem;font-weight:600;color:var(--text-secondary);background:var(--bg-tertiary);padding:2px 8px;border-radius:8px;max-width:90px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
-.ios-group-header-chevron { color:var(--text-secondary);font-size:1.2rem;transition:transform .22s ease;flex-shrink:0; }
-.ios-group .ios-group-body { display:grid;grid-template-rows:0fr;transition:grid-template-rows .26s ease; }
-.ios-group:not(.collapsed) .ios-group-body { grid-template-rows:1fr; }
-.ios-group-body-inner { overflow:hidden;min-height:0; }
-.ios-group:not(.collapsed) .ios-group-header-chevron { transform:rotate(90deg); }
 .ios-row { width:100%;display:flex;align-items:center;gap:12px;padding:14px 16px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:18px;margin-bottom:8px;text-align:left;color:var(--text-primary);font:inherit;cursor:pointer;transition:transform .16s,background .16s,border-color .16s; }
 .ios-row:last-child { margin-bottom:0; }
 .ios-row:active { transform:scale(.985);background:var(--bg-tertiary); }
@@ -506,43 +476,6 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
     .ai-row { grid-template-columns:repeat(2,1fr); }
     .config-grid.two { grid-template-columns:1fr; }
     .config-actions { grid-template-columns:1fr; }
-
-    /* ── Chat de Eva: ajustes mobile-first ──
-       El JS renderiza burbujas con max-width inline (80%/92%) que dejan
-       muy poco margen lateral en pantallas angostas. Forzamos 85% en Eva
-       y reducimos paddings para ganar espacio legible. */
-    .eva-chat-container { height: calc(100vh - 110px); height: calc(100dvh - 110px); }
-    .eva-chat-header { padding: 10px 12px; }
-    .eva-avatar { width: 34px; height: 34px; font-size: 1.1rem; }
-
-    .eva-messages { padding: 10px 8px 6px; gap: 6px; }
-    .eva-msg { max-width: 90% !important; }
-    .eva-msg.user { max-width: 80% !important; }
-    .eva-bubble {
-        padding: 9px 12px !important;
-        font-size: 0.9rem !important;
-        max-width: 100% !important;
-        line-height: 1.45;
-    }
-    .eva-bubble img { max-height: 220px !important; }
-
-    .eva-suggestions { padding: 0 8px 8px; }
-    .suggestion-btn { padding: 7px 12px; font-size: 0.78rem; }
-
-    .eva-input-area { padding: 8px 10px 10px; }
-    .eva-input-row input {
-        padding: 11px 14px;
-        font-size: 0.9rem;
-    }
-
-    /* Modal detalle evento: mas aire en mobile */
-    .modal-content { width: 94%; max-height: 86vh; border-radius: 14px; }
-    .modal-header { padding: 11px 12px; font-size: 0.85rem; }
-    .modal-body { padding: 12px; }
-    .event-description { font-size: 0.88rem; line-height: 1.5; }
-    .feedback-buttons { flex-direction: column; gap: 8px; }
-    .feedback-buttons .feedback-btn,
-    .feedback-buttons button { width: 100%; }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -1054,14 +987,12 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
 
 @media (max-width: 480px) {
     .carousel-card {
-        min-width: 150px;
-        max-width: 150px;
+        min-width: 140px;
+        max-width: 140px;
     }
-    .card-frame img { height: 80px; }
-    .card-desc { font-size: 0.68rem; }
-    .eva-bubble { font-size: 0.88rem !important; }
-    .modal-content { width: 95%; max-height: 88vh; }
-    .event-description { font-size: 0.84rem; }
+    .modal-content {
+        width: 95%;
+    }
 }
 
 /* ── PC layout fixes ───────────────────────────────────────── */
@@ -1130,71 +1061,254 @@ body.keyboard-open #app-content.eva-page { bottom: 0 !important; }
     }
 }
 
-/* ========== Zone editor (Fase 3) ========== */
-/* Punto #2: al editar zonas, ocultar las demás secciones de config para evitar
-   que el usuario toque botones irrelevantes (brillo, sensibilidad) mientras dibuja. */
-.camera-config-page.zone-editing-active > .config-section:not(#zone-editor-section) {
-    display: none !important;
-}
-.camera-config-page.zone-editing-active > .config-actions {
-    display: none !important;
+/* ── ZONE DRAWER ────────────────────────────────────────────── */
+.zone-drawer-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 900;
+    display: none;
+    align-items: flex-end;
+    justify-content: center;
 }
 
-.zone-form-card {
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px;
-}
-.zone-form-title {
-    font-weight: 600;
-    margin-bottom: 10px;
-}
-.zone-field {
-    margin-bottom: 10px;
-}
-.zone-input,
-.zone-select {
-    width: 100%;
-    box-sizing: border-box;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    color: var(--text-primary);
-    font-size: 0.95rem;
-    font-family: inherit;
-}
-.zone-input::placeholder { color: var(--text-secondary); opacity: 0.7; }
-.zone-input:focus,
-.zone-select:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(10,132,255,0.18);
-}
-.zone-select { -webkit-appearance: none; appearance: none; }
-.zone-form-hint {
-    font-size: 0.82rem;
-    color: var(--text-secondary);
-    margin: 8px 0 12px;
-    text-align: center;
-}
-.zone-row {
+.zone-drawer-overlay.active {
     display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    padding: 10px;
-    background: var(--bg-tertiary);
-    border-radius: 10px;
-    margin-bottom: 8px;
+    animation: fadeIn 0.2s ease;
 }
-.zone-chip {
-    width: 24px;
-    height: 24px;
-    border-radius: 6px;
-    flex-shrink: 0;
+
+.zone-drawer {
+    background: var(--bg-secondary, #1c1c1e);
+    border-radius: 20px 20px 0 0;
+    width: 100%;
+    max-width: 560px;
+    max-height: 92vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    padding-bottom: env(safe-area-inset-bottom);
+}
+
+.zone-drawer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border, #2c2c2e);
+    position: sticky;
+    top: 0;
+    background: var(--bg-secondary, #1c1c1e);
+    z-index: 1;
+}
+
+.zone-drawer-header h3 {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+}
+
+.zone-drawer-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #8e8e93);
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+}
+
+.zone-drawer-body {
+    padding: 16px 20px;
+    flex: 1;
+    overflow-y: auto;
+}
+
+.zone-drawer-frame {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16/9;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 16px;
+    cursor: crosshair;
+    user-select: none;
+}
+
+.zone-drawer-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+}
+
+.zone-drawer-frame canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+}
+
+.zone-drawer-tools {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.zone-tool-btn {
+    flex: 1;
+    min-width: 80px;
+    padding: 10px 12px;
+    background: var(--bg-tertiary, #2c2c2e);
+    border: 1px solid var(--border, #3a3a3c);
+    border-radius: 10px;
+    color: var(--text-primary, #fff);
+    font-size: 0.85rem;
+    cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
+    gap: 6px;
+    transition: all 0.15s ease;
+}
+
+.zone-tool-btn:hover {
+    background: var(--bg-quaternary, #3a3a3c);
+}
+
+.zone-tool-btn.active {
+    background: var(--accent, #0a84ff);
+    border-color: var(--accent, #0a84ff);
+    color: #fff;
+}
+
+.zone-color-palette {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.zone-color-swatch {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: transform 0.15s ease;
+}
+
+.zone-color-swatch:hover {
+    transform: scale(1.1);
+}
+
+.zone-color-swatch.active {
+    border-color: #fff;
+    box-shadow: 0 0 0 2px var(--accent, #0a84ff);
+}
+
+.zone-type-select {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-tertiary, #2c2c2e);
+    border: 1px solid var(--border, #3a3a3c);
+    border-radius: 10px;
+    color: var(--text-primary, #fff);
     font-size: 0.9rem;
+    margin-bottom: 12px;
+}
+
+.zone-name-input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-tertiary, #2c2c2e);
+    border: 1px solid var(--border, #3a3a3c);
+    border-radius: 10px;
+    color: var(--text-primary, #fff);
+    font-size: 0.9rem;
+    margin-bottom: 12px;
+}
+
+.zone-drawer-footer {
+    display: flex;
+    gap: 8px;
+    padding: 16px 20px;
+    border-top: 1px solid var(--border, #2c2c2e);
+    position: sticky;
+    bottom: 0;
+    background: var(--bg-secondary, #1c1c1e);
+}
+
+.zone-list-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: var(--bg-tertiary, #2c2c2e);
+    border-radius: 10px;
+    margin-bottom: 8px;
+    border-left: 4px solid var(--zone-color, #0a84ff);
+}
+
+.zone-list-item .zone-type-icon {
+    font-size: 1.2rem;
+}
+
+.zone-list-item .zone-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.zone-list-item .zone-name {
+    font-size: 0.9rem;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.zone-list-item .zone-type-name {
+    font-size: 0.75rem;
+    color: var(--text-secondary, #8e8e93);
+}
+
+.zone-list-item .zone-delete {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #8e8e93);
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 4px;
+}
+
+.zone-list-item .zone-delete:hover {
+    color: #ff453a;
+}
+
+.zones-empty {
+    text-align: center;
+    padding: 24px 16px;
+    color: var(--text-secondary, #8e8e93);
+    font-size: 0.85rem;
+    background: var(--bg-tertiary, #2c2c2e);
+    border-radius: 10px;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes slideUp {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+/* ── ZONES LIST IN CONFIG ───────────────────────────────────── */
+.zones-list {
+    margin-top: 8px;
 }

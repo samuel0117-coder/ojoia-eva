@@ -1,0 +1,6 @@
+# Firebase remote config (no versionado — cada nodo tiene el suyo)
+{
+  "api_key": "YOUR_API_KEY",
+  "project_id": "YOUR_PROJECT_ID",
+  "database_url": "https://YOUR_PROJECT-default-rtdb.firebaseio.com"
+}

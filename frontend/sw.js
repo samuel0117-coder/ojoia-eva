@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ojoia-v10';
+const CACHE_NAME = 'ojoia-v13';
 
 self.addEventListener('install', e => { 
     e.waitUntil(self.skipWaiting()); 
@@ -33,23 +33,8 @@ self.addEventListener('push', e => {
 });
 self.addEventListener('notificationclick', e => {
   e.notification.close();
-  const data = e.notification.data || {};
-  const targetUrl = data.url || '/';
-  e.waitUntil(clients.matchAll({type:'window', includeUncontrolled: true}).then(clist => {
-    // Si hay ventana abierta de nuestro origen → focus + delegar el deep-link al cliente
-    // (el cliente cambia su hash para que _handleInitialRoute abra el modal del evento).
-    for (let c of clist) {
-      try {
-        const url = new URL(c.url);
-        if (url.origin === self.location.origin) {
-          c.postMessage({ type: 'ojoia-event', url: targetUrl });
-          return c.focus();
-        }
-      } catch (_) {}
-    }
-    // Si no hay ventana abierta, abrir directo con el deep-link completo (#cameras?event=...).
-    // NO limpiar el ?event= : el routing del frontend necesita ese parámetro.
-    const openTarget = targetUrl || self.registration.scope;
-    if (clients.openWindow) return clients.openWindow(openTarget);
+  e.waitUntil(clients.matchAll({type:'window'}).then(clist => {
+    for (let c of clist) { if (c.url === e.notification.data.url && 'focus' in c) return c.focus(); }
+    if (clients.openWindow) return clients.openWindow(e.notification.data.url || '/');
   }));
 });

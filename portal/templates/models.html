@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 20px;">Modelos</h2>
+
+<div class="card">
+    <h2>Chat con IA</h2>
+    <div class="form-group">
+        <label>Modelo</label>
+        <select id="model">
+            <option value="qwen35b">Qwen 3.6 35B A3B (más potente)</option>
+            <option value="qwen9b">Qwen 3.5 9B (balanceado)</option>
+            <option value="qwen7b">Qwen 3 7B (rápido)</option>
+        </select>
+    </div>
+    <div class="chat-box" id="chatBox"></div>
+    <div style="display: flex; gap: 8px;">
+        <input type="text" id="message" placeholder="Escribe tu mensaje..." style="flex: 1; margin-bottom: 0;">
+        <button class="btn" onclick="sendMessage()">Enviar</button>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Tu API Key</h2>
+    <code style="background: #0d1117; padding: 12px; display: block; border-radius: 8px; word-break: break-all;">{{ api_key }}</code>
+    <p style="color: #8b949e; margin-top: 12px; font-size: 14px;">
+        Usa esta key para acceder vía API: <code>Authorization: Bearer {{ api_key }}</code>
+    </p>
+</div>
+
+<script>
+const apiKey = "{{ api_key }}";
+const chatBox = document.getElementById('chatBox');
+const messageInput = document.getElementById('message');
+
+async function sendMessage() {
+    const text = messageInput.value.trim();
+    if (!text) return;
+    const model = document.getElementById('model').value;
+    
+    // Add user message
+    chatBox.innerHTML += `<div class="message user"><div class="role">Tú</div>${text}</div>`;
+    messageInput.value = '';
+    chatBox.scrollTop = chatBox.scrollHeight;
+    
+    try {
+        const resp = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({model: model, messages: [{role: 'user', content: text}]})
+        });
+        const data = await resp.json();
+        const reply = data.choices?.[0]?.message?.content || JSON.stringify(data);
+        chatBox.innerHTML += `<div class="message assistant"><div class="role">IA</div>${reply}</div>`;
+    } catch (e) {
+        chatBox.innerHTML += `<div class="message assistant"><div class="role">Error</div>${e.message}</div>`;
+    }
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+messageInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') sendMessage();
+});
+</script>
+{% endblock %}

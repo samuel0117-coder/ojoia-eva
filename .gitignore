@@ -1,31 +1,83 @@
-# === Secretos (NUNCA commitear) ===
-ai_system/
-**/firebase-key*.json
-**/firebase-service-account*.json
-**/service-account*.json
-*.pem
-.env
-.env.*
-
-# === Datos de cliente (NUNCA commitear) ===
-storage/
-
-# === Logs ===
-**/*.log
-firebase-debug.log
-
-# === Build / cache ===
-node_modules/
-.cache/
-dist/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# === OS / IDE ===
-.DS_Store
-.vscode/
+# Secrets — NUNCA trackear
+firebase-key.json
+.env
+*.env.local
+
+# Logs
+*.log
+cloudflared.log
+ai_system/api_eva.log
+ai_system/api_eva_chat.log
+
+# Storage de usuarios (PII, cámaras, frames)
+storage/
+!storage/.gitkeep
+
+# Venvs (no trackear, son locales)
+venv*/
+venv*/
+*/venv*/
+**/venv*/
+
+# Assets pesados (imágenes, vídeo, modelos)
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+*.avi
+*.engine
+*.pt
+*.safetensors
+*.bin
+!frontend/img/
+!frontend/assets/
+
+# Editor / OS
 .idea/
-
-# === Temporales de agentes ===
+.vscode/
+.DS_Store
+Thumbs.db
 *.tmp
+*.swp
+
+# AI system (submódulos externos, no trackear)
+ai_system/ComfyUI*/
+ai_system/SadTalker*/
+ai_system/chatrd/
+ai_system/.insightface/
+ai_system/voxtral*/
+ai_system/wan*/
+ai_system/RealESRGAN*/
+ai_system/Wav2Lip*/
+
+# Node
+node_modules/
+
+# Certificados (se trackean separado, no en el repo)
+*.crt
+*.key
+*.p12
+
+# Archivos de backup — NUNCA trackear (riesgo de secrets)
 *.bak
+*.backup
+*.backup2
+*~
+*.swp
+
+# Archivos con modelos pesados / caches
+.cache/
+*.gguf
+*.bin
+*.safetensors
+
+# Backups de git creados por filter-repo/operaciones manuales
+.git.backup.*/
+/tmp/

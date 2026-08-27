@@ -1,0 +1,51 @@
+# B6 — parche systemd: whisper.service
+# Cambios vs /etc/systemd/system/whisper.service actual:
+#   - Restart=on-failure -> Restart=always
+#   + StartLimitIntervalSec=300 + StartLimitBurst=5
+#   (RestartSec sube a 15 suave para no competir con qwen/yolo en arranque)
+#
+# Aplicar:
+#   sudo cp /opt/ojoia/docs/systemd/whisper.service /etc/systemd/system/whisper.service
+#   sudo systemctl daemon-reload && sudo systemctl restart whisper.service
+
+[Unit]
+Description=Whisper Turbo ASR (GPU configurable)
+After=yolo-server.service
+Wants=yolo-server.service
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+WorkingDirectory=/opt/ojoia/code
+# GPU selection and VRAM tuning via env vars (future-proof: change GPU without code edits)
+# WHISPER_GPU: physical GPU index (default "1")
+# WHISPER_MEM_FRAC: per-process VRAM fraction (default 0.15 ~ 3.6 GB)
+# WHISPER_HIGH_WORKERS / WHISPER_NORMAL_WORKERS: concurrent transcriptions per priority
+# WHISPER_GLOBAL_CONCURRENT: global GPU inference cap (ignored if batched mode active -> forced to 1)
+# WHISPER_BATCH_SIZE: segment-level batch size inside BatchedInferencePipeline
+Environment=HF_HOME=/home/sam/.cache/hf_models
+Environment=HF_HUB_OFFLINE=0
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
+Environment=WHISPER_GPU=0
+Environment=WHISPER_MEM_FRAC=0.25
+Environment=WHISPER_COMPUTE=int8
+Environment=WHISPER_HIGH_WORKERS=4
+Environment=WHISPER_NORMAL_WORKERS=4
+Environment=WHISPER_GLOBAL_CONCURRENT=12
+Environment=WHISPER_BATCH_SIZE=4
+Environment=WHISPER_BEAM_SIZE=1
+Environment=WHISPER_USER_BATCHED=false
+ExecStart=/home/sam/ai_system/venv/bin/python -u /opt/ojoia/code/whisper_server.py
+# B6: Restart=always
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=8G
+MemorySwapMax=2G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

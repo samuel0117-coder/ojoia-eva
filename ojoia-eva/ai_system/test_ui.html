@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Test - Whisper · SDXL · AudioLDM2 · Voxtral · ComfyUI</title>
+<script>window.APP_VERSION='20260531_FINAL';</script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, monospace; background: #0f0f0f; color: #e0e0e0; padding: 20px; }
+  .container { max-width: 800px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+  h1 { text-align: center; color: #0ff; font-size: 1.4em; border-bottom: 1px solid #333; padding-bottom: 12px; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 20px; }
+  .card h2 { font-size: 1em; color: #0ff; margin-bottom: 12px; }
+  label { display: block; font-size: 0.85em; color: #aaa; margin-bottom: 4px; }
+  input, textarea, select { width: 100%; background: #111; border: 1px solid #333; color: #e0e0e0; padding: 10px; border-radius: 4px; font-family: inherit; font-size: 0.9em; }
+  textarea { resize: vertical; min-height: 60px; }
+  input[type="file"] { padding: 8px; font-size: 0.85em; }
+  button { background: #0ff; color: #000; border: none; padding: 10px 24px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.9em; margin-top:8px; margin-right:4px; }
+  button:hover { background: #3ff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  .row * { flex: 1; }
+  .result { background: #111; border: 1px solid #333; border-radius: 4px; padding: 12px; font-size: 0.85em; white-space: pre-wrap; word-break: break-all; min-height: 40px; max-height: 300px; overflow: auto; margin-top: 8px; }
+  .error { color: #f44; }
+  .ok { color: #0f0; }
+  .gpu-info { font-size: 0.75em; color: #666; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🧪 Test: Whisper · SDXL · AudioLDM2 · Voxtral · ComfyUI</h1>
+
+  <div class="card">
+    <h2>🔍 Health Check</h2>
+    <div class="row">
+      <button onclick="health('whisper')">Whisper</button>
+      <button onclick="health('sdxl')">SDXL</button>
+      <button onclick="health('audioldm2')">AudioLDM2</button>
+      <button onclick="health('voxtral')">Voxtral</button>
+    </div>
+    <div id="health-result" class="result">Presiona un botón para verificar...</div>
+  </div>
+
+  <div class="card">
+    <h2>🔊 Voxtral TTS <span class="gpu-info">GPU 2 · INT4</span></h2>
+    <label>Texto</label>
+    <textarea id="tts-text" placeholder="Escribe texto para convertir a voz">Hello, this is a test of Voxtral text to speech</textarea>
+    <label style="margin-top:8px">Voz</label>
+    <select id="tts-voice">
+      <option value="tara">tara (neutral female)</option>
+      <option value="neutral_female">neutral_female</option>
+      <option value="neutral_male">neutral_male</option>
+    </select>
+    <div class="row" style="margin-top:8px">
+      <button onclick="speak()">🔊 Generar Audio</button>
+    </div>
+    <div id="voxtral-result" class="result">Esperando texto...</div>
+    <div id="voxtral-audio"></div>
+  </div>
+
+  <div class="card">
+    <h2>🎵 AudioLDM2 <span class="gpu-info">GPU 2 · bajo demanda</span></h2>
+    <label>Prompt</label>
+    <textarea id="audioldm2-prompt">techno music with a strong beat</textarea>
+    <div style="margin-top:8px">
+      <button onclick="audioldm2Generate()">🎵 Generar Audio (10s)</button>
+    </div>
+    <div id="audioldm2-result" class="result">Escribe un prompt para generar audio...</div>
+    <div id="audioldm2-audio"></div>
+  </div>
+
+  <div class="card">
+    <h2>🎬 ComfyUI - Wan 2.1 I2V <span class="gpu-info">GPU 2 · un modelo a la vez</span></h2>
+  <label>Imagen de referencia</label>
+    <input type="file" id="i2v-image" accept="image/*">
+  <label style="margin-top:8px">Prompt</label>
+    <textarea id="i2v-prompt" placeholder="Ej: cinematic shot, dramatic lighting">A cinematic shot, slowly zooming in, dramatic lighting</textarea>
+  <div style="margin-top:8px">
+      <button onclick="generateI2V()" id="btn-generate-i2v">🎬 Generar Video</button>
+  </div>
+    <div id="i2v-result" class="result">Sube imagen + prompt para generar video...</div>
+  <video id="i2v-video" controls style="display:none;width:100%;border-radius:4px;margin-top:8px;max-height:500px;background:#000"></video>
+  </div>
+</div>
+
+<script>
+const VOXTRAL = "/api/voxtral";
+const AUDIOldm2 = "/api/audioldm2";
+
+// ── Health ──────────────────────────────────────────────────────────────
+async function health(svc) {
+  const el = document.getElementById("health-result");
+  el.textContent = "Verificando " + svc + "...";
+  try {
+    let r = await fetch("/api/" + svc + "/health");
+    if (!r.ok) { el.innerHTML = svc + " → ❌ HTTP " + r.status; return; }
+    let d = await r.json();
+    let status = d.status || d.data?.status || "?";
+    let extra = d.data?.model || d.data?.comfyui_version || "";
+    el.innerHTML = svc + " → " + (status === "ok" ? "✅" : "⚠️") + " " + status + " " + extra;
+  } catch(e) { el.innerHTML = svc + " → ❌ " + e.message; }
+}
+
+// ── Voxtral TTS ─────────────────────────────────────────────────────────
+async function speak() {
+  const text = document.getElementById("tts-text").value;
+  const voice = document.getElementById("tts-voice").value;
+  const el = document.getElementById("voxtral-result");
+  const audioEl = document.getElementById("voxtral-audio");
+  if (!text.trim()) { el.innerHTML = '<span class="error">Escribe texto</span>'; return; }
+  el.textContent = "Generando audio...";
+  try {
+    let r = await fetch(VOXTRAL + "/v1/audio/speech", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ input: text, voice: voice, response_format: "wav" })
+    });
+    if (!r.ok) { el.innerHTML = '<span class="error">Error HTTP: ' + r.status + '</span>'; return; }
+    let blob = await r.blob();
+    let url = URL.createObjectURL(blob);
+    audioEl.innerHTML = '<audio controls src="' + url + '"></audio>';
+    el.innerHTML = "✅ Audio: " + (blob.size/1024).toFixed(0) + " KB | Voz: " + voice;
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── AudioLDM2 ───────────────────────────────────────────────────────────
+async function audioldm2Generate() {
+  const prompt = document.getElementById("audioldm2-prompt").value;
+  const el = document.getElementById("audioldm2-result");
+  if (!prompt.trim()) { el.innerHTML = '<span class="error">Escribe un prompt</span>'; return; }
+  el.textContent = "Generando audio (puede tardar 30s+)...";
+  try {
+    let r = await fetch(AUDIOldm2 + "/generate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ prompt, num_inference_steps: 10, audio_length_in_s: 10 })
+    });
+    if (!r.ok) { el.innerHTML = '<span class="error">Error ' + r.status + '</span>'; return; }
+    let blob = await r.blob();
+    let url = URL.createObjectURL(blob);
+    document.getElementById("audioldm2-audio").innerHTML = '<audio controls src="' + url + '"></audio>';
+    el.innerHTML = "✅ Audio generado (" + (blob.size/1024).toFixed(0) + " KB)";
+  } catch(e) { el.innerHTML = '<span class="error">Error: ' + e.message + '</span>'; }
+}
+
+// ── Wan I2V ─────────────────────────────────────────────────────────────
+async function generateI2V() {
+  const file = document.getElementById("i2v-image").files[0];
+  const prompt = document.getElementById("i2v-prompt").value.trim();
+  const resultEl = document.getElementById("i2v-result");
+  const videoEl = document.getElementById("i2v-video");
+  const btn = document.getElementById("btn-generate-i2v");
+  if (!file) { resultEl.innerHTML = '<span class="error">Sube una imagen</span>'; return; }
+  if (!prompt) { resultEl.innerHTML = '<span class="error">Escribe un prompt</span>'; return; }
+
+  btn.disabled = true;
+  resultEl.textContent = "Subiendo imagen...";
+  videoEl.style.display = "none";
+
+  try {
+    // 1. Upload image
+    let imgForm = new FormData();
+    imgForm.append("image", file, file.name);
+    let uploadResp = await fetch("/api/comfyui/upload/image", { method: "POST", body: imgForm });
+    if (!uploadResp.ok) throw new Error("Error subiendo: " + uploadResp.status);
+    let uploadData = JSON.parse(await uploadResp.text());
+    let imgName = uploadData.name;
+    if (!imgName) throw new Error("Sin nombre de imagen");
+
+    resultEl.textContent = "Enviando a GPU...";
+
+    // 2. Submit workflow
+    let workflow = {
+      "1": { "class_type": "WanVideoModelLoader", "inputs": { "model": "wan2.1-i2v-14b-480p-Q3_K_S.gguf", "base_precision": "bf16", "quantization": "disabled", "load_device": "main_device", "attention_mode": "sdpa" } },
+      "2": { "class_type": "LoadWanVideoT5TextEncoder", "inputs": { "model_name": "umt5_xxl_fp16.safetensors", "precision": "bf16", "load_device": "main_device" } },
+      "3": { "class_type": "WanVideoTextEncode", "inputs": { "positive_prompt": prompt, "negative_prompt": "blur, low quality", "t5": ["2", 0], "force_offload": true } },
+      "4": { "class_type": "WanVideoVAELoader", "inputs": { "model_name": "wan_2.1_vae.safetensors", "precision": "fp16" } },
+      "5": { "class_type": "LoadImage", "inputs": { "image": imgName } },
+      "6": { "class_type": "WanVideoImageToVideoEncode", "inputs": { "vae": ["4", 0], "start_image": ["5", 0], "width": 256, "height": 256, "num_frames": 5, "force_offload": true, "noise_aug_strength": 0.02, "start_latent_strength": 1.0, "end_latent_strength": 1.0 } },
+      "7": { "class_type": "WanVideoSampler", "inputs": { "model": ["1", 0], "image_embeds": ["6", 0], "text_embeds": ["3", 0], "steps": 4, "cfg": 5.0, "shift": 3.0, "seed": Math.floor(Math.random()*2147483647), "scheduler": "unipc", "riflex_freq_index": 0, "force_offload": true } },
+      "8": { "class_type": "WanVideoDecode", "inputs": { "vae": ["4", 0], "samples": ["7", 0], "enable_vae_tiling": true, "tile_x": 64, "tile_y": 64, "tile_stride_x": 32, "tile_stride_y": 32 } },
+      "9": { "class_type": "VHS_VideoCombine", "inputs": { "images": ["8", 0], "frame_rate": 4, "loop_count": 0, "filename_prefix": "WanOut", "format": "video/h264-mp4", "pixel_format": "yuv420p", "crf": 20, "save_metadata": false, "pingpong": false, "save_output": true } }
+    };
+
+    let promptResp = await fetch("/api/comfyui/prompt", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ prompt: workflow })
+    });
+    if (!promptResp.ok) throw new Error("Error enviando: " + promptResp.status);
+    let promptData = JSON.parse(await promptResp.text());
+    let promptId = promptData.prompt_id;
+    if (!promptId) throw new Error("Sin prompt_id");
+
+    resultEl.textContent = "Generando en GPU... (1-3 min)";
+
+    // 3. Poll using /history AND /queue
+    let videoFile = null;
+    for (let i = 0; i < 120; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      
+      // Check if still running
+      try {
+        let q = await (await fetch("/api/comfyui/queue")).json();
+        let running = (q.queue_running || []).length;
+        
+        // Check history
+        let h = await (await fetch("/api/comfyui/history")).json();
+        for (let [pid, entry] of Object.entries(h)) {
+          if (entry.outputs) {
+            for (let [nid, out] of Object.entries(entry.outputs)) {
+              if (out.videos && out.videos.length > 0) {
+                videoFile = out.videos[0];
+                break;
+              }
+            }
+          }
+          if (videoFile) break;
+        }
+        
+        resultEl.textContent = "Generando... (running:" + running + ", poll:" + (i+1) + ")";
+        
+        if (videoFile) break;
+        if (running === 0 && i > 5) { resultEl.textContent = "Procesado. Verificando output..."; break; }
+      } catch(e) {
+        resultEl.textContent = "Poll error: " + e.message;
+      }
+    }
+
+    // 4. Try to get video by listing recent output files
+    if (!videoFile) {
+      // Fallback: try all recent mp4 files
+      try {
+        let viewResp = await fetch("/api/comfyui/view?filename=WanOut_00001.mp4&subfolder=&type=output");
+        if (viewResp.ok && viewResp.headers.get("content-type")?.includes("video")) {
+          videoFile = {filename: "WanOut_00001.mp4"};
+        }
+      } catch(e) {}
+    }
+
+    if (videoFile) {
+      let videoUrl = "/api/comfyui/view?filename=" + videoFile.filename + "&subfolder=" + (videoFile.subfolder || "") + "&type=output";
+      videoEl.src = videoUrl;
+      videoEl.style.display = "block";
+      resultEl.innerHTML = "✅ Video generado!";
+      // Try to get blob for size
+      try {
+        let vr = await fetch(videoUrl);
+        let vb = await vr.blob();
+        resultEl.innerHTML = "✅ Video (" + (vb.size/1024).toFixed(0) + " KB)";
+      } catch(e) {}
+    } else {
+      resultEl.innerHTML = '<span class="error">Timeout. Revisa /api/comfyui/history manualmente</span>';
+    }
+
+  } catch(e) {
+    resultEl.innerHTML = '<span class="error">Error: ' + e.message + '</span>';
+    console.error("I2V error:", e);
+  }
+
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>

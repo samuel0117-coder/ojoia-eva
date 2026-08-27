@@ -1,0 +1,9 @@
+# Regla udev: permitir lectura de energía RAPL al grupo adm
+# sam (usuario del megapanel) pertenece al grupo adm y podrá leer la
+# energía real del CPU sin sudo, evitando estimaciones aproximadas.
+# Instalar: sudo cp 99-rapl-power.rules /etc/udev/rules.d/
+#            sudo udevadm control --reload-rules
+#            sudo udevadm trigger --subsystem-match=powercap --action=change
+# Verificar: sam@test: cat /sys/class/powercap/intel-rapl:0/energy_uj
+
+KERNEL=="energy_uj", SUBSYSTEM=="powercap", GROUP="adm", MODE="0440"
