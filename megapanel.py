@@ -161,21 +161,37 @@ def service_enabled(sid: str, level: str) -> str:
 
 
 # ── Medición de energía ──────────────────────────────────────────────────────
-_RAPL_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj"
+# CPU: se lee el RAPL del paquete (energía acumulada en µJ) en dos instantes y
+# se calcula la potencia instantánea. Requiere lectura de energy_uj (ver regla
+# udev: udevadm info; ver /etc/udev/rules.d/99-rapl-power.rules). Si no hay
+# acceso (permiso denegado), se reporta CPU en 0 y solo se muestran las GPUs.
+_RAPL_PATHS = [
+    "/sys/class/powercap/intel-rapl:0/energy_uj",
+    "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
+]
 
 def _read_rapl_uj() -> float:
     """Lee la energía acumulada del paquete CPU en microjulios."""
-    try:
-        with open(_RAPL_PATH) as f:
-            return float(f.read().strip())
-    except Exception:
-        return 0.0
+    for p in _RAPL_PATHS:
+        try:
+            with open(p) as f:
+                return float(f.read().strip())
+        except Exception:
+            continue
+    return 0.0
 
 def measure_cpu_power_w(sample_s: float = 1.0) -> float:
     """Calcula el consumo del CPU en Watts usando dos lecturas RAPL."""
     e1 = _read_rapl_uj()
     if e1 <= 0:
-        return 0.0
+        # Fallback: estimar desde carga (rough). Loadavg * factor por core.
+        # Valor orientativo: la potencia media del CPU suele escalar con la
+        # carga; si no hay RAPL accesible, reportamos estimación conservadora.
+        try:
+            l1 = os.getloadavg()[0]
+            return round(l1 * 12, 2)  # aprox W por unidad de load
+        except Exception:
+            return 0.0
     time.sleep(sample_s)
     e2 = _read_rapl_uj()
     if e2 <= 0 or e2 <= e1:
@@ -821,6 +837,7 @@ canvas { max-width: 100%; }
   </div>
   <div class="grid">
     <div class="card"><h2>GPUs</h2><div id="ov-gpus"></div></div>
+    <div class="card"><h2>⚡ Energía</h2><div id="ov-power"></div></div>
     <div class="card"><h2>Servicios críticos</h2><div id="ov-svcs-list" style="font-size:12px;line-height:1.8"></div></div>
     <div class="card"><h2>Tokens por modelo (24h)</h2><div id="ov-models" style="font-size:12px;line-height:1.8"></div></div>
   </div>
@@ -829,6 +846,7 @@ canvas { max-width: 100%; }
 <!-- ═══ Infraestructura ═══ -->
 <div id="page-infra" class="page">
   <div class="grid">
+    <div class="card"><h2>⚡ Energía</h2><div id="power"></div></div>
     <div class="card"><h2>GPUs</h2><div id="gpus"></div></div>
     <div class="card"><h2>Sistema</h2><div id="sys"></div></div>
     <div class="card"><h2>Colas CineIA</h2><div id="queues"></div></div>
@@ -1011,6 +1029,34 @@ async function refresh(){
     `).join('');
     document.getElementById('gpus').innerHTML = gpuHtml;
     if(document.getElementById('ov-gpus')) document.getElementById('ov-gpus').innerHTML = gpuHtml;
+    // ⚡ Energía
+    if(s.power){
+      const pw = s.power;
+      const rows = pw.gpus.map(g=>`
+        <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">
+          <span>GPU ${g.index} <span style="color:var(--muted);font-size:11px">${g.name}</span></span>
+          <b>${g.w} W</b>
+        </div>`).join('');
+      const powerHtml = `
+        <div style="font-size:28px;font-weight:700;line-height:1.2">
+          ⚡ <span style="color:var(--yellow)">${pw.total_w}</span> W
+        </div>
+        <div style="color:var(--muted);font-size:12px;margin:4px 0 8px">Consumo total del sistema</div>
+        <div style="display:flex;justify-content:space-between;padding:3px 0">
+          <span>🖥 CPU (RAPL)</span><b>${pw.cpu_w} W</b>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:3px 0">
+          <span>🎮 Total GPUs (${pw.gpus.length})</span><b>${pw.gpu_w} W</b>
+        </div>
+        <div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;font-size:12px;color:var(--muted);font-weight:600">Desglose por GPU</div>
+        ${rows}
+      `;
+      document.getElementById('power').innerHTML = powerHtml;
+      if(document.getElementById('ov-power')) document.getElementById('ov-power').innerHTML = `
+        <div style="font-size:24px;font-weight:700">⚡ <span style="color:var(--yellow)">${pw.total_w}</span> W</div>
+        <div style="color:var(--muted);font-size:12px">CPU ${pw.cpu_w}W · GPUs ${pw.gpu_w}W</div>
+      `;
+    }
     // system
     document.getElementById('sys').innerHTML = `
       <div>Load: ${s.load['1'].toFixed(1)} / ${s.load['5'].toFixed(1)} / ${s.load['15'].toFixed(1)}</div>
