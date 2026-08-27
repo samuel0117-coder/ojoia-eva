@@ -1,0 +1,15 @@
+[Unit]
+Description=Ajustar permisos de RAPL energy_uj para grupo adm (CPU power para megapanel)
+After=local-fs.target
+Before=multipathd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Cambia el grupo a 'adm' y los permisos a 0440 (root:adm, lectura grupo)
+# Permite al usuario 'sam' (miembro de adm) leer energía RAPL sin sudo.
+# Aplica a TODOS los archivos energy_uj de RAPL (package, dram, etc).
+ExecStart=/bin/bash -c 'for f in /sys/class/powercap/intel-rapl*/**/energy_uj /sys/class/powercap/intel-rapl*/energy_uj; do [ -f "$$f" ] || continue; chgrp adm "$$f" && chmod 0440 "$$f" && echo "OK $$f"; done; true'
+
+[Install]
+WantedBy=multi-user.target
