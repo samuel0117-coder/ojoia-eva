@@ -23,9 +23,27 @@ const EvaChat = {
     // P0 (Fuga #7.1): helper para escapar valores interpolados en atributos
     // HTML/onclick. Si un camera_id o event_id del backend contiene ' o "
     // o <script>, sin este escape tenemos RCE via onclick inline.
+    // CRÍTICO: escapa caracteres especiales para que un string pueda
+    // interpolarse en un atributo JS (ej: onclick="func('${...}')").
+    // Sin este escape, si s contiene ' o ", se genera HTML inválido
+    // y el navegador tira SyntaxError: expected expression, got '}'.
     _escAttr(s) {
-        return String(s || '').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
-            .replace(/"/g, '"').replace(/'/g, '\'');
+        // Hacemos escape de entidades HTML manualmente para evitar bugs
+        // de regex con caracteres especiales. Usamos un loop character por
+        // character para máxima seguridad.
+        s = String(s == null ? '' : s);
+        let out = '';
+        for (const c of s) {
+            switch (c) {
+                case '&': out += '&'; break;
+                case '<': out += '<'; break;
+                case '>': out += '>'; break;
+                case '"': out += '"'; break;
+                case "'": out += '&#39;'; break; // &#39; no se confunde
+                default: out += c;
+            }
+        }
+        return out;
     },
     sessionId: null,
     history: [],
