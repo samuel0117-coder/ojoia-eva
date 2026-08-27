@@ -160,6 +160,41 @@ def service_enabled(sid: str, level: str) -> str:
     return run_cmd(f"{cmd} is-enabled {sid} 2>/dev/null")
 
 
+# ── Medición de energía ──────────────────────────────────────────────────────
+_RAPL_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj"
+
+def _read_rapl_uj() -> float:
+    """Lee la energía acumulada del paquete CPU en microjulios."""
+    try:
+        with open(_RAPL_PATH) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+def measure_cpu_power_w(sample_s: float = 1.0) -> float:
+    """Calcula el consumo del CPU en Watts usando dos lecturas RAPL."""
+    e1 = _read_rapl_uj()
+    if e1 <= 0:
+        return 0.0
+    time.sleep(sample_s)
+    e2 = _read_rapl_uj()
+    if e2 <= 0 or e2 <= e1:
+        return 0.0
+    d_uj = (e2 - e1) % (2 ** 64)  # manejo de wrap-around del contador
+    return round(d_uj / 1_000_000 / sample_s, 2)  # uJ/s -> W
+
+# ── Mapeo de servicios del panel → contenedores Docker ───────────────────────
+# Los modelos se ejecutan como contenedores Docker, no como systemd units.
+# Mapeamos el id del panel al nombre del contenedor real para que el botón
+# start/stop/restart funcione correctamente.
+DOCKER_MAP = {
+    "qwen9b.service":   "ai-qwen-9b-1",
+    "qwen.service":     "qwen-7b",
+    "qwen35b.service":  "qwen-35b-a3b",
+    "whisper.service":  "whisper-turbo",
+    "yolo-server.service": "yolo-pose",
+}
+
 # ─── Endpoints API ───────────────────────────────────────────────────────────
 
 @app.get("/api/status")
@@ -220,7 +255,28 @@ async def status():
 
     # services
     svcs = []
+    # Estado de contenedores Docker (para modelos) en un solo snapshot
+    docker_state = {}
+    try:
+        d_out = run_cmd("docker ps -a --format '{{.Names}}|{{.State}}' 2>/dev/null", timeout=10)
+        for line in d_out.splitlines():
+            if "|" in line:
+                name, state = line.split("|", 1)
+                docker_state[name.strip()] = state.strip()
+    except Exception:
+        pass
     for s in SERVICES:
+        # Si es un servicio Docker, usar el estado real del contenedor
+        if s["id"] in DOCKER_MAP:
+            container = DOCKER_MAP[s["id"]]
+            state = docker_state.get(container, "absent")
+            active = state in ("running", "Up", "restarting")
+            enabled = state in ("running", "Up", "restarting") or "true"
+            svcs.append({
+                **s, "active": active, "enabled": state if state != "absent" else "-",
+                "docker": True, "container": container, "docker_state": state,
+            })
+            continue
         active = service_active(s["id"], s["level"])
         enabled = service_enabled(s["id"], s["level"])
         svcs.append({
@@ -251,6 +307,16 @@ async def status():
     # maintenance mode
     maintenance = MAINTENANCE_FLAG.exists()
 
+    # ── Energía: CPU (RAPL) + GPUs (power.draw) = total ────────────────────
+    try:
+        import asyncio as _asyncio
+        cpu_power = await _asyncio.to_thread(measure_cpu_power_w, 1.0)
+    except Exception:
+        cpu_power = 0.0
+    gpu_power = sum(g.get("power_w") or 0 for g in gpus)
+    total_power = round(cpu_power + gpu_power, 2)
+    per_gpu = [{"index": g["index"], "name": g["name"], "w": round(g.get("power_w") or 0, 2)} for g in gpus]
+
     return {
         "timestamp": datetime.now().isoformat(),
         "hostname": platform.node(),
@@ -259,6 +325,12 @@ async def status():
         "ram": {"total_mb": mem_total, "used_mb": mem_used, "free_mb": mem_free, "cache_mb": ram_cache, "pct": round(mem_used / max(mem_total, 1) * 100, 1)},
         "swap": {"used_mb": swap_used},
         "disk": {"total": disk_total, "used": disk_used, "free": disk_free, "pct": disk_pct},
+        "power": {
+            "cpu_w": cpu_power,
+            "gpu_w": round(gpu_power, 2),
+            "gpus": per_gpu,
+            "total_w": total_power,
+        },
         "gpus": gpus,
         "services": svcs,
         "incidents": incidents,
@@ -293,6 +365,25 @@ async def control(service_id: str, action: str):
         raise HTTPException(400, "action must be start|stop|restart|enable|disable")
     if not service_id.endswith(".service"):
         service_id += ".service"
+
+    # ── Servicio Docker: mapear y ejecutar docker directamente ──────────────
+    if service_id in DOCKER_MAP:
+        container = DOCKER_MAP[service_id]
+        docker_actions = {
+            "start":   f"docker start {container}",
+            "stop":    f"docker stop {container}",
+            "restart": f"docker restart {container}",
+            "enable":  f"docker start {container}",
+            "disable": f"docker stop {container}",
+        }
+        if action not in docker_actions:
+            raise HTTPException(400, f"action invalida: {action}")
+        cmd = docker_actions[action]
+        out = run_cmd(cmd, timeout=60)
+        result = out or "ok"
+        return {"service": service_id, "action": action,
+                "type": "docker", "container": container, "result": result}
+
     level = "user"
     node = "ojoia"
     for s in SERVICES:
@@ -934,7 +1025,7 @@ async function refresh(){
         <td>${sv.name}<div style="color:var(--muted);font-size:11px">${sv.id}</div></td>
         <td>${sv.port||'-'}</td>
         <td>${gpuTag(sv.gpu)}</td>
-        <td><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.active?'OK':'DOWN'}</td>
+        <td><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.active?'OK':(sv.docker?sv.docker_state:'DOWN')}</td>
         <td style="color:var(--muted);font-size:11px">${sv.enabled||'-'}</td>
         <td>
           <button class="s" onclick="control('${sv.id}','start')">▶</button>

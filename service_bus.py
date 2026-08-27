@@ -221,6 +221,13 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
                 if isinstance(payload, dict):
                     # Capturar prompt y model para el log
                     request_model = payload.get("model", "")
+                    # Reescribir el model del body al model_id real del backend
+                    if request_model in MODELS_CATALOG:
+                        real_model_id = MODELS_CATALOG[request_model].get("model_id", request_model)
+                        if real_model_id and real_model_id != request_model:
+                            payload["model"] = real_model_id
+                            body = json.dumps(payload).encode("utf-8")
+                            fwd_headers["content-length"] = str(len(body))
                     msgs = payload.get("messages", [])
                     if isinstance(msgs, list):
                         prompt_text = " ".join(
@@ -231,9 +238,10 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
                     is_stream = bool(payload.get("stream", False))
                     if is_stream and "stream_options" not in payload:
                         payload["stream_options"] = {"include_usage": True}
-                    # Thinking off para qwen9b por defecto
-                    if name == "qwen9b" and "chat_template_kwargs" not in payload:
-                        payload["chat_template_kwargs"] = {"enable_thinking": False}
+                    # Thinking: respetar lo que el cliente envie en chat_template_kwargs.
+                    # Si el cliente NO especifica, activar thinking por defecto (maxima calidad).
+                    if "chat_template_kwargs" not in payload:
+                        payload["chat_template_kwargs"] = {"enable_thinking": True}
                     body = json.dumps(payload).encode("utf-8")
                     fwd_headers["content-length"] = str(len(body))
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -273,6 +281,20 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
                 upstream = await client.send(req, stream=True)
                 status_code = upstream.status_code
                 async for chunk in upstream.aiter_raw():
+                    # Reemplazar el nombre del modelo en cada chunk SSE si es el path
+                    if request_model and b'"model":' in chunk:
+                        try:
+                            text = chunk.decode("utf-8", errors="ignore")
+                            # Buscar "model":"<algo>" y reemplazar si es path largo
+                            import re
+                            text = re.sub(
+                                rb'"model"\s*:\s*"[^"]*\.gguf[^"]*"',
+                                ('"model":"' + request_model + '"').encode(),
+                                chunk,
+                            )
+                            chunk = text.encode("utf-8") if isinstance(text, str) else text
+                        except Exception:
+                            pass
                     full_buf += chunk
                     m["total_done"] += 0  # no-op for clarity
                     yield chunk
@@ -289,16 +311,17 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
                     try:
                         pt, ct = _extract_usage_from_sse(full_buf)
                         if pt or ct:
+                            model_for_tracking = request_model if request_model else name
                             billing.track_usage(
-                                client_id=client_id, model=name,
+                                client_id=client_id, model=model_for_tracking,
                                 prompt_tokens=pt, completion_tokens=ct)
                             # Log completo en SQLite
-                            price = MODEL_PRICES.get(name, {"input": 0.0, "output": 0.0})
+                            price = MODEL_PRICES.get(model_for_tracking, MODEL_PRICES.get(name, {"input": 0.0, "output": 0.0}))
                             cost = (pt / 1_000_000 * price["input"] +
                                     ct / 1_000_000 * price["output"])
                             resp_text = _extract_response_text_from_sse(full_buf)
                             log_request(
-                                client_id=client_id, model=name, backend=name,
+                                client_id=client_id, model=model_for_tracking, backend=name,
                                 prompt_tokens=pt, completion_tokens=ct,
                                 cost_usd=cost, latency_ms=int((time.monotonic()-t0)*1000),
                                 status_code=status_code, stream=True,
@@ -387,6 +410,19 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
             log.debug(f"billing track error: {e}")
     purge_old()
 
+    # Reemplazar el campo "model" en la respuesta por el ID limpio
+    # (algunos backends como llamacpp devuelven el path del .gguf)
+    if status == 200 and request_model:
+        try:
+            resp_data = json.loads(content)
+            if isinstance(resp_data, dict) and "model" in resp_data:
+                # Si el modelo devuelto es un path o distinto al solicitado, reemplazarlo
+                if resp_data["model"] != request_model:
+                    resp_data["model"] = request_model
+                    content = json.dumps(resp_data).encode("utf-8")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
     if billing and client_id:
         try:
             quota = billing.get_quota_status(client_id, plan or "free")
@@ -466,29 +502,47 @@ MODELS_CATALOG = {
         "model_id": "qwen35",
         "name": "Qwen 3.5 9B",
         "owned_by": "ojoia",
-        "description": "Qwen 3.5 9B - vllm, 128K contexto, multimodal (texto/imagen/video)",
+        "description": "Modelo multimodal de 9B parámetros en vLLM. Procesa texto, imágenes y video. Ideal para chat general, código y razonamiento con contexto de 128K. Soporta tool calling y thinking.",
         "capabilities": ["text", "image", "video", "thinking"],
+        "modalities": {
+            "input": ["text", "image", "video"],
+            "output": ["text"]
+        },
         "context_length": 131072,
+        "supports_tools": True,
+        "supports_thinking": True,
     },
     "qwen36-35b-a3b": {
         "id": "qwen36-35b-a3b",
         "backend": "qwen35b",
-        "model_id": "qwen36-35b-a3b",
+        "model_id": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf",
         "name": "Qwen 3.6 35B A3B",
         "owned_by": "ojoia",
-        "description": "Qwen 3.6 35B A3B - llamacpp, 156K contexto, máxima calidad",
-        "capabilities": ["text", "image", "video", "thinking"],
+        "description": "Modelo MoE de 35B (3B activos) cuantizado IQ4 en llama.cpp. Máxima calidad para razonamiento complejo, código avanzado y multimodalidad (texto, imagen, audio, video). Contexto de 156K.",
+        "capabilities": ["text", "image", "audio", "video", "pdf", "thinking"],
+        "modalities": {
+            "input": ["text", "image", "audio", "video", "pdf"],
+            "output": ["text"]
+        },
         "context_length": 156160,
+        "supports_tools": True,
+        "supports_thinking": True,
     },
     "qwen3-7b": {
         "id": "qwen3-7b",
         "backend": "qwen7b",
-        "model_id": "qwen3-7b",
+        "model_id": "/models/7b",
         "name": "Qwen 3 7B",
         "owned_by": "ojoia",
-        "description": "Qwen 3 7B - sglang, 16K contexto, ligero y rápido",
+        "description": "Modelo ligero de 7B parámetros en SGLang. Procesa texto, imágenes y video. Perfecto para tareas rápidas, chat general y prototipado con bajo consumo. Contexto de 16K.",
         "capabilities": ["text", "image", "video", "thinking"],
+        "modalities": {
+            "input": ["text", "image", "video"],
+            "output": ["text"]
+        },
         "context_length": 16000,
+        "supports_tools": True,
+        "supports_thinking": True,
     },
     "whisper-turbo": {
         "id": "whisper-turbo",
@@ -496,9 +550,15 @@ MODELS_CATALOG = {
         "model_id": "whisper-turbo",
         "name": "Whisper Turbo",
         "owned_by": "ojoia",
-        "description": "Whisper Turbo - faster-whisper, transcripción de audio",
+        "description": "Modelo de transcripción de audio a texto usando faster-whisper. Soporta múltiples idiomas y es muy rápido.",
         "capabilities": ["audio"],
+        "modalities": {
+            "input": ["audio"],
+            "output": ["text"]
+        },
         "context_length": 0,
+        "supports_tools": False,
+        "supports_thinking": False,
     },
 }
 
@@ -516,7 +576,12 @@ async def list_models():
             "created": 1787428011,
             "owned_by": m["owned_by"],
             "capabilities": m.get("capabilities", ["text"]),
+            "modalities": m.get("modalities", {}),
             "name": m.get("name", m["id"]),
+            "description": m.get("description", ""),
+            "context_length": m.get("context_length", 0),
+            "supports_tools": m.get("supports_tools", False),
+            "supports_thinking": m.get("supports_thinking", False),
         })
     return {"object": "list", "data": models_list}
 
