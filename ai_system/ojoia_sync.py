@@ -48,10 +48,25 @@ def _pick_credential() -> Path:
 
 
 class OjoiaSync:
-    """Push de estado + polling de comandos contra Firestore."""
+    """Push de estado + polling de comandos contra Firestore.
+
+    Free tier de Firebase tiene límites:
+      - 20K writes/día
+      - 1 write/seg sostenido
+      - 50K reads/día
+
+    Por eso las frecuencias son conservadoras: status cada 30s, billing cada 5min.
+    Si se recibe 429 (quota), se hace backoff exponencial con jitter.
+    """
+
+    # Estado de backoff global (compartido por todas las instancias)
+    _quota_state = {
+        "consecutive_429": 0,
+        "next_retry_after": 0.0,
+    }
 
     def __init__(self, node_id: str, fb_project: str | None = None,
-                 interval: float = 5.0, cred: Path | None = None):
+                 interval: float = 30.0, cred: Path | None = None):
         self.node_id = node_id
         self.interval = interval
         self.db = None
@@ -80,65 +95,132 @@ class OjoiaSync:
     def enabled(self) -> bool:
         return self.db is not None
 
+    def _is_quota_exceeded(self, error_str: str) -> bool:
+        """Detecta si el error es 429 Quota Exceeded."""
+        return "429" in error_str or "Quota exceeded" in error_str or "RESOURCE_EXHAUSTED" in error_str
+
+    def _handle_quota_backoff(self):
+        """Backoff exponencial con jitter para 429."""
+        OjoiaSync._quota_state["consecutive_429"] += 1
+        n = OjoiaSync._quota_state["consecutive_429"]
+        # 1s, 2s, 4s, 8s, 16s, 32s, 60s (max)
+        delay = min(60, 2 ** min(n, 6))
+        # jitter ±20%
+        import random
+        delay = delay * (0.8 + 0.4 * random.random())
+        OjoiaSync._quota_state["next_retry_after"] = time.time() + delay
+        print(f"[ojoia_sync] 429 Quota — backoff {delay:.1f}s (attempt #{n})")
+
+    def _reset_quota_backoff(self):
+        if OjoiaSync._quota_state["consecutive_429"] > 0:
+            print(f"[ojoia_sync] quota recovered after {OjoiaSync._quota_state['consecutive_429']} attempts")
+            OjoiaSync._quota_state["consecutive_429"] = 0
+            OjoiaSync._quota_state["next_retry_after"] = 0.0
+
     def push_status(self, status: dict) -> None:
-        """Escribe el snapshot de estado del nodo en Firestore."""
+        """Escribe el snapshot MÍNIMO de estado del nodo en Firestore.
+
+        Solo enviamos lo esencial para que la web SPA muestre el estado,
+        NO el snapshot completo que tiene 100+ campos.
+        """
         if not self.enabled:
             return
+        if time.time() < OjoiaSync._quota_state["next_retry_after"]:
+            return  # en backoff
         try:
+            # Snapshot mínimo: solo lo que la web necesita
+            services = status.get("services", [])
+            minimal_services = [
+                {
+                    "id": s.get("id"),
+                    "name": s.get("name"),
+                    "active": s.get("active"),
+                    "paused": s.get("paused"),
+                    "port": s.get("port"),
+                    "gpu": s.get("gpu"),
+                    "docker": s.get("docker", False),
+                    "container": s.get("container"),
+                    "docker_state": s.get("docker_state"),
+                }
+                for s in services
+            ]
             doc = self.db.collection("nodes").document(self.node_id)
             doc.set({
                 "node_id": self.node_id,
                 "online": True,
                 "hostname": status.get("hostname", ""),
                 "updated_at": firestore.SERVER_TIMESTAMP,
-                "status": status,
+                "status": {
+                    "hostname": status.get("hostname"),
+                    "uptime_s": status.get("uptime_s"),
+                    "load": status.get("load"),
+                    "ram": status.get("ram"),
+                    "disk": status.get("disk"),
+                    "power": status.get("power"),
+                    "gpus": status.get("gpus", []),
+                    "services": minimal_services,
+                    "incidents_count": len(status.get("incidents", [])),
+                    "maintenance_mode": status.get("maintenance_mode"),
+                },
             })
+            self._reset_quota_backoff()
         except Exception as e:
-            print(f"[ojoia_sync] ERROR push status: {e}")
+            err = str(e)
+            if self._is_quota_exceeded(err):
+                self._handle_quota_backoff()
+            else:
+                print(f"[ojoia_sync] ERROR push status: {e}")
 
     def push_billing(self, billing: dict) -> None:
         """Sincroniza datos de billing (stats, clients, config) a Firestore.
 
-        Estructura en Firestore:
-          /billing/global/stats/{window}  -> stats agregados
-          /billing/global/clients        -> lista de clientes con uso
-          /billing/global/config         -> precios y planes
-          /billing/global/reqlog/{id}    -> requests recientes (max 200)
+        IMPORTANTE: respeta el backoff de quota y reduce escrituras.
         """
         if not self.enabled:
             return
+        if time.time() < OjoiaSync._quota_state["next_retry_after"]:
+            return  # en backoff
+        writes_done = 0
         try:
             base = self.db.collection("billing").document("global")
-            # Stats por ventana
-            if "stats" in billing:
-                for window_h, sdata in billing["stats"].items():
-                    base.collection("stats").document(str(window_h)).set({
-                        "window_h": window_h,
-                        "data": sdata,
-                        "updated_at": firestore.SERVER_TIMESTAMP,
-                    })
-            # Clientes
-            if "clients" in billing:
-                base.collection("clients_meta").document("current").set({
-                    "clients": billing["clients"],
-                    "count": len(billing["clients"]),
+            # Solo actualizamos 24h stats (lo más importante para el dashboard)
+            if "stats" in billing and "24" in billing["stats"]:
+                base.collection("stats").document("24").set({
+                    "window_h": 24,
+                    "data": billing["stats"]["24"],
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 })
-            # Config (precios + planes)
+                writes_done += 1
+            # Config (precios + planes) - una sola vez
             if "config" in billing:
                 base.collection("config").document("current").set({
                     "config": billing["config"],
                     "updated_at": firestore.SERVER_TIMESTAMP,
                 })
-            # ReqLog (últimos N)
+                writes_done += 1
+            # Clientes - solo si hay cambios (si count == 0 skip)
+            if "clients" in billing and billing["clients"]:
+                base.collection("clients_meta").document("current").set({
+                    "clients": billing["clients"][:20],  # solo top 20
+                    "count": len(billing["clients"]),
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                })
+                writes_done += 1
+            # ReqLog: solo los últimos 50 (no 200)
             if "reqlog" in billing:
-                for req in billing["reqlog"][:200]:
+                for req in billing["reqlog"][:50]:
                     base.collection("reqlog").document(str(req.get("id", ""))).set({
                         **req,
                         "synced_at": firestore.SERVER_TIMESTAMP,
                     })
+                    writes_done += 1
+            self._reset_quota_backoff()
         except Exception as e:
-            print(f"[ojoia_sync] ERROR push billing: {e}")
+            err = str(e)
+            if self._is_quota_exceeded(err):
+                self._handle_quota_backoff()
+            else:
+                print(f"[ojoia_sync] ERROR push billing ({writes_done} writes antes): {e}")
 
     def billing_provider(self) -> dict:
         """Retorna un provider de billing listo para pasar a run_loop como billing_provider.

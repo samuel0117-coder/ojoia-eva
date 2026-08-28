@@ -456,22 +456,32 @@ class HealthMonitor:
                 svc.consecutive_failures = 0
             svc.loading_since = 0.0
         else:
-            # grace window para carga de modelos pesados (qwen-35b tarda minutos)
             state = await self._docker_state(svc)
             now = time.time()
+            # Para servicios que NO son modelos pesados, el grace es más corto
+            # (yolo, whisper arrancan en <10s). Solo modelos grandes (qwen-35b)
+            # necesitan 15min de gracia.
+            GRACE_SECS = 900 if "qwen" in svc.name.lower() else 60
+
             if state in ("starting", "restarting", "created"):
                 if svc.loading_since == 0.0:
                     svc.loading_since = now
-                if now - svc.loading_since < 900:  # 15 min de gracia
+                if now - svc.loading_since < GRACE_SECS:
                     self.log(f"{svc.name} ({svc.container}): cargando ({state}) — grace {int(now - svc.loading_since)}s", "INFO")
                     return
-                self.log(f"{svc.name} ({svc.container}): lleva >15min en {state} — reiniciando", "WARN")
+                self.log(f"{svc.name} ({svc.container}): lleva >{GRACE_SECS}s en {state} — reiniciando", "WARN")
                 svc.loading_since = 0.0
-            elif svc.last_restart and (now - svc.last_restart) < 900:
+            elif svc.last_restart and (now - svc.last_restart) < GRACE_SECS:
                 self.log(f"{svc.name} ({svc.container}): reiniciado hace {int(now - svc.last_restart)}s — grace", "INFO")
                 return
             else:
-                svc.loading_since = 0.0
+                # Resetear el grace si el container está exited y NO fue nuestro restart.
+                # Caso típico: yolo recibe señal externa (docker stop externo) y
+                # debemos reiniciarlo, no respetarle un grace que no le dimos.
+                if state in ("exited", "dead") and svc.last_restart and (now - svc.last_restart) > GRACE_SECS:
+                    svc.last_restart = 0.0
+                    svc.loading_since = 0.0
+                    self.log(f"{svc.name} ({svc.container}): grace expirado (exit externo), forzar restart", "WARN")
             svc.failures += 1
             if svc.critical and svc.consecutive_failures < 6:
                 self.log(f"{svc.name} ({svc.container}): DOWN (container={container_ok}, port={port_ok}, http={http_ok}) — auto-restart", "WARN")

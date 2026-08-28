@@ -1453,58 +1453,61 @@ if __name__ == "__main__":
     import uvicorn
     import threading as _threading
     # ── Sincronización multi-nodo vía Firestore ─────────────────────────────
-    # Si firebase-key.json está disponible, empuja el estado a /nodes/{id} y
-    # pull comandos de /control/{id}/cmds. También sincroniza billing a
-    # /billing/global/* para alimentar la SPA web (megapanel-ojoia.web.app).
-    # IMPORTANTE: las frecuencias son conservadoras para evitar 429 Quota
-    # exceeded del free tier de Firestore (~1 write/sec/sustained).
-    try:
-        from ojoia_sync import OjoiaSync
-        _sync = OjoiaSync(node_id=NODE_ID)
-        if _sync.enabled:
-            def _sync_worker():
-                import asyncio
-                async def _loop():
-                    SYNC_INTERVAL = 15  # push status cada 15s (era 5s)
-                    BILLING_INTERVAL = 180  # billing cada 3min (era 60s)
-                    last_billing = 0.0
-                    last_status = 0.0
-                    while True:
-                        now = asyncio.get_event_loop().time()
-                        # Push status
-                        if (now - last_status) >= SYNC_INTERVAL:
+    # Si OJOIA_SYNC=0 o firebase-key.json no está disponible, NO se hace sync.
+    # Esto es importante porque el free tier de Firestore tiene 429 quota
+    # que rompe el health-monitor si se supera.
+    # Por defecto está DESHABILITADO para evitar 429. Activar con OJOIA_SYNC=1.
+    OJOIA_SYNC_ENABLED = os.environ.get("OJOIA_SYNC", "0") == "1"
+
+    if not OJOIA_SYNC_ENABLED:
+        print("[megapanel] ojoia_sync DESHABILITADO (OJOIA_SYNC=0). "
+              "El panel web no se sincronizará con Firestore hasta que se active explícitamente.")
+    else:
+        # ── Sincronización multi-nodo vía Firestore ─────────────────────────────
+        try:
+            from ojoia_sync import OjoiaSync
+            _sync = OjoiaSync(node_id=NODE_ID)
+            if _sync.enabled:
+                def _sync_worker():
+                    import asyncio
+                    async def _loop():
+                        SYNC_INTERVAL = 60   # status cada 60s (conservador)
+                        BILLING_INTERVAL = 600  # billing cada 10min
+                        last_billing = 0.0
+                        last_status = 0.0
+                        while True:
+                            now = asyncio.get_event_loop().time()
+                            if (now - last_status) >= SYNC_INTERVAL:
+                                try:
+                                    status_data = status() if callable(status) else {}
+                                    if asyncio.iscoroutine(status_data):
+                                        status_data = await status_data
+                                    _sync.push_status(status_data)
+                                    last_status = now
+                                except Exception as _e:
+                                    print(f"[ojoia_sync] push error: {_e}")
                             try:
-                                status_data = status() if callable(status) else {}
-                                if asyncio.iscoroutine(status_data):
-                                    status_data = await status_data
-                                _sync.push_status(status_data)
-                                last_status = now
+                                ctrl = control if callable(control) else None
+                                if ctrl and asyncio.iscoroutinefunction(ctrl):
+                                    await _sync.poll_control(ctrl)
+                                elif ctrl:
+                                    _sync.poll_control(ctrl)
                             except Exception as _e:
-                                print(f"[ojoia_sync] push error: {_e}")
-                        # Poll commands
-                        try:
-                            ctrl = control if callable(control) else None
-                            if ctrl and asyncio.iscoroutinefunction(ctrl):
-                                await _sync.poll_control(ctrl)
-                            elif ctrl:
-                                _sync.poll_control(ctrl)
-                        except Exception as _e:
-                            print(f"[ojoia_sync] poll error: {_e}")
-                        # Billing sync (mucho menos frecuente)
-                        if (now - last_billing) >= BILLING_INTERVAL:
-                            try:
-                                _sync.push_billing(_sync.billing_provider())
-                                last_billing = now
-                            except Exception as _e:
-                                print(f"[ojoia_sync] billing sync error: {_e}")
-                        await asyncio.sleep(2)  # pequeño tick para no quemar CPU
-                asyncio.run(_loop())
-            t = _threading.Thread(target=_sync_worker, daemon=True)
-            t.start()
-            print(f"[megapanel] ojoia_sync iniciado para nodo={NODE_ID} "
-                  f"(status=15s, billing=3min)")
-    except Exception as e:
-        print(f"[megapanel] ojoia_sync no disponible: {e}")
+                                print(f"[ojoia_sync] poll error: {_e}")
+                            if (now - last_billing) >= BILLING_INTERVAL:
+                                try:
+                                    _sync.push_billing(_sync.billing_provider())
+                                    last_billing = now
+                                except Exception as _e:
+                                    print(f"[ojoia_sync] billing sync error: {_e}")
+                            await asyncio.sleep(10)
+                    asyncio.run(_loop())
+                t = _threading.Thread(target=_sync_worker, daemon=True)
+                t.start()
+                print(f"[megapanel] ojoia_sync iniciado para nodo={NODE_ID} "
+                      f"(status=60s, billing=10min, con backoff)")
+        except Exception as e:
+            print(f"[megapanel] ojoia_sync no disponible: {e}")
 
     # A2 (defense in depth): bind 127.0.0.1 unicamente. El panel se expone
     # exclusivamente via el tunel Cloudflare -> nginx 19001 -> 127.0.0.1:9001.
