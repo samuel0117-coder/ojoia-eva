@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reportes Automáticos - OjoIA Admin</title>
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --accent: #4a90e2;
+            --accent-hover: #357abd;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --border: #333;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+        .header {
+            background: var(--bg-secondary);
+            padding: 20px 30px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 1.5rem; }
+        .header a {
+            color: var(--accent);
+            text-decoration: none;
+            padding: 8px 16px;
+            background: var(--bg-primary);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 30px; }
+        
+        .card {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            border: 1px solid var(--border);
+        }
+        .card h2 { margin-bottom: 20px; font-size: 1.3rem; }
+        .card h3 { margin: 20px 0 10px; font-size: 1.1rem; color: var(--text-secondary); }
+        
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 12px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 1rem;
+        }
+        .form-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 8px;
+        }
+        .form-row { display: flex; gap: 16px; }
+        .form-row .form-group { flex: 1; }
+        
+        .btn {
+            padding: 12px 24px;
+            border-radius: 6px;
+            border: none;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-secondary {
+            background: transparent;
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+        }
+        .btn-success { background: var(--success); color: white; }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: var(--bg-primary);
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value { font-size: 2rem; font-weight: bold; color: var(--accent); }
+        .stat-label { color: var(--text-secondary); font-size: 0.9rem; margin-top: 4px; }
+        
+        .toggle-switch {
+            display: inline-flex;
+            align-items: center;
+            cursor: pointer;
+        }
+        .toggle-switch input { display: none; }
+        .toggle-slider {
+            width: 50px;
+            height: 26px;
+            background: var(--border);
+            border-radius: 13px;
+            position: relative;
+            margin-right: 10px;
+            transition: background 0.3s;
+        }
+        .toggle-slider::after {
+            content: '';
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 20px;
+            height: 20px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.3s;
+        }
+        .toggle-switch input:checked + .toggle-slider { background: var(--success); }
+        .toggle-switch input:checked + .toggle-slider::after { transform: translateX(24px); }
+        
+        .report-list { list-style: none; }
+        .report-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        .report-item:last-child { border-bottom: none; }
+        .report-info { flex: 1; }
+        .report-name { font-weight: 500; }
+        .report-date { color: var(--text-secondary); font-size: 0.85rem; margin-top: 4px; }
+        .report-actions { display: flex; gap: 8px; }
+        
+        .alert {
+            padding: 12px 16px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+        .alert-success { background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); color: var(--success); }
+        .alert-error { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
+        
+        .hidden { display: none; }
+        .loading { text-align: center; padding: 40px; color: var(--text-secondary); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📄 Reportes Automáticos</h1>
+        <a href="index.html">← Volver al Admin</a>
+    </div>
+    
+    <div class="container">
+        <div id="alert-container"></div>
+        
+        <!-- Estadísticas -->
+        <div class="card">
+            <h2>📊 Estadísticas de Reportes</h2>
+            <div class="stats-grid" id="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-enabled">—</div>
+                    <div class="stat-label">Estado</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-schedule">—</div>
+                    <div class="stat-label">Horario</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-total">—</div>
+                    <div class="stat-label">Total Enviados</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-last">—</div>
+                    <div class="stat-label">Último Envío</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Configuración -->
+        <div class="card">
+            <h2>⚙️ Configuración de Envío</h2>
+            
+            <div class="form-group">
+                <label class="toggle-switch">
+                    <input type="checkbox" id="config-enabled" checked>
+                    <span class="toggle-slider"></span>
+                    <span>Activar reportes automáticos diarios</span>
+                </label>
+            </div>
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Hora de envío</label>
+                    <input type="time" id="config-time" value="07:30">
+                </div>
+                <div class="form-group">
+                    <label>Formato</label>
+                    <select id="config-format">
+                        <option value="html">HTML (Recomendado)</option>
+                        <option value="pdf">PDF</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Cámaras a incluir (vacío = todas)</label>
+                <input type="text" id="config-cameras" placeholder="cam_001, cam_002">
+            </div>
+            
+            <div style="margin-top: 20px;">
+                <button class="btn btn-primary" onclick="saveConfig()">💾 Guardar Configuración</button>
+                <button class="btn btn-secondary" onclick="loadConfig()">🔄 Cargar Configuración</button>
+                <button class="btn btn-success" onclick="sendTestReport()">🧪 Enviar Reporte de Prueba</button>
+            </div>
+        </div>
+        
+        <!-- Historial -->
+        <div class="card">
+            <h2>📜 Historial de Reportes</h2>
+            <button class="btn btn-secondary" onclick="loadReports()" style="margin-bottom: 16px;">🔄 Actualizar Lista</button>
+            <ul class="report-list" id="report-list">
+                <li class="loading">Cargando reportes...</li>
+            </ul>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = '/api';
+        let currentUser = localStorage.getItem('ojoia_user_id') || 'test_user_001';
+        
+        // Mostrar alerta
+        function showAlert(message, type = 'success') {
+            const container = document.getElementById('alert-container');
+            container.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+            setTimeout(() => container.innerHTML = '', 5000);
+        }
+        
+        // Cargar configuración
+        async function loadConfig() {
+            try {
+                const res = await fetch(`${API_BASE}/reports/config?user_id=${currentUser}`);
+                const data = await res.json();
+                
+                if (data.success) {
+                    const config = data.config;
+                    document.getElementById('config-enabled').checked = config.enabled !== false;
+                    
+                    const hour = String(config.hour || 7).padStart(2, '0');
+                    const minute = String(config.minute || 30).padStart(2, '0');
+                    document.getElementById('config-time').value = `${hour}:${minute}`;
+                    
+                    document.getElementById('config-format').value = config.format || 'html';
+                    document.getElementById('config-cameras').value = (config.cameras || []).join(', ');
+                    
+                    // Actualizar stats
+                    document.getElementById('stat-enabled').textContent = config.enabled ? '✅ Activo' : '❌ Inactivo';
+                    document.getElementById('stat-schedule').textContent = `${hour}:${minute}`;
+                    document.getElementById('stat-total').textContent = config.total_sent || 0;
+                    document.getElementById('stat-last').textContent = config.last_sent ? 
+                        new Date(config.last_sent).toLocaleDateString() : 'Nunca';
+                }
+            } catch (e) {
+                console.error('Error loading config:', e);
+                showAlert('Error cargando configuración: ' + e.message, 'error');
+            }
+        }
+        
+        // Guardar configuración
+        async function saveConfig() {
+            try {
+                const timeValue = document.getElementById('config-time').value;
+                const [hour, minute] = timeValue.split(':').map(Number);
+                
+                const camerasValue = document.getElementById('config-cameras').value;
+                const cameras = camerasValue ? camerasValue.split(',').map(c => c.trim()) : [];
+                
+                const config = {
+                    enabled: document.getElementById('config-enabled').checked,
+                    hour,
+                    minute,
+                    format: document.getElementById('config-format').value,
+                    cameras
+                };
+                
+                const res = await fetch(`${API_BASE}/reports/config?user_id=${currentUser}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    showAlert('✅ Configuración guardada exitosamente');
+                    loadConfig();
+                } else {
+                    showAlert('❌ Error guardando configuración: ' + (data.error || 'Unknown'), 'error');
+                }
+            } catch (e) {
+                showAlert('Error guardando configuración: ' + e.message, 'error');
+            }
+        }
+        
+        // Enviar reporte de prueba
+        async function sendTestReport() {
+            try {
+                showAlert('📤 Enviando reporte de prueba...');
+                
+                const res = await fetch(`${API_BASE}/reports/send?user_id=${currentUser}&date=yesterday`);
+                const data = await res.json();
+                
+                if (data.success) {
+                    showAlert('✅ Reporte enviado exitosamente. Revisa el chat de Eva.');
+                    loadReports();
+                } else {
+                    showAlert('❌ Error enviando reporte: ' + (data.error || 'Unknown'), 'error');
+                }
+            } catch (e) {
+                showAlert('Error enviando reporte: ' + e.message, 'error');
+            }
+        }
+        
+        // Cargar reportes
+        async function loadReports() {
+            try {
+                const res = await fetch(`${API_BASE}/reports/list?user_id=${currentUser}&limit=20`);
+                const data = await res.json();
+                
+                const list = document.getElementById('report-list');
+                
+                if (data.success && data.reports.length > 0) {
+                    list.innerHTML = data.reports.map(r => `
+                        <li class="report-item">
+                            <div class="report-info">
+                                <div class="report-name">📄 ${r.filename}</div>
+                                <div class="report-date">${new Date(r.created_at).toLocaleString()} • ${r.size} bytes</div>
+                            </div>
+                            <div class="report-actions">
+                                <a href="${r.url}" target="_blank" class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.85rem;">👁️ Ver</a>
+                                <a href="${r.url}" download class="btn btn-primary" style="padding: 6px 12px; font-size: 0.85rem;">⬇️ Descargar</a>
+                            </div>
+                        </li>
+                    `).join('');
+                } else {
+                    list.innerHTML = '<li class="loading">No hay reportes generados</li>';
+                }
+            } catch (e) {
+                document.getElementById('report-list').innerHTML = 
+                    '<li class="loading">Error cargando reportes: ' + e.message + '</li>';
+            }
+        }
+        
+        // Inicializar
+        document.addEventListener('DOMContentLoaded', () => {
+            loadConfig();
+            loadReports();
+        });
+    </script>
+</body>
+</html>

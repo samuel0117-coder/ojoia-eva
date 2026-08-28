@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reporte Diario - olas pollo</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: -apple-system, sans-serif; background: linear-gradient(135deg, #667eea, #764ba2); padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 20px; padding: 30px; }
+        h1 { text-align: center; color: #1a1a1a; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 30px 0; }
+        .stat { background: #f5f7fa; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #667eea; }
+        .btn-download { display: block; text-align: center; background: #667eea; color: white; padding: 15px; border-radius: 10px; text-decoration: none; margin-top: 20px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🍽️ Reporte Diario - olas pollo</h1>
+        <p style="text-align: center; color: #666;">9 de julio, 2026</p>
+        
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value">951</div>
+                <div>Análisis</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">16</div>
+                <div>Personas</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">3</div>
+                <div>Eventos</div>
+            </div>
+        </div>
+        
+        <div style="margin: 30px 0;">
+            <canvas id="chart"></canvas>
+        </div>
+        
+        <a href="reporte-olas-pollo-2026-07-09.pdf" class="btn-download" download>📥 Descargar PDF</a>
+    </div>
+    
+    <script>
+        new Chart(document.getElementById('chart'), {
+            type: 'bar',
+            data: {
+                labels: ['10:00', '12:00', '14:00', '16:00', '18:00'],
+                datasets: [{
+                    label: 'Actividad',
+                    data: [5, 12, 8, 15, 10],
+                    backgroundColor: 'rgba(102, 126, 234, 0.6)'
+                }]
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,15 +1,12 @@
 /**
- * chat-2026.js — Chat con Eva (Sistema Operativo + Setup)
- *
+ * eva-chat-v5.js — Chat con Eva (Sistema Operativo + Setup)
+ * 
  * FLUJO:
  * - Sin cámaras: Eva entra en modo setup (configuración determinista)
  * - Con cámaras: Eva entra en modo OS con sugerencias rápidas
- *
+ * 
  * Las sugerencias se muestran como botones clickeables arriba del input.
  * La conversación persiste al cambiar de tab.
- *
- * BUILD 20260822-a: fuerza invalidación de cache Cloudflare (bug Content-Encoding).
- * 2026-08-26: cabecera actualizada (era "eva-chat-v7.js" — ya no aplica).
  */
 
 const EvaChat = {
@@ -20,13 +17,6 @@ const EvaChat = {
         if (h === '10.0.0.44' || h === 'localhost' || h === '') return 'http://localhost:8007';
         return 'https://api.ojoia.com.do';
     })(),
-    // P0 (Fuga #7.1): helper para escapar valores interpolados en atributos
-    // HTML/onclick. Si un camera_id o event_id del backend contiene ' o "
-    // o <script>, sin este escape tenemos RCE via onclick inline.
-    _escAttr(s) {
-        return String(s || '').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
-            .replace(/"/g, '"').replace(/'/g, '\'');
-    },
     sessionId: null,
     history: [],
     isLoading: false,
@@ -123,10 +113,8 @@ const EvaChat = {
                 this._summary = saved.summary || this._summary;
                 // Re-renderiza si hubo agregados o cambio el summary
                 if (added > 0 || this._summary !== prevSummary) {
-                    // v14: forzar scroll. Otra pestaña escribió msgs nuevos y el usuario está
-        // en esta pestaña activa, así que debe ver los msgs nuevos.
-        this.render();
-        this.scrollToBottom(true);
+                    this.render();
+                    this.scrollToBottom();
                 }
             } catch (err) { console.warn('[EvaChat] cross-tab sync failed:', err); }
         };
@@ -149,13 +137,6 @@ const EvaChat = {
         if (this._storageHandler) {
             try { window.removeEventListener('storage', this._storageHandler); } catch (e) {}
             this._storageHandler = null;
-        }
-        // P0 (Bug #3): remove el listener visibilitychange que _startRemoteSync
-        // agrego. Sin esto, cada logout/login acumula un handler sobre el
-        // document, disparando N polls paralelos cada 10s.
-        if (this._visibilityHandler) {
-            try { document.removeEventListener('visibilitychange', this._visibilityHandler); } catch (e) {}
-            this._visibilityHandler = null;
         }
         if (this._remoteSyncInterval) {
             clearInterval(this._remoteSyncInterval);
@@ -195,20 +176,17 @@ const EvaChat = {
             if (ageMin < 30) return; // ya hay un greeting reciente (< 30 min)
         }
         // Construir el greeting
-        // v14: declarar greeting/events FUERA del try para que el scope sea correcto
-        // y el catch pueda establecerlos sin depender de var hoisting.
         let greeting;
-        let events = [];
         try {
             const brief = await this._buildDailyBrief();
             greeting = brief.text;
             this._hasRecentAlerts = brief.alerts > 0;
             this._briefEvent = brief.event || null;
-            events = brief.events || [];
+            var events = brief.events || [];
         } catch (e) {
             const name = (this.userName || 'amigo').split(' ')[0];
             greeting = `Hola, ${name}.\n\nHoy tu negocio se ve tranquilo.\n\nRevisé tus cámaras y no encontré alertas reales.\n¿Quieres ver qué está pasando ahora?`;
-            events = [];
+            var events = [];
         }
         // APPEND (no replace) — solo agregar si history está vacío o si el último
         // mensaje no es ya este greeting (anti-dup)
@@ -294,12 +272,8 @@ const EvaChat = {
         }
 
         const chips = this._buildQuickChips();
-        const suggestionsHtml = chips.length ? `<div class="eva-suggestions" style="display:flex;gap:8px;overflow-x:auto;padding:0 16px 10px">${chips.map(chip => `<button class="suggestion-btn" onclick="EvaChat.sendSuggestion(${this._escAttr(JSON.stringify(chip.text))})">${this.escapeHtml(chip.label)}</button>`).join('')}</div>` : '';
+        const suggestionsHtml = chips.length ? `<div class="eva-suggestions" style="display:flex;gap:8px;overflow-x:auto;padding:0 16px 10px">${chips.map(chip => `<button class="suggestion-btn" onclick="EvaChat.sendSuggestion('${chip.text.replace(/'/g, "\\'")}')">${chip.label}</button>`).join('')}</div>` : '';
 
-        // v14: capturar estado de scroll ANTES de rebuildar el DOM.
-        // innerHTML destruye la posición de scroll actual; si el usuario estaba
-        // al fondo, hay que restaurarla tras el render o el chat saltará arriba.
-        const wasAtBottom = this._userAtBottom;
         chatEl.innerHTML = `
             <div class="eva-chat-header" style="height:72px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid rgba(255,255,255,0.06);background:rgba(28,28,30,0.72);backdrop-filter:blur(24px)">
                 <div style="display:flex;align-items:center;gap:10px;min-width:0">
@@ -338,11 +312,8 @@ const EvaChat = {
             const input = document.getElementById('eva-input');
             if (input) input.focus();
             this._drawPendingHeatmaps();
-            // v14: si el usuario estaba al fondo antes del rebuild, forzar
-            // scroll al fondo. innerHTML resetea el scroll a 0 y el handler
-            // onscroll lo marca como no-al-fondo, así que sin esto el chat
-            // sube en lugar de mantenerse abajo.
-            if (wasAtBottom) this.scrollToBottom(true);
+            // Solo forzar scroll al fondo en render completo (cambio de página,
+            // inicialización, etc). NO hacer auto-scroll en poll remoto.
         }, 300);
     },
 
@@ -354,7 +325,7 @@ const EvaChat = {
             .replace(/ó/g, 'o')
             .replace(/ú/g, 'u')
             .replace(/ñ/g, 'n');
-        if (text.includes('no se pudo') || text.includes('fallo') || text.includes('falló') || text.includes('error') || text.includes('confund') || text.includes('desubic')) return false;
+        if (text.includes('no se pudo') || text.includes('fallo') || text.includes('falló') || text.includes('error') || text.includes('confund') || text.includes('desubic') || text.includes('instarlar')) return false;
         return text.includes('instalar camara') ||
             text.includes('agregar camara') ||
             text.includes('añadir camara') ||
@@ -367,10 +338,6 @@ const EvaChat = {
             text.includes('quiero una camara');
     },
 
-    // _isSetupArtifact: ELIMINADO (nunca se usa). El filtro anterior borrraba msgs
-// válidos con palabras genéricas como "configuración". El backend recibe el
-// historial completo y debe decidir qué ignorar; el frontend no debe filtrar.
-/*
     _isSetupArtifact(text) {
         const t = String(text || '').toLowerCase();
         return t.includes('vamos a instalar') ||
@@ -381,7 +348,6 @@ const EvaChat = {
             t.includes('apruebas esta configuración') ||
             t.includes('retomo la instalación');
     },
-*/
 
     _isOsIntentText(msg) {
         const text = (msg || '').trim().toLowerCase()
@@ -459,15 +425,18 @@ const EvaChat = {
         this.isLoading = true;
         const sendBtn = document.getElementById('eva-send-btn');
         if (sendBtn) sendBtn.disabled = true;
-        // v14: sin render aquí — se renderiza una sola vez con la respuesta del API.
-        // addMessage con render=false evita un innerHTML completo destruyendo
-        // heatmaps/carrusel mientras el usuario espera la respuesta.
-        this.addMessage('user', msg, null, false);
+        this.addMessage('user', msg);
         this.showTyping();
-        // v15: ELIMINAR early-return para install camera intent.
-        // El mensaje SIEMPRE va al API para que el backend dirija el motor de estados
-        // (WIZARD_QR, WIZARD_ZONES_DRAW). Antes el frontend respondía hardcodeado y
-        // nunca notificaba al backend, dejándolo fuera de contexto.
+        if (this._isInstallCameraIntent(intentText)) {
+            this.hideTyping();
+            this.addMessage('assistant', 'Perfecto. Voy a iniciar la instalación contigo paso a paso.');
+            this.isLoading = false;
+            if (sendBtn) sendBtn.disabled = false;
+            setTimeout(() => {
+                if (window.App && typeof App.newCamera === 'function') App.newCamera();
+            }, 250);
+            return;
+        }
         try {
             // UN SOLO CHAT: SIEMPRE usar el mismo session_id estable del usuario
             // ("chat_<uid>"), sin importar si el mensaje es OS, setup, install, etc.
@@ -478,7 +447,7 @@ const EvaChat = {
             // Reintentar 2 veces con backoff para resistir microcortes de red móvil.
             for (let attempt = 0; attempt < 3; attempt++) {
                 try {
-                    r = await apiFetch(`${this.API}/config/chat`, {
+                    r = await fetch(`${this.API}/config/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -511,12 +480,10 @@ const EvaChat = {
                     // para detectar regresiones. NO tocamos this.sessionId.
                     console.warn('[EvaChat] backend devolvió sessionId distinto (ignorado):', data.sessionId, 'vs', this.sessionId);
                 }
-                // v14: NO filtrar el historial. El filtro anterior (_isSetupArtifact) borrraba
-        // msgs válidos del asistente (ej: "configuración") cada vez que el usuario
-        // escribía un OS intent, perdiendo contexto de la conversación. El backend
-        // recibe el historial completo y debe decidir qué ignorar; el frontend no
-        // debe ser el que deje de registrar mensajes.
-        localStorage.setItem(this._sessionKey, this.sessionId);
+                if (this._isOsIntentText(intentText) && !this._isInstallCameraIntent(intentText)) {
+                    this.history = this.history.filter(m => !(m.role === 'assistant' && this._isSetupArtifact(m.content || '')));
+                }
+                localStorage.setItem(this._sessionKey, this.sessionId);
                 
                 // Detectar fase del wizard para mostrar UI especial
                 const nextPhase = data.next_phase || data.phase;
@@ -524,36 +491,17 @@ const EvaChat = {
                 let extraHtml = '';
                 
                 if (nextPhase === 'WIZARD_QR' && data.claim_token) {
-                    // P0 (Fuga #7.3): QR generado localmente. Antes se llamaba a
-                    // api.qrserver.com pasando el claim_token por URL — el secret de
-                    // pairing ESP32 se filtraba a un servicio externo via HTTP.
-                    // Usar qrcodejs (cargado desde CDN en index.html) que genera un
-                    // canvas en el DOM sin ninguna request externa.
-                    const qrUrl = `https://api.ojoia.com.do/api/claim-qr?token=${encodeURIComponent(data.claim_token)}`;
-                    const qrContainerId = `qr-box-${Date.now()}`;
-                    extraHtml = `<div style="margin-top:12px;text-align:center"><div id="${qrContainerId}" style="background:#fff;padding:12px;border-radius:12px;display:inline-block"></div><div style="margin-top:8px;font-weight:600">Código: <span style="font-family:monospace;font-size:1.1rem">${data.claim_token}</span></div><div class="meta">Escanea el QR o escribe el código en el portal del ESP32</div></div>`;
-                    // El QRCode se renderiza post-injection del HTML. setTimeout(0)
-                    // asegura que el DOM ya tiene el contenedor.
-                    setTimeout(() => {
-                        const el = document.getElementById(qrContainerId);
-                        if (el && typeof QRCode !== 'undefined') {
-                            try {
-                                new QRCode(el, { text: qrUrl, width: 200, height: 200,
-                                    colorDark: '#000000', colorLight: '#ffffff',
-                                    correctLevel: QRCode.CorrectLevel.H });
-                            } catch (e) { console.error('QR local fallo:', e); }
-                        }
-                    }, 0);
+                    // Mostrar QR y código
+                    const qrUrl = `https://api.ojoia.com.do/api/claim-qr?token=${data.claim_token}`;
+                    extraHtml = `<div style="margin-top:12px;text-align:center"><div style="background:#fff;padding:12px;border-radius:12px;display:inline-block"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrUrl)}" style="width:200px;height:200px"></div><div style="margin-top:8px;font-weight:600">Código: <span style="font-family:monospace;font-size:1.1rem">${data.claim_token}</span></div><div class="meta">Escanea el QR o escribe el código en el portal del ESP32</div></div>`;
                 }
                 
                 if (nextPhase === 'WIZARD_ZONES_DRAW' && camId) {
-                    // P0 (Fuga #7.1): _escAttr evita RCE si camId contiene ' o "
-                    extraHtml = `<div style="margin-top:12px"><button class="btn" style="width:100%;background:var(--accent);color:#fff" onclick="EvaChat._openZoneEditorFromWizard('${this._escAttr(camId)}')">📍 Ir a Configurar Zonas</button><div class="meta" style="margin-top:8px;text-align:center">Dibuja las zonas importantes (caja, entrada, cocina) y luego regresa aquí y dime "listo"</div></div>`;
+                    // Mostrar botón para ir a configurar zonas
+                    extraHtml = `<div style="margin-top:12px"><button class="btn" style="width:100%;background:var(--accent);color:#fff" onclick="EvaChat._openZoneEditorFromWizard('${camId}')">📍 Ir a Configurar Zonas</button><div class="meta" style="margin-top:8px;text-align:center">Dibuja las zonas importantes (caja, entrada, cocina) y luego regresa aquí y dime "listo"</div></div>`;
                 }
                 
-                // v14: timestamp entero (segundos) para que el merge por role|content|timestamp
-                // funcione y no duplique msgs al recargar.
-                const msg = { role: 'assistant', content: data.response + (extraHtml ? '\n\n' + extraHtml : ''), image_url: data.image_url || '', events: data.events_found || data.events || [], timestamp: Math.floor(Date.now() / 1000) };
+                const msg = { role: 'assistant', content: data.response + (extraHtml ? '\n\n' + extraHtml : ''), image_url: data.image_url || '', events: data.events_found || data.events || [], timestamp: Date.now() / 1000 };
                 if (data.heatmap && data.heatmap_meta) {
                     msg.heatmap = data.heatmap;
                     msg.heatmap_meta = data.heatmap_meta;
@@ -564,11 +512,6 @@ const EvaChat = {
                 this._hasRecentAlerts = (await this._readStatus()).alerts > 0;
                 this._saveConversation();
                 this.render();
-                // v14: forzar scroll al fondo tras respuesta del asistente.
-                // El setTimeout interno de render() puede no haberse ejecutado
-                // todavía (race con la respuesta del API), así que forzamos
-                // explícitamente para que el último mensaje siempre sea visible.
-                this.scrollToBottom(true);
             } else {
                 this.addMessage('assistant', data.response || 'Error procesando tu mensaje.');
             }
@@ -584,7 +527,7 @@ const EvaChat = {
     async showAlertEvent(eventId) {
         if (!eventId) return;
         try {
-            const r = await apiFetch(`${this.API}/api/events/${eventId}?user_id=${this.userId}`);
+            const r = await fetch(`${this.API}/api/events/${eventId}?user_id=${this.userId}`);
             if (!r.ok) return;
             const event = await r.json();
             const qa = event.qwen_analysis || {};
@@ -645,21 +588,12 @@ const EvaChat = {
         this.sendMessage();
     },
 
-// ── ADD MESSAGE ─────────────────────────────────────────────
-        // v14: parámetro `render` opcional (default true) para evitar doble render
-        // en sendMessage: se agrega el user msg sin render, y luego un único
-        // render() con la respuesta del asistente. Sin esto, cada mensaje
-        // enviaba 2 innerHTML completos (destruyendo heatmaps/carrusel).
-        addMessage(role, text, events = null, render = true) {
-            this.history.push({ role, content: text, events: events || [], timestamp: Math.floor(Date.now() / 1000) });
-            this._saveConversation();
-            if (render) {
-                this.render();
-                // v14: forzar scroll al fondo para que el mensaje recién agregado
-                // (usuaria o error) siempre sea visible.
-                this.scrollToBottom(true);
-            }
-        },
+    // ── ADD MESSAGE ─────────────────────────────────────────────
+    addMessage(role, text, events = null) {
+        this.history.push({ role, content: text, events: events || [], timestamp: Date.now() / 1000 });
+        this._saveConversation();
+        this.render();
+    },
 
     cleanEventDescription(desc) {
         if (!desc) return '';
@@ -749,8 +683,7 @@ const EvaChat = {
                 ? `<img src="${imgSrc}" onerror="this.onerror=null;this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 fill=%22%232c2c2e%22/><text x=%2250%22 y=%2252%22 text-anchor=%22middle%22 font-size=%2226%22 fill=%22%238e8e93%22>📷</text></svg>'" loading="lazy">`
                 : `<div style="width:100%;height:90px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);color:var(--text-secondary);font-size:1.5rem">📷</div>`;
             const videoBadge = framesCount ? '<div class="card-video-badge">▶ Video</div>' : '';
-            // P0 (Fuga #7.1): _escAttr evita RCE si event_id contiene ' o "
-            html += `<div class="carousel-card ${anomalyClass}" onclick="EvaChat.openEventDetail('${this._escAttr(evt.event_id)}')"><div class="card-time">${this.escapeHtml(this._formatEventDateTime(evt))}</div><div class="card-camera">${this.escapeHtml(evt.camera_name || evt.camera_id || '')}</div><div class="card-frame">${imgHtml}${videoBadge}</div><div class="card-desc">${this.escapeHtml(desc).substring(0, 90)}</div><div class="card-persons">👥 ${persons || '—'} persona${persons === 1 ? '' : 's'}</div>${anomalyClass ? '<div class="card-anomaly-badge">⚠️ Alerta</div>' : ''}</div>`;
+            html += `<div class="carousel-card ${anomalyClass}" onclick="EvaChat.openEventDetail('${evt.event_id}')"><div class="card-time">${this.escapeHtml(this._formatEventDateTime(evt))}</div><div class="card-camera">${this.escapeHtml(evt.camera_name || evt.camera_id || '')}</div><div class="card-frame">${imgHtml}${videoBadge}</div><div class="card-desc">${this.escapeHtml(desc).substring(0, 90)}</div><div class="card-persons">👥 ${persons || '—'} persona${persons === 1 ? '' : 's'}</div>${anomalyClass ? '<div class="card-anomaly-badge">⚠️ Alerta</div>' : ''}</div>`;
         }
         html += `</div></div>`;
         return html;
@@ -781,7 +714,7 @@ const EvaChat = {
 
     async sendFeedback(eventId, isReal, btn) {
         try {
-            await apiFetch(`${this.API}/api/chat/eva/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: this.userId, event_id: eventId, is_real: isReal }) });
+            await fetch(`${this.API}/api/chat/eva/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: this.userId, event_id: eventId, is_real: isReal }) });
             const parent = btn.parentElement;
             parent.querySelectorAll('.feedback-btn').forEach(b => b.disabled = true);
             btn.style.opacity = '1';
@@ -839,7 +772,7 @@ const EvaChat = {
         const status = await this._readStatus();
         // M4.6: excluir vigilance_alert (centinela de 1 frame) del "último análisis".
         // El brief debe basarse en análisis reales de Eva, no en disparos operativos.
-        const eventsR = await apiFetch(`${this.API}/api/user/events?user_id=${this.userId}&filter=today&limit=20&exclude_vigilance=true`);
+        const eventsR = await fetch(`${this.API}/api/user/events?user_id=${this.userId}&filter=today&limit=20&exclude_vigilance=true`);
         const events = eventsR.ok ? (await eventsR.json()).events || [] : [];
         const name = (this.userName || 'amigo').split(' ')[0];
         const business = this._businessName || 'tu negocio';
@@ -963,24 +896,16 @@ const EvaChat = {
         return remHours ? `${days} días y ${remHours} horas` : `${days} días`;
     },
 
-// ── UI HELPERS ──────────────────────────────────────────────
-        // v14: forzar scroll al fondo al mostrar typing. El usuario acaba de
-        // enviar un mensaje (interacción activa), así que el typing indicator
-        // debe ser visible. Sin force, si el usuario estaba leyendo msgs
-        // anteriores, el typing aparecería oculto.
-        showTyping() {
-            const container = document.getElementById('eva-messages');
-            if (!container) return;
-            const typing = document.createElement('div');
-            typing.className = 'eva-msg assistant typing-indicator';
-            typing.id = 'eva-typing';
-            typing.innerHTML = `<div class="eva-bubble"><span class="typing-label">Eva está revisando</span><span class="typing-dots"><span>●</span><span>●</span><span>●</span></span></div>`;
+    // ── UI HELPERS ──────────────────────────────────────────────
+    showTyping() {
+        const container = document.getElementById('eva-messages');
+        if (!container) return;
+        const typing = document.createElement('div');
+        typing.className = 'eva-msg assistant typing-indicator';
+        typing.id = 'eva-typing';
+        typing.innerHTML = `<div class="eva-bubble"><span class="typing-label">Eva está revisando</span><span class="typing-dots"><span>●</span><span>●</span><span>●</span></span></div>`;
         container.appendChild(typing);
-        // v14: forzar scroll al fondo. El usuario acaba de enviar un mensaje
-        // (interacción activa), así que el typing indicator debe ser visible.
-        // Sin force, si el usuario estaba leyendo msgs anteriores, el typing
-        // aparecería oculto y el usuario no vería que Eva está respondiendo.
-        this.scrollToBottom(true);
+        this.scrollToBottom();
     },
 
     hideTyping() { const t = document.getElementById('eva-typing'); if (t) t.remove(); },
@@ -1059,7 +984,7 @@ const EvaChat = {
         try {
             // UN SOLO CHAT: enviar session_id al backend para que devuelva SOLO
             // la sesión del usuario, no la unión de todas (que mezclaba chats).
-            const r = await apiFetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`);
+            const r = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`);
             if (r.ok) {
                 const data = await r.json();
                 if (data && Array.isArray(data.history)) {
@@ -1101,13 +1026,7 @@ const EvaChat = {
                 }
             }
         } catch(e) {}
-        // v14: si el GET remoto falló, inicializar _remoteHistoryTs con el ts
-        // del último msg local. Sin esto, _remoteHistoryTs queda en 0 y el
-        // polling de 10s ve remoteTs=0 === _remoteHistoryTs=0 → "sin cambios"
-        // → nunca sincroniza con el backend.
-        const lastLocalTs = this.history.length ? (this.history[this.history.length - 1].timestamp || 0) : 0;
-        this._remoteHistoryTs = lastLocalTs || this._remoteHistoryTs;
-        this._lastHistoryTs = String(lastLocalTs || this._remoteHistoryTs);
+        // Si GET falló, ya tenemos el local state cargado
     },
 
     // F2: Polling cada 10s para detectar cambios remotos (otro dispositivo).
@@ -1155,20 +1074,14 @@ const EvaChat = {
             if (this._historyPollInFlight) return;
             this._historyPollInFlight = true;
             try {
-                // v14: SIN limit=1. El backend puede no soportarlo y devolver
-                // todo el historial (200 msgs) en cada poll de 10s → saturación.
-                // Solo pedimos el ts del server; si cambió, fetch completo y merge.
-                const r = await apiFetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`,
+                const r = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}&limit=1`,
                     { signal: AbortSignal.timeout(8000) });
                 if (!r.ok) return;
                 const data = await r.json();
                 const remoteTs = parseInt(data.ts || 0, 10) || 0;
-                // v14: si _remoteHistoryTs es 0 (no se inicializó), usar el ts del
-                // último msg local para evitar loop infinito de "cambios".
-                const baseline = this._remoteHistoryTs || (this.history.length ? this.history[this.history.length - 1].timestamp || 0 : 0);
-                if (!remoteTs || remoteTs === baseline) return;
+                if (!remoteTs || remoteTs === this._remoteHistoryTs) return;
                 // Hubo cambios en otro dispositivo -> fetch completo y MERGE
-                const full = await apiFetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`,
+                const full = await fetch(`${this.API}/api/chat/eva/history?user_id=${this.userId}&session_id=${encodeURIComponent(this.sessionId)}`,
                     { signal: AbortSignal.timeout(8000) });
                 if (!full.ok) return;
                 const fullData = await full.json();
@@ -1207,19 +1120,11 @@ const EvaChat = {
         // Polling cada 10s
         this._remoteSyncInterval = setInterval(poll, 10000);
         // Poll inmediato cuando la pestana vuelve a ser visible
-        // P0 (Bug #3): guardar la referencia al handler para poder removerlo
-        // en teardown(). Antes se hacia addEventListener con una closure nueva
-        // en cada init() y nunca se removia => tras logout/login habia N
-        // handlers disparandose en paralelo, cada uno llamando poll().
-        if (this._visibilityHandler) {
-            try { document.removeEventListener('visibilitychange', this._visibilityHandler); } catch (e) {}
-        }
-        this._visibilityHandler = () => {
+        document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'visible') {
                 setTimeout(poll, 300);
             }
-        };
-        document.addEventListener('visibilitychange', this._visibilityHandler);
+        });
     },
 
     _saveConversation() {
@@ -1251,7 +1156,7 @@ const EvaChat = {
         clearTimeout(this._saveDebounce);
         this._saveDebounce = setTimeout(() => {
             try {
-                apiFetch(`${this.API}/api/chat/eva/history`, {
+                fetch(`${this.API}/api/chat/eva/history`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     // UN SOLO CHAT: enviar session_id estable del usuario para que
@@ -1303,8 +1208,8 @@ const EvaChat = {
     async _readStatus() {
         try {
             const [camsR, evtsR] = await Promise.all([
-                apiFetch(`${this.API}/api/cameras?user_id=${this.userId}`),
-                apiFetch(`${this.API}/api/user/events?user_id=${this.userId}&filter=today&limit=1`)
+                fetch(`${this.API}/api/cameras?user_id=${this.userId}`),
+                fetch(`${this.API}/api/user/events?user_id=${this.userId}&filter=today&limit=1`)
             ]);
             const cams = (await camsR.json()).cameras || [];
             const events = (await evtsR.json()).events || [];
@@ -1338,7 +1243,7 @@ const EvaChat = {
     // ── LOAD BUSINESS CONTEXT ───────────────────────────────────
     async loadBusinessContext() {
         try {
-            const r = await apiFetch(`${this.API}/api/user/profile?user_id=${this.userId}`);
+            const r = await fetch(`${this.API}/api/user/profile?user_id=${this.userId}`);
             if (r.ok) {
                 const profile = await r.json();
                 if (profile.name) this.userName = profile.name;
@@ -1383,5 +1288,3 @@ function _initKeyboardWatcher() {
     update();
 }
 
-
-// cache-bust-fingerprint: 20260822-z

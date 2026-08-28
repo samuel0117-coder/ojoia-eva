@@ -1,0 +1,2186 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OjoIA Admin</title>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+    <script>
+        const firebaseConfig = {apiKey:"AIzaSyAtlS7rikClpJBVHM46gPvN4HL_CYyRxP0",authDomain:"ojoia-67216.firebaseapp.com",projectId:"ojoia-67216",storageBucket:"ojoia-67216.firebasestorage.app",messagingSenderId:"490868607747",appId:"1:490868607747:web:f722468d4f3493deb8f736",measurementId:"G-KX5V3B6547"};
+        firebase.initializeApp(firebaseConfig);
+    </script>
+    <style>
+        :root{--bg-primary:#000;--bg-secondary:#1c1c1e;--bg-tertiary:#2c2c2e;--text-primary:#fff;--text-secondary:#aeaeb2;--accent:#0a84ff;--success:#30d158;--warning:#ffd60a;--danger:#ff453a;--border:#38383a}
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg-primary);color:var(--text-primary);line-height:1.5}
+        .header{background:var(--bg-secondary);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+        .header h1{font-size:1.3rem;font-weight:700}
+        .status-badge{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:0.8rem;font-weight:500}
+        .status-badge.online{background:rgba(48,209,88,.15);color:var(--success)}
+        .status-badge.offline{background:rgba(255,69,58,.15);color:var(--danger)}
+        .status-dot{width:8px;height:8px;border-radius:50%}
+        .status-dot.online{background:var(--success);animation:pulse 2s infinite}
+        .status-dot.offline{background:var(--danger)}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+        .admin-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 24px;gap:4px;overflow-x:auto;background:var(--bg-secondary)}
+        .admin-tab{padding:14px 20px;background:transparent;border:none;color:var(--text-secondary);cursor:pointer;font-size:0.9rem;border-bottom:2px solid transparent;white-space:nowrap}
+        .admin-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+        .container{max-width:1200px;margin:0 auto;padding:24px}
+        .panel{display:none}.panel.active{display:block}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+        .card{background:var(--bg-secondary);border-radius:12px;padding:20px;border:1px solid var(--border)}
+        .card-title{font-size:0.75rem;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px}
+        .form-group{margin-bottom:16px}
+        .form-group label{display:block;font-size:0.85rem;color:var(--text-secondary);margin-bottom:6px}
+        .form-group input,.form-group textarea,.form-group select{width:100%;padding:12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:0.9rem;font-family:inherit}
+        .form-group textarea{min-height:100px;resize:vertical}
+        .form-group input:focus,.form-group select:focus{border-color:var(--accent);outline:none}
+        .btn{padding:10px 20px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-size:0.9rem;font-weight:600;cursor:pointer}
+        .btn:disabled{opacity:.5;cursor:not-allowed}
+        .btn-sm{padding:6px 12px;font-size:0.8rem}
+        .btn-danger{background:var(--danger)}.btn-success{background:var(--success)}
+        .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text-primary)}
+        .btn-warning{background:var(--warning);color:#000}
+        .btn-group{display:flex;gap:8px;flex-wrap:wrap}
+        .server-url-box{background:var(--bg-tertiary);border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid var(--border)}
+        .server-url-box .url{font-family:'SF Mono',monospace;font-size:1.1rem;color:var(--accent);word-break:break-all}
+        .server-url-box .url.empty{color:var(--text-secondary)}
+        .copy-btn{padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:0.8rem;cursor:pointer;margin-left:8px}
+        .info-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:0.9rem}
+        .info-row:last-child{border-bottom:none}
+        .info-label{color:var(--text-secondary)}
+        .info-value{font-weight:500;font-family:'SF Mono',monospace;font-size:0.85rem}
+        .info-value.ok{color:var(--success)}.info-value.err{color:var(--danger)}
+        .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:0.9rem;z-index:1000;display:none}
+        .toast.show{display:block}.toast.success{background:var(--success);color:#000}.toast.error{background:var(--danger);color:#fff}
+        .login-screen{position:fixed;inset:0;background:radial-gradient(circle at top,#10243f,#000 48%);display:flex;align-items:center;justify-content:center;padding:24px;z-index:2000}
+        .login-card{background:var(--bg-secondary);border:1px solid var(--border);border-radius:16px;padding:28px;width:100%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+        .login-card h2{margin-bottom:8px}.login-card p{color:var(--text-secondary);font-size:0.9rem;margin-bottom:18px}
+        .login-note{font-size:0.75rem;color:var(--text-secondary);margin-top:12px;line-height:1.45}
+        table{width:100%;border-collapse:collapse}
+        th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);font-size:0.85rem}
+        th{color:var(--text-secondary);font-weight:500;font-size:0.75rem;text-transform:uppercase}
+        tr:hover{background:var(--bg-tertiary)}
+        .badge{display:inline-block;padding:3px 8px;border-radius:4px;font-size:0.7rem;font-weight:600}
+        .badge-ok{background:rgba(48,209,88,.15);color:var(--success)}
+        .badge-warn{background:rgba(255,214,10,.15);color:var(--warning)}
+        .badge-err{background:rgba(255,69,58,.15);color:var(--danger)}
+        .user-detail{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:999;align-items:center;justify-content:center}
+        .user-detail.show{display:flex}
+        .user-detail-card{background:var(--bg-secondary);border-radius:12px;padding:24px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;border:1px solid var(--border)}
+        .user-detail-card h3{margin-bottom:16px}
+        .user-detail-card .close{float:right;cursor:pointer;font-size:1.5rem}
+        .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:998;align-items:center;justify-content:center}
+        .modal-overlay.show{display:flex}
+        .modal-box{background:var(--bg-secondary);border-radius:12px;padding:24px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;border:1px solid var(--border)}
+        .modal-box h3{margin-bottom:16px}
+        .modal-box .modal-close{float:right;cursor:pointer;font-size:1.5rem}
+        .plan-editor{border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
+        .plan-editor input,.plan-editor select{margin-bottom:8px}
+        .plan-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+        .rules-box{background:var(--bg-tertiary);border-radius:8px;padding:12px;margin:8px 0;font-size:0.85rem;border:1px solid var(--border)}
+        .rules-box h4{color:var(--accent);margin-bottom:8px;font-size:0.8rem}
+        .monitor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+        .prompt-audit-score{font-size:2rem;font-weight:700;color:var(--accent)}
+        .prompt-audit-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+        .prompt-audit-textarea{min-height:260px}
+        .monitor-card{background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;padding:12px;position:relative;overflow:hidden}
+        .monitor-card img{width:100%;height:160px;object-fit:cover;background:#000;border-radius:8px;border:1px solid var(--border)}
+        .monitor-card .title{font-weight:700;margin-top:8px}.monitor-card .meta{font-size:0.75rem;color:var(--text-secondary);margin-top:4px}
+    </style>
+    <script>
+        let currentCameraDetail = null;
+    </script>
+</head>
+<body>
+<div id="login-screen" class="login-screen">
+    <div class="login-card">
+        <h2>🛡️ OjoIA Admin</h2>
+        <p>Acceso restringido. Ingresa el token administrador para continuar.</p>
+        <div class="form-group">
+            <label>Token administrador</label>
+            <input id="admin-token" type="password" placeholder="Token de /home/sam/storage/admin_config.json">
+        </div>
+        <div id="login-error" style="display:none;color:var(--danger);font-size:0.85rem;margin-bottom:12px"></div>
+        <button id="btn-admin-login" class="btn" style="width:100%" onclick="doAdminLogin()">Entrar</button>
+        <div class="login-note">Si no tienes token, revisa <code>/home/sam/storage/admin_config.json</code> en el servidor. El token inicial se genera automáticamente la primera vez.</div>
+    </div>
+</div>
+
+<div id="app-shell" style="display:none">
+<div class="header">
+    <h1>🛡️ OjoIA Admin</h1>
+    <div class="status-badge offline" id="hdr-badge">
+        <span class="status-dot offline" id="hdr-dot"></span>
+        <span id="hdr-text">Offline</span>
+    </div>
+    <button class="btn btn-sm btn-outline" onclick="logoutAdmin()" style="margin-left:12px">Salir</button>
+</div>
+
+<div class="admin-tabs">
+    <button class="admin-tab active" id="tab-dashboard" onclick="switchTab('dashboard')">📊 Dashboard</button>
+    <button class="admin-tab" id="tab-monitoring" onclick="switchTab('monitoring')">📡 Monitoreo</button>
+    <button class="admin-tab" id="tab-users" onclick="switchTab('users')">👥 Usuarios</button>
+    <button class="admin-tab" id="tab-events" onclick="switchTab('events')">📈 Eventos</button>
+    <button class="admin-tab" id="tab-cameras" onclick="switchTab('cameras')">📷 Cámaras</button>
+    <button class="admin-tab" id="tab-billing" onclick="switchTab('billing')">💳 Facturación</button>
+    <button class="admin-tab" id="tab-storage" onclick="switchTab('storage')">💾 Almacenamiento</button>
+    <button class="admin-tab" id="tab-plans" onclick="switchTab('plans')">📦 Planes</button>
+    <button class="admin-tab" id="tab-system" onclick="switchTab('system')">⚙️ Sistema</button>
+    <button class="admin-tab" id="tab-support" onclick="switchTab('support')">💬 Soporte</button>
+    <button class="admin-tab" id="tab-logs" onclick="switchTab('logs')">📜 Logs</button>
+    <button class="admin-tab" id="tab-identity" onclick="switchTab('identity')">👤 Identity</button>
+</div>
+
+<div class="container">
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     DASHBOARD
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel active" id="panel-dashboard">
+    <div class="grid" id="dash-grid">
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">📊 General</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:16px">
+                <div><div class="info-value" style="font-size:2rem" id="d-users">—</div><div class="info-label">Usuarios</div></div>
+                <div><div class="info-value" style="font-size:2rem" id="d-cams">—</div><div class="info-label">Cámaras</div></div>
+                <div><div class="info-value" style="font-size:2rem;color:var(--success)" id="d-online">—</div><div class="info-label">Online</div></div>
+                <div><div class="info-value" style="font-size:2rem;color:var(--warning)" id="d-queue">—</div><div class="info-label">En cola</div></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">🟢 Por plan</div>
+            <div id="dash-planes"><p style="color:var(--text-secondary);font-size:0.85rem">Cargando...</p></div>
+        </div>
+        <div class="card">
+            <div class="card-title">🔴 Alertas recientes</div>
+            <div id="dash-alerts"><p style="color:var(--text-secondary);font-size:0.85rem">Cargando...</p></div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     MONITOREO / ALERTAS
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-monitoring">
+    <div class="grid" style="margin-bottom:16px">
+        <div class="card"><div class="card-title">📷 Cámaras totales</div><div class="info-value" style="font-size:2rem" id="mon-total-cameras">—</div></div>
+        <div class="card"><div class="card-title">🟢 Online</div><div class="info-value" style="font-size:2rem;color:var(--success)" id="mon-online">—</div></div>
+        <div class="card"><div class="card-title">🔴 Offline</div><div class="info-value" style="font-size:2rem;color:var(--danger)" id="mon-offline">—</div></div>
+        <div class="card"><div class="card-title">🚨 Alertas hoy</div><div class="info-value" style="font-size:2rem;color:var(--warning)" id="mon-alerts">—</div></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div class="card-title" style="margin-bottom:0">📡 Cámaras en monitoreo</div>
+            <div class="btn-group">
+                <button class="btn btn-sm btn-outline" onclick="loadMonitoring()">🔄 Refrescar</button>
+                <button class="btn btn-sm filter-btn active" onclick="filterMonitoring('all')">Todas</button>
+                <button class="btn btn-sm filter-btn" onclick="filterMonitoring('online')">Online</button>
+                <button class="btn btn-sm filter-btn" onclick="filterMonitoring('offline')">Offline</button>
+            </div>
+        </div>
+        <div id="monitor-cameras" class="monitor-grid"><p style="color:var(--text-secondary)">Cargando...</p></div>
+    </div>
+    <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div class="card-title" style="margin-bottom:0">🚨 Alertas recientes</div>
+            <button class="btn btn-sm btn-outline" onclick="loadMonitoring()">🔄 Refrescar</button>
+        </div>
+        <div id="monitor-alerts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+            <p style="color:var(--text-secondary)">Cargando...</p>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     USUARIOS
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-users">
+    <div class="card">
+        <div class="card-title">👥 Usuarios Registrados (<span id="users-count">0</span>)</div>
+        <div class="btn-group" style="margin-bottom:12px">
+            <button class="btn btn-sm" onclick="showUserEditor()">➕ Crear Usuario</button>
+            <button class="btn btn-sm btn-outline" onclick="loadUsers()">🔄 Refrescar</button>
+        </div>
+        <div style="overflow-x:auto">
+        <table style="min-width:1100px">
+            <thead><tr>
+                <th>Nombre</th>
+                <th>Negocio</th>
+                <th>Plan</th>
+                <th>Cobertura</th>
+                <th>Vence</th>
+                <th>Cámaras</th>
+                <th>Pagos</th>
+                <th>Token</th>
+                <th>Acciones</th>
+            </tr></thead>
+            <tbody id="users-tbody"><tr><td colspan="10" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
+        </table>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     EVENTOS
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-events">
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">📊 Resumen</div>
+            <div class="info-row"><span class="info-label">Total eventos</span><span class="info-value" id="ev-total">—</span></div>
+            <div class="info-row"><span class="info-label">Violaciones</span><span class="info-value" id="ev-violations" style="color:var(--danger)">—</span></div>
+            <div class="info-row"><span class="info-label">Normal</span><span class="info-value" id="ev-normal">—</span></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                <button class="btn btn-sm btn-outline" onclick="loadEvents()">🔄 Refrescar</button>
+                <button class="btn btn-sm filter-btn active" onclick="filterEvents('all')">Todos</button>
+                <button class="btn btn-sm filter-btn" onclick="filterEvents('violation')">Violaciones</button>
+                <button class="btn btn-sm filter-btn" onclick="filterEvents('info')">Info</button>
+            </div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">📜 Últimos Eventos</div>
+            <div id="ev-list" style="max-height:500px;overflow-y:auto">
+                <p style="color:var(--text-secondary);text-align:center;padding:20px">Cargando...</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     CÁMARAS
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-cameras">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">📷 Cámaras Registradas</div>
+            <div style="overflow-x:auto">
+            <table style="min-width:900px">
+                <thead><tr>
+                    <th>Cámara</th>
+                    <th>Nombre</th>
+                    <th>Usuario</th>
+                    <th>Estado</th>
+                    <th>Último anuncio</th>
+                    <th>Último frame</th>
+                    <th>Token</th>
+                    <th>Acciones</th>
+                </tr></thead>
+                <tbody id="cams-tbody"><tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
+            </table>
+            </div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">🟠 Frames en cola (Firestore)</div>
+            <div id="queue-status" style="margin-bottom:12px"><p style="color:var(--text-secondary);font-size:0.85rem">Verificando...</p></div>
+            <div class="btn-group" style="margin-bottom:12px">
+                <button class="btn btn-sm" onclick="refreshQueue()">🔄 Refrescar</button>
+                <button class="btn btn-sm btn-success" onclick="processQueue()">⚡ Procesar cola</button>
+                <button class="btn btn-sm btn-danger" onclick="clearQueue()">🗑️ Limpiar</button>
+            </div>
+            <div id="queue-frames"><p style="color:var(--text-secondary);text-align:center;padding:20px">Sin frames en cola</p></div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     FACTURACIÓN
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-billing">
+    <div class="grid">
+        <div class="card"><div class="card-title">🟢 Activos</div><div class="info-value" style="font-size:2rem;color:var(--success)" id="bill-active">—</div></div>
+        <div class="card"><div class="card-title">🟡 Por vencer</div><div class="info-value" style="font-size:2rem;color:var(--warning)" id="bill-warning">—</div></div>
+        <div class="card"><div class="card-title">🔴 Vencidos</div><div class="info-value" style="font-size:2rem;color:var(--danger)" id="bill-expired">—</div></div>
+        <div class="card"><div class="card-title">💰 Ingresos</div><div class="info-value" style="font-size:2rem;color:var(--accent)" id="bill-revenue">—</div></div>
+        <div class="card"><div class="card-title">👥 Total usuarios</div><div class="info-value" style="font-size:2rem" id="bill-total">—</div></div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">💳 Facturación por Usuario</div>
+            <div class="btn-group" style="margin-bottom:12px">
+                <button class="btn btn-sm filter-btn active" onclick="filterBilling('all')">Todos</button>
+                <button class="btn btn-sm filter-btn" onclick="filterBilling('active')">🟢 Activos</button>
+                <button class="btn btn-sm filter-btn" onclick="filterBilling('warning')">🟡 Por vencer</button>
+                <button class="btn btn-sm filter-btn" onclick="filterBilling('expired')">🔴 Vencidos</button>
+                <button class="btn btn-sm filter-btn" onclick="filterBilling('trial')">🟣 Prueba</button>
+                <button class="btn btn-sm filter-btn" onclick="filterBilling('pending')">📋 Pago pendiente</button>
+            </div>
+            <div style="overflow-x:auto">
+            <table style="min-width:1100px">
+                <thead><tr>
+                    <th>Estado</th>
+                    <th>Usuario</th>
+                    <th>Negocio</th>
+                    <th>Plan</th>
+                    <th>Vence</th>
+                    <th>Días</th>
+                    <th>Cámaras</th>
+                    <th>Pagos</th>
+                    <th>Próx. pago</th>
+                    <th>Acciones</th>
+                </tr></thead>
+                <tbody id="billing-tbody"><tr><td colspan="10" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
+            </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     ALMACENAMIENTO
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-storage">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <div class="card-title" style="margin-bottom:0">🗂️ Discos y Planes</div>
+                <div class="btn-group">
+                    <button class="btn btn-sm btn-outline" onclick="scanDisks()">🔄 Escanear</button>
+                    <button class="btn btn-sm btn-outline" onclick="autodetectDisks()">🔍 Auto-detectar</button>
+                    <button class="btn btn-sm" onclick="showAddDiskForm()">➕ Agregar Disco</button>
+                    <button class="btn btn-sm btn-success" onclick="saveDisksConfig()">💾 Guardar</button>
+                </div>
+            </div>
+            <div id="add-disk-form" style="display:none;margin-bottom:12px" class="rules-box">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+                    <div style="flex:1;min-width:180px"><label style="font-size:0.75rem;color:var(--text-secondary)">Montaje</label><input id="new-disk-mount" type="text" placeholder="/mnt/disk2"></div>
+                    <div style="flex:1;min-width:180px"><label style="font-size:0.75rem;color:var(--text-secondary)">Etiqueta</label><input id="new-disk-label" type="text" placeholder="HDD Backup"></div>
+                    <button class="btn btn-sm" onclick="addDisk()">Agregar</button>
+                </div>
+            </div>
+            <div class="rules-box" style="margin-bottom:12px">
+                <div class="card-title" style="margin-bottom:8px">🕐 Limpieza y Umbral</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+                    <div><label style="font-size:0.75rem;color:var(--text-secondary)">Hora limpieza</label><input id="ttl-cleanup-hour" type="number" min="0" max="23" value="23"></div>
+                    <div><label style="font-size:0.75rem;color:var(--text-secondary)">Frames TTL horas</label><input id="ttl-frames" type="number" min="1" value="24"></div>
+                    <div><label style="font-size:0.75rem;color:var(--text-secondary)">Sessions TTL días</label><input id="ttl-sessions" type="number" min="1" value="7"></div>
+                    <div><label style="font-size:0.75rem;color:var(--text-secondary)">Umbral disco %</label><input id="ttl-fill-threshold" type="number" min="50" max="99" value="90"></div>
+                </div>
+            </div>
+            <div id="autodetect-results"></div>
+            <div id="disks-list"><p style="color:var(--text-secondary)">Cargando discos...</p></div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <div class="card-title" style="margin-bottom:0">👤 Almacenamiento por Usuario</div>
+                <button class="btn btn-sm btn-outline" onclick="loadStorageUsers()">🔄 Refrescar</button>
+            </div>
+            <div style="overflow-x:auto">
+                <table style="min-width:900px">
+                    <thead><tr>
+                        <th>Usuario</th>
+                        <th>Disco</th>
+                        <th>Plan</th>
+                        <th>Cuota</th>
+                        <th>Usado</th>
+                        <th>%</th>
+                        <th>Editar</th>
+                        <th>Migrar</th>
+                    </tr></thead>
+                    <tbody id="storage-tbody"><tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     PLANES (CRUD)
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-plans">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+                <div class="card-title" style="margin-bottom:0">📦 Gestión de Planes</div>
+                <button class="btn btn-sm" onclick="showPlanEditor()">➕ Crear Plan</button>
+            </div>
+            <div id="plans-list"><p style="color:var(--text-secondary)">Cargando planes...</p></div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     SISTEMA
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-system">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">🌐 Acceso Remoto</div>
+            <div class="server-url-box">
+                <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px">
+                    <span class="url" id="ngrok-url">Sin conexión</span>
+                    <button class="copy-btn" id="btn-copy" onclick="cfgCopy()" style="display:none">📋 Copiar</button>
+                    <span class="badge badge-ok" id="ngrok-on" style="display:none">Activo</span>
+                    <span class="badge badge-err" id="ngrok-off">Inactivo</span>
+                </div>
+            </div>
+            <div id="cfg-card" style="display:none;margin-top:12px">
+                <div class="form-group" style="margin-bottom:8px">
+                    <label>URL del servidor (cloudflared/ngrok)</label>
+                    <div style="display:flex;gap:8px">
+                        <input id="cfg-url" type="url" placeholder="https://api.ojoia.com.do" style="flex:1">
+                        <button class="btn btn-sm" onclick="cfgSave()">Guardar URL</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">📡 Estado del Servidor</div>
+            <div class="info-row"><span class="info-label">Estado</span><span class="info-value" id="srv-status">—</span></div>
+            <div class="info-row"><span class="info-label">URL</span><span class="info-value" id="srv-url">—</span></div>
+            <div class="info-row"><span class="info-label">Puerto</span><span class="info-value" id="srv-port">—</span></div>
+        </div>
+        <div class="card">
+            <div class="card-title">🔧 Acciones</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+                <button class="btn btn-outline" onclick="cfgShow()">⚙️ Cambiar URL Manualmente</button>
+                <button class="btn btn-outline" onclick="reloadStatus()">🔄 Refrescar Estado</button>
+                <button class="btn btn-outline" onclick="testHealth()">💓 Test Health</button>
+                <button class="btn btn-warning" onclick="restartBackend()">⚠️ Reiniciar Backend</button>
+                <button class="btn btn-warning" onclick="restartTunnel()">⚠️ Reiniciar Túnel</button>
+                <button class="btn btn-success" onclick="createBackup()">💾 Crear Backup</button>
+                <button class="btn btn-outline" onclick="loadBackups()">📦 Backups</button>
+                <button class="btn btn-outline" onclick="loadProcesses()">🧾 Procesos</button>
+            </div>
+        </div>
+        <div class="card" style="grid-column:1/-1;display:none" id="backups-box">
+            <div class="card-title">📦 Backups</div>
+            <div id="backups-list" style="margin-bottom:12px"></div>
+            <button class="btn btn-sm btn-outline" onclick="loadBackups()">🔄 Refrescar Backups</button>
+        </div>
+        <div class="card" style="grid-column:1/-1;display:none" id="processes-box">
+            <div class="card-title">🧾 Procesos</div>
+            <div id="processes-list" class="log-box"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">⏱️ Intervalo de Análisis</div>
+            <p style="font-size:0.8rem;color:var(--text-secondary);margin-bottom:12px;">
+                Controla cada cuántos segundos entra un frame al grid de análisis (16 frames).
+                Más bajo = análisis más frecuente. Más alto = menos carga en GPU.
+            </p>
+            <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;">
+                <input type="range" id="analysis-interval-slider" min="1" max="10" step="0.5" value="3"
+                    oninput="document.getElementById('analysis-interval-val').textContent=this.value+'s'"
+                    style="flex:1;accent-color:var(--accent);">
+                <span id="analysis-interval-val" style="font-weight:600;font-size:1.1rem;min-width:45px;text-align:right;">3s</span>
+            </div>
+            <div class="info-row"><span class="info-label">Tiempo para llenar grid</span><span id="analysis-estimated" style="font-weight:600;">~48s</span></div>
+            <button class="btn btn-success" onclick="saveAnalysisInterval()" style="width:100%;margin-top:12px;">💾 Guardar</button>
+            <div id="analysis-interval-status" style="font-size:0.8rem;margin-top:8px;text-align:center;"></div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">🤖 Prompt de Eva</div>
+            <div class="form-group">
+                <textarea id="prompt-eva" rows="12" placeholder="Prompt de Eva..."></textarea>
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-success" onclick="saveEvaPrompt()">💾 Guardar</button>
+                <button class="btn btn-outline" onclick="loadEvaPrompt()">🔄 Recargar</button>
+                <button class="btn btn-outline" onclick="calcTokens()">🔢 Calcular Tokens</button>
+            </div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">📚 Documentos RAG</div>
+            <div id="eva-docs-list" style="margin-bottom:12px"></div>
+            <div class="btn-group">
+                <button class="btn btn-outline" onclick="loadEvaDocs()">🔄 Recargar</button>
+                <button class="btn btn-outline" onclick="showAddDocForm()">➕ Nuevo Documento</button>
+            </div>
+        </div>
+        <div class="card" style="grid-column:1/-1;display:none" id="eva-doc-editor">
+            <div class="card-title" id="doc-editor-title">📝 Editar Documento</div>
+            <div class="form-group"><label>Nombre</label><input id="doc-name" type="text"></div>
+            <div class="form-group"><label>Contenido</label><textarea id="doc-content" rows="10"></textarea></div>
+            <div class="btn-group">
+                <button class="btn btn-success" onclick="saveEvaDoc()">💾 Guardar</button>
+                <button class="btn btn-outline" onclick="hideDocEditor()">Cancelar</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     LOGS
+     ══     ══════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-support">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">💬 Contacto de Soporte (visible en la app)</div>
+            <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:16px">Estos datos aparecen en la sección "Soporte" de la app del cliente. Edita el número de WhatsApp, correo y los datos bancarios para recibir pagos.</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+                <div class="form-group">
+                    <label>WhatsApp (código país + número, sin + ni espacios)</label>
+                    <input id="sc-whatsapp" type="text" placeholder="18290000000">
+                </div>
+                <div class="form-group">
+                    <label>Correo de soporte</label>
+                    <input id="sc-email" type="email" placeholder="soporte@ojoia.com.do">
+                </div>
+                <div class="form-group">
+                    <label>Teléfono (formato libre)</label>
+                    <input id="sc-phone" type="text" placeholder="+1-829-000-0000">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Datos para pagar (banco, cuenta, titular, referencia)</label>
+                <textarea id="sc-bank" placeholder="Banco Popular Dominicano&#10;Cuenta de ahorro: 0000000000&#10;Titular: OjoIA&#10;Referencia: código de cliente"></textarea>
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-success" onclick="saveSupportContact()">💾 Guardar</button>
+                <button class="btn btn-outline" onclick="loadSupportContact()">🔄 Recargar</button>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="panel" id="panel-logs">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <div class="card-title" style="margin-bottom:0">📜 Auditoría Admin</div>
+                <div class="btn-group">
+                    <button class="btn btn-sm btn-outline" onclick="loadLogs()">🔄 Refrescar</button>
+                    <button class="btn btn-sm filter-btn active" onclick="filterLogs('all')">Todos</button>
+                    <button class="btn btn-sm filter-btn" onclick="filterLogs('admin_login')">Login</button>
+                    <button class="btn btn-sm filter-btn" onclick="filterLogs('admin_user_create')">Usuarios</button>
+                    <button class="btn btn-sm filter-btn" onclick="filterLogs('admin_camera_update')">Cámaras</button>
+                    <button class="btn btn-sm filter-btn" onclick="filterLogs('admin_system_restart_backend')">Sistema</button>
+                </div>
+            </div>
+            <div id="admin-audit-logs" class="log-box">Cargando...</div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">🧠 api_eva.log (últimas líneas)</div>
+            <div id="api-log-tail" class="log-box">Cargando...</div>
+        </div>
+    </div>
+</div>
+
+</div><!-- /container -->
+
+<!-- USER DETAIL MODAL -->
+<div class="user-detail" id="user-detail">
+    <div class="user-detail-card">
+        <span class="close" onclick="closeUserDetail()">&times;</span>
+        <h3 id="ud-name">Usuario</h3>
+        <div id="ud-content"></div>
+    </div>
+</div>
+
+<!-- USER EDITOR MODAL -->
+<div class="modal-overlay" id="user-editor-modal">
+    <div class="modal-box" style="max-width:720px">
+        <span class="modal-close" onclick="closeUserEditor()">&times;</span>
+        <h3 id="user-editor-title">Usuario</h3>
+        <div id="user-editor-content"></div>
+    </div>
+</div>
+
+<!-- CAMERA DETAIL MODAL -->
+<div class="modal-overlay" id="camera-detail-modal">
+    <div class="modal-box" style="max-width:1000px;max-height:90vh;width:95%">
+        <span class="modal-close" onclick="closeCameraDetail()">&times;</span>
+        <h3 id="camera-detail-title">Cámara</h3>
+        <div id="camera-detail-content"></div>
+    </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════
+     IDENTITY — Reconocimiento Facial
+     ════════════════════════════════════════════════════════════════════════════ -->
+<div class="panel" id="panel-identity">
+    <div class="grid">
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title">👤 Identity Wan — Reconocimiento Facial</div>
+            <p style="color:var(--text-secondary);font-size:.85rem;margin-bottom:16px">
+                Registra caras de empleados y personas autorizadas. El sistema las reconocerá en las cámaras
+                y podrá identificar quién está en cada zona.
+            </p>
+            <div class="btn-group">
+                <button class="btn btn-success" onclick="openIdentityApp()">🧪 Abrir App de Prueba</button>
+                <button class="btn btn-outline" onclick="checkIdentityHealth()">💓 Health Check</button>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">📊 Estado del Módulo</div>
+            <div id="identity-status">
+                <div class="info-row"><span class="info-label">Servicio</span><span class="info-value" id="idw-status">—</span></div>
+                <div class="info-row"><span class="info-label">GPU</span><span class="info-value" id="idw-gpu">—</span></div>
+                <div class="info-row"><span class="info-label">VRAM libre</span><span class="info-value" id="idw-vram">—</span></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-title">👥 Personas Registradas</div>
+            <div id="identity-faces-list" style="margin-bottom:12px">
+                <span style="color:var(--text-secondary);font-size:.8rem">Cargando...</span>
+            </div>
+            <button class="btn btn-sm btn-outline" onclick="loadIdentityFaces()">↻ Actualizar</button>
+        </div>
+    </div>
+</div>
+
+<!-- CAMERA EDITOR MODAL -->
+<div class="modal-overlay" id="camera-editor-modal">
+    <div class="modal-box" style="max-width:760px">
+        <span class="modal-close" onclick="closeCameraEditor()">&times;</span>
+        <h3 id="camera-editor-title">Cámara</h3>
+        <div id="camera-editor-content"></div>
+    </div>
+</div>
+
+<!-- CAMERA COMMAND MODAL -->
+<div class="modal-overlay" id="camera-command-modal">
+    <div class="modal-box">
+        <span class="modal-close" onclick="closeCameraCommand()">&times;</span>
+        <h3>🎮 Comando Cámara</h3>
+        <div class="form-group"><label>JSON comando</label><textarea id="camera-command-json" rows="8">{}</textarea></div>
+        <div class="btn-group"><button class="btn btn-success" onclick="sendCameraCommand()">Enviar</button><button class="btn btn-outline" onclick="closeCameraCommand()">Cancelar</button></div>
+        <div id="camera-command-result" style="margin-top:12px"></div>
+    </div>
+</div>
+
+<!-- PLAN EDITOR MODAL -->
+<div class="modal-overlay" id="plan-editor-overlay">
+    <div class="modal-box" style="max-width:600px">
+        <span class="modal-close" onclick="closePlanEditor()">✕</span>
+        <h3 id="plan-editor-title">Nuevo Plan</h3>
+        <div class="form-group"><label>ID del plan</label><input id="pe-id" type="text" placeholder="pro"></div>
+        <div class="form-group"><label>Nombre</label><input id="pe-name" type="text" placeholder="Pro"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="form-group"><label>Precio mensual</label><input id="pe-price-monthly" type="number" min="0" step="0.01" value="0"></div>
+            <div class="form-group"><label>Precio anual</label><input id="pe-price-yearly" type="number" min="0" step="0.01" value="0"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+            <div class="form-group"><label>Días cobertura</label><input id="pe-duration" type="number" min="1" value="30"></div>
+            <div class="form-group"><label>Días prueba</label><input id="pe-trial" type="number" min="0" value="0"></div>
+            <div class="form-group"><label>GB storage</label><input id="pe-storage" type="number" min="1" value="10"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="form-group"><label>Máx cámaras</label><input id="pe-cameras" type="number" min="1" value="1"></div>
+            <div class="form-group"><label>Máx reglas/cámara</label><input id="pe-rules" type="number" min="1" value="2"></div>
+        </div>
+        <div class="form-group"><label>Moneda</label><input id="pe-currency" type="text" value="USD"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+            <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem"><input type="checkbox" id="pe-ai" checked> Análisis IA</label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem"><input type="checkbox" id="pe-alerts" checked> Alertas push</label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem"><input type="checkbox" id="pe-grid"> Grid</label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem"><input type="checkbox" id="pe-multizone"> Multi-zona</label>
+        </div>
+        <div class="form-group"><label>Soporte</label>
+            <select id="pe-support">
+                <option value="community">Comunidad</option>
+                <option value="email">Email</option>
+                <option value="priority">Prioritario</option>
+                <option value="direct">Directo</option>
+            </select>
+        </div>
+        <div class="btn-group" style="margin-top:16px">
+            <button class="btn btn-success btn-sm" onclick="planSave()">💾 Guardar</button>
+            <button class="btn btn-outline btn-sm" onclick="closePlanEditor()">Cancelar</button>
+        </div>
+    </div>
+</div>
+
+<!-- EDIT STORAGE MODAL -->
+<div class="modal-overlay" id="edit-storage-modal">
+    <div class="modal-box">
+        <span class="modal-close" onclick="closeEditStorageModal()">&times;</span>
+        <h3>✏️ Editar Usuario</h3>
+        <div id="edit-storage-content"></div>
+    </div>
+</div>
+
+<!-- MIGRATE USER MODAL -->
+<div class="modal-overlay" id="migrate-modal">
+    <div class="modal-box">
+        <span class="modal-close" onclick="closeMigrateModal()">&times;</span>
+        <h3>📦 Migrar Usuario</h3>
+        <div id="migrate-content"></div>
+    </div>
+</div>
+
+</div>
+
+<!-- EVENT DETAIL MODAL -->
+<div class="modal-overlay" id="event-detail-modal">
+    <div class="modal-box" style="max-width:820px">
+        <span class="modal-close" onclick="closeEventDetail()">&times;</span>
+        <h3>📋 Evento</h3>
+        <div id="event-detail-content"></div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+
+let API = '';
+let ADMIN_SESSION = '';
+const HDRS = { 'ngrok-skip-browser-warning': 'true' };
+const ADMIN_SESSION_KEY = 'ojoia_admin_session';
+const ADMIN_CONFIG_KEY = 'ojoia_admin_config';
+
+function apiFetch(path, opts = {}) {
+    const headers = { ...HDRS, ...opts.headers };
+    if (ADMIN_SESSION) headers.Authorization = 'Bearer ' + ADMIN_SESSION;
+    return fetch(API + path, { mode: 'cors', headers, ...opts });
+}
+function apiGetJSON(path) {
+    return apiFetch(path).then(async r => {
+        if (r.status === 401) {
+            logoutAdmin();
+            throw new Error('Sesión expirada');
+        }
+        return r.json();
+    });
+}
+
+// ── ADMIN LOGIN ──
+function showLogin() {
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('app-shell').style.display = 'none';
+    ADMIN_SESSION = '';
+}
+function showAdmin() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app-shell').style.display = 'block';
+}
+function initAuth() {
+    const saved = localStorage.getItem(ADMIN_SESSION_KEY);
+    if (!saved) { showLogin(); return; }
+    ADMIN_SESSION = saved;
+    apiGetJSON('/admin/auth/me').then(() => showAdmin()).catch(() => showLogin());
+}
+function doAdminLogin() {
+    const token = document.getElementById('admin-token').value.trim();
+    const btn = document.getElementById('btn-admin-login');
+    const err = document.getElementById('login-error');
+    err.style.display = 'none';
+    if (!token) { err.textContent = 'Ingresa el token administrador'; err.style.display = 'block'; return; }
+    if (!API) { err.textContent = 'Conectando con el backend... intenta en unos segundos'; err.style.display = 'block'; return; }
+    btn.disabled = true; btn.textContent = 'Entrando...';
+    apiFetch('/admin/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token })
+    }).then(r => r.json()).then(d => {
+        btn.disabled = false; btn.textContent = 'Entrar';
+        if (!d.success) { err.textContent = d.error || 'Credencial inválida'; err.style.display = 'block'; return; }
+        ADMIN_SESSION = d.session_token;
+        localStorage.setItem(ADMIN_SESSION_KEY, ADMIN_SESSION);
+        showAdmin();
+        loadLogs();
+        loadDashboard();
+    }).catch(e => {
+        btn.disabled = false; btn.textContent = 'Entrar';
+        err.textContent = e.message || 'Error de conexión';
+        err.style.display = 'block';
+    });
+}
+function logoutAdmin() {
+    const token = ADMIN_SESSION || localStorage.getItem(ADMIN_SESSION_KEY) || '';
+    if (API && token) {
+        apiFetch('/admin/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + token } }).catch(() => {});
+    }
+    localStorage.removeItem(ADMIN_SESSION_KEY);
+    ADMIN_SESSION = '';
+    showLogin();
+}
+
+// ── SUPPORT CONTACT ──
+function loadSupportContact() {
+    apiGetJSON('/admin/support-contact').then(d => {
+        document.getElementById('sc-whatsapp').value = d.whatsapp || '';
+        document.getElementById('sc-email').value = d.email || '';
+        document.getElementById('sc-phone').value = d.phone || '';
+        document.getElementById('sc-bank').value = d.bank_info || '';
+    }).catch(() => toast('❌ Error cargando contacto', false));
+}
+function saveSupportContact() {
+    const body = {
+        whatsapp: document.getElementById('sc-whatsapp').value.trim(),
+        email: document.getElementById('sc-email').value.trim(),
+        phone: document.getElementById('sc-phone').value.trim(),
+        bank_info: document.getElementById('sc-bank').value
+    };
+    apiFetch('/admin/support-contact', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+        .then(r => r.json()).then(d => {
+            if (d.success) toast('✅ Contacto guardado', true);
+            else toast('❌ ' + (d.detail || 'Error'), false);
+        }).catch(() => toast('❌ Error', false));
+}
+
+// ── AUTO-CONNECT ──
+function autoConnect() {
+    const saved = localStorage.getItem('ojoia_admin_api');
+    if (saved) { API = saved; reloadStatus(); initAuth(); return; }
+    setTimeout(() => {
+        if (!API) {
+            const knownUrl = 'https://api.ojoia.com.do';
+            fetch(knownUrl + '/health', {mode:'cors'})
+                .then(r => r.json())
+                .then(d => {
+                    if (d.status === 'ok') {
+                        API = knownUrl;
+                        localStorage.setItem('ojoia_admin_api', API);
+                        reloadStatus();
+                        initAuth();
+                    }
+                }).catch(() => setHeader(false));
+        }
+    }, 2000);
+}
+
+// ── UI HELPERS ──
+function toast(msg, ok) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show' + (ok ? ' success' : ' error');
+    setTimeout(() => t.className = 'toast', 3500);
+}
+function setHeader(ok) {
+    document.getElementById('hdr-dot').className = 'status-dot ' + (ok ? 'online' : 'offline');
+    document.getElementById('hdr-text').textContent = ok ? 'Online' : 'Offline';
+    document.getElementById('hdr-badge').className = 'status-badge ' + (ok ? 'online' : 'offline');
+}
+function fmtDate(s) {
+    if (!s) return '—';
+    try {
+        let n = typeof s === 'number' ? s : parseInt(s, 10);
+        if (!isNaN(n) && n > 0 && n < 100000000000) n = n * 1000;
+        const d = new Date(isNaN(n) ? s : n);
+        return d.toLocaleDateString('es-ES', {day:'2-digit',month:'short',year:'numeric'}) + ' ' + 
+               d.toLocaleTimeString('es-ES', {hour:'2-digit',minute:'2-digit',hour12:true});
+    } catch(e) { return String(s).substring(0,16); }
+}
+function fmtSize(mb) {
+    if (!mb) return '0 MB';
+    if (mb >= 1024) return (mb / 1024).toFixed(1) + ' GB';
+    return mb + ' MB';
+}
+function escapeHtml(v) {
+    return String(v || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+// ── TABS ──
+function switchTab(t) {
+    ['dashboard','monitoring','users','events','cameras','billing','storage','plans','system','support','logs','identity'].forEach(x => {
+        const tab = document.getElementById('tab-' + x);
+        const panel = document.getElementById('panel-' + x);
+        if (tab) tab.classList.toggle('active', x === t);
+        if (panel) panel.classList.toggle('active', x === t);
+    });
+    if (t === 'dashboard') loadDashboard();
+    if (t === 'monitoring') loadMonitoring();
+    if (t === 'users') loadUsers();
+    if (t === 'events') loadEvents();
+    if (t === 'cameras') { loadCameras(); refreshQueue(); }
+    if (t === 'billing') loadBilling();
+    if (t === 'storage') loadStorage();
+    if (t === 'plans') loadPlans();
+    if (t === 'system') { reloadStatus(); loadEvaPrompt(); loadEvaDocs(); loadAnalysisInterval(); }
+    if (t === 'support') loadSupportContact();
+    if (t === 'identity') { checkIdentityHealth(); loadIdentityFaces(); }
+    if (t === 'logs') loadLogs();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+function loadDashboard() {
+    Promise.all([
+        apiGetJSON('/admin/users'),
+        apiGetJSON('/admin/cameras'),
+        apiGetJSON('/admin/billing'),
+        apiGetJSON('/admin/queue/status')
+    ]).then(([users, cams, billing, queue]) => {
+        const us = users.users || [];
+        document.getElementById('d-users').textContent = us.length;
+        
+        const cameras = cams.cameras || [];
+        document.getElementById('d-cams').textContent = cameras.length;
+        const online = cameras.filter(c => c.active).length;
+        document.getElementById('d-online').textContent = online;
+        
+        const fbQ = queue.firebase_queue || {};
+        document.getElementById('d-queue').textContent = (fbQ.pending_frames || 0) + (queue.queue_length || 0);
+        
+        // Planes distribution
+        const planCounts = {};
+        us.forEach(u => { const p = u.plan || 'free'; planCounts[p] = (planCounts[p] || 0) + 1; });
+        let plansHtml = '';
+        for (const [plan, count] of Object.entries(planCounts)) {
+            plansHtml += `<div class="info-row"><span class="info-label">${plan}</span><span class="info-value">${count}</span></div>`;
+        }
+        document.getElementById('dash-planes').innerHTML = plansHtml || '<p style="color:var(--text-secondary)">Sin usuarios</p>';
+        
+        // Recent alerts
+        apiGetJSON('/admin/events?limit=5').then(ev => {
+            const events = ev.events || [];
+            const alerts = events.filter(e => e.event_type === 'violation');
+            let html = '';
+            alerts.slice(0, 5).forEach(a => {
+                html += `<div class="info-row"><span class="info-label" style="color:var(--danger)">🚨 ${a.camera_id || '?'}</span><span style="font-size:0.75rem;color:var(--text-secondary)">${fmtDate(a.timestamp)}</span></div>`;
+            });
+            document.getElementById('dash-alerts').innerHTML = html || '<p style="color:var(--text-secondary)">Sin alertas recientes</p>';
+        }).catch(() => {});
+        
+        setHeader(true);
+    }).catch(() => setHeader(false));
+}
+
+let _monitoringFilter = 'all';
+function loadMonitoring() {
+    Promise.all([
+        apiGetJSON('/admin/monitoring/overview'),
+        apiGetJSON('/admin/monitoring/cameras?limit=100'),
+        apiGetJSON('/admin/monitoring/alerts?limit=12&hours=24')
+    ]).then(([overview, cams, alerts]) => {
+        document.getElementById('mon-total-cameras').textContent = overview.cameras_total || 0;
+        document.getElementById('mon-online').textContent = overview.cameras_online || 0;
+        document.getElementById('mon-offline').textContent = overview.cameras_offline || 0;
+        document.getElementById('mon-alerts').textContent = overview.alerts_today || 0;
+        renderMonitoringCameras(cams.cameras || []);
+        renderMonitoringAlerts(alerts.alerts || []);
+    }).catch(() => {
+        document.getElementById('monitor-cameras').innerHTML = '<p style="color:var(--danger)">Error cargando monitoreo</p>';
+    });
+}
+function renderMonitoringCameras(cameras) {
+    const el = document.getElementById('monitor-cameras');
+    let list = cameras;
+    if (_monitoringFilter !== 'all') list = cameras.filter(c => (_monitoringFilter === 'online') ? c.active : !c.active);
+    if (!list.length) { el.innerHTML = '<p style="color:var(--text-secondary)">Sin cámaras</p>'; return; }
+    el.innerHTML = list.map(c => {
+        const icon = c.active ? '🟢' : '🔴';
+        const age = c.frame_age_s != null ? c.frame_age_s + 's frame' : c.offline_seconds != null ? Math.round(c.offline_seconds/60) + 'm offline' : '—';
+        const m = c.metrics || {};
+        return '<div class="monitor-card">' +
+            '<img src="' + API + c.latest_frame_url + '" alt="' + (c.name || c.camera_id) + '">' +
+            '<div class="title">' + icon + ' ' + (c.name || c.camera_id) + '</div>' +
+            '<div class="meta">👤 ' + (c.user_name || c.user_id || '—') + ' · ' + (c.business_name || '') + '</div>' +
+            '<div class="meta">🕐 ' + age + ' · 🚨 ' + (m.today_alerts || 0) + ' hoy · 📦 ' + (m.total_events || 0) + ' eventos</div>' +
+            '<div class="meta">📹 ' + c.camera_id + '</div>' +
+            '<div style="margin-top:8px"><button class="btn btn-sm btn-outline" onclick="openCameraDetail(\'' + c.camera_id + '\',\'' + c.user_id + '\')">🔍 Abrir cámara</button> <button class="btn btn-sm" onclick="openCameraDetail(\'' + c.camera_id + '\',\'' + c.user_id + '\');setTimeout(()=>showCameraDetailTab(\'mejorar\'),50)">Mejorar Vigilancia</button></div>' +
+            '</div>';
+    }).join('');
+}
+function renderMonitoringAlerts(alerts) {
+    const el = document.getElementById('monitor-alerts');
+    if (!alerts.length) { el.innerHTML = '<p style="color:var(--text-secondary)">Sin alertas recientes</p>'; return; }
+    el.innerHTML = alerts.map(a => {
+        const img = a.image_url ? API + a.image_url : '';
+        const desc = (a.description || (a.qwen_analysis && a.qwen_analysis.description) || 'Alerta').substring(0, 150);
+        return '<div class="monitor-card">' +
+            (img ? '<img src="' + img + '" alt="evento">' : '<div style="height:160px;background:#111;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--text-secondary)">Sin imagen</div>') +
+            '<div class="title">🚨 ' + fmtDate(a.timestamp) + '</div>' +
+            '<div class="meta">📹 ' + (a.camera_name || a.camera_id || '—') + ' · 👤 ' + (a._user_id || '—') + '</div>' +
+            '<div class="meta">' + desc + '</div>' +
+            '<div style="margin-top:8px"><button class="btn btn-sm btn-outline" onclick="showEventDetail(\'' + (a.event_id || '') + '\',\'' + (a._user_id || '') + '\')">📋 Ver</button></div>' +
+            '</div>';
+    }).join('');
+}
+function filterMonitoring(f) {
+    _monitoringFilter = f;
+    document.querySelectorAll('#panel-monitoring .filter-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    loadMonitoring();
+}
+function openCameraDetail(cameraId, userId) {
+    apiGetJSON('/admin/monitoring/cameras/' + cameraId + '?user_id=' + userId + '&recent_frames=12&recent_alerts=12').then(d => {
+        currentCameraDetail = d;
+        renderCameraDetail(d);
+        document.getElementById('camera-detail-modal').classList.add('show');
+    }).catch(() => toast('❌ Error cargando cámara', false));
+}
+function closeCameraDetail() { document.getElementById('camera-detail-modal').classList.remove('show'); }
+function renderCameraDetail(d) {
+    const c = d;
+    const a = d.audit || {};
+    const cfg = d.config || {};
+    document.getElementById('camera-detail-title').textContent = (d.name || d.camera_id) + ' · ' + (d.user_name || d.user_id || '');
+    document.getElementById('camera-detail-content').innerHTML =
+        '<div class="admin-tabs" style="margin-bottom:12px">' +
+        '<button class="admin-tab active" onclick="showCameraDetailTab(\'estado\')">Estado</button>' +
+        '<button class="admin-tab" onclick="showCameraDetailTab(\'frames\')">Frames</button>' +
+        '<button class="admin-tab" onclick="showCameraDetailTab(\'alertas\')">Alertas</button>' +
+        '<button class="admin-tab" onclick="showCameraDetailTab(\'config\')">Configuración</button>' +
+        '<button class="admin-tab" onclick="showCameraDetailTab(\'mejorar\')">Mejorar Vigilancia</button>' +
+        '<button class="admin-tab" onclick="showCameraDetailTab(\'auditoria\')">Auditoría</button>' +
+        '</div>' +
+        '<div class="grid" id="camtab-estado">' +
+        '<div class="card"><div class="card-title">Estado</div>' +
+        '<div class="info-row"><span class="info-label">Estado</span><span class="info-value ' + (d.active ? 'ok' : 'err') + '">' + (d.active ? 'Online' : 'Offline') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Último frame</span><span class="info-value">' + (d.last_frame || '—') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Edad frame</span><span class="info-value">' + (d.frame_age_s != null ? d.frame_age_s + 's' : '—') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Edad announce</span><span class="info-value">' + (d.announce_age_s != null ? d.announce_age_s + 's' : '—') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Offline</span><span class="info-value">' + (d.offline_seconds != null ? Math.round(d.offline_seconds/60) + 'm' : '—') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Comandos pendientes</span><span class="info-value">' + (d.pending_commands ? 'Sí' : 'No') + '</span></div>' +
+        '</div>' +
+        '<div class="card"><div class="card-title">Último frame</div><img src="' + API + d.latest_frame_url + '" style="width:100%;max-height:260px;object-fit:contain;background:#000;border-radius:8px"></div>' +
+        '<div class="card"><div class="card-title">Datos</div>' +
+        '<div class="info-row"><span class="info-label">Cámara</span><span class="info-value">' + d.camera_id + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Usuario</span><span class="info-value">' + (d.user_id || '—') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Negocio</span><span class="info-value">' + (d.business_name || '—') + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Disco</span><span class="info-value">' + (d.disk_mount || '—') + '</span></div>' +
+        '<div style="margin-top:12px" class="btn-group"><button class="btn btn-sm btn-outline" onclick="cameraCommand(\'' + d.camera_id + '\')">🎮 Comando</button><button class="btn btn-sm btn-warning" onclick="cameraOTA(\'' + d.camera_id + '\')">OTA</button></div>' +
+        '</div></div>' +
+        '<div class="card" id="camtab-frames" style="display:none"><div class="card-title">Frames recientes</div>' + renderRecentFrames(d.recent_frames || []) + '</div>' +
+        '<div class="card" id="camtab-alertas" style="display:none"><div class="card-title">Alertas recientes</div>' + renderCameraAlerts(d.recent_alerts || []) + '</div>' +
+        '<div class="card" id="camtab-config" style="display:none">' + renderCameraConfigForm(d) + '</div>' +
+        '<div class="card" id="camtab-mejorar" style="display:none">' + renderCameraImprove(d) + '</div>' +
+        '<div class="card" id="camtab-auditoria" style="display:none">' + renderCameraAudit(a) + '</div>';
+}
+function showCameraDetailTab(t) {
+    ['estado','frames','alertas','config','mejorar','auditoria'].forEach(x => document.getElementById('camtab-' + x).style.display = x === t ? 'block' : 'none');
+    document.querySelectorAll('#camera-detail-content .admin-tab').forEach(b => b.classList.remove('active'));
+    const tab = Array.from(document.querySelectorAll('#camera-detail-content .admin-tab')).find(b => (b.getAttribute('onclick') || '').includes("'" + t + "'"));
+    if (tab) tab.classList.add('active');
+    if (t === 'mejorar') loadPromptAudit(currentCameraDetail);
+}
+function renderRecentFrames(frames) {
+    if (!frames.length) return '<p style="color:var(--text-secondary)">Sin frames recientes</p>';
+    return '<div class="monitor-grid">' + frames.map(f => '<div class="monitor-card"><img src="' + API + f.frame_url + '" alt="frame"><div class="meta">' + fmtDate(f.timestamp) + ' · ' + Math.round((f.size||0)/1024) + ' KB</div></div>').join('') + '</div>';
+}
+function renderCameraAlerts(alerts) {
+    if (!alerts.length) return '<p style="color:var(--text-secondary)">Sin alertas recientes</p>';
+    return '<div class="monitor-grid">' + alerts.map(a => '<div class="monitor-card"><img src="' + API + a.image_url + '" alt="alerta"><div class="title">🚨 ' + fmtDate(a.timestamp) + '</div><div class="meta">' + (a.description || '').substring(0, 120) + '</div><button class="btn btn-sm btn-outline" style="margin-top:8px" onclick="showEventDetail(\'' + (a.event_id || '') + '\',\'' + (a._user_id || '') + '\')">📋 Ver</button></div>').join('') + '</div>';
+}
+function renderCameraConfigForm(d) {
+    const cfg = d.config || {};
+    return '<div class="form-group"><label>Prompt vigilancia</label><textarea id="cd-prompt" rows="8">' + escapeHtml(cfg.vigilance_prompt || '') + '</textarea></div>' +
+        '<div class="form-group"><label>Reglas JSON</label><textarea id="cd-rules" rows="8">' + JSON.stringify(cfg.rules || cfg.rules_es || [], null, 2) + '</textarea></div>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div class="form-group"><label>Cooldown min</label><input id="cd-cooldown" type="number" min="5" max="60" value="' + (cfg.cooldown_min || d.cooldown_min || 5) + '"></div><div class="form-group"><label>Yolo triggers</label><input id="cd-yolo" type="text" value="' + escapeHtml((cfg.yolo_triggers || ['person']).join(',')) + '"></div></div>' +
+        '<button class="btn btn-success" onclick="saveCameraDetailConfig(\'' + d.camera_id + '\',\'' + d.user_id + '\')">💾 Guardar configuración</button>';
+}
+function saveCameraDetailConfig(cameraId, userId) {
+    let rules = [];
+    try { rules = JSON.parse(document.getElementById('cd-rules').value || '[]'); } catch(e) { toast('❌ Reglas JSON inválido', false); return; }
+    apiFetch('/admin/cameras/' + cameraId, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        user_id: userId,
+        vigilance_prompt: document.getElementById('cd-prompt').value,
+        vigilance_rules: rules,
+        rules_es: rules,
+        cooldown_min: parseInt(document.getElementById('cd-cooldown').value) || 5,
+        yolo_triggers: document.getElementById('cd-yolo').value.split(',').map(x => x.trim()).filter(Boolean)
+    })}).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Configuración guardada', true); openCameraDetail(cameraId, userId); }
+        else toast('❌ ' + (d.detail || d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+let currentPromptAudit = null;
+function renderCameraImprove(d) {
+    return '<div class="rules-box"><h4>Mejorar Vigilancia</h4>' +
+        '<p style="color:var(--text-secondary);margin-bottom:12px">Audita el prompt actual, propone reglas más observables y guarda una versión antes de aplicar.</p>' +
+        '<div class="prompt-audit-actions"><button class="btn btn-sm btn-outline" onclick="loadPromptAudit(currentCameraDetail)">Auditar prompt</button><button class="btn btn-sm btn-outline" onclick="loadPromptVersions(currentCameraDetail)">Ver versiones</button></div>' +
+        '</div><div id="prompt-audit-result"></div>';
+}
+function loadPromptAudit(d) {
+    if (!d) return;
+    const el = document.getElementById('prompt-audit-result');
+    el.innerHTML = '<p style="color:var(--text-secondary)">Auditoría en proceso...</p>';
+    apiFetch('/admin/cameras/' + d.camera_id + '/prompt-audit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id:d.user_id})})
+        .then(r => r.json()).then(audit => {
+            currentPromptAudit = audit;
+            renderPromptAuditResult(audit);
+        }).catch(() => { el.innerHTML = '<p style="color:var(--danger)">No se pudo auditar el prompt.</p>'; });
+}
+function renderPromptAuditResult(audit) {
+    const rules = audit.suggested_rules || audit.rules || [];
+    const tests = audit.tests_needed || [];
+    const diagnosis = audit.diagnosis || [];
+    const el = document.getElementById('prompt-audit-result');
+    el.innerHTML = '<div class="grid" style="grid-template-columns:1fr">' +
+        '<div class="card"><div class="card-title">Resultado auditoría</div>' +
+        '<div class="prompt-audit-score">' + (audit.score || 0) + '/100</div>' +
+        '<div class="meta">Fuente: ' + (audit.auditor_model || audit.source || 'local') + '</div>' +
+        (audit.warning ? '<div class="meta" style="color:var(--warning);margin-top:8px">' + escapeHtml(audit.warning) + '</div>' : '') +
+        '<div style="margin-top:12px">' + (diagnosis.length ? diagnosis.map(x => '<div class="rules-box">' + escapeHtml(x) + '</div>').join('') : '<p style="color:var(--text-secondary)">Sin problemas críticos detectados.</p>') + '</div>' +
+        '</div>' +
+        '<div class="card"><div class="card-title">Prompt sugerido</div><textarea id="pa-prompt" class="prompt-audit-textarea">' + escapeHtml(audit.suggested_prompt || '') + '</textarea></div>' +
+        '<div class="card"><div class="card-title">Reglas sugeridas JSON</div><textarea id="pa-rules" rows="10">' + escapeHtml(JSON.stringify(rules, null, 2)) + '</textarea></div>' +
+        '<div class="card"><div class="card-title">Ajustes sugeridos</div>' +
+        '<div class="info-row"><span class="info-label">YOLO triggers</span><span class="info-value">' + escapeHtml((audit.suggested_yolo_triggers || []).join(', ')) + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Cooldown min</span><span class="info-value">' + (audit.suggested_cooldown_min || 5) + '</span></div>' +
+        '<div style="margin-top:12px"><strong>Pruebas recomendadas</strong>' + (tests.length ? '<ul style="margin-left:18px;margin-top:8px;color:var(--text-secondary)">' + tests.map(x => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul>' : '') + '</div>' +
+        '</div>' +
+        '<div class="card"><div class="card-title">Aplicar mejora</div>' +
+        '<p style="color:var(--text-secondary);margin-bottom:12px">Esto guarda una versión del prompt y reemplaza la configuración activa de vigilancia.</p>' +
+        '<button class="btn btn-success" onclick="applyPromptAudit()">Aplicar mejora</button>' +
+        '</div></div>';
+}
+function applyPromptAudit() {
+    const d = currentCameraDetail;
+    const audit = currentPromptAudit;
+    if (!d || !audit) return;
+    let rules = [];
+    try { rules = JSON.parse(document.getElementById('pa-rules').value || '[]'); } catch(e) { toast('❌ Reglas JSON inválido', false); return; }
+    if (!confirm('¿Aplicar esta mejora al prompt activo?')) return;
+    apiFetch('/admin/cameras/' + d.camera_id + '/prompt-apply', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        user_id: d.user_id,
+        prompt: document.getElementById('pa-prompt').value,
+        rules: rules,
+        rules_es: rules,
+        yolo_triggers: audit.suggested_yolo_triggers || [],
+        cooldown_min: parseInt(audit.suggested_cooldown_min || 5),
+        score: audit.score,
+        diagnosis: audit.diagnosis || [],
+        source: audit.source || 'admin',
+        reason: 'Aplicado desde pestaña Mejorar Vigilancia'
+    })}).then(r => r.json()).then(res => {
+        if (res.success) { toast('✅ Mejora aplicada y versionada', true); openCameraDetail(d.camera_id, d.user_id); }
+        else toast('❌ ' + (res.detail || res.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+function loadPromptVersions(d) {
+    if (!d) return;
+    const el = document.getElementById('prompt-audit-result');
+    el.innerHTML = '<p style="color:var(--text-secondary)">Cargando versiones...</p>';
+    apiGetJSON('/admin/cameras/' + d.camera_id + '/prompt-versions?user_id=' + d.user_id).then(v => {
+        const versions = (v.versions || []).slice().reverse();
+        renderPromptAuditResult({
+            score: 0,
+            auditor_model: 'historial',
+            suggested_prompt: '',
+            suggested_rules: [],
+            suggested_yolo_triggers: [],
+            suggested_cooldown_min: 5,
+            diagnosis: [],
+            tests_needed: [],
+            warning: ''
+        });
+        const el2 = document.getElementById('prompt-audit-result');
+        el2.innerHTML = '<div class="rules-box"><h4>Historial de versiones</h4>' +
+            (versions.length ? versions.map(ver => '<div class="rules-box" style="margin-bottom:8px"><strong>Versión ' + ver.version + '</strong> · ' + fmtDate(ver.created_at) + '<br>' +
+                '<span class="badge ' + (ver.applied ? 'badge-ok' : 'badge-warn') + '">' + (ver.applied ? 'aplicada' : 'auditoría') + '</span> ' +
+                (ver.score != null ? ' · score ' + ver.score : '') + ' · ' + escapeHtml(ver.reason || '') + '</div>').join('') : '<p style="color:var(--text-secondary)">Sin versiones guardadas.</p>') + '</div>';
+    }).catch(() => { el.innerHTML = '<p style="color:var(--danger)">No se pudo cargar el historial.</p>'; });
+}
+function renderCameraAudit(a) {
+    const rate = Math.round((a.false_alarm_rate || 0) * 100) + '%';
+    const flags = (a.audit_flags || []).length ? a.audit_flags.join(', ') : 'Sin alertas de auditoría';
+    const reviews = (a.reviews || []).slice(-10).reverse();
+    return '<div class="grid">' +
+        '<div class="card"><div class="card-title">Métrica</div>' +
+        '<div class="info-row"><span class="info-label">Reviews</span><span class="info-value">' + (a.total_reviews || 0) + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Falsas alarmas</span><span class="info-value" style="color:var(--danger)">' + (a.false_alarm_count || 0) + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Confirmadas</span><span class="info-value" style="color:var(--success)">' + (a.confirmed_count || 0) + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Tasa falsa alarma</span><span class="info-value">' + rate + '</span></div>' +
+        '<div class="info-row"><span class="info-label">Auditoría</span><span class="info-value ' + (a.audit_flags && a.audit_flags.length ? 'err' : 'ok') + '">' + flags + '</span></div>' +
+        '</div>' +
+        '<div class="card" style="grid-column:1/-1"><div class="card-title">Historial reviews</div>' + (reviews.length ? reviews.map(r => '<div class="rules-box" style="margin-bottom:8px"><strong>' + (r.decision === 'false_alarm' ? 'Falsa alarma' : r.decision) + '</strong> · evento ' + r.event_id + ' · ' + (r.reason || '') + ' · ' + fmtDate(r.created_at) + '</div>').join('') : '<p style="color:var(--text-secondary)">Sin reviews aún</p>') + '</div>' +
+        '</div>';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// USUARIOS
+// ═══════════════════════════════════════════════════════════════════════════════
+function loadUsers() {
+    apiGetJSON('/admin/users').then(d => {
+        const us = d.users || [];
+        document.getElementById('users-count').textContent = us.length;
+        const tb = document.getElementById('users-tbody');
+        if (!us.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-secondary)">Sin usuarios</td></tr>'; return; }
+        tb.innerHTML = us.map(u => {
+            const accessStatus = u._access_status || 'active';
+            const statusIcon = accessStatus === 'active' ? '🟢' : accessStatus === 'warning' ? '🟡' : '🔴';
+            const planLabel = (u.plan || 'free').charAt(0).toUpperCase() + (u.plan || 'free').slice(1);
+            const camCount = u.camera_count || (u.cameras ? u.cameras.length : 0);
+            const maxCams = u._max_cameras || '?';
+            const paymentCount = u._payment_count || 0;
+            const tokenShort = (u.access_token || '').substring(0, 12) + '...';
+            const planColors = { founder: 'badge-ok', pro: 'badge-ok', business: 'badge-ok', free: '', trial: 'badge-warn' };
+            return '<tr>' +
+                '<td style="font-weight:500">' + (u.name || u.user_id || '—') + '</td>' +
+                '<td>' + (u.business_name || '—') + '</td>' +
+                '<td><span class="badge ' + (planColors[u.plan] || '') + '">' + planLabel + '</span></td>' +
+                '<td>' + statusIcon + ' ' + (accessStatus === 'active' ? 'Activo' : accessStatus === 'warning' ? 'Por vencer' : 'Vencido') + '</td>' +
+                '<td style="font-size:0.75rem">' + fmtDate(u.plan_end) + '</td>' +
+                '<td style="text-align:center">' + camCount + '/' + maxCams + '</td>' +
+                '<td style="text-align:center">' + paymentCount + '</td>' +
+                '<td style="font-size:0.7rem;font-family:monospace">' + tokenShort + '</td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="showUserDetail(\'' + u.user_id + '\')">📋</button> <button class="btn btn-sm btn-outline" onclick="editExistingUser(\'' + u.user_id + '\')">✏️</button> <button class="btn btn-sm btn-danger" onclick="deleteUser(\'' + u.user_id + '\')">🗑️</button></td>' +
+            '</tr>';
+        }).join('');
+    }).catch(e => {
+        document.getElementById('users-tbody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--danger)">Error</td></tr>';
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EVENTOS
+// ═══════════════════════════════════════════════════════════════════════════════
+function loadEvents() {
+    apiGetJSON('/admin/events?limit=30').then(d => {
+        let events = d.events || [];
+        if (_eventsFilter !== 'all') events = events.filter(e => e.event_type === _eventsFilter);
+        document.getElementById('ev-total').textContent = events.length;
+        document.getElementById('ev-violations').textContent = (d.events || []).filter(e => e.event_type === 'violation').length;
+        document.getElementById('ev-normal').textContent = (d.events || []).filter(e => e.event_type !== 'violation').length;
+        
+        const listEl = document.getElementById('ev-list');
+        if (!events.length) { listEl.innerHTML = '<p style="color:var(--text-secondary);text-align:center">Sin eventos</p>'; return; }
+        
+        let h = '';
+        events.forEach(evt => {
+            const type = evt.event_type || 'info';
+            const typeBadge = type === 'violation' ? '<span class="badge badge-err">VIOLACIÓN</span>' : '<span class="badge badge-ok">' + type + '</span>';
+            const desc = (evt.metadata?.qwen_analysis || evt.description || '—').substring(0, 120);
+            const ts = fmtDate(evt.timestamp);
+            h += '<div class="rules-box" style="margin-bottom:6px">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+                typeBadge + '<span style="font-size:0.7rem;color:var(--text-secondary)">' + ts + '</span></div>' +
+                '<p style="font-size:0.85rem">' + desc + '</p>' +
+                '<p style="font-size:0.7rem;color:var(--text-secondary);margin-top:4px">📹 ' + (evt.camera_id || '—') + ' · 👤 ' + (evt._user_id || '—') + '</p>' +
+                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">' +
+                '<button class="btn btn-sm btn-outline" onclick="showEventDetail(\'' + (evt.event_id || '') + '\',\'' + (evt._user_id || '') + '\')">📋</button>' +
+                '<button class="btn btn-sm btn-success" onclick="confirmEvent(\'' + (evt.event_id || '') + '\',\'' + (evt._user_id || '') + '\')">✅ Confirmar</button>' +
+                '<button class="btn btn-sm btn-danger" onclick="dismissEvent(\'' + (evt.event_id || '') + '\',\'' + (evt._user_id || '') + '\')">⏸ Descartar</button>' +
+                '</div>' +
+                '</div>';
+        });
+        listEl.innerHTML = h;
+    }).catch(() => {
+        document.getElementById('ev-list').innerHTML = '<p style="color:var(--danger);text-align:center">Error</p>';
+    });
+}
+
+let _eventsFilter = 'all';
+function filterEvents(f) {
+    _eventsFilter = f;
+    document.querySelectorAll('#panel-events .filter-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    loadEvents();
+}
+
+function showEventDetail(eventId, userId) {
+    if (!eventId) return;
+    apiGetJSON('/admin/events/' + eventId + (userId ? '?user_id=' + userId : '')).then(d => {
+        document.getElementById('event-detail-content').innerHTML = '<pre class="json-box">' + JSON.stringify(d, null, 2) + '</pre>';
+        document.getElementById('event-detail-modal').classList.add('show');
+    }).catch(() => toast('❌ Error cargando evento', false));
+}
+function closeEventDetail() { document.getElementById('event-detail-modal').classList.remove('show'); }
+function confirmEvent(eventId, userId) {
+    const reason = prompt('Motivo de confirmación:', 'Alerta válida');
+    apiFetch('/admin/events/' + eventId + '/confirm', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id: userId || '', reason: reason || 'Alerta válida'})})
+        .then(r => r.json()).then(d => { if (d.success) { toast('✅ Evento confirmado', true); loadEvents(); loadMonitoring(); } else toast('❌ Error', false); })
+        .catch(() => toast('❌ Error', false));
+}
+function dismissEvent(eventId, userId) {
+    const reason = prompt('Motivo de falsa alarma:', 'Usuario indicó falsa alarma');
+    apiFetch('/admin/events/' + eventId + '/dismiss', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id: userId || '', reason: reason || 'Usuario indicó falsa alarma'})})
+        .then(r => r.json()).then(d => { if (d.success) { toast('✅ Falsa alarma registrada', true); loadEvents(); loadMonitoring(); } else toast('❌ Error', false); })
+        .catch(() => toast('❌ Error', false));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CÁMARAS
+// ═══════════════════════════════════════════════════════════════════════════════
+function loadCameras() {
+    apiGetJSON('/admin/cameras').then(d => {
+        const cameras = d.cameras || [];
+        const tb = document.getElementById('cams-tbody');
+        if (!cameras.length) { tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-secondary)">Sin cámaras</td></tr>'; return; }
+        tb.innerHTML = cameras.map(c => {
+            const statusIcon = c.active ? '🟢' : '🔴';
+            const statusText = c.active ? 'Online' : 'Offline';
+            const la = c.last_announce ? fmtDate(c.last_announce) : '—';
+            const lf = c.last_frame ? fmtDate(c.last_frame) : '—';
+            return '<tr>' +
+                '<td style="font-family:monospace;font-size:0.8rem">' + c.camera_id + '</td>' +
+                '<td>' + (c.name || '—') + '</td>' +
+                '<td style="font-size:0.8rem">' + (c.user_id || c.business_name || '—') + '</td>' +
+                '<td>' + statusIcon + ' ' + statusText + '</td>' +
+                '<td style="font-size:0.75rem">' + la + '</td>' +
+                '<td style="font-size:0.75rem">' + lf + '</td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="editCamera(\'' + c.camera_id + '\')">✏️</button> <button class="btn btn-sm btn-outline" onclick="cameraCommand(\'' + c.camera_id + '\')">🎮</button> <button class="btn btn-sm btn-warning" onclick="cameraOTA(\'' + c.camera_id + '\')">OTA</button> <button class="btn btn-sm btn-danger" onclick="deleteCamera(\'' + c.camera_id + '\')">🗑️</button></td>' +
+            '</tr>';
+        }).join('');
+    }).catch(() => {});
+}
+
+let _editingCameraId = null, _commandCameraId = null;
+function editCamera(cameraId) {
+    _editingCameraId = cameraId;
+    document.getElementById('camera-editor-title').textContent = 'Editar Cámara';
+    apiGetJSON('/admin/cameras/' + cameraId).then(d => {
+        document.getElementById('camera-editor-content').innerHTML =
+            '<div class="form-group"><label>Nombre</label><input id="ce-name" type="text" value="' + (d.name || '') + '"></div>' +
+            '<div class="form-group"><label>Zona</label><input id="ce-zone" type="text" value="' + (d.zone || '') + '"></div>' +
+            '<div class="form-group"><label>Cooldown min</label><input id="ce-cooldown" type="number" min="5" max="60" value="' + (d.cooldown_min || 5) + '"></div>' +
+            '<div class="form-group"><label>Reglas (JSON array)</label><textarea id="ce-rules" rows="5">' + JSON.stringify(d.rules || d.rules_es || [], null, 2) + '</textarea></div>' +
+            '<div class="btn-group"><button class="btn btn-success btn-sm" onclick="saveCameraEditor()">💾 Guardar</button><button class="btn btn-outline btn-sm" onclick="closeCameraEditor()">Cancelar</button></div>';
+        document.getElementById('camera-editor-modal').classList.add('show');
+    }).catch(() => toast('❌ Error cargando cámara', false));
+}
+function closeCameraEditor() { document.getElementById('camera-editor-modal').classList.remove('show'); _editingCameraId = null; }
+function saveCameraEditor() {
+    let rules = [];
+    try { rules = JSON.parse(document.getElementById('ce-rules').value || '[]'); } catch(e) { toast('❌ Reglas JSON inválido', false); return; }
+    apiFetch('/admin/cameras/' + _editingCameraId, {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+            name: document.getElementById('ce-name').value,
+            zone: document.getElementById('ce-zone').value,
+            cooldown_min: parseInt(document.getElementById('ce-cooldown').value) || 5,
+            vigilance_rules: rules
+        })
+    }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Cámara guardada', true); closeCameraEditor(); loadCameras(); }
+        else toast('❌ ' + (d.detail || d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+function cameraCommand(cameraId) {
+    _commandCameraId = cameraId;
+    document.getElementById('camera-command-result').innerHTML = '';
+    document.getElementById('camera-command-modal').classList.add('show');
+}
+function closeCameraCommand() { document.getElementById('camera-command-modal').classList.remove('show'); _commandCameraId = null; }
+function sendCameraCommand() {
+    let body = {};
+    try { body = JSON.parse(document.getElementById('camera-command-json').value || '{}'); } catch(e) { toast('❌ JSON inválido', false); return; }
+    apiFetch('/admin/cameras/' + _commandCameraId + '/cmd', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+        .then(r => r.json()).then(d => {
+            document.getElementById('camera-command-result').innerHTML = '<pre class="json-box">' + JSON.stringify(d, null, 2) + '</pre>';
+            toast(d.ok || d.success ? '✅ Comando enviado' : '⚠️ Comando procesado con aviso', d.ok || d.success);
+        }).catch(() => toast('❌ Error', false));
+}
+function cameraOTA(cameraId) {
+    apiGetJSON('/admin/cameras/' + cameraId + '/ota').then(d => {
+        toast('✅ OTA info: ' + (d.firmware_version || '—'), true);
+        document.getElementById('camera-command-result').innerHTML = '<pre class="json-box">' + JSON.stringify(d, null, 2) + '</pre>';
+        document.getElementById('camera-command-modal').classList.add('show');
+    }).catch(() => toast('❌ Error OTA', false));
+}
+function deleteCamera(cameraId) {
+    if (!confirm('¿Eliminar cámara ' + cameraId + '?')) return;
+    apiFetch('/admin/cameras/' + cameraId, {method:'DELETE'}).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Cámara eliminada', true); loadCameras(); }
+        else toast('❌ ' + (d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUEUE (Firestore)
+// ═══════════════════════════════════════════════════════════════════════════════
+function refreshQueue() {
+    apiGetJSON('/admin/queue/firestore/status').then(d => {
+        const qs = document.getElementById('queue-status');
+        const qf = document.getElementById('queue-frames');
+        
+        if (!d.success) {
+            qs.innerHTML = '<p style="color:var(--danger);font-size:0.85rem">Firestore: ' + (d.error || 'Sin acceso') + '</p>';
+            qf.innerHTML = '<p style="color:var(--text-secondary);text-align:center;padding:10px">Sin frames</p>';
+            return;
+        }
+        
+        qs.innerHTML = '<span style="color:var(' + (d.queue_length > 0 ? '--warning' : '--success') + ')">' +
+            (d.queue_length > 0 ? '⚠️ ' + d.queue_length + ' frames pendientes (' + d.total_kb + ' KB)' : '✅ Cola vacía') + '</span>';
+        
+        if (!d.frames || !d.frames.length) {
+            qf.innerHTML = '<p style="color:var(--text-secondary);text-align:center;padding:10px">Sin frames en cola</p>';
+            return;
+        }
+        
+        let html = '';
+        d.frames.forEach(f => {
+            html += '<div class="queue-item">' +
+                '<div class="queue-thumb">🖼️</div>' +
+                '<div class="queue-info">' +
+                    '<div class="cam">' + f.camera_id + ' / ' + f.session_id + '</div>' +
+                    '<div class="meta">' + (f.timestamp || f.queued_at) + ' · ' + f.size_kb + ' KB · ' + (f.status || 'pending') + '</div>' +
+                '</div>' +
+            '</div>';
+        });
+        qf.innerHTML = html;
+    }).catch(() => {
+        document.getElementById('queue-status').innerHTML = '<p style="color:var(--text-secondary)">Verifique conexión</p>';
+    });
+}
+
+function processQueue() {
+if (!confirm('¿Procesar frames en cola? Esto los enviará al pipeline de análisis y borrará los procesados.')) return;
+    const btn = event.target; btn.disabled=true; btn.textContent='⚙️ Procesando...';
+    apiFetch('/admin/queue/firestore/process', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+        .then(r => r.json()).then(d => {
+            btn.disabled=false; btn.textContent='⚡ Procesar cola';
+            if (d.success) {
+                toast('✅ Procesados: ' + d.processed + (d.errors > 0 ? ' (⚠️ ' + d.errors + ' eliminados/errores)' : ''), true);
+                refreshQueue();
+            } else {
+                toast('❌ ' + (d.error || 'Error'), false);
+            }
+        }).catch(() => { btn.disabled=false; btn.textContent='⚡ Procesar cola'; toast('❌ Error', false); });
+}
+
+function clearQueue() {
+    if (!confirm('¿Eliminar TODOS los frames en cola? Esto no se puede deshacer.')) return;
+    apiFetch('/admin/queue/firestore/clear', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+        .then(r => r.json()).then(d => {
+            if (d.success) { toast('✅ ' + d.deleted + ' frames eliminados', true); refreshQueue(); }
+            else toast('❌ Error', false);
+        }).catch(() => toast('❌ Error', false));
+}
+
+// Load cameras when tab switches
+const _origSwitchTab = switchTab;
+// (switchTab already calls loadCameras)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// USER DETAIL
+// ═══════════════════════════════════════════════════════════════════════════════
+function showUserDetail(userId) {
+    apiGetJSON('/admin/users/' + userId).then(d => {
+        document.getElementById('user-detail-content').innerHTML = '<pre class="json-box">' + JSON.stringify(d, null, 2) + '</pre>';
+        document.getElementById('user-detail').classList.add('show');
+    }).catch(() => toast('❌ Error cargando usuario', false));
+}
+function editExistingUser(userId) { showUserEditor(userId); }
+function closeUserDetail() { document.getElementById('user-detail').classList.remove('show'); }
+
+let _editingUserId = null;
+function showUserEditor(userId) {
+    _editingUserId = userId || null;
+    document.getElementById('user-editor-title').textContent = userId ? 'Editar Usuario' : 'Crear Usuario';
+    const content = document.getElementById('user-editor-content');
+    content.innerHTML = '<p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:12px">Completa los campos principales del usuario.</p>' +
+        '<div class="form-group"><label>Nombre</label><input id="ue-name" type="text"></div>' +
+        '<div class="form-group"><label>Email</label><input id="ue-email" type="email"></div>' +
+        '<div class="form-group"><label>Teléfono</label><input id="ue-phone" type="text"></div>' +
+        '<div class="form-group"><label>Negocio</label><input id="ue-business" type="text"></div>' +
+        '<div class="form-group"><label>Tipo negocio</label><input id="ue-biztype" type="text" placeholder="retail"></div>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">' +
+        '<div class="form-group"><label>Plan</label><input id="ue-plan" type="text" value="free"></div>' +
+        '<div class="form-group"><label>Estado</label><select id="ue-status"><option value="active">active</option><option value="suspended">suspended</option></select></div>' +
+        '</div>' +
+        '<div class="form-group"><label>Plan end timestamp</label><input id="ue-plan-end" type="number" min="0" value="0"></div>' +
+        '<div class="form-group"><label>Token acceso</label><input id="ue-token" type="text"></div>' +
+        '<div class="btn-group"><button class="btn btn-success btn-sm" onclick="saveUserEditor()">💾 Guardar</button><button class="btn btn-outline btn-sm" onclick="closeUserEditor()">Cancelar</button></div>';
+    document.getElementById('user-editor-modal').classList.add('show');
+    if (userId) {
+        apiGetJSON('/admin/users/' + userId).then(d => {
+            document.getElementById('ue-name').value = d.name || '';
+            document.getElementById('ue-email').value = d.email || '';
+            document.getElementById('ue-phone').value = d.phone || '';
+            document.getElementById('ue-business').value = d.business_name || '';
+            document.getElementById('ue-biztype').value = d.business_type || 'retail';
+            document.getElementById('ue-plan').value = d.plan || 'free';
+            document.getElementById('ue-status').value = d.status || 'active';
+            document.getElementById('ue-plan-end').value = d.plan_end || 0;
+            document.getElementById('ue-token').value = d.access_token || '';
+        }).catch(() => {});
+    }
+}
+function closeUserEditor() { document.getElementById('user-editor-modal').classList.remove('show'); _editingUserId = null; }
+function saveUserEditor() {
+    const body = {
+        name: document.getElementById('ue-name').value,
+        email: document.getElementById('ue-email').value,
+        phone: document.getElementById('ue-phone').value,
+        business_name: document.getElementById('ue-business').value,
+        business_type: document.getElementById('ue-biztype').value,
+        plan: document.getElementById('ue-plan').value,
+        status: document.getElementById('ue-status').value,
+        plan_end: parseInt(document.getElementById('ue-plan-end').value) || 0,
+        access_token: document.getElementById('ue-token').value
+    };
+    const url = _editingUserId ? '/admin/users/' + _editingUserId : '/admin/users';
+    const method = _editingUserId ? 'PUT' : 'POST';
+    apiFetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+        .then(r => r.json()).then(d => {
+            if (d.success) { toast('✅ Usuario guardado', true); closeUserEditor(); loadUsers(); loadBilling(); }
+            else toast('❌ ' + (d.detail || d.error || 'Error'), false);
+        }).catch(() => toast('❌ Error', false));
+}
+function deleteUser(userId) {
+    if (!confirm('¿Eliminar usuario ' + userId + '? Esta acción borra storage y Firebase Auth si existe.')) return;
+    apiFetch('/admin/users/' + userId, {method:'DELETE'}).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Usuario eliminado', true); loadUsers(); loadBilling(); }
+        else toast('❌ ' + (d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function renewUser(userId) {
+    const days = prompt('Días a agregar:', '30');
+    if (!days || isNaN(parseInt(days))) return;
+    const amount = prompt('Monto (USD):', '0');
+    apiFetch('/admin/users/' + userId + '/renew', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({duration_days: parseInt(days), amount: parseFloat(amount) || 0, notes: 'Manual'})
+    }).then(r => r.json()).then(res => {
+        if (res.success) { toast('✅ Renovado', true); showUserDetail(userId); loadBilling(); loadUsers(); }
+    }).catch(() => toast('❌ Error', false));
+}
+function changePlan(userId) {
+    const plan = prompt('Nuevo plan (free/pro/business/founder):', '');
+    if (!plan) return;
+    apiFetch('/admin/users/' + userId + '/renew', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({plan, duration_days: 0, amount: 0, notes: 'Cambio plan'})
+    }).then(r => r.json()).then(res => {
+        if (res.success) { toast('✅ Plan cambiado', true); showUserDetail(userId); loadBilling(); }
+    }).catch(() => toast('❌ Error', false));
+}
+function regenToken(userId) {
+    apiFetch('/admin/users/' + userId + '/regen-token', {method:'POST'})
+        .then(r => r.json()).then(res => {
+            if (res.success) { toast('✅ Token: ' + res.access_token.substring(0, 20) + '...', true); showUserDetail(userId); }
+        }).catch(() => toast('❌ Error', false));
+}
+function toggleUserStatus(userId, action) {
+    apiFetch('/admin/users/' + userId + '/' + action, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+        .then(r => r.json()).then(res => {
+            if (res.success) { toast('✅ ' + action, true); showUserDetail(userId); loadUsers(); }
+        }).catch(() => toast('❌ Error', false));
+}
+function confirmPayment(userId, paymentId) {
+    apiFetch('/admin/users/' + userId + '/payment/' + paymentId + '/confirm', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
+    }).then(r => r.json()).then(res => {
+        if (res.success) { toast('✅ Pago confirmado', true); showUserDetail(userId); loadBilling(); }
+    }).catch(() => toast('❌ Error', false));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLANES CRUD
+// ═══════════════════════════════════════════════════════════════════════════════
+function loadPlans() {
+    apiGetJSON('/admin/plans').then(d => {
+        const plans = d.plans || {};
+        const container = document.getElementById('plans-list');
+        if (!Object.keys(plans).length) { container.innerHTML = '<p style="color:var(--text-secondary)">Sin planes</p>'; return; }
+        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">';
+        Object.entries(plans).forEach(([pid, p]) => {
+            const pubBadge = p.public ? '<span class="badge badge-ok">Público</span>' : '<span class="badge badge-warn">Privado</span>';
+            const f = p.features || {};
+            const feats = [];
+            if (f.ai_analysis) feats.push('IA');
+            if (f.alerts_push) feats.push('Alertas');
+            if (f.grid_detection) feats.push('Grid');
+            if (f.multi_zone) feats.push('Multi-zona');
+            html += '<div class="plan-editor">' +
+                '<div class="plan-header"><div><strong style="font-size:1.1rem">' + (p.name || pid) + '</strong> ' + pubBadge + '</div>' +
+                '<div style="font-size:1.3rem;font-weight:800;color:var(--accent)">$' + (p.price_monthly || 0) + '<span style="font-size:0.8rem;color:var(--text-secondary)">/mes</span></div></div>' +
+                '<div style="font-size:0.8rem;color:var(--text-secondary);margin-bottom:8px"><strong>ID:</strong> ' + pid + ' | <strong>Duración:</strong> ' + (p.duration_days || 30) + 'd | <strong>Prueba:</strong> ' + (p.trial_days || 0) + 'd</div>' +
+                '<div style="font-size:0.85rem;margin-bottom:8px">📷 ' + (p.max_cameras || 1) + ' cámaras · 💾 ' + (p.max_storage_gb || 5) + ' GB · 📋 ' + (p.max_rules_per_camera || 2) + ' reglas/cam</div>' +
+                '<div style="font-size:0.75rem;color:var(--text-secondary);margin-bottom:12px">⭐ ' + feats.join(' · ') + ' · 🛟 ' + (p.support || 'community') + '</div>' +
+                '<div style="display:flex;gap:6px">' +
+                '<button class="btn btn-sm btn-outline" onclick="editPlan(\'' + pid + '\')">✏️ Editar</button>' +
+                (pid !== 'free' ? '<button class="btn btn-sm btn-danger" onclick="deletePlan(\'' + pid + '\')">🗑️</button>' : '') +
+                '</div></div>';
+        });
+        html += '</div>';
+        container.innerHTML = html;
+    }).catch(() => {
+        document.getElementById('plans-list').innerHTML = '<p style="color:var(--danger)">Error</p>';
+    });
+}
+
+let _editingPlanId = null;
+function showPlanEditor(planId) {
+    _editingPlanId = planId || null;
+    document.getElementById('plan-editor-title').textContent = planId ? 'Editar Plan' : 'Nuevo Plan';
+    if (planId) {
+        apiGetJSON('/admin/plans').then(d => {
+            const p = (d.plans || {})[planId] || {};
+            document.getElementById('pe-id').value = planId;
+            document.getElementById('pe-id').disabled = true;
+            document.getElementById('pe-name').value = p.name || '';
+            document.getElementById('pe-price-monthly').value = p.price_monthly || 0;
+            document.getElementById('pe-price-yearly').value = p.price_yearly || 0;
+            document.getElementById('pe-duration').value = p.duration_days || 30;
+            document.getElementById('pe-trial').value = p.trial_days || 0;
+            document.getElementById('pe-storage').value = p.max_storage_gb || 10;
+            document.getElementById('pe-cameras').value = p.max_cameras || 1;
+            document.getElementById('pe-rules').value = p.max_rules_per_camera || 2;
+            document.getElementById('pe-currency').value = p.currency || 'USD';
+            const f = p.features || {};
+            document.getElementById('pe-ai').checked = f.ai_analysis !== false;
+            document.getElementById('pe-alerts').checked = f.alerts_push !== false;
+            document.getElementById('pe-grid').checked = !!f.grid_detection;
+            document.getElementById('pe-multizone').checked = !!f.multi_zone;
+            document.getElementById('pe-support').value = f.support || 'community';
+            document.getElementById('plan-editor-overlay').classList.add('show');
+        });
+    } else {
+        ['pe-id','pe-name','pe-price-monthly','pe-price-yearly','pe-duration','pe-trial','pe-storage','pe-cameras','pe-rules','pe-currency'].forEach(id => {
+            const el = document.getElementById(id); if(el) el.value = '';
+        });
+        document.getElementById('pe-id').disabled = false;
+        document.getElementById('pe-price-monthly').value = 0;
+        document.getElementById('pe-price-yearly').value = 0;
+        document.getElementById('pe-duration').value = 30;
+        document.getElementById('pe-trial').value = 0;
+        document.getElementById('pe-storage').value = 10;
+        document.getElementById('pe-cameras').value = 1;
+        document.getElementById('pe-rules').value = 2;
+        document.getElementById('pe-currency').value = 'USD';
+        document.getElementById('pe-ai').checked = true;
+        document.getElementById('pe-alerts').checked = true;
+        document.getElementById('pe-grid').checked = false;
+        document.getElementById('pe-multizone').checked = false;
+        document.getElementById('pe-support').value = 'community';
+        document.getElementById('plan-editor-overlay').classList.add('show');
+    }
+}
+function closePlanEditor() { document.getElementById('plan-editor-overlay').classList.remove('show'); _editingPlanId = null; }
+function editPlan(pid) { showPlanEditor(pid); }
+function deletePlan(pid) {
+    if (!confirm('¿Eliminar plan "' + pid + '"?')) return;
+    apiFetch('/admin/plans/' + pid, {method:'DELETE'}).then(r => r.json()).then(res => {
+        if (res.success) { toast('✅ Eliminado (' + (res.migrated_users||0) + ' migrados)', true); loadPlans(); }
+    }).catch(() => toast('❌ Error', false));
+}
+function planSave() {
+    const pid = document.getElementById('pe-id').value.trim().toLowerCase().replace(/\s+/g, '_');
+    if (!pid) { toast('❌ ID requerido', false); return; }
+    const body = {
+        name: document.getElementById('pe-name').value || pid,
+        price_monthly: parseFloat(document.getElementById('pe-price-monthly').value) || 0,
+        price_yearly: parseFloat(document.getElementById('pe-price-yearly').value) || 0,
+        plan_id: pid,
+        duration_days: parseInt(document.getElementById('pe-duration').value) || 30,
+        trial_days: parseInt(document.getElementById('pe-trial').value) || 0,
+        max_storage_gb: parseInt(document.getElementById('pe-storage').value) || 10,
+        max_cameras: parseInt(document.getElementById('pe-cameras').value) || 1,
+        max_rules_per_camera: parseInt(document.getElementById('pe-rules').value) || 2,
+        currency: document.getElementById('pe-currency').value || 'USD',
+        features: {
+            ai_analysis: document.getElementById('pe-ai').checked,
+            alerts_push: document.getElementById('pe-alerts').checked,
+            grid_detection: document.getElementById('pe-grid').checked,
+            multi_zone: document.getElementById('pe-multizone').checked,
+            support: document.getElementById('pe-support').value
+        },
+        public: true
+    };
+    const url = _editingPlanId ? '/admin/plans/' + _editingPlanId : '/admin/plans';
+    const method = _editingPlanId ? 'PUT' : 'POST';
+    apiFetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+        .then(r => r.json()).then(res => {
+            if (res.success) { toast('✅ Guardado', true); closePlanEditor(); loadPlans(); }
+            else toast('❌ ' + (res.detail || 'Error'), false);
+        }).catch(() => toast('❌ Error', false));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BILLING
+// ═══════════════════════════════════════════════════════════════════════════════
+let _billingData = [], _billingFilter = 'all';
+
+function loadBilling() {
+    apiGetJSON('/admin/billing').then(d => {
+        _billingData = d.users || [];
+        const s = d.summary || {};
+        document.getElementById('bill-active').textContent = s.active || 0;
+        document.getElementById('bill-warning').textContent = s.warning || 0;
+        document.getElementById('bill-expired').textContent = s.expired || 0;
+        document.getElementById('bill-total').textContent = s.total_users || 0;
+        document.getElementById('bill-revenue').textContent = '$' + (s.total_revenue || 0).toFixed(2);
+        renderBillingTable();
+    }).catch(() => {});
+}
+function renderBillingTable() {
+    let users = _billingData;
+    if (_billingFilter === 'active') users = users.filter(u => u.access_status === 'active');
+    else if (_billingFilter === 'warning') users = users.filter(u => u.access_status === 'warning');
+    else if (_billingFilter === 'expired') users = users.filter(u => u.access_status === 'expired');
+    else if (_billingFilter === 'trial') users = users.filter(u => u.trial_end && u.trial_days_left > 0);
+    else if (_billingFilter === 'pending') users = users.filter(u => u.pending_payments > 0);
+    const tb = document.getElementById('billing-tbody');
+    if (!users.length) { tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-secondary)">Sin resultados</td></tr>'; return; }
+    tb.innerHTML = users.map(u => {
+        const icon = u.access_status === 'active' ? '🟢' : u.access_status === 'warning' ? '🟡' : '🔴';
+        const days = u.days_left !== undefined && u.days_left <= 7 ? '<span style="color:var(--warning)">' + u.days_left + 'd</span>' : (u.days_left !== undefined ? u.days_left + 'd' : '—');
+        return '<tr>' +
+            '<td>' + icon + '</td>' +
+            '<td style="font-weight:500">' + (u.name || u.user_id || '—') + '</td>' +
+            '<td>' + (u.business_name || '—') + '</td>' +
+            '<td><span class="badge badge-ok">' + (u.plan_name || u.plan) + '</span></td>' +
+            '<td style="font-size:0.75rem">' + fmtDate(u.plan_end) + '</td>' +
+            '<td style="text-align:center">' + days + '</td>' +
+            '<td style="text-align:center">' + (u.camera_count || 0) + '</td>' +
+            '<td style="text-align:center">' + (u.payment_count || 0) + (u.pending_payments > 0 ? ' <span style="color:var(--warning)">(' + u.pending_payments + ' p)</span>' : '') + '</td>' +
+            '<td style="font-size:0.75rem">' + fmtDate(u.next_due) + '</td>' +
+            '<td><button class="btn btn-sm btn-outline" onclick="showUserDetail(\'' + u.user_id + '\')">📋</button></td>' +
+        '</tr>';
+    }).join('');
+}
+function filterBilling(f) {
+    _billingFilter = f;
+    document.querySelectorAll('#panel-billing .filter-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    renderBillingTable();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALMACENAMIENTO
+// ═══════════════════════════════════════════════════════════════════════════════
+let _disksData = null;
+
+function loadStorage() {
+    loadDisks();
+    loadStorageUsers();
+}
+
+function loadDisks() {
+    apiGetJSON('/admin/disks').then(d => {
+        _disksData = d;
+        const threshold = d.disk_fill_threshold_pct || 90;
+        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">';
+        (d.disks || []).forEach((disk, i) => {
+            const pct = disk.total_gb > 0 ? Math.round((disk.used_gb / disk.total_gb) * 100) : 0;
+            const color = pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--success)';
+            const full = pct >= threshold;
+            html += '<div class="rules-box" style="border-color:' + (full ? 'var(--danger)' : 'var(--border)') + '">';
+            html += '<div class="plan-header"><h4>🗂️ ' + (disk.label || disk.mount) + (full ? ' <span class="badge badge-err">LLENO</span>' : '') + '</h4>';
+            html += (d.disks || []).length > 1 ? '<button class="btn btn-sm btn-danger" onclick="removeDisk(' + i + ')">🗑️</button>' : '';
+            html += '</div>';
+            html += '<p><strong>Montaje:</strong> ' + disk.mount + '</p>';
+            html += '<p><strong>Espacio:</strong> ' + (disk.used_gb || 0) + ' GB / ' + (disk.total_gb || 0) + ' GB</p>';
+            html += '<div style="background:var(--bg-primary);border-radius:4px;height:8px;margin:8px 0"><div style="background:' + color + ';border-radius:4px;height:8px;width:' + Math.min(pct, 100) + '%"></div></div>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">' + pct + '% usado — ' + (disk.free_gb || 0) + ' GB libre</p>';
+            html += '<label style="font-size:0.7rem;color:var(--text-secondary)">Carpeta de usuarios</label>';
+            html += '<input type="text" id="disk-path-' + i + '" value="' + (disk.user_folder || 'users') + '" style="width:100%;margin-top:4px;padding:8px;font-size:0.8rem">';
+            html += '</div>';
+        });
+        html += '</div>';
+        document.getElementById('disks-list').innerHTML = html;
+        document.getElementById('ttl-cleanup-hour').value = d.default_cleanup_hour || 23;
+        document.getElementById('ttl-frames').value = d.default_frames_ttl_hours || 24;
+        document.getElementById('ttl-sessions').value = d.default_sessions_ttl_days || 7;
+        document.getElementById('ttl-fill-threshold').value = threshold;
+    }).catch(e => {
+        document.getElementById('disks-list').innerHTML = '<p style="color:var(--danger)">Error: ' + e.message + '</p>';
+    });
+}
+
+function showAddDiskForm() {
+    const form = document.getElementById('add-disk-form');
+    form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+function addDisk() {
+    const mount = document.getElementById('new-disk-mount').value.trim();
+    const label = document.getElementById('new-disk-label').value.trim() || mount;
+    if (!mount) { toast('❌ Ingresa el montaje', false); return; }
+    apiFetch('/admin/disks/add', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mount, label}) })
+        .then(r => r.json()).then(d => {
+            if (d.success) { toast('✅ Disco agregado', true); loadDisks(); document.getElementById('add-disk-form').style.display = 'none'; }
+            else toast('❌ ' + (d.detail || d.error || 'Error'), false);
+        }).catch(() => toast('❌ Error', false));
+}
+
+function removeDisk(index) {
+    if (!confirm('¿Quitar este disco de la configuración?')) return;
+    const disk = (_disksData && _disksData.disks) ? _disksData.disks[index] : null;
+    if (!disk) return;
+    apiFetch('/admin/disks/remove', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mount: disk.mount}) })
+        .then(r => r.json()).then(d => { if (d.success) { toast('✅ Disco removido', true); loadDisks(); } else toast('❌ Error', false); })
+        .catch(() => toast('❌ Error', false));
+}
+
+function scanDisks() {
+    apiFetch('/admin/disks/scan', { method:'POST' }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Discos escaneados', true); loadDisks(); } else toast('❌ Error', false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function autodetectDisks() {
+    apiGetJSON('/admin/disks/autodetect').then(d => {
+        const detected = d.detected || [];
+        if (!detected.length) { document.getElementById('autodetect-results').innerHTML = '<p style="color:var(--text-secondary)">No se detectaron discos adicionales</p>'; return; }
+        let html = '<h4 style="color:var(--accent);margin-bottom:8px">🔍 Discos Detectados</h4>';
+        detected.forEach(disk => {
+            html += '<div class="rules-box" style="margin-bottom:8px">';
+            html += '<p><strong>' + disk.mount + '</strong></p>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">' + (disk.free_gb || 0) + ' GB libre / ' + (disk.total_gb || 0) + ' GB total</p>';
+            html += '<button class="btn btn-sm" onclick="addDetectedDisk(\'' + disk.mount + '\',\'' + (disk.label || disk.mount) + '\')">➕ Agregar este disco</button>';
+            html += '</div>';
+        });
+        document.getElementById('autodetect-results').innerHTML = html;
+    }).catch(() => toast('❌ Error', false));
+}
+
+function addDetectedDisk(mount, label) {
+    document.getElementById('new-disk-mount').value = mount;
+    document.getElementById('new-disk-label').value = label;
+    document.getElementById('add-disk-form').style.display = 'block';
+    addDisk();
+}
+
+function saveDisksConfig() {
+    if (!_disksData) return;
+    _disksData.default_cleanup_hour = parseInt(document.getElementById('ttl-cleanup-hour').value) || 23;
+    _disksData.default_frames_ttl_hours = parseInt(document.getElementById('ttl-frames').value) || 24;
+    _disksData.default_sessions_ttl_days = parseInt(document.getElementById('ttl-sessions').value) || 7;
+    _disksData.disk_fill_threshold_pct = parseInt(document.getElementById('ttl-fill-threshold').value) || 90;
+    (_disksData.disks || []).forEach((disk, i) => {
+        const input = document.getElementById('disk-path-' + i);
+        if (input) disk.user_folder = input.value.trim() || 'users';
+    });
+    apiFetch('/admin/disks/save', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(_disksData) })
+        .then(r => r.json()).then(d => { if (d.success) toast('✅ Configuración guardada', true); else toast('❌ Error', false); })
+        .catch(() => toast('❌ Error', false));
+}
+
+function loadStorageUsers() {
+    apiGetJSON('/admin/storage').then(d => {
+        const us = d.users || [];
+        const tb = document.getElementById('storage-tbody');
+        if (!us.length) { tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Sin usuarios</td></tr>'; return; }
+        tb.innerHTML = us.map(u => {
+            const pct = u.usage_percent || 0;
+            const color = pct > 90 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--success)';
+            return '<tr>' +
+                '<td style="font-weight:500;font-size:0.8rem">' + (u.user_id || '—') + '</td>' +
+                '<td style="font-size:0.75rem">' + (u.disk_mount || '—') + '</td>' +
+                '<td><span class="badge badge-ok">' + (u.plan || 'free') + '</span></td>' +
+                '<td>' + (u.quota_gb || 0) + ' GB</td>' +
+                '<td>' + fmtSize(u.used_mb) + '</td>' +
+                '<td><div style="background:var(--bg-primary);border-radius:4px;height:6px;width:60px;display:inline-block"><div style="background:' + color + ';border-radius:4px;height:6px;width:' + Math.min(pct, 100) + '%"></div></div> <span style="font-size:0.75rem">' + pct + '%</span></td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="openEditStorageModal(\'' + u.user_id + '\')">✏️</button></td>' +
+                '<td><button class="btn btn-sm btn-outline" onclick="openMigrateModal(\'' + u.user_id + '\')">📦</button></td>' +
+            '</tr>';
+        }).join('');
+    }).catch(() => {
+        document.getElementById('storage-tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--danger)">Error</td></tr>';
+    });
+}
+
+function openEditStorageModal(userId) {
+    apiGetJSON('/admin/storage/' + userId).then(d => {
+        const disks = (_disksData && _disksData.disks) || [];
+        let diskOptions = disks.map(disk => '<option value="' + disk.mount + '"' + (d.disk_mount === disk.mount ? ' selected' : '') + '>' + (disk.label || disk.mount) + '</option>').join('');
+        const plans = Object.keys((_disksData && _disksData.plans) || {});
+        let planOptions = plans.map(p => '<option value="' + p + '"' + (d.plan === p ? ' selected' : '') + '>' + p.toUpperCase() + '</option>').join('');
+        document.getElementById('edit-storage-content').innerHTML =
+            '<div class="form-group"><label>Usuario</label><input type="text" value="' + userId + '" disabled></div>' +
+            '<div class="form-group"><label>Cuota (GB)</label><input id="edit-storage-quota" type="number" min="1" value="' + (d.quota_gb || 1) + '"></div>' +
+            '<div class="form-group"><label>Disco</label><select id="edit-storage-disk">' + diskOptions + '</select></div>' +
+            '<div class="form-group"><label>Plan</label><select id="edit-storage-plan">' + planOptions + '</select></div>' +
+            '<div class="form-group"><label>Cámaras máximas</label><input id="edit-storage-cameras" type="number" min="1" value="' + (d.max_cameras || 1) + '"></div>' +
+            '<div class="btn-group"><button class="btn btn-success btn-sm" onclick="saveUserStorage(\'' + userId + '\')">💾 Guardar</button><button class="btn btn-outline btn-sm" onclick="closeEditStorageModal()">Cancelar</button></div>';
+        document.getElementById('edit-storage-modal').classList.add('show');
+    }).catch(() => toast('❌ Error cargando usuario', false));
+}
+
+function closeEditStorageModal() { document.getElementById('edit-storage-modal').classList.remove('show'); }
+
+function saveUserStorage(userId) {
+    apiFetch('/admin/storage/' + userId + '/update', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+            storage_quota_gb: parseInt(document.getElementById('edit-storage-quota').value) || 1,
+            disk_mount: document.getElementById('edit-storage-disk').value,
+            plan: document.getElementById('edit-storage-plan').value,
+            max_cameras: parseInt(document.getElementById('edit-storage-cameras').value) || 1
+        })
+    }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Actualizado', true); closeEditStorageModal(); loadStorageUsers(); loadUsers(); }
+        else toast('❌ ' + (d.error || 'Error'), false);
+    }).catch(() => toast('❌ Error', false));
+}
+
+function openMigrateModal(userId) {
+    apiGetJSON('/admin/storage/' + userId).then(d => {
+        const disks = ((_disksData && _disksData.disks) || []).filter(x => x.mount !== d.disk_mount);
+        if (!disks.length) { toast('❌ No hay otros discos disponibles', false); return; }
+        let html = '<p style="margin-bottom:12px;color:var(--text-secondary)">Migrar <strong>' + userId + '</strong> de <code>' + (d.disk_mount || '—') + '</code> a:</p>';
+        disks.forEach(disk => {
+            html += '<div class="rules-box" style="margin-bottom:8px">';
+            html += '<p><strong>' + (disk.label || disk.mount) + '</strong></p>';
+            html += '<p style="font-size:0.75rem;color:var(--text-secondary)">' + disk.mount + ' — ' + (disk.free_gb || 0) + ' GB libre</p>';
+            html += '<button class="btn btn-sm btn-warning" onclick="migrateUser(\'' + userId + '\',\'' + disk.mount + '\')">📦 Migrar aquí</button>';
+            html += '</div>';
+        });
+        html += '<button class="btn btn-outline btn-sm" onclick="closeMigrateModal()">Cancelar</button>';
+        document.getElementById('migrate-content').innerHTML = html;
+        document.getElementById('migrate-modal').classList.add('show');
+    }).catch(() => toast('❌ Error', false));
+}
+
+function closeMigrateModal() { document.getElementById('migrate-modal').classList.remove('show'); }
+
+function migrateUser(userId, targetDisk) {
+    if (!confirm('¿Migrar ' + userId + ' a ' + targetDisk + '?')) return;
+    apiFetch('/admin/storage/' + userId + '/migrate', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({disk_mount: targetDisk}) })
+        .then(r => r.json()).then(d => {
+            if (d.success) { toast('✅ Usuario migrado', true); closeMigrateModal(); loadStorageUsers(); loadUsers(); }
+            else toast('❌ ' + (d.error || 'Error'), false);
+        }).catch(() => toast('❌ Error', false));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ESTADO
+// ═══════════════════════════════════════════════════════════════════════════════
+function reloadStatus() {
+    const CACHE_KEY = 'ojoia_server_status_cache';
+    const CACHE_TTL = 5 * 60 * 1000;
+    try {
+        const cached = localStorage.getItem(CACHE_KEY);
+        if (cached) {
+            const { data, ts } = JSON.parse(cached);
+            if (Date.now() - ts < CACHE_TTL) {
+                _applyServerStatus(data);
+                return;
+            }
+        }
+    } catch(e) {}
+    apiGetJSON('/admin/server/status').then(d => {
+        try { localStorage.setItem(CACHE_KEY, JSON.stringify({ data: d, ts: Date.now() })); } catch(e) {}
+        _applyServerStatus(d);
+    }).catch(() => {
+        document.getElementById('srv-status').textContent = 'Offline';
+        document.getElementById('srv-status').className = 'info-value err';
+        setHeader(false);
+    });
+}
+
+function _applyServerStatus(d) {
+    const url = d.ngrok_url || d.backend || '—';
+    document.getElementById('ngrok-url').textContent = url;
+    document.getElementById('ngrok-url').className = 'url' + (url !== '—' ? '' : ' empty');
+    document.getElementById('ngrok-on').style.display = url !== '—' ? 'inline-block' : 'none';
+    document.getElementById('ngrok-off').style.display = url !== '—' ? 'none' : 'inline-block';
+    document.getElementById('btn-copy').style.display = url !== '—' ? 'inline-block' : 'none';
+    document.getElementById('srv-status').textContent = 'Online';
+    document.getElementById('srv-status').className = 'info-value ok';
+    document.getElementById('srv-url').textContent = url;
+    document.getElementById('srv-port').textContent = d.backend_port || '8005';
+    setHeader(true);
+}
+let _origReloadStatus = reloadStatus;
+reloadStatus = function() {
+    _origReloadStatus();
+};
+
+function cfgCopy() {
+    const u = document.getElementById('ngrok-url').textContent;
+    if (u && u !== '—') { navigator.clipboard.writeText(u); toast('✅ Copiada', true); }
+}
+function cfgShow() {
+    document.getElementById('cfg-card').style.display = 'block';
+    document.getElementById('cfg-url').value = document.getElementById('ngrok-url').textContent === 'Sin conexión' ? '' : document.getElementById('ngrok-url').textContent;
+}
+function cfgHide() { document.getElementById('cfg-card').style.display = 'none'; }
+function cfgSave() {
+    const u = document.getElementById('cfg-url').value.trim().replace(/\/$/, '');
+    if (!u) return;
+    apiFetch('/admin/server/cloudflared/save', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url:u}) })
+        .then(() => apiFetch('/admin/server/sync-firestore', { method:'POST' }))
+        .then(() => { cfgHide(); reloadStatus(); toast('✅ URL guardada y sincronizada', true); })
+        .catch(() => toast('❌ Error guardando URL', false));
+}
+function testHealth() {
+    apiGetJSON('/health').then(d => toast('💓 ' + d.status, true)).catch(() => toast('❌ Sin respuesta', false));
+}
+function restartBackend() {
+    if (!confirm('¿Reiniciar backend api_eva.service?')) return;
+    apiFetch('/admin/system/restart/backend', {method:'POST'}).then(r => r.json()).then(d => {
+        toast(d.success ? '✅ Backend reiniciado' : '❌ Error', d.success);
+        if (d.success) setTimeout(() => location.reload(), 2500);
+    }).catch(() => toast('❌ Error', false));
+}
+function restartTunnel() {
+    if (!confirm('¿Reiniciar túnel tunnel.service? El DNS puede tardar 10-30s.')) return;
+    apiFetch('/admin/system/restart/tunnel', {method:'POST'}).then(r => r.json()).then(d => {
+        toast(d.success ? '✅ Túnel reiniciado' : '❌ Error', d.success);
+        if (d.success) setTimeout(() => reloadStatus(), 35000);
+    }).catch(() => toast('❌ Error', false));
+}
+function createBackup() {
+    apiFetch('/admin/backups/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+        .then(r => r.json()).then(d => { toast(d.success ? '✅ Backup creado: ' + d.backup : '❌ Error', d.success); loadBackups(); })
+        .catch(() => toast('❌ Error', false));
+}
+function loadBackups() {
+    apiGetJSON('/admin/backups').then(d => {
+        const box = document.getElementById('backups-box');
+        const list = document.getElementById('backups-list');
+        box.style.display = 'block';
+        if (!d.backups || !d.backups.length) { list.innerHTML = '<p style="color:var(--text-secondary)">Sin backups</p>'; return; }
+        list.innerHTML = d.backups.map(b => '<div class="rules-box" style="margin-bottom:8px"><strong>' + b.name + '</strong> · ' + b.size_mb + ' MB · ' + b.created_at + '</div>').join('');
+    }).catch(() => toast('❌ Error cargando backups', false));
+}
+function loadProcesses() {
+    apiGetJSON('/admin/system/processes').then(d => {
+        document.getElementById('processes-box').style.display = 'block';
+        document.getElementById('processes-list').textContent = (d.processes || []).join('\n');
+    }).catch(() => toast('❌ Error cargando procesos', false));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYSTEM - PROMPTS & DOCS
+// ═══════════════════════════════════════════════════════════════════════════════
+function loadEvaPrompt() {
+    apiGetJSON('/admin/eva-config').then(d => {
+        document.getElementById('prompt-eva').value = d.prompt || '';
+    }).catch(() => {});
+}
+function saveEvaPrompt() {
+    const prompt = document.getElementById('prompt-eva').value;
+    apiFetch('/admin/system/prompts', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({prompt})
+    }).then(r => r.json()).then(d => { if(d.success) toast('✅ Guardado', true); else toast('❌ Error', false); })
+    .catch(() => toast('❌ Error', false));
+}
+// ── Análisis: intervalo de entrada al grid ──
+function loadAnalysisInterval() {
+    apiFetch('/admin/system/analysis-interval')
+        .then(r => r.json()).then(d => {
+            const val = d.analysis_interval_s || 3;
+            const slider = document.getElementById('analysis-interval-slider');
+            if (slider) {
+                slider.value = val;
+                document.getElementById('analysis-interval-val').textContent = val + 's';
+            }
+            updateAnalysisEstimated(val);
+        }).catch(() => {});
+}
+function saveAnalysisInterval() {
+    const val = parseFloat(document.getElementById('analysis-interval-slider').value);
+    apiFetch('/admin/system/analysis-interval', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({analysis_interval_s: val})
+    }).then(r => r.json()).then(d => {
+        const el = document.getElementById('analysis-interval-status');
+        if (d.success) {
+            el.textContent = '✅ Guardado: cada ' + val + 's entra 1 frame al grid';
+            el.style.color = 'var(--success)';
+            updateAnalysisEstimated(val);
+        } else {
+            el.textContent = '❌ Error al guardar';
+            el.style.color = 'var(--danger)';
+        }
+    }).catch(() => {
+        document.getElementById('analysis-interval-status').textContent = '❌ Error de red';
+    });
+}
+function updateAnalysisEstimated(val) {
+    const secs = Math.round(val * 16);
+    document.getElementById('analysis-estimated').textContent = '~' + secs + 's';
+}
+function calcTokens() {
+    const text = document.getElementById('prompt-eva').value;
+    apiFetch('/admin/calc-tokens', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({prompt: text})
+    }).then(r => r.json()).then(d => {
+        toast('🔢 ~' + (d.estimated_tokens || Math.ceil(text.length/4)) + ' tokens', true);
+    }).catch(() => toast('❌ Error', false));
+}
+function loadEvaDocs() {
+    apiGetJSON('/admin/eva-docs').then(d => {
+        const docs = d.documents || [];
+        const el = document.getElementById('eva-docs-list');
+        if (!docs.length) { el.innerHTML = '<p style="color:var(--text-secondary);font-size:0.85rem">Sin documentos RAG</p>'; return; }
+        let html = '';
+        docs.forEach(doc => {
+            html += '<div class="rules-box" style="display:flex;justify-content:space-between;align-items:center">' +
+                '<span>📄 ' + doc + '</span>' +
+                '<button class="btn btn-sm btn-outline" onclick="editDoc(\'' + doc + '\')">✏️</button></div>';
+        });
+        el.innerHTML = html;
+    }).catch(() => {});
+}
+function showAddDocForm() { document.getElementById('doc-name').value = ''; document.getElementById('doc-content').value = ''; document.getElementById('eva-doc-editor').style.display = 'block'; }
+function hideDocEditor() { document.getElementById('eva-doc-editor').style.display = 'none'; }
+function editDoc(name) {
+    apiGetJSON('/admin/eva-docs/' + name).then(d => {
+        document.getElementById('doc-name').value = d.name || name;
+        document.getElementById('doc-content').value = d.content || '';
+        document.getElementById('eva-doc-editor').style.display = 'block';
+    }).catch(() => {});
+}
+function saveEvaDoc() {
+    const name = document.getElementById('doc-name').value.trim();
+    const content = document.getElementById('doc-content').value;
+    if (!name) { toast('❌ Nombre requerido', false); return; }
+    apiFetch('/admin/eva-docs/save', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, content})
+    }).then(r => r.json()).then(d => {
+        if (d.success) { toast('✅ Guardado', true); hideDocEditor(); loadEvaDocs(); }
+    }).catch(() => toast('❌ Error', false));
+}
+
+let _logsFilter = 'all';
+function loadLogs() {
+    apiGetJSON('/admin/logs?limit=200&tail=120').then(d => {
+        renderAuditLogs(d.audit_logs || []);
+        document.getElementById('api-log-tail').textContent = (d.api_tail || []).join('\n');
+    }).catch(() => {
+        document.getElementById('admin-audit-logs').textContent = 'Error cargando logs';
+    });
+}
+function renderAuditLogs(logs) {
+    const el = document.getElementById('admin-audit-logs');
+    if (!logs.length) { el.textContent = 'Sin logs'; return; }
+    el.textContent = logs.map(l => {
+        const action = l.action || 'unknown';
+        if (_logsFilter !== 'all' && action !== _logsFilter) return '';
+        return '[' + (l.ts || '') + '] ' + action + ' actor=' + (l.actor || '') + ' target=' + (l.target || '') + ' data=' + JSON.stringify(l.data || {});
+    }).filter(Boolean).join('\n');
+}
+function filterLogs(f) {
+    _logsFilter = f;
+    document.querySelectorAll('#panel-logs .filter-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    loadLogs();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IDENTITY — Reconocimiento Facial
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const IDW_API = 'https://api.ojoia.com.do';
+
+function openIdentityApp() {
+    window.open(`${IDW_API}/test-identity`, '_blank');
+}
+
+async function checkIdentityHealth() {
+    try {
+        const r = await fetch(`${IDW_API}/api/idw/health`);
+        const d = await r.json();
+        document.getElementById('idw-status').textContent = d.status || '—';
+        document.getElementById('idw-status').className = 'info-value ' + (d.status === 'ok' ? 'ok' : 'err');
+        document.getElementById('idw-gpu').textContent = d.gpu_name || '—';
+        document.getElementById('idw-vram').textContent = d.vram_free_gb ? `${d.vram_free_gb} GB` : '—';
+    } catch(e) {
+        document.getElementById('idw-status').textContent = 'offline';
+        document.getElementById('idw-status').className = 'info-value err';
+    }
+}
+
+async function loadIdentityFaces() {
+    const el = document.getElementById('identity-faces-list');
+    el.innerHTML = '<span style="color:var(--text-secondary);font-size:.8rem">Cargando...</span>';
+    try {
+        const r = await fetch(`${IDW_API}/api/identity/list-faces?user_id=z6q9KStIs1boz31q2fiHJREPBMH2`);
+        const d = await r.json();
+        if (!d.faces || !d.faces.length) {
+            el.innerHTML = '<span style="color:var(--text-secondary);font-size:.8rem">No hay personas registradas</span>';
+            return;
+        }
+        el.innerHTML = d.faces.map(f => `
+            <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+                <img src="${IDW_API}/api/identity/face-image/${f.person_id}" style="width:32px;height:32px;border-radius:50%;object-fit:cover" onerror="this.style.display='none'">
+                <span style="font-size:.85rem">${f.person_name}</span>
+                <span style="font-size:.7rem;color:var(--text-secondary);margin-left:auto">${f.person_id.slice(0,12)}...</span>
+            </div>
+        `).join('');
+    } catch(e) {
+        el.innerHTML = `<span style="color:var(--danger);font-size:.8rem">Error: ${e.message}</span>`;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════════════════
+autoConnect();
+setInterval(() => { if (API && ADMIN_SESSION) reloadStatus(); }, 15000);
+setInterval(() => { if (API && ADMIN_SESSION && document.getElementById('panel-monitoring').classList.contains('active')) loadMonitoring(); }, 30000);
+</script>
+</body>
+</html>
