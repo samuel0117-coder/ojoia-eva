@@ -1,0 +1,15 @@
+[Unit]
+Description=Docker: whisper-turbo (speech-to-text, GPU0)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker start whisper-turbo
+ExecStop=/usr/bin/docker stop whisper-turbo
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

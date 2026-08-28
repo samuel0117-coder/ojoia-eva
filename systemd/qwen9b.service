@@ -1,0 +1,15 @@
+[Unit]
+Description=Docker: qwen-9b (vLLM, GPU0)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker start ai-qwen-9b-1
+ExecStop=/usr/bin/docker stop ai-qwen-9b-1
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1412,6 +1412,53 @@ setInterval(()=>{ refresh(); if(document.getElementById('page-overview').classLi
 
 if __name__ == "__main__":
     import uvicorn
+    import threading as _threading
+    # ── Sincronización multi-nodo vía Firestore ─────────────────────────────
+    # Si firebase-key.json está disponible, empuja el estado a /nodes/{id} y
+    # pull comandos de /control/{id}/cmds. También sincroniza billing a
+    # /billing/global/* para alimentar la SPA web (megapanel-ojoia.web.app).
+    try:
+        from ojoia_sync import OjoiaSync
+        _sync = OjoiaSync(node_id=NODE_ID)
+        if _sync.enabled:
+            def _sync_worker():
+                import asyncio
+                async def _loop():
+                    last_billing = 0.0
+                    while True:
+                        # Push status (la función status es async)
+                        try:
+                            status_data = status() if callable(status) else {}
+                            if asyncio.iscoroutine(status_data):
+                                status_data = await status_data
+                            _sync.push_status(status_data)
+                        except Exception as _e:
+                            print(f"[ojoia_sync] push error: {_e}")
+                        # Poll commands (control es async)
+                        try:
+                            ctrl = control if callable(control) else None
+                            if ctrl and asyncio.iscoroutinefunction(ctrl):
+                                await _sync.poll_control(ctrl)
+                            elif ctrl:
+                                _sync.poll_control(ctrl)
+                        except Exception as _e:
+                            print(f"[ojoia_sync] poll error: {_e}")
+                        # Billing sync cada 60s
+                        now = asyncio.get_event_loop().time()
+                        if (now - last_billing) >= 60:
+                            try:
+                                _sync.push_billing(_sync.billing_provider())
+                                last_billing = now
+                            except Exception as _e:
+                                print(f"[ojoia_sync] billing sync error: {_e}")
+                        await asyncio.sleep(5)
+                asyncio.run(_loop())
+            t = _threading.Thread(target=_sync_worker, daemon=True)
+            t.start()
+            print(f"[megapanel] ojoia_sync iniciado para nodo={NODE_ID}")
+    except Exception as e:
+        print(f"[megapanel] ojoia_sync no disponible: {e}")
+
     # A2 (defense in depth): bind 127.0.0.1 unicamente. El panel se expone
     # exclusivamente via el tunel Cloudflare -> nginx 19001 -> 127.0.0.1:9001.
     # Antes bind="0.0.0.0" lo dejaba alcanzable en la LAN 10.0.0.44 sin pasar

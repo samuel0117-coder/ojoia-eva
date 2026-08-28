@@ -1,0 +1,15 @@
+[Unit]
+Description=Docker: yolo-pose (YOLO pose estimation, GPU1)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker start yolo-pose
+ExecStop=/usr/bin/docker stop yolo-pose
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
