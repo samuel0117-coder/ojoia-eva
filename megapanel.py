@@ -28,26 +28,51 @@ from datetime import datetime
 from pathlib import Path
 
 import hmac
-import sys
-from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).parent))
-from fastapi import FastAPI, HTTPException, Request, Header, Depends
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 import httpx
-from billing import BillingStore
-from billing_log import (get_requests, get_request_detail, set_rating,
-                          get_stats, get_storage_info, purge_old)
 
-app = FastAPI(title="OjoIA Server Megapanel", version="1.1")
+app = FastAPI(title="OjoIA Server Megapanel", version="1.2")
+
+# ── Carga de configuración desde ojoia.env ─────────────────────────────────
+# Variables de entorno para multi-nodo y service bus. Ver NODO_CONEXION.md.
+_OJOIA_ENV_FILE = Path("/opt/ojoia/config/ojoia.env")
+
+
+def _load_ojoia_env() -> dict:
+    """Carga KEY=VALUE de /opt/ojoia/config/ojoia.env al entorno."""
+    env_vars = {}
+    if _OJOIA_ENV_FILE.exists():
+        try:
+            for line in _OJOIA_ENV_FILE.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip('"').strip("'")
+                    os.environ[k] = v
+                    env_vars[k] = v
+        except Exception as e:
+            print(f"[megapanel] ERROR leyendo {_OJOIA_ENV_FILE}: {e}")
+    return env_vars
+
+
+_OJOIA_ENV = _load_ojoia_env()
+NODE_ID = os.environ.get("NODE_ID", platform.node())
+CINEIA_AGENT_URL = os.environ.get("CINEIA_AGENT_URL", "")
+CINEIA_AGENT_TOKEN = os.environ.get("CINEIA_AGENT_TOKEN", "")
+SERVICE_BUS_PORT = int(os.environ.get("SERVICE_BUS_PORT", "8200"))
+SERVICE_BUS_URL = f"http://127.0.0.1:{SERVICE_BUS_PORT}"
 
 # ── Auth: Bearer token (defense in depth) ────────────────────────────────
 # El panel está expuesto vía túnel Cloudflare (server-admin.ojoia.com.do).
 # Antes: cero auth + POST /api/control/{id}/{action} ejecutaba systemctl sin
 # validación -> RCE remoto. Ahora se exige Authorization: Bearer <MEGAPANEL_TOKEN>
 # en TODOS los /api/* (excepto / que sirve el HTML). El token se carga desde
-# env MEGAPANEL_TOKEN o desde /home/sam/.ojoia_megapanel_token (mode 600).
+# env MEGAPANEL_TOKEN, /opt/ojoia/config/ojoia.env, o /home/sam/.ojoia_megapanel_token.
 # Si no hay token configurado, EL PANEL SE NIEGA A ARRANCAR (fail-loud) para que
 # nunca quede expuesto por omisión.
 _MEGAPANEL_TOKEN_FILE = Path("/home/sam/.ojoia_megapanel_token")
@@ -112,30 +137,61 @@ async def _require_auth(request: Request, call_next):
 
 # ─── Tabla maestra de servicios (idéntica al health_monitor) ─────────────────
 
-# ── Config multi-nodo ──────────────────────────────────────────
-NODE_ID = os.environ.get("NODE_ID", "ojoia")
-CINEIA_AGENT_URL = os.environ.get("CINEIA_AGENT_URL", "http://10.0.0.44:8300")
-
 SERVICES = [
-    # ── Nodo OJOIA (master) ──
-    {"id": "tunnel.service", "node": "ojoia", "port": 0, "level": "system", "gpu": -1, "name": "Cloudflare Tunnel", "kind": "network"},
-    {"id": "api-eva.service", "node": "ojoia", "port": 8005, "level": "system", "gpu": -1, "name": "OjoIA API Eva", "kind": "api"},
-    {"id": "qwen9b.service", "node": "ojoia", "port": 8018, "level": "system", "gpu": 0, "name": "Qwen VL-9B (vLLM)", "kind": "llm"},
-    {"id": "qwen.service", "node": "ojoia", "port": 8004, "level": "system", "gpu": 1, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
-    {"id": "qwen35b.service", "node": "ojoia", "port": 8019, "level": "system", "gpu": 1, "name": "Qwen 35B (llama.cpp)", "kind": "llm"},
-    {"id": "whisper.service", "node": "ojoia", "port": 8008, "level": "system", "gpu": 1, "name": "Whisper Turbo ASR", "kind": "asr"},
-    {"id": "yolo-server.service", "node": "ojoia", "port": 8002, "level": "system", "gpu": 1, "name": "YOLO Pose", "kind": "vision"},
-    {"id": "chatrd.service", "node": "ojoia", "port": 8010, "level": "user", "gpu": -1, "name": "ChatRD API", "kind": "api"},
-    {"id": "health-monitor.service", "node": "ojoia", "port": 9000, "level": "user", "gpu": -1, "name": "Health Monitor (this)", "kind": "infra"},
-    # ── Nodo CINEIA (worker) ──
-    {"id": "comfyui.service", "node": "cineia", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "kind": "image", "managed": True},
-    {"id": "movie_server.service", "node": "cineia", "port": 8090, "level": "user", "gpu": 2, "name": "CineIA Movie Server", "kind": "video"},
-    {"id": "cineia_studio_server.service", "node": "cineia", "port": 8095, "level": "user", "gpu": -1, "name": "CineIA Studio API", "kind": "api"},
-    {"id": "post_server.service", "node": "cineia", "port": 8014, "level": "user", "gpu": 2, "name": "Post-Production (RIFE/Lipsync)", "kind": "post"},
-    {"id": "audio_server.service", "node": "cineia", "port": 8013, "level": "user", "gpu": 2, "name": "Audio Server", "kind": "audio"},
-    {"id": "f5_tts_server.service", "node": "cineia", "port": 8017, "level": "user", "gpu": 2, "name": "F5-TTS", "kind": "audio"},
-    {"id": "admin_panel.service", "node": "cineia", "port": 8030, "level": "user", "gpu": -1, "name": "ChatRD Admin", "kind": "api"},
+    {"id": "tunnel.service", "port": 0, "level": "system", "gpu": -1, "name": "Cloudflare Tunnel", "kind": "network"},
+    {"id": "api-eva.service", "port": 8005, "level": "system", "gpu": -1, "name": "OjoIA API Eva", "kind": "api"},
+    {"id": "qwen.service", "port": 8004, "level": "system", "gpu": 0, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
+    {"id": "whisper.service", "port": 8008, "level": "system", "gpu": 1, "name": "Whisper Turbo ASR", "kind": "asr"},
+    {"id": "yolo-server.service", "port": 8002, "level": "system", "gpu": 1, "name": "YOLO Pose", "kind": "vision"},
+    {"id": "qwen14b.service", "port": 8015, "level": "user", "gpu": 1, "name": "Qwen 14B (SGLang)", "kind": "llm"},
+    {"id": "chatrd.service", "port": 8010, "level": "user", "gpu": -1, "name": "ChatRD API", "kind": "api"},
+    {"id": "admin_panel.service", "port": 8030, "level": "user", "gpu": -1, "name": "ChatRD Admin (legacy)", "kind": "api"},
+    {"id": "comfyui.service", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "kind": "image", "managed": True},
+    {"id": "movie_server.service", "port": 8090, "level": "user", "gpu": 2, "name": "CineIA Movie Server", "kind": "video"},
+    {"id": "cineia_studio_server.service", "port": 8095, "level": "user", "gpu": -1, "name": "CineIA Studio API", "kind": "api"},
+    {"id": "post_server.service", "port": 8014, "level": "user", "gpu": 2, "name": "Post-Production (RIFE/Lipsync)", "kind": "post"},
+    {"id": "audio_server.service", "port": 8013, "level": "user", "gpu": 2, "name": "Audio Server (MusicGen)", "kind": "audio"},
+    {"id": "f5_tts_server.service", "port": 8017, "level": "user", "gpu": 2, "name": "F5-TTS", "kind": "audio"},
+    {"id": "health-monitor.service", "port": 9000, "level": "user", "gpu": -1, "name": "Health Monitor (this)", "kind": "infra"},
+
+    # ── Stack CineIA nuevo (Docker, ver docker-compose.h3.yml) ──
+    # Solo containers que realmente existen en este nodo (cineia):
+    #   cineia-flux (UP, GPU 2). Los demás servicios CineIA (h3-worker, f5tts
+    #   CPU, musicgen, realesrgan, stable-audio, sadtalker, redis) NO están
+    #   definidos en el compose actual y se omiten para no mostrar DOWN fantasma.
+    {"id": "cineia-flux", "port": 8020, "level": "docker", "gpu": 2, "name": "Flux GGUF (master images + batch)", "kind": "image", "managed": "docker", "container": "cineia-flux", "compose_file": "/home/sam/proyecto movie/docker-compose.h3.yml"},
+
+    # ── Service Bus (OpenAI-compatible) ──
+    {"id": "service-bus", "port": 8200, "level": "system", "gpu": -1, "name": "Service Bus (OpenAI API)", "kind": "infra"},
 ]
+
+# ── DOCKER_MAP: service_id -> container name (para start/stop via docker) ──
+DOCKER_MAP = {
+    "qwen9b.service":  "ai-qwen-9b-1",
+    "qwen.service":    "qwen-7b",
+    "qwen35b.service": "qwen-35b-a3b",
+    "whisper.service": "whisper-turbo",
+    "yolo-server.service": "yolo-pose",
+    # CineIA Docker (solo los que existen realmente en este nodo)
+    "cineia-flux":     "cineia-flux",
+}
+
+# ── Nodos remotos configurados (CINEIA_AGENT_URL en ojoia.env apunta al nodo
+# hermano; el nombre del nodo remoto se infiere del hostname o de la URL). ──
+REMOTE_NODES = []
+if CINEIA_AGENT_URL:
+    # Intentar inferir el node_id del nodo remoto desde la URL o usar "ojoia"
+    # por convención (este nodo = cineia, el otro = ojoia según docs).
+    remote_node_id = "ojoia"
+    for env_k, env_v in _OJOIA_ENV.items():
+        if env_k == "REMOTE_NODE_ID":
+            remote_node_id = env_v
+    REMOTE_NODES.append({
+        "node_id": remote_node_id,
+        "agent_url": CINEIA_AGENT_URL,
+        "agent_token": CINEIA_AGENT_TOKEN,
+        "name": f"{remote_node_id} (nodo remoto)",
+    })
 
 
 def run_cmd(cmd, timeout=8):
@@ -150,7 +206,30 @@ def service_active(sid: str, level: str) -> bool:
     cmd = "systemctl"
     if level == "user":
         cmd += " --user"
+    elif level == "docker":
+        # Para Docker: docker inspect --format='{{.State.Running}}' container
+        container = _docker_container_for(sid)
+        if container:
+            out = run_cmd(f"docker inspect --format='{{{{.State.Running}}}}' {container} 2>/dev/null")
+            return out.strip() == "true"
+        return False
     return run_cmd(f"{cmd} is-active --quiet {sid}") == ""
+
+
+def _docker_container_for(sid: str) -> str | None:
+    """Devuelve el nombre del container docker asociado a un service id."""
+    for s in SERVICES:
+        if s["id"] == sid and s.get("managed") == "docker":
+            return s.get("container")
+    return DOCKER_MAP.get(sid)
+
+
+def _docker_compose_for(sid: str) -> str | None:
+    """Devuelve la ruta del docker-compose asociado a un service id."""
+    for s in SERVICES:
+        if s["id"] == sid and s.get("managed") == "docker":
+            return s.get("compose_file")
+    return None
 
 
 def service_enabled(sid: str, level: str) -> str:
@@ -160,56 +239,51 @@ def service_enabled(sid: str, level: str) -> str:
     return run_cmd(f"{cmd} is-enabled {sid} 2>/dev/null")
 
 
-# ── Medición de energía ──────────────────────────────────────────────────────
-# CPU: se lee el RAPL del paquete (energía acumulada en µJ) en dos instantes y
-# se calcula la potencia instantánea. Requiere lectura de energy_uj (ver regla
-# udev: udevadm info; ver /etc/udev/rules.d/99-rapl-power.rules). Si no hay
-# acceso (permiso denegado), se reporta CPU en 0 y solo se muestran las GPUs.
-_RAPL_PATHS = [
-    "/sys/class/powercap/intel-rapl:0/energy_uj",
-    "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj",
-]
+def measure_cpu_power_w() -> float | None:
+    """Lee consumo CPU via RAPL (intel-rapl). Fallback a None si no disponible."""
+    rapl_path = Path("/sys/class/powercap/intel-rapl:0/energy_uj")
+    if not rapl_path.exists():
+        return None
+    try:
+        e1 = int(rapl_path.read_text().strip())
+        t1 = time.monotonic()
+        time.sleep(0.1)
+        e2 = int(rapl_path.read_text().strip())
+        t2 = time.monotonic()
+        microjoules = e2 - e1
+        seconds = t2 - t1
+        if microjoules < 0:
+            microjoules += 2**32  # overflow
+        return round(microjoules / 1e6 / seconds, 1)
+    except Exception:
+        return None
 
-def _read_rapl_uj() -> float:
-    """Lee la energía acumulada del paquete CPU en microjulios."""
-    for p in _RAPL_PATHS:
-        try:
-            with open(p) as f:
-                return float(f.read().strip())
-        except Exception:
-            continue
-    return 0.0
 
-def measure_cpu_power_w(sample_s: float = 1.0) -> float:
-    """Calcula el consumo del CPU en Watts usando dos lecturas RAPL."""
-    e1 = _read_rapl_uj()
-    if e1 <= 0:
-        # Fallback: estimar desde carga (rough). Loadavg * factor por core.
-        # Valor orientativo: la potencia media del CPU suele escalar con la
-        # carga; si no hay RAPL accesible, reportamos estimación conservadora.
-        try:
-            l1 = os.getloadavg()[0]
-            return round(l1 * 12, 2)  # aprox W por unidad de load
-        except Exception:
-            return 0.0
-    time.sleep(sample_s)
-    e2 = _read_rapl_uj()
-    if e2 <= 0 or e2 <= e1:
-        return 0.0
-    d_uj = (e2 - e1) % (2 ** 64)  # manejo de wrap-around del contador
-    return round(d_uj / 1_000_000 / sample_s, 2)  # uJ/s -> W
+async def fetch_remote_node(node: dict) -> dict:
+    """Consulta el agent de un nodo remoto (CINEIA_AGENT_URL) y devuelve su estado."""
+    result = {
+        "node_id": node["node_id"],
+        "name": node["name"],
+        "agent_url": node["agent_url"],
+        "online": False,
+        "services": [],
+        "gpus": [],
+    }
+    try:
+        headers = {}
+        if node.get("agent_token"):
+            headers["Authorization"] = f"Bearer {node['agent_token']}"
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{node['agent_url']}/status", headers=headers)
+            if r.status_code == 200:
+                data = r.json()
+                result["online"] = True
+                result["services"] = data.get("services", [])
+                result["gpus"] = data.get("gpus", [])
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
-# ── Mapeo de servicios del panel → contenedores Docker ───────────────────────
-# Los modelos se ejecutan como contenedores Docker, no como systemd units.
-# Mapeamos el id del panel al nombre del contenedor real para que el botón
-# start/stop/restart funcione correctamente.
-DOCKER_MAP = {
-    "qwen9b.service":   "ai-qwen-9b-1",
-    "qwen.service":     "qwen-7b",
-    "qwen35b.service":  "qwen-35b-a3b",
-    "whisper.service":  "whisper-turbo",
-    "yolo-server.service": "yolo-pose",
-}
 
 # ─── Endpoints API ───────────────────────────────────────────────────────────
 
@@ -271,35 +345,11 @@ async def status():
 
     # services
     svcs = []
-    # Estado de contenedores Docker (para modelos) en un solo snapshot
-    docker_state = {}
-    try:
-        d_out = run_cmd("docker ps -a --format '{{.Names}}|{{.State}}' 2>/dev/null", timeout=10)
-        for line in d_out.splitlines():
-            if "|" in line:
-                name, state = line.split("|", 1)
-                docker_state[name.strip()] = state.strip()
-    except Exception:
-        pass
     for s in SERVICES:
-        # Si es un servicio Docker, usar el estado real del contenedor
-        if s["id"] in DOCKER_MAP:
-            container = DOCKER_MAP[s["id"]]
-            state = docker_state.get(container, "absent")
-            active = state in ("running", "Up", "restarting")
-            enabled = state in ("running", "Up", "restarting") or "true"
-            svcs.append({
-                **s, "active": active, "enabled": state if state != "absent" else "-",
-                "docker": True, "container": container, "docker_state": state,
-            })
-            continue
         active = service_active(s["id"], s["level"])
         enabled = service_enabled(s["id"], s["level"])
-        svcs.append({
-            **s,
-            "active": active,
-            "enabled": enabled,
-        })
+        s_copy = {**s, "active": active, "enabled": enabled, "node": NODE_ID}
+        svcs.append(s_copy)
 
     # uptime
     uptime_s = 0
@@ -323,36 +373,117 @@ async def status():
     # maintenance mode
     maintenance = MAINTENANCE_FLAG.exists()
 
-    # ── Energía: CPU (RAPL) + GPUs (power.draw) = total ────────────────────
-    try:
-        import asyncio as _asyncio
-        cpu_power = await _asyncio.to_thread(measure_cpu_power_w, 1.0)
-    except Exception:
-        cpu_power = 0.0
-    gpu_power = sum(g.get("power_w") or 0 for g in gpus)
-    total_power = round(cpu_power + gpu_power, 2)
-    per_gpu = [{"index": g["index"], "name": g["name"], "w": round(g.get("power_w") or 0, 2)} for g in gpus]
+    # power: CPU (RAPL) + GPUs (nvidia-smi)
+    cpu_power_w = measure_cpu_power_w()
+    gpu_power_w = sum(g.get("power_w") or 0 for g in gpus)
+    total_power_w = round((cpu_power_w or 0) + gpu_power_w, 1)
 
     return {
         "timestamp": datetime.now().isoformat(),
         "hostname": platform.node(),
+        "node_id": NODE_ID,
         "uptime_s": uptime_s,
         "load": {"1": load1, "5": load5, "15": load15},
         "ram": {"total_mb": mem_total, "used_mb": mem_used, "free_mb": mem_free, "cache_mb": ram_cache, "pct": round(mem_used / max(mem_total, 1) * 100, 1)},
         "swap": {"used_mb": swap_used},
         "disk": {"total": disk_total, "used": disk_used, "free": disk_free, "pct": disk_pct},
-        "power": {
-            "cpu_w": cpu_power,
-            "gpu_w": round(gpu_power, 2),
-            "gpus": per_gpu,
-            "total_w": total_power,
-        },
         "gpus": gpus,
         "services": svcs,
         "incidents": incidents,
         "maintenance_mode": maintenance,
         "health_monitor_url": HEALTH_MONITOR_URL,
+        "power": {
+            "cpu_w": cpu_power_w,
+            "gpu_w": round(gpu_power_w, 1),
+            "total_w": total_power_w,
+        },
+        "remote_nodes": [n["node_id"] for n in REMOTE_NODES],
+        "service_bus_url": SERVICE_BUS_URL,
     }
+
+
+@app.get("/api/nodes")
+async def nodes():
+    """Estado de todos los nodos: este nodo + nodos remotos configurados."""
+    # Este nodo
+    local = {
+        "node_id": NODE_ID,
+        "name": platform.node(),
+        "online": True,
+        "self": True,
+    }
+    # Nodos remotos
+    remote = []
+    for node in REMOTE_NODES:
+        remote.append(await fetch_remote_node(node))
+    return {"local": local, "remote": remote}
+
+
+@app.post("/api/exec/{node_id}/{backend}")
+async def exec_remote_model(node_id: str, backend: str, body: dict):
+    """Ejecuta un modelo en un nodo remoto (o service bus local) via OpenAI API."""
+    # Determinar URL destino
+    if node_id == "local" or node_id == NODE_ID:
+        # Local service bus
+        url = f"{SERVICE_BUS_URL}/{backend}/v1/chat/completions"
+        token = os.environ.get("SERVICE_BUS_TOKEN", "")
+    else:
+        # Buscar nodo remoto
+        target = None
+        for n in REMOTE_NODES:
+            if n["node_id"] == node_id:
+                target = n
+                break
+        if not target:
+            raise HTTPException(404, f"Nodo {node_id} no encontrado")
+        url = f"{target['agent_url']}/{backend}/v1/chat/completions"
+        token = target.get("agent_token", "")
+
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(url, json=body, headers=headers)
+            return JSONResponse(r.json(), status_code=r.status_code)
+    except Exception as e:
+        raise HTTPException(502, f"Error llamando {node_id}: {e}")
+
+
+@app.get("/api/billing/clients")
+async def billing_clients():
+    """Lista clientes y uso (proxy a Redis billing store)."""
+    try:
+        import redis
+        r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+        keys = r.keys("ojoia_billing:usage:*:total")
+        clients = []
+        for k in keys:
+            cid = k.decode().split(":")[2]
+            usage = r.get(k) or b"0"
+            cost = r.get(f"ojoia_billing:cost:{cid}:total") or b"0"
+            clients.append({
+                "client_id": cid,
+                "usage": int(usage),
+                "cost_cents": int(cost),
+            })
+        return {"clients": clients}
+    except Exception as e:
+        return {"clients": [], "error": str(e)}
+
+
+@app.get("/api/billing/stats")
+async def billing_stats():
+    """Stats agregadas últimas 24h."""
+    try:
+        import redis
+        r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+        keys = r.keys("ojoia_billing:usage:24h:*")
+        total_usage = sum(int(r.get(k) or 0) for k in keys)
+        return {"window": "24h", "total_requests": total_usage}
+    except Exception as e:
+        return {"window": "24h", "total_requests": 0, "error": str(e)}
 
 
 @app.get("/api/logs/{service_id}")
@@ -379,51 +510,66 @@ async def control(service_id: str, action: str):
     """Controlar servicio: start | stop | restart | enable | disable."""
     if action not in ("start", "stop", "restart", "enable", "disable"):
         raise HTTPException(400, "action must be start|stop|restart|enable|disable")
+
+    # Buscar el servicio
+    svc = None
+    for s in SERVICES:
+        if s["id"] == service_id:
+            svc = s
+            break
+    if not svc:
+        raise HTTPException(404, f"servicio no encontrado: {service_id}")
+
+    level = svc.get("level", "user")
+
+    # ── Docker (usa DOCKER_MAP si no hay container/compose_file en el svc) ──
+    is_docker = svc.get("managed") == "docker" or service_id in DOCKER_MAP
+    if is_docker:
+        container = svc.get("container") or DOCKER_MAP.get(service_id)
+        compose_file = svc.get("compose_file")
+        if action in ("enable", "disable"):
+            return {
+                "service": service_id,
+                "action": action,
+                "result": "servicio docker: enable/disable no aplica (usa docker compose up/down)",
+            }
+        if action == "start":
+            cmd = f"docker start {container}" if container else f"docker compose -f {compose_file} start"
+        elif action == "stop":
+            cmd = f"docker stop {container}" if container else f"docker compose -f {compose_file} stop"
+        elif action == "restart":
+            cmd = f"docker restart {container}" if container else f"docker compose -f {compose_file} restart"
+        else:
+            raise HTTPException(400, f"acción no soportada para docker: {action}")
+        out = run_cmd(cmd, timeout=60)
+        return {"service": service_id, "action": action, "result": out or "ok", "container": container, "node": NODE_ID}
+
+    # ── Nodo remoto ──
+    remote_node_id = svc.get("node")
+    if remote_node_id and remote_node_id != NODE_ID:
+        target = None
+        for n in REMOTE_NODES:
+            if n["node_id"] == remote_node_id:
+                target = n
+                break
+        if not target:
+            raise HTTPException(404, f"Nodo remoto {remote_node_id} no encontrado")
+        try:
+            headers = {"Authorization": f"Bearer {MEGAPANEL_TOKEN}"}
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"{target['agent_url']}/api/control/{service_id}/{action}", headers=headers)
+                return JSONResponse(r.json(), status_code=r.status_code)
+        except Exception as e:
+            raise HTTPException(502, f"Error enviando acción a {remote_node_id}: {e}")
+
+    # ── Systemd ──
     if not service_id.endswith(".service"):
         service_id += ".service"
-
-    # ── Servicio Docker: mapear y ejecutar docker directamente ──────────────
-    if service_id in DOCKER_MAP:
-        container = DOCKER_MAP[service_id]
-        docker_actions = {
-            "start":   f"docker start {container}",
-            "stop":    f"docker stop {container}",
-            "restart": f"docker restart {container}",
-            "enable":  f"docker start {container}",
-            "disable": f"docker stop {container}",
-        }
-        if action not in docker_actions:
-            raise HTTPException(400, f"action invalida: {action}")
-        cmd = docker_actions[action]
-        out = run_cmd(cmd, timeout=60)
-        result = out or "ok"
-        return {"service": service_id, "action": action,
-                "type": "docker", "container": container, "result": result}
-
     level = "user"
-    node = "ojoia"
     for s in SERVICES:
         if s["id"] == service_id:
             level = s["level"]
-            node = s.get("node", "ojoia")
             break
-    # Si el servicio vive en CINEIA, proxy al agente remoto
-    if node == "cineia":
-        try:
-            headers = {}
-            agent_tok = os.environ.get("CINEIA_AGENT_TOKEN", "")
-            if agent_tok:
-                headers["Authorization"] = f"Bearer {agent_tok}"
-            async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(f"{CINEIA_AGENT_URL}/api/control",
-                                 json={"service": service_id, "action": action},
-                                 headers=headers)
-                return r.json()
-        except Exception as e:
-            return {"service": service_id, "action": action, "result": f"ERROR agente cineia: {e}"}
-    # level=system: el recovery lo hace systemd solo (Restart=on-failure). No intentamos
-    # reiniciar desde el panel (requeriria sudo/polkit -> popup molesto). Se informa al
-    # operador para que lo haga via SSH si es necesario forzar un reinicio manual.
     if level == "system" and action in ("restart", "start", "stop"):
         return {
             "service": service_id,
@@ -433,31 +579,10 @@ async def control(service_id: str, action: str):
                 f"Para forzar manualmente: sudo systemctl {action} {service_id}"
             ),
         }
-    # level=user se ejecuta como sam sin sudo (systemd --user).
     flag = "--user" if level == "user" else ""
     cmd = f"systemctl {flag} {action} {service_id}"
     out = run_cmd(cmd, timeout=30)
-    return {"service": service_id, "action": action, "result": out or "ok"}
-
-
-@app.get("/api/nodes")
-async def nodes():
-    """Estado de todos los nodos (ojoia local + cineia remoto)."""
-    result = {"ojoia": None, "cineia": None}
-    # local
-    try:
-        result["ojoia"] = {"status": "online", "host": "localhost"}
-    except Exception:
-        pass
-    # remoto cineia
-    try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"{CINEIA_AGENT_URL}/api/metrics")
-            if r.status_code == 200:
-                result["cineia"] = r.json()
-    except Exception as e:
-        result["cineia"] = {"status": "offline", "error": str(e)}
-    return result
+    return {"service": service_id, "action": action, "result": out or "ok", "node": NODE_ID}
 
 
 @app.get("/api/gpu")
@@ -538,181 +663,7 @@ async def tunnel_status():
     }
 
 
-# ─── Billing / API Keys (admin) ──────────────────────────────────────────────
-
-class KeyCmd(BaseModel):
-    client_id: str
-    label: str = ""
-    plan: str = "free"
-
-
-class RevokeCmd(BaseModel):
-    key: str
-
-
-class PriceCmd(BaseModel):
-    model: str
-    input_price: float
-    output_price: float
-    unit: str = "tokens"
-
-
-class PlanCmd(BaseModel):
-    plan: str
-    tokens_quota: int
-    rpm: int
-    name: str = ""
-
-
-class RatingCmd(BaseModel):
-    rating: int  # 1=up, -1=down, 0=neutral
-
-
-class PlanDeleteCmd(BaseModel):
-    plan: str
-
-
-_billing = None
-try:
-    _billing = BillingStore.instance()
-except Exception as e:
-    print(f"[megapanel] billing no disponible: {e}")
-
-
-@app.get("/api/billing/clients")
-async def billing_clients():
-    """Lista el uso de todos los clientes (admin)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    out = _billing.get_all_clients_usage("month")
-    # Enriquecer con quota
-    for c in out:
-        cid = c["client_id"]
-        # Obtener plan del primer key del cliente
-        keys = _billing.list_keys(cid)
-        plan = keys[0]["plan"] if keys else "free"
-        q = _billing.get_quota_status(cid, plan)
-        c["plan"] = plan
-        c["quota"] = q
-    return {"count": len(out), "clients": out}
-
-
-@app.post("/admin/keys")
-async def admin_create_key(cmd: KeyCmd):
-    """Crea una API key para un cliente (admin)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    if cmd.plan not in ("free", "dev", "pro", "enterprise"):
-        return JSONResponse({"error": "plan invalido"}, status_code=400)
-    r = _billing.create_key(cmd.client_id, cmd.label, cmd.plan)
-    return {"key": r["key"], "client_id": r["client_id"], "plan": r["plan"],
-            "label": r["label"], "created_at": r["created_at"]}
-
-
-@app.get("/admin/keys")
-async def admin_list_keys():
-    """Lista todas las API keys (admin)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    return {"keys": _billing.list_keys()}
-
-
-@app.post("/admin/keys/revoke")
-async def admin_revoke_key(cmd: RevokeCmd):
-    """Revoca una API key (admin)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    ok = _billing.revoke_key(cmd.key)
-    return {"revoked": ok}
-
-
-# ─── Billing config: precios y planes editables en caliente ─────────────────
-
-@app.get("/api/billing/config")
-async def billing_config():
-    """Retorna precios y planes actuales (live)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    return _billing.get_config()
-
-
-@app.put("/api/billing/prices")
-async def billing_update_price(cmd: PriceCmd):
-    """Actualiza el precio de un modelo (live)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    return {"updated": _billing.update_price(
-        cmd.model, cmd.input_price, cmd.output_price, cmd.unit)}
-
-
-@app.put("/api/billing/plans")
-async def billing_update_plan(cmd: PlanCmd):
-    """Actualiza o crea un plan (live)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    return {"updated": _billing.update_plan(
-        cmd.plan, cmd.tokens_quota, cmd.rpm, cmd.name)}
-
-
-@app.post("/api/billing/plans/delete")
-async def billing_delete_plan(cmd: PlanDeleteCmd):
-    """Elimina un plan (si no tiene keys asignadas)."""
-    if not _billing:
-        return JSONResponse({"error": "billing no disponible"}, status_code=503)
-    ok = _billing.delete_plan(cmd.plan)
-    if not ok:
-        return JSONResponse({"error": "no se pudo eliminar (tiene keys o no existe)"},
-                            status_code=400)
-    return {"deleted": True}
-
-
-# ─── Request log (SQLite) ───────────────────────────────────────────────────
-
-@app.get("/api/billing/log")
-async def billing_log(limit: int = 50, offset: int = 0,
-                      client_id: str = "", model: str = "",
-                      only_errors: bool = False, min_cost: float = 0.0):
-    """Lista requests del log con filtros."""
-    return {"requests": get_requests(
-        limit=limit, offset=offset, client_id=client_id, model=model,
-        only_errors=only_errors, min_cost=min_cost)}
-
-
-@app.get("/api/billing/log/{request_id}")
-async def billing_log_detail(request_id: int):
-    """Detalle de un request (prompt + response completos)."""
-    d = get_request_detail(request_id)
-    if not d:
-        return JSONResponse({"error": "request no encontrado"}, status_code=404)
-    return d
-
-
-@app.put("/api/billing/log/{request_id}/rating")
-async def billing_log_rating(request_id: int, cmd: RatingCmd):
-    """Setea el rating de un request (1=up, -1=down, 0=neutral)."""
-    ok = set_rating(request_id, cmd.rating)
-    return {"updated": ok}
-
-
-# ─── Stats y storage ────────────────────────────────────────────────────────
-
-@app.get("/api/billing/stats")
-async def billing_stats(hours: int = 24):
-    """Estadisticas agregadas para el dashboard."""
-    return get_stats(hours)
-
-
-@app.get("/api/billing/storage")
-async def billing_storage():
-    """Info de almacenamiento del log SQLite."""
-    return get_storage_info()
-
-
-@app.post("/api/billing/purge")
-async def billing_purge():
-    """Purge manual del log (registros >retention_days)."""
-    n = purge_old()
-    return {"purged": n, "storage": get_storage_info()}
+# ─── UI HTML embebida ─────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def ui():
@@ -737,27 +688,15 @@ HTML_FILE = """<!DOCTYPE html>
 }
 * { box-sizing: border-box; }
 body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, monospace; margin: 0; }
-/* Header compacto */
-header { padding: 10px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-header h1 { margin: 0; font-size: 16px; }
-.header-auth { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.badge { padding: 3px 8px; border-radius: 12px; font-size: 11px; cursor: pointer; }
+header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+header h1 { margin: 0; font-size: 18px; }
+.badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; }
 .badge-ok { background: rgba(63,185,80,.2); color: var(--green); }
 .badge-err { background: rgba(248,81,73,.2); color: var(--red); }
-/* Nav top-level */
-.main-nav { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 0 20px; overflow-x: auto; }
-.nav-btn { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 12px 16px; cursor: pointer; font-size: 13px; white-space: nowrap; }
-.nav-btn:hover { color: var(--text); background: rgba(255,255,255,.03); }
-.nav-btn.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
-.nav-btn.err-dot::after { content:''; display:inline-block; width:7px; height:7px; background:var(--red); border-radius:50%; margin-left:6px; vertical-align:middle; }
-/* Contenido */
-.page { padding: 20px; max-width: 1500px; margin: 0 auto; display: none; }
-.page.active { display: block; }
+.container { padding: 20px; max-width: 1400px; margin: 0 auto; }
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
-.grid2 { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
 .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
-.card h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
 .gpu-bar { background: var(--border); height: 8px; border-radius: 4px; margin: 4px 0 12px; overflow: hidden; }
 .gpu-bar > div { height: 100%; background: linear-gradient(90deg, var(--green), var(--yellow), var(--red)); }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -772,297 +711,160 @@ th { color: var(--muted); font-weight: normal; font-size: 11px; text-transform: 
 .tag.g1 { background: rgba(63,185,80,.15); color: var(--green); }
 .tag.g2 { background: rgba(210,153,34,.15); color: var(--yellow); }
 .tag.cpu { background: rgba(139,148,158,.15); color: var(--muted); }
-button { background: var(--border); color: var(--text); border: 0; padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 12px; margin: 2px; }
+button { background: var(--border); color: var(--text); border: 0; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; margin: 2px; }
 button:hover { background: #444c56; }
 button.r { color: var(--red); }
 button.s { color: var(--green); }
 .maint { border: 1px solid var(--yellow); color: var(--yellow); }
-.mono { font-family: monospace; }
 .log { background: #010409; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 11px; max-height: 300px; overflow: auto; white-space: pre; }
 input { background: var(--border); color: var(--text); border:0; padding:6px; border-radius:4px; }
-select { background: var(--border); color: var(--text); border:0; padding:6px; border-radius:4px; }
 .pill { padding: 1px 6px; border-radius: 3px; font-size: 11px; }
 .pill.L1 { background: rgba(63,185,80,.15); color: var(--green); }
 .pill.L5 { background: rgba(210,153,34,.15); color: var(--yellow); }
 .pill.L15{ background: rgba(248,81,73,.15); color: var(--red); }
-.usage-bar { background: var(--border); height: 6px; border-radius: 3px; margin: 4px 0 8px; overflow: hidden; }
-.usage-bar > div { height: 100%; background: linear-gradient(90deg, var(--blue), var(--purple)); }
-.key-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
-.copy-btn { font-size: 10px; padding: 2px 6px; }
-.kpi { font-size: 26px; font-weight: 700; color: var(--blue); }
-.kpi-grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:16px; }
-.kpi-card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:12px; text-align:center; }
-.kpi-label { font-size:11px; color:var(--muted); margin-top:2px; }
-.row-err { color: var(--red); }
-.rating-up { color: var(--green); } .rating-down { color: var(--red); } .rating-none { color: var(--muted); }
-.price-row { display:flex; gap:6px; align-items:center; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; flex-wrap:wrap; }
-.price-row input { width: 70px; }
-canvas { max-width: 100%; }
-.toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
 <body>
 <header>
-  <h1>🖥️ OjoIA Control — <span id="host" style="color:var(--muted);font-size:13px"></span></h1>
-  <div class="header-auth">
-    <input id="tok" type="password" placeholder="Bearer token..." style="width:200px;font-size:12px">
-    <button onclick="saveTok()">Guardar</button>
-    <span id="tok-status" style="color:var(--muted);font-size:11px"></span>
+  <h1>OjoIA Server Control — <span id="host"></span></h1>
+  <div>
     <span id="maint-badge" class="badge badge-ok">NORMAL</span>
-    <button class="maint" onclick="toggleMaint(true)" style="font-size:11px">🔧 Mant.</button>
-    <button onclick="toggleMaint(false)" style="font-size:11px">▶ Salir</button>
-    <button onclick="refreshAll()">⟳</button>
+    <button class="maint" onclick="toggleMaint(true)">Modo Mantenimiento</button>
+    <button onclick="toggleMaint(false)">Salir Mantenimiento</button>
+    <button onclick="refresh()">⟳</button>
   </div>
 </header>
-
-<nav class="main-nav">
-  <button class="nav-btn active" onclick="goPage('overview')">📊 Overview</button>
-  <button class="nav-btn" onclick="goPage('infra')">🏗 Infraestructura</button>
-  <button class="nav-btn" onclick="goPage('billing')">💳 Billing</button>
-  <button class="nav-btn" onclick="goPage('clients')">👥 Clientes</button>
-  <button class="nav-btn" onclick="goPage('reqlog')">📋 Request Log</button>
-  <button class="nav-btn" onclick="goPage('prices')">⚙ Precios/Planes</button>
-</nav>
-
-<!-- ═══ Overview: resumen rápido de todo ═══ -->
-<div id="page-overview" class="page active">
-  <div class="kpi-grid">
-    <div class="kpi-card"><div class="kpi" id="ov-reqs">—</div><div class="kpi-label">Requests 24h</div></div>
-    <div class="kpi-card"><div class="kpi" id="ov-tokens">—</div><div class="kpi-label">Tokens 24h</div></div>
-    <div class="kpi-card"><div class="kpi" id="ov-cost">—</div><div class="kpi-label">Costo 24h</div></div>
-    <div class="kpi-card"><div class="kpi" id="ov-errs">—</div><div class="kpi-label">Errores 24h</div></div>
-    <div class="kpi-card"><div class="kpi" id="ov-svcs">—</div><div class="kpi-label">Servicios OK</div></div>
-    <div class="kpi-card"><div class="kpi" id="ov-storage">—</div><div class="kpi-label">DB Log size</div></div>
-  </div>
-  <div class="grid">
-    <div class="card"><h2>GPUs</h2><div id="ov-gpus"></div></div>
-    <div class="card"><h2>⚡ Energía</h2><div id="ov-power"></div></div>
-    <div class="card"><h2>Servicios críticos</h2><div id="ov-svcs-list" style="font-size:12px;line-height:1.8"></div></div>
-    <div class="card"><h2>Tokens por modelo (24h)</h2><div id="ov-models" style="font-size:12px;line-height:1.8"></div></div>
-  </div>
+<div class="card" style="margin-bottom:16px">
+  <h2>Auth</h2>
+  <input id="tok" type="password" placeholder="Bearer token (MEGAPANEL_TOKEN)" style="width:60%">
+  <button onclick="saveTok()">Guardar</button>
+  <span id="tok-status" style="color:var(--muted);font-size:12px;margin-left:8px"></span>
 </div>
 
-<!-- ═══ Infraestructura ═══ -->
-<div id="page-infra" class="page">
+<div class="container">
   <div class="grid">
-    <div class="card"><h2>⚡ Energía</h2><div id="power"></div></div>
-    <div class="card"><h2>GPUs</h2><div id="gpus"></div></div>
-    <div class="card"><h2>Sistema</h2><div id="sys"></div></div>
-    <div class="card"><h2>Colas CineIA</h2><div id="queues"></div></div>
+    <div class="card">
+      <h2>GPUs</h2>
+      <div id="gpus"></div>
+    </div>
+    <div class="card">
+      <h2>Sistema</h2>
+      <div id="sys"></div>
+    </div>
+    <div class="card">
+      <h2>Colas CineIA</h2>
+      <div id="queues"></div>
+    </div>
   </div>
+
   <div class="card" style="margin-top:16px">
     <h2>Servicios <span id="svc-count"></span></h2>
-    <table><thead><tr><th>Servicio</th><th>Puerto</th><th>GPU</th><th>Estado</th><th>Enabled</th><th></th></tr></thead>
-    <tbody id="services"></tbody></table>
+    <table>
+      <thead><tr><th>Servicio</th><th>Puerto</th><th>GPU</th><th>Node</th><th>Estado</th><th>Enabled</th><th></th></tr></thead>
+      <tbody id="services"></tbody>
+    </table>
   </div>
+
   <div class="grid" style="margin-top:16px">
-    <div class="card"><h2>Incidentes (Health Monitor)</h2><div id="incidents" class="log"></div></div>
-    <div class="card"><h2>Logs <select id="log-svc" onchange="loadSvcLog()"></select></h2><div id="svc-logs" class="log"></div></div>
-  </div>
-</div>
-
-<!-- ═══ Billing Dashboard ═══ -->
-<div id="page-billing" class="page">
-  <div class="toolbar">
-    <button onclick="loadDashboard()">⟳ Actualizar</button>
-    <select id="dash-hours" onchange="loadDashboard()">
-      <option value="1">1h</option><option value="6">6h</option>
-      <option value="24" selected>24h</option><option value="168">7d</option><option value="720">30d</option>
-    </select>
-  </div>
-  <div class="kpi-grid">
-    <div class="kpi-card"><div class="kpi" id="kpi-reqs">0</div><div class="kpi-label">Requests</div></div>
-    <div class="kpi-card"><div class="kpi" id="kpi-tokens">0</div><div class="kpi-label">Tokens</div></div>
-    <div class="kpi-card"><div class="kpi" id="kpi-cost">$0</div><div class="kpi-label">Costo</div></div>
-    <div class="kpi-card"><div class="kpi" id="kpi-lat">0ms</div><div class="kpi-label">Lat avg</div></div>
-    <div class="kpi-card"><div class="kpi" id="kpi-err">0</div><div class="kpi-label">Errores</div></div>
-    <div class="kpi-card"><div class="kpi" id="kpi-rating">—</div><div class="kpi-label">👍/👎</div></div>
-  </div>
-  <div class="grid2">
-    <div class="card"><h3>Uso por hora (tokens)</h3><canvas id="chart-hours" height="120"></canvas></div>
-    <div class="card"><h3>Tokens por modelo</h3><div id="by-model"></div></div>
-    <div class="card"><h3>Tokens por cliente</h3><div id="by-client"></div></div>
-  </div>
-  <div class="card" style="margin-top:12px">
-    <h3>Almacenamiento del log</h3>
-    <div id="storage-info" style="font-size:12px;color:var(--muted)"></div>
-    <button class="r" style="margin-top:8px" onclick="purgeLog()">🗑 Purge manual (>30 dias)</button>
-  </div>
-</div>
-
-<!-- ═══ Clientes + Keys ═══ -->
-<div id="page-clients" class="page">
-  <div class="toolbar">
-    <button onclick="loadBilling()">⟳ Actualizar uso</button>
-    <button onclick="showCreateKey()">+ Crear API Key</button>
-  </div>
-  <div id="key-create" style="display:none; margin-bottom:12px; padding:10px; border:1px solid var(--border); border-radius:6px">
-    <input id="kc-client" placeholder="client_id (ej: acme_corp)" style="width:30%">
-    <input id="kc-label" placeholder="label (ej: produccion)" style="width:25%">
-    <select id="kc-plan"></select>
-    <button class="s" onclick="createKey()">Crear</button>
-    <button onclick="document.getElementById('key-create').style.display='none'">Cancelar</button>
-    <div id="kc-result" style="margin-top:8px;font-size:12px;color:var(--green)"></div>
-  </div>
-  <div class="grid2">
-    <div><h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">Clientes (uso mensual)</h3><div id="billing-clients"></div></div>
-    <div><h3 style="color:var(--muted);font-size:12px;margin:0 0 8px">API Keys</h3><div id="billing-keys"></div></div>
-  </div>
-</div>
-
-<!-- ═══ Request Log ═══ -->
-<div id="page-reqlog" class="page">
-  <div class="toolbar">
-    <input id="log-filter-client" placeholder="cliente" style="width:15%">
-    <input id="log-filter-model" placeholder="modelo" style="width:15%">
-    <label style="font-size:13px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-filter-errors"> Solo errores</label>
-    <button onclick="loadReqLog(0)">Buscar</button>
-    <button onclick="loadReqLog(offset-50)">← Anterior</button>
-    <button onclick="loadReqLog(offset+50)">Siguiente →</button>
-    <span id="log-page" style="font-size:12px;color:var(--muted)"></span>
-  </div>
-  <table id="log-table">
-    <thead><tr><th>Hora</th><th>Cliente</th><th>Modelo</th><th>Tokens</th><th>Costo</th><th>Lat</th><th>Status</th><th>Rating</th><th></th></tr></thead>
-    <tbody id="log-body"></tbody>
-  </table>
-</div>
-
-<!-- ═══ Precios y Planes ═══ -->
-<div id="page-prices" class="page">
-  <div class="toolbar"><button onclick="loadConfig()">⟳ Recargar</button></div>
-  <div class="grid2">
-    <div><h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Precios por modelo (por 1M tokens)</h3><div id="prices-editor"></div></div>
-    <div>
-      <h3 style="font-size:12px;color:var(--muted);margin:0 0 8px">Planes</h3>
-      <div id="plans-editor"></div>
-      <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px">
-        <h3 style="font-size:11px;color:var(--muted)">Nuevo plan</h3>
-        <input id="np-name" placeholder="plan (ej: trial)" style="width:20%">
-        <input id="np-display" placeholder="display" style="width:20%">
-        <input id="np-quota" type="number" placeholder="quota tokens" style="width:20%">
-        <input id="np-rpm" type="number" placeholder="rpm" style="width:10%">
-        <button class="s" onclick="createPlan()">+ Crear plan</button>
-      </div>
+    <div class="card">
+      <h2>⚡ Energía (CPU RAPL + GPUs)</h2>
+      <div id="power"></div>
+    </div>
+    <div class="card">
+      <h2>🌐 Nodos remotos <span id="remote-cnt"></span></h2>
+      <div id="remote-nodes"></div>
     </div>
   </div>
-</div>
 
-<!-- ═══ Modal de detalle de request ═══ -->
-<div id="req-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100;padding:40px">
-  <div class="card" style="max-width:800px;margin:0 auto;max-height:80vh;overflow:auto">
-    <div style="display:flex;justify-content:space-between;margin-bottom:12px">
-      <h2 style="margin:0">Request #<span id="md-id"></span></h2>
-      <div>
-        <button class="s" onclick="rateReq(1)">👍 Up</button>
-        <button class="r" onclick="rateReq(-1)">👎 Down</button>
-        <button onclick="document.getElementById('req-modal').style.display='none'">✕ Cerrar</button>
-      </div>
+  <div class="card" style="margin-top:16px">
+    <h2>🧪 Ejecutar modelo (Service Bus OpenAI-compatible)</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+      <label>Nodo:
+        <select id="exec-node" style="margin-left:4px"></select>
+      </label>
+      <label>Backend:
+        <select id="exec-backend" style="margin-left:4px">
+          <option value="qwen7b">qwen7b (8004)</option>
+          <option value="qwen9b">qwen9b (8018)</option>
+          <option value="qwen35b">qwen35b (8019)</option>
+          <option value="whisper">whisper (8008)</option>
+          <option value="yolo">yolo (8002)</option>
+        </select>
+      </label>
+      <input id="exec-prompt" placeholder="Prompt..." style="flex:1;min-width:200px;padding:6px;background:var(--bg);color:var(--fg);border:1px solid var(--muted);border-radius:4px">
+      <button onclick="runExec()">▶ Ejecutar</button>
     </div>
-    <div id="md-meta" style="font-size:12px;color:var(--muted);margin-bottom:12px"></div>
-    <h3 style="font-size:12px;color:var(--muted)">Prompt</h3>
-    <div id="md-prompt" class="log" style="white-space:pre-wrap;margin-bottom:12px"></div>
-    <h3 style="font-size:12px;color:var(--muted)">Response</h3>
-    <div id="md-response" class="log" style="white-space:pre-wrap"></div>
+    <pre id="exec-out" style="background:var(--bg);padding:8px;border-radius:4px;max-height:200px;overflow:auto;font-size:12px;margin:0"></pre>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>💰 Billing (clientes enterprise)</h2>
+    <div id="billing"></div>
+  </div>
+
+  <div class="grid" style="margin-top:16px">
+    <div class="card">
+      <h2>Incidentes recientes (Health Monitor)</h2>
+      <div id="incidents" class="log"></div>
+    </div>
+    <div class="card">
+      <h2>Logs <select id="log-svc" onchange="loadLog()"></select></h2>
+      <div id="logs" class="log"></div>
+    </div>
   </div>
 </div>
 
 <script>
+// Auth: token persistido en localStorage, enviado como Authorization: Bearer.
 const API = '';
 let TOKEN = localStorage.getItem('megapanel_token') || '';
-let _currentStatus = null;
 function saveTok(){
   TOKEN = document.getElementById('tok').value.trim();
   localStorage.setItem('megapanel_token', TOKEN);
   document.getElementById('tok-status').textContent = TOKEN ? 'guardado ✓' : 'vacio';
-  refreshAll();
+  refresh();
 }
-if(TOKEN) document.getElementById('tok-status').textContent = 'cargado ✓';
+if(TOKEN) document.getElementById('tok-status').textContent = 'cargado de memoria';
 async function get(url){
   const r = await fetch(API + url, {headers: TOKEN ? {'Authorization':'Bearer '+TOKEN} : {}});
-  if(r.status === 401){ document.getElementById('tok-status').textContent = '⚠ token invalido/falta'; }
+  if(r.status === 401){ document.getElementById('tok-status').textContent = 'token invalido/falta'; }
   return await r.json();
 }
 async function post(url, body){
   const r = await fetch(API + url, {method:'POST',
     headers:{'Content-Type':'application/json', ...(TOKEN ? {'Authorization':'Bearer '+TOKEN} : {})},
     body: body ? JSON.stringify(body) : undefined});
-  if(r.status === 401){ document.getElementById('tok-status').textContent = '⚠ token invalido/falta'; }
+  if(r.status === 401){ document.getElementById('tok-status').textContent = 'token invalido/falta'; }
   return await r.json();
-}
-async function putJSON(url, body){
-  const r = await fetch(API + url, {method:'PUT',
-    headers:{'Content-Type':'application/json', ...(TOKEN ? {'Authorization':'Bearer '+TOKEN} : {})},
-    body: body ? JSON.stringify(body) : undefined});
-  if(r.status === 401){ document.getElementById('tok-status').textContent = '⚠ token invalido/falta'; }
-  return {ok:r.ok, data: await r.json()};
 }
 function pct(p){ return `<span class="pill ${p<70?'L1':p<90?'L5':'L15'}">${p}%</span>`; }
 function gpuTag(g){ if(g<0) return '<span class="tag cpu">CPU</span>'; return `<span class="tag g${g}">GPU ${g}</span>`; }
 
-// ── Navegación top-level ───────────────────────────────────────────────────
-function goPage(name){
-  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
-  event && event.target && event.target.classList.add('active');
-  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
-  document.getElementById('page-'+name).classList.add('active');
-  if(name==='overview') loadOverview();
-  if(name==='billing') loadDashboard();
-  if(name==='clients') loadBilling();
-  if(name==='reqlog') loadReqLog(0);
-  if(name==='prices') loadConfig();
-}
-function refreshAll(){ refresh(); loadOverview(); }
-
-// ── Infraestructura: refresh ────────────────────────────────────────────────
 async function refresh(){
   try {
     const s = await get('/api/status');
-    _currentStatus = s;
-    document.getElementById('host').textContent = s.hostname + ' · uptime ' + Math.floor(s.uptime_s/3600) + 'h';
-    // gpus (infra + overview comparten elemento gpus)
-    const gpuHtml = s.gpus.map(g=>`
+    document.getElementById('host').textContent = s.hostname + ' · node=' + (s.node_id||'?') + ' · uptime ' + Math.floor(s.uptime_s/3600) + 'h';
+    // gpus
+    document.getElementById('gpus').innerHTML = s.gpus.map(g=>`
       <div><b>GPU ${g.index}</b> ${g.name} · ${pct(g.mem_pct)} · ${g.util_pct}% util · ${g.temp_c}°C
       ${g.power_w?'· '+g.power_w+'W':''}</div>
       <div class="gpu-bar"><div style="width:${g.mem_pct}%"></div></div>
       <div style="color:var(--muted);font-size:12px">${g.mem_used_mb}/${g.mem_total_mb} MB · ${g.mem_free_mb} free</div>
     `).join('');
-    document.getElementById('gpus').innerHTML = gpuHtml;
-    if(document.getElementById('ov-gpus')) document.getElementById('ov-gpus').innerHTML = gpuHtml;
-    // ⚡ Energía
-    if(s.power){
-      const pw = s.power;
-      const rows = pw.gpus.map(g=>`
-        <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">
-          <span>GPU ${g.index} <span style="color:var(--muted);font-size:11px">${g.name}</span></span>
-          <b>${g.w} W</b>
-        </div>`).join('');
-      const powerHtml = `
-        <div style="font-size:28px;font-weight:700;line-height:1.2">
-          ⚡ <span style="color:var(--yellow)">${pw.total_w}</span> W
-        </div>
-        <div style="color:var(--muted);font-size:12px;margin:4px 0 8px">Consumo total del sistema</div>
-        <div style="display:flex;justify-content:space-between;padding:3px 0">
-          <span>🖥 CPU (RAPL)</span><b>${pw.cpu_w} W</b>
-        </div>
-        <div style="display:flex;justify-content:space-between;padding:3px 0">
-          <span>🎮 Total GPUs (${pw.gpus.length})</span><b>${pw.gpu_w} W</b>
-        </div>
-        <div style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px;font-size:12px;color:var(--muted);font-weight:600">Desglose por GPU</div>
-        ${rows}
-      `;
-      document.getElementById('power').innerHTML = powerHtml;
-      if(document.getElementById('ov-power')) document.getElementById('ov-power').innerHTML = `
-        <div style="font-size:24px;font-weight:700">⚡ <span style="color:var(--yellow)">${pw.total_w}</span> W</div>
-        <div style="color:var(--muted);font-size:12px">CPU ${pw.cpu_w}W · GPUs ${pw.gpu_w}W</div>
-      `;
-    }
     // system
     document.getElementById('sys').innerHTML = `
       <div>Load: ${s.load['1'].toFixed(1)} / ${s.load['5'].toFixed(1)} / ${s.load['15'].toFixed(1)}</div>
       <div>RAM: ${pct(s.ram.pct)} · ${s.ram.used_mb}/${s.ram.total_mb} MB</div>
       <div>Swap: ${s.swap.used_mb} MB</div>
       <div>Disk: ${pct(s.disk.pct)} · ${s.disk.used}/${s.disk.total}</div>
+    `;
+    // power (CPU RAPL + GPU total)
+    const pw = s.power || {cpu_w:null, gpu_w:0, total_w:0};
+    document.getElementById('power').innerHTML = `
+      <div>CPU: <b>${pw.cpu_w!=null?pw.cpu_w+' W':'N/A (RAPL no disponible)'}</b></div>
+      <div>GPUs: <b>${pw.gpu_w} W</b> (suma de ${s.gpus.length} GPUs)</div>
+      <div style="margin-top:6px;font-size:18px">Total: <b>${pw.total_w} W</b></div>
+      <div style="color:var(--muted);font-size:11px;margin-top:4px">Service Bus: ${s.service_bus_url||'-'}</div>
     `;
     // services
     document.getElementById('svc-count').textContent = '(' + s.services.length + ')';
@@ -1071,32 +873,63 @@ async function refresh(){
         <td>${sv.name}<div style="color:var(--muted);font-size:11px">${sv.id}</div></td>
         <td>${sv.port||'-'}</td>
         <td>${gpuTag(sv.gpu)}</td>
-        <td><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.active?'OK':(sv.docker?sv.docker_state:'DOWN')}</td>
+        <td><span class="tag ${sv.node===(s.node_id||'')?'g0':'g1'}">${sv.node||'?'}</span></td>
+        <td><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.active?'OK':'DOWN'}</td>
         <td style="color:var(--muted);font-size:11px">${sv.enabled||'-'}</td>
         <td>
           <button class="s" onclick="control('${sv.id}','start')">▶</button>
           <button class="r" onclick="control('${sv.id}','stop')">■</button>
           <button onclick="control('${sv.id}','restart')">↻</button>
-          <button onclick="loadSvcLog('${sv.id}')">logs</button>
+          <button onclick="loadLog('${sv.id}')">logs</button>
         </td>
       </tr>`).join('');
-    // overview: servicios criticos resumidos
-    if(document.getElementById('ov-svcs-list')){
-      const crit = s.services.filter(sv=>sv.id.includes('qwen')||sv.id.includes('tunnel')||sv.id.includes('eva'));
-      document.getElementById('ov-svcs').textContent = s.services.filter(x=>x.active).length + '/' + s.services.length;
-      document.getElementById('ov-svcs-list').innerHTML = crit.map(sv=>
-        `<div><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.name}</div>`).join('');
+    // exec node select
+    const ns = document.getElementById('exec-node');
+    if(ns.options.length === 0){
+      ns.add(new Option('local (este nodo)', s.node_id||'local'));
+      (s.remote_nodes||[]).forEach(n => ns.add(new Option(n, n)));
     }
     // log svc select
     const sel = document.getElementById('log-svc');
-    if(sel.options.length === 0){ s.services.forEach(sv => sel.add(new Option(sv.name, sv.id))); }
+    if(sel.options.length === 0){
+      s.services.forEach(sv => sel.add(new Option(sv.name, sv.id)));
+    }
     // maintenance
     const m = document.getElementById('maint-badge');
     if(s.maintenance_mode){ m.className='badge badge-err'; m.textContent='MANTENIMIENTO'; }
     else { m.className='badge badge-ok'; m.textContent='NORMAL'; }
     // incidents
-    document.getElementById('incidents').textContent = s.incidents.map(i=>`[${i.t}] [${i.level}] ${i.msg}`).join('\\n');
-  } catch(e) { console.error(e); }
+    document.getElementById('incidents').textContent = s.incidents.map(i=>`[${i.t}] [${i.level}] ${i.msg}`).join('\n');
+  } catch(e) {
+    console.error(e);
+  }
+  // remote nodes
+  try {
+    const n = await get('/api/nodes');
+    document.getElementById('remote-cnt').textContent = '(' + (n.remote?n.remote.length:0) + ')';
+    if(n.remote && n.remote.length){
+      document.getElementById('remote-nodes').innerHTML = n.remote.map(r=>`
+        <div style="padding:6px 0;border-bottom:1px solid var(--muted)">
+          <b>${r.name}</b> · <span class="dot ${r.online?'dot-on':'dot-off'}"></span>${r.online?'online':'offline'}
+          <div style="color:var(--muted);font-size:11px">${r.agent_url}</div>
+          ${r.error?'<div style="color:var(--err);font-size:11px">'+r.error+'</div>':''}
+          ${r.online?`<div style="font-size:12px;margin-top:4px">${(r.services||[]).length} servicios · ${(r.gpus||[]).length} GPUs</div>`:''}
+        </div>
+      `).join('');
+    } else {
+      document.getElementById('remote-nodes').innerHTML = '<span style="color:var(--muted)">Sin nodos remotos configurados (CINEIA_AGENT_URL vacío en ojoia.env)</span>';
+    }
+  } catch(e) { document.getElementById('remote-nodes').innerHTML = '<span style="color:var(--muted)">Error consultando nodos</span>'; }
+  // billing
+  try {
+    const b = await get('/api/billing/clients');
+    if(b.clients && b.clients.length){
+      document.getElementById('billing').innerHTML = '<table style="width:100%"><tr><th>Cliente</th><th>Uso</th><th>Costo</th></tr>' +
+        b.clients.map(c=>`<tr><td>${c.client_id}</td><td>${c.usage}</td><td>${c.cost_cents/100} USD</td></tr>`).join('') + '</table>';
+    } else {
+      document.getElementById('billing').innerHTML = '<span style="color:var(--muted)">Sin clientes registrados</span>';
+    }
+  } catch(e) { document.getElementById('billing').innerHTML = '<span style="color:var(--muted)">Error billing</span>'; }
   // queues
   try {
     const q = await get('/api/queues');
@@ -1108,205 +941,42 @@ async function refresh(){
     document.getElementById('queues').innerHTML = html;
   } catch(e) { document.getElementById('queues').innerHTML = `<span style="color:var(--muted)">Sin datos</span>`; }
 }
-async function control(id, action){ await post(`/api/control/${id}/${action}`); setTimeout(refresh, 800); }
-async function loadSvcLog(svc){
+async function control(id, action){
+  const r = await post(`/api/control/${id}/${action}`);
+  setTimeout(refresh, 800);
+}
+async function loadLog(svc){
   svc = svc || document.getElementById('log-svc').value;
   if(!svc) return;
   const r = await get(`/api/logs/${svc.replace('.service','')}?lines=80`);
-  document.getElementById('svc-logs').textContent = r.lines.join('\\n');
-  document.getElementById('svc-logs').scrollTop = 9999;
+  document.getElementById('logs').textContent = r.lines.join('\n');
+  document.getElementById('logs').scrollTop = 9999;
 }
 async function toggleMaint(enable){
+  let ext = '';
   if(enable){ ext = prompt('URL de API externa para fallback (dejar vacío si ninguna):') || ''; }
-  await post('/api/maintenance', {enable, external_api_url: ext||''});
+  await post('/api/maintenance', {enable, external_api_url: ext});
   refresh();
 }
-
-// ── Overview: KPIs rápidos ──────────────────────────────────────────────────
-async function loadOverview(){
+async function runExec(){
+  const node = document.getElementById('exec-node').value;
+  const backend = document.getElementById('exec-backend').value;
+  const prompt = document.getElementById('exec-prompt').value;
+  if(!prompt){ alert('Prompt vacío'); return; }
+  document.getElementById('exec-out').textContent = 'Ejecutando...';
+  const body = {model: backend, messages: [{role:'user', content: prompt}], max_tokens: 200};
   try {
-    const s = await get('/api/billing/stats?hours=24');
-    document.getElementById('ov-reqs').textContent = (s.total_requests||0).toLocaleString();
-    document.getElementById('ov-tokens').textContent = (s.total_tokens||0).toLocaleString();
-    document.getElementById('ov-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
-    document.getElementById('ov-errs').textContent = (s.errors||0);
-    const byM = Object.entries(s.by_model||{}).map(([m,v])=>
-      `<div><span class="tag g1">${m}</span> <b>${v.tokens.toLocaleString()}</b> tok · ${v.requests} req</div>`).join('');
-    if(document.getElementById('ov-models')) document.getElementById('ov-models').innerHTML = byM || '<span style="color:var(--muted)">sin datos</span>';
-  } catch(e) { console.error('overview billing',e); }
-  try {
-    const st = await get('/api/billing/storage');
-    if(document.getElementById('ov-storage')) document.getElementById('ov-storage').textContent = st.db_size_mb + 'MB';
-    if(document.getElementById('storage-info')) document.getElementById('storage-info').innerHTML =
-      `DB: <b>${st.db_size_mb} MB</b> · ${st.total_records.toLocaleString()} registros · Free: <b>${st.disk_free_mb.toLocaleString()} MB</b> · Retención: <b>${st.retention_days} dias</b><br><span style="font-size:11px">${st.db_path}</span>`;
-  } catch(e) {}
+    const r = await post(`/api/exec/${node}/${backend}`, body);
+    let text = '';
+    if(r.choices && r.choices[0]) text = r.choices[0].message.content;
+    else text = JSON.stringify(r, null, 2);
+    document.getElementById('exec-out').textContent = text;
+  } catch(e) {
+    document.getElementById('exec-out').textContent = 'ERROR: ' + e;
+  }
 }
-
-// ── Dashboard billing completo ─────────────────────────────────────────────
-let _chart = null;
-async function loadDashboard(){
-  const h = parseInt(document.getElementById('dash-hours').value);
-  try {
-    const s = await get('/api/billing/stats?hours='+h);
-    document.getElementById('kpi-reqs').textContent = (s.total_requests||0).toLocaleString();
-    document.getElementById('kpi-tokens').textContent = (s.total_tokens||0).toLocaleString();
-    document.getElementById('kpi-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
-    document.getElementById('kpi-lat').textContent = (s.avg_latency_ms||0)+'ms';
-    document.getElementById('kpi-err').textContent = (s.errors||0);
-    document.getElementById('kpi-rating').textContent = `${s.up_votes||0}/${s.down_votes||0}`;
-    const byM = Object.entries(s.by_model||{}).map(([m,v])=>
-      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span><span class="tag g1">${m}</span></span><span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
-    document.getElementById('by-model').innerHTML = byM || '<span style="color:var(--muted)">sin datos</span>';
-    const byC = Object.entries(s.by_client||{}).map(([c,v])=>
-      `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span><b>${c}</b></span><span><b>${v.tokens.toLocaleString()}</b> tok · $${v.cost.toFixed(4)} · ${v.requests} req</span></div>`).join('');
-    document.getElementById('by-client').innerHTML = byC || '<span style="color:var(--muted)">sin datos</span>';
-    const labels = (s.hourly||[]).map(h=>new Date(h.ts*1000).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'}));
-    const tokens = (s.hourly||[]).map(h=>h.tokens);
-    if(_chart) _chart.destroy();
-    const ctx = document.getElementById('chart-hours');
-    if(ctx && labels.length){
-      _chart = new Chart(ctx, {type:'line', data:{labels,datasets:[{label:'Tokens',data:tokens,borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,.1)',fill:true}]},
-        options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',maxTicksLimit:8}},y:{ticks:{color:'#8b949e'}}}}});
-    }
-  } catch(e) { console.error('dashboard',e); }
-}
-async function purgeLog(){
-  if(!confirm('Purgar registros >30 dias?')) return;
-  const r = await post('/api/billing/purge', {});
-  alert('Purgados: '+r.purged);
-  loadDashboard();
-}
-
-// ── Clientes + Keys ─────────────────────────────────────────────────────────
-function showCreateKey(){
-  const el = document.getElementById('key-create');
-  el.style.display = el.style.display === 'none' ? 'block' : 'none';
-  document.getElementById('kc-result').textContent = '';
-}
-async function createKey(){
-  const client = document.getElementById('kc-client').value.trim();
-  const label = document.getElementById('kc-label').value.trim();
-  const plan = document.getElementById('kc-plan').value;
-  if(!client){ alert('client_id requerido'); return; }
-  const r = await post('/admin/keys', {client_id: client, label, plan});
-  if(r.key){
-    document.getElementById('kc-result').innerHTML = `Key creada: <code style="color:var(--green)">${r.key}</code> <button class="copy-btn" onclick="navigator.clipboard.writeText('${r.key}')">copiar</button>`;
-    loadBilling();
-  } else { document.getElementById('kc-result').innerHTML = `<span style="color:var(--red)">Error: ${JSON.stringify(r)}</span>`; }
-}
-async function revokeKey(key){
-  if(!confirm('Revocar key ' + key.slice(0,20) + '...?')) return;
-  await post('/admin/keys/revoke', {key});
-  loadBilling();
-}
-async function loadBilling(){
-  try { const cfg = await get('/api/billing/config');
-    const sel = document.getElementById('kc-plan');
-    if(sel && cfg.plans) sel.innerHTML = Object.entries(cfg.plans).map(([k,v])=>`<option value="${k}">${k} (${(v.tokens_quota/1e6).toFixed(0)}M tok/mes)</option>`).join('');
-  } catch(e) {}
-  try {
-    const c = await get('/api/billing/clients');
-    const html = (c.clients || []).map(cl => {
-      const q = cl.quota || {}; const pctUsed = q.pct_used || 0;
-      const models = Object.entries(cl.usage?.by_model || {}).map(([m,t]) => `<span class="tag g1">${m}: ${t.tokens} tok</span>`).join(' ');
-      return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
-        <div><b>${cl.client_id}</b> <span class="tag cpu">${cl.plan}</span></div>
-        <div style="font-size:12px;color:var(--muted)">${cl.tokens.toLocaleString()} tokens · $${cl.cost_usd.toFixed(4)} · ${cl.requests} reqs</div>
-        <div class="usage-bar"><div style="width:${Math.min(100,pctUsed)}%"></div></div>
-        <div style="font-size:11px;color:var(--muted)">${pctUsed.toFixed(1)}% de ${(q.tokens_quota||0).toLocaleString()} tok · ${(q.tokens_remaining||0).toLocaleString()} libres</div>
-        <div style="margin-top:4px">${models}</div></div>`;
-    }).join('') || '<span style="color:var(--muted)">Sin clientes con uso</span>';
-    document.getElementById('billing-clients').innerHTML = html;
-  } catch(e) { document.getElementById('billing-clients').innerHTML = '<span style="color:var(--red)">Error</span>'; }
-  try {
-    const k = await get('/admin/keys');
-    const html = (k.keys || []).map(rec => `<div class="key-row">
-      <div><div><b>${rec.client_id}</b> <span class="tag cpu">${rec.plan}</span> ${rec.revoked?'<span class="pill L15">REVOKED</span>':''}</div>
-      <div style="font-size:11px;color:var(--muted)">${rec.key_masked} ${rec.label?'· '+rec.label:''}</div></div>
-      ${rec.revoked?'':`<button class="r copy-btn" onclick="revokeKey('${rec.key}')">revocar</button>`}</div>`).join('') || '<span style="color:var(--muted)">Sin keys</span>';
-    document.getElementById('billing-keys').innerHTML = html;
-  } catch(e) { document.getElementById('billing-keys').innerHTML = '<span style="color:var(--red)">Error</span>'; }
-}
-
-// ── Request Log ─────────────────────────────────────────────────────────────
-let offset = 0;
-async function loadReqLog(off){
-  offset = Math.max(0, off||0);
-  const client = document.getElementById('log-filter-client').value.trim();
-  const model = document.getElementById('log-filter-model').value.trim();
-  const errors = document.getElementById('log-filter-errors').checked;
-  let url = `/api/billing/log?limit=50&offset=${offset}`;
-  if(client) url += `&client_id=${encodeURIComponent(client)}`;
-  if(model) url += `&model=${encodeURIComponent(model)}`;
-  if(errors) url += `&only_errors=true`;
-  try {
-    const r = await get(url);
-    const rows = (r.requests||[]).map(req=>{
-      const ts = new Date(req.ts*1000).toLocaleString('es',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
-      const errCls = req.status_code>=400 ? 'row-err' : '';
-      const rat = req.rating>0?'👍':req.rating<0?'👎':'<span class="rating-none">—</span>';
-      return `<tr class="${errCls}"><td style="font-size:11px;color:var(--muted)">${ts}</td><td>${req.client_id}</td><td><span class="tag g1">${req.model}</span></td><td>${(req.prompt_tokens+req.completion_tokens).toLocaleString()}</td><td>$${req.cost_usd.toFixed(6)}</td><td>${req.latency_ms}ms</td><td>${req.status_code}</td><td>${rat}</td><td><button onclick="showReq(${req.id})">ver</button></td></tr>`;
-    }).join('');
-    document.getElementById('log-body').innerHTML = rows || '<tr><td colspan="9" style="color:var(--muted)">sin resultados</td></tr>';
-    document.getElementById('log-page').textContent = `offset ${offset}`;
-  } catch(e) { console.error('log',e); }
-}
-async function showReq(id){
-  try {
-    const r = await get(`/api/billing/log/${id}`);
-    document.getElementById('md-id').textContent = id;
-    document.getElementById('md-meta').innerHTML = `Cliente: <b>${r.client_id}</b> · Modelo: <b>${r.model}</b> · Tokens: ${r.prompt_tokens}+${r.completion_tokens} · Costo: $${r.cost_usd.toFixed(6)} · Lat: ${r.latency_ms}ms · Status: ${r.status_code} · ${r.stream?'stream':'non-stream'} · Rating: ${r.rating>0?'👍 up':r.rating<0?'👎 down':'—'}`;
-    document.getElementById('md-prompt').textContent = r.prompt || '(vacio)';
-    document.getElementById('md-response').textContent = r.response || '(vacio)';
-    document.getElementById('req-modal').style.display = 'block';
-  } catch(e) { console.error('showReq',e); }
-}
-async function rateReq(rating){
-  const id = document.getElementById('md-id').textContent;
-  await putJSON(`/api/billing/log/${id}/rating`, {rating});
-  showReq(parseInt(id)); loadReqLog(offset);
-}
-
-// ── Precios y Planes ─────────────────────────────────────────────────────────
-async function loadConfig(){
-  try {
-    const cfg = await get('/api/billing/config');
-    const prices = Object.entries(cfg.prices||{}).map(([m,p])=>
-      `<div class="price-row"><span class="tag g1" style="min-width:80px">${m}</span><input type="number" step="0.01" value="${p.input}" id="pr-in-${m}" placeholder="in"><input type="number" step="0.01" value="${p.output}" id="pr-out-${m}" placeholder="out"><input type="text" value="${p.unit}" id="pr-unit-${m}" style="width:60px" placeholder="unit"><button class="s" onclick="savePrice('${m}')">guardar</button></div>`).join('');
-    document.getElementById('prices-editor').innerHTML = prices || '<span style="color:var(--muted)">sin modelos</span>';
-    const plans = Object.entries(cfg.plans||{}).map(([k,v])=>
-      `<div class="price-row"><span class="tag cpu" style="min-width:80px">${k}</span><input type="text" value="${v.name}" id="pl-name-${k}" style="width:80px"><input type="number" value="${v.tokens_quota}" id="pl-quota-${k}" placeholder="quota"><input type="number" value="${v.rpm}" id="pl-rpm-${k}" style="width:60px" placeholder="rpm"><button class="s" onclick="savePlan('${k}')">guardar</button><button class="r" onclick="deletePlan('${k}')">eliminar</button></div>`).join('');
-    document.getElementById('plans-editor').innerHTML = plans || '<span style="color:var(--muted)">sin planes</span>';
-  } catch(e) { console.error('config',e); }
-}
-async function savePrice(model){
-  const inp = document.getElementById('pr-in-'+model).value;
-  const out = document.getElementById('pr-out-'+model).value;
-  const unit = document.getElementById('pr-unit-'+model).value;
-  const r = await putJSON('/api/billing/prices', {model, input_price:parseFloat(inp), output_price:parseFloat(out), unit});
-  if(r.ok) alert('Precio actualizado'); else alert('Error: '+JSON.stringify(r.data));
-}
-async function savePlan(plan){
-  const name = document.getElementById('pl-name-'+plan).value, quota = document.getElementById('pl-quota-'+plan).value, rpm = document.getElementById('pl-rpm-'+plan).value;
-  const r = await putJSON('/api/billing/plans', {plan, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name});
-  if(r.ok) alert('Plan actualizado'); else alert('Error: '+JSON.stringify(r.data));
-}
-async function deletePlan(plan){
-  if(!confirm('Eliminar plan '+plan+'? (solo si no tiene keys)')) return;
-  const r = await post('/api/billing/plans/delete', {plan});
-  if(r.deleted) loadConfig(); else alert('Error: '+JSON.stringify(r));
-}
-async function createPlan(){
-  const name = document.getElementById('np-name').value.trim(), display = document.getElementById('np-display').value.trim(), quota = document.getElementById('np-quota').value, rpm = document.getElementById('np-rpm').value;
-  if(!name||!quota||!rpm){ alert('Completa todos los campos'); return; }
-  const r = await putJSON('/api/billing/plans', {plan:name, tokens_quota:parseInt(quota), rpm:parseInt(rpm), name:display||name});
-  if(r.ok){ document.getElementById('np-name').value=''; loadConfig(); } else alert('Error: '+JSON.stringify(r.data));
-}
-
-// ── Init ─────────────────────────────────────────────────────────────────────
-refresh(); loadOverview();
-setInterval(()=>{ refresh(); if(document.getElementById('page-overview').classList.contains('active')) loadOverview(); }, 10000);
-
+refresh();
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>
@@ -1318,5 +988,60 @@ if __name__ == "__main__":
     # exclusivamente via el tunel Cloudflare -> nginx 19001 -> 127.0.0.1:9001.
     # Antes bind="0.0.0.0" lo dejaba alcanzable en la LAN 10.0.0.44 sin pasar
     # por nginx/CF (bypass de toda proteccion).
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("MEGAPANEL_PORT", "9001")),
-                log_level="info")
+
+    # ── Sincronización multi-nodo (Firestore push + poll control) ──
+    _port = int(os.environ.get("MEGAPANEL_PORT", "9001"))
+    _local_url = f"http://127.0.0.1:{_port}"
+
+    def _status_provider():
+        """Snapshot de estado de ESTE nodo (para push al clúster Firestore)."""
+        import httpx as _hx
+        try:
+            r = _hx.get(f"{_local_url}/api/status", timeout=6,
+                        headers={"Authorization": f"Bearer {MEGAPANEL_TOKEN}"})
+            if r.status_code == 200:
+                return r.json()
+            return {"error": f"HTTP {r.status_code}"}
+        except Exception as _e:
+            return {"error": str(_e)}
+
+    def _control_executor(service_id: str, action: str):
+        """Ejecuta un comando de control recibido desde el panel web (Firestore)."""
+        import httpx as _hx
+        try:
+            r = _hx.post(f"{_local_url}/api/control/{service_id}/{action}",
+                         timeout=30,
+                         headers={"Authorization": f"Bearer {MEGAPANEL_TOKEN}"})
+            return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _run_sync_loop(sync, status_provider, control_executor):
+        import asyncio as _asyncio
+        try:
+            async def _loop():
+                while True:
+                    try:
+                        sync.push_status(status_provider())
+                    except Exception as _e:
+                        print(f"[ojoia_sync] push error: {_e}")
+                    try:
+                        await sync.poll_control(control_executor)
+                    except Exception as _e:
+                        print(f"[ojoia_sync] poll error: {_e}")
+                    await _asyncio.sleep(sync.interval)
+            _asyncio.run(_loop())
+        except Exception as _e:
+            print(f"[ojoia_sync] loop terminó: {_e}")
+
+    import threading as _th
+    try:
+        from ojoia_sync import OjoiaSync
+        _sync = OjoiaSync(node_id=NODE_ID)
+        if _sync.enabled:
+            t = _th.Thread(target=_run_sync_loop, args=(_sync, _status_provider, _control_executor), daemon=True)
+            t.start()
+    except Exception as e:
+        print(f"[megapanel] No se pudo iniciar sincronización Firestore: {e}")
+
+    uvicorn.run(app, host="127.0.0.1", port=_port, log_level="info")
