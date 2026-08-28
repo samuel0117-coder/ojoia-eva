@@ -81,3 +81,7 @@ node_modules/
 # Backups de git creados por filter-repo/operaciones manuales
 .git.backup.*/
 /tmp/
+# Basura del otro nodo que se coló accidentalmente
+.git.backup-before-filter/
+.git.backup*/
+*.bak-*

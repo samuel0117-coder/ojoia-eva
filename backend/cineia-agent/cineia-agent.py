@@ -25,52 +25,10 @@ except ImportError:
     NODE_ID = os.environ.get("NODE_ID", "cineia")
     NODE_NAME = os.environ.get("NODE_NAME", "CineIA Worker")
 
-import hmac
-import os
-from datetime import datetime
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-try:
-    from shared.config import NODE_ID, NODE_NAME
-except ImportError:
-    NODE_ID = os.environ.get("NODE_ID", "cineia")
-    NODE_NAME = os.environ.get("NODE_NAME", "CineIA Worker")
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
 import uvicorn
 
 app = FastAPI(title="CineIA Agent", version="1.0")
-
-# ── Auth ─────────────────────────────────────────────────────
-_AGENT_TOKEN_FILE = Path("/home/sam/.cineia_agent_token")
-
-def _load_agent_token() -> str:
-    tok = (os.environ.get("CINEIA_AGENT_TOKEN") or "").strip()
-    if not tok and _AGENT_TOKEN_FILE.exists():
-        tok = _AGENT_TOKEN_FILE.read_text().strip()
-    return tok
-
-AGENT_TOKEN = _load_agent_token()
-
-def _check_token(auth: str | None):
-    if not AGENT_TOKEN:
-        return  # sin token configurado, no exige auth (dev)
-    if not auth or not auth.startswith("Bearer "):
-        raise HTTPException(401, "Authorization requerido")
-    tok = auth.replace("Bearer ", "").strip()
-    if not hmac.compare_digest(tok, AGENT_TOKEN):
-        raise HTTPException(401, "Token invalido")
-
-@app.middleware("http")
-async def _require_auth(request: Request, call_next):
-    if request.url.path.startswith("/api/control"):
-        try:
-            _check_token(request.headers.get("authorization"))
-        except HTTPException:
-            return JSONResponse({"detail": "Token invalido"}, status_code=401)
-    return await call_next(request)
 
 LOCAL_SERVICES = [
     {"id": "comfyui.service", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "managed": True},
