@@ -210,20 +210,22 @@ def _discover_systemd_services() -> list:
     _RELEVANT_KEYWORDS = ("ojoia", "qwen", "eva", "tunnel", "chatrd", "admin_panel",
                           "comfyui", "movie", "cineia", "post", "audio", "f5",
                           "health", "megapanel", "project", "ui-server", "ai-arranque",
-                          "redis", "whisper", "yolo", "bus")
+                          "redis", "whisper", "yolo", "ojoia-bus")
     services = []
     systemd_dir = Path("/etc/systemd/system")
     if not systemd_dir.exists():
         return services
     for f in systemd_dir.glob("*.service"):
         sid = f.name
+        sid_lower = sid.lower()
         if sid in _KNOWN_SYSTEMD_SERVICES:
             meta = _KNOWN_SYSTEMD_SERVICES[sid]
-        elif any(kw in sid.lower() for kw in _RELEVANT_KEYWORDS):
+        elif any(kw == sid_lower or sid_lower.startswith(kw + ".") or sid_lower.startswith(kw + "-") or sid_lower.startswith(kw + "_")
+                 for kw in _RELEVANT_KEYWORDS):
             meta = {"name": sid.replace(".service", "").replace("-", " ").title(),
                     "port": 0, "gpu": -1, "kind": "service"}
         else:
-            continue  # omitir servicios de sistema no relevantes
+            continue  # omitir servicios de sistema no relevantes (dbus, chronyd, vmtoolsd, etc)
         services.append({
             "id": sid,
             "name": meta.get("name", sid.replace(".service", "").replace("-", " ").title()),
