@@ -553,6 +553,43 @@ class HealthMonitor:
 monitor = HealthMonitor()
 
 
+def _resolve_service(name: str):
+    """Resuelve un nombre de servicio flexible.
+
+    Acepta:
+      - "yolo" (nombre del ServiceDef)
+      - "yolo-server.service" (id del megapanel)
+      - "yolo-server" (sin .service)
+      - "whisper" / "whisper-turbo"
+      - "qwen7b" / "qwen.service" / "qwen.service"
+    """
+    # Match exacto primero
+    if name in monitor.services:
+        return monitor.services[name]
+    # Quitar .service suffix
+    clean = name[:-len(".service")] if name.endswith(".service") else name
+    if clean in monitor.services:
+        return monitor.services[clean]
+    # Mapeo explícito entre id del megapanel y nombre del health-monitor
+    PANEL_TO_HEALTH = {
+        "qwen.service": "qwen7b",
+        "qwen35b.service": "qwen35b",
+        "qwen9b.service": "qwen9b",
+        "whisper.service": "whisper",
+        "yolo-server.service": "yolo",
+        "qwen14b.service": "qwen14b",
+    }
+    if clean in PANEL_TO_HEALTH:
+        mapped = PANEL_TO_HEALTH[clean]
+        if mapped in monitor.services:
+            return monitor.services[mapped]
+    # Búsqueda fuzzy por substring
+    for sname, svc in monitor.services.items():
+        if clean == sname or sname in clean or clean in sname:
+            return svc
+    return None
+
+
 async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
         line = await asyncio.wait_for(reader.readline(), timeout=10)
@@ -578,7 +615,7 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                          b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         elif path.startswith("/restart/") and method == "POST":
             svc_name = path[len("/restart/"):]
-            svc = monitor.services.get(svc_name)
+            svc = _resolve_service(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
             else:
@@ -587,7 +624,7 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 writer.write(b"HTTP/1.1 " + status + b"\r\n\r\n")
         elif path.startswith("/stop/") and method == "POST":
             svc_name = path[len("/stop/"):]
-            svc = monitor.services.get(svc_name)
+            svc = _resolve_service(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
             else:
@@ -608,7 +645,7 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
         elif path.startswith("/start/") and method == "POST":
             svc_name = path[len("/start/"):]
-            svc = monitor.services.get(svc_name)
+            svc = _resolve_service(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
             else:
@@ -649,7 +686,7 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         elif path.startswith("/resume/") and method == "POST":
             # Resume un servicio pausado (no lo arranca, solo le quita el flag).
             svc_name = path[len("/resume/"):]
-            svc = monitor.services.get(svc_name)
+            svc = _resolve_service(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
             else:
