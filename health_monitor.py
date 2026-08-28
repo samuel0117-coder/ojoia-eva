@@ -53,10 +53,12 @@ COMFYUI_MANAGED = os.environ.get("COMFYUI_MANAGED", "1") == "1"
 class ServiceDef:
     name: str
     port: int
-    level: str  # "system" | "user"
+    level: str  # "system" | "user" | "docker"
     gpu: int  # -1 = CPU
     health_path: str  # URL path for health check, e.g. "/health"
     critical: bool = True
+    # docker-only: container name (when level == "docker")
+    container: str = ""
     # runtime state
     last_ok: bool = True
     failures: int = 0
@@ -67,6 +69,8 @@ class ServiceDef:
 
 
 # Tabla maestra: fuente de verdad de todos los servicios
+# Los modelos IA corren en Docker (level="docker", container=<nombre>).
+# El health-monitor los gestiona directamente con `docker start/restart`.
 SERVICES = [
     # CPU - OjoIA core
     ServiceDef("tunnel.service", 0, "system", -1, "", critical=True),
@@ -76,24 +80,24 @@ SERVICES = [
     # los revive solo via Restart=on-failure. El monitor sigue chequeando el estado
     # (visible en megapanel) pero NO intenta reiniciarlos.
     ServiceDef("api-eva.service", 8005, "system", -1, "/health", critical=True, disabled_restart=True),
-    ServiceDef("yolo-server.service", 8002, "system", 1, "", critical=False),
-    # GPU 0 - Qwen 9B (vLLM) + Whisper
-    ServiceDef("qwen9b.service", 8018, "system", 0, "/v1/models", critical=True, disabled_restart=True),
-    ServiceDef("whisper.service", 8008, "system", 1, "/health", critical=True),
-    # GPU 1 - Qwen 7B (sglang) + Qwen 35B (llama.cpp)
-    ServiceDef("qwen.service", 8004, "system", 1, "/v1/models", critical=True, disabled_restart=True),
-    ServiceDef("qwen35b.service", 8019, "system", 1, "/health", critical=True, disabled_restart=True),
+    # ── GPU 0 - Qwen 9B (vLLM) + Whisper (Docker) ──
+    ServiceDef("qwen9b", 8018, "docker", 0, "/v1/models", critical=True,
+               container="ai-qwen-9b-1"),
+    ServiceDef("whisper", 8008, "docker", 1, "/health", critical=True,
+               container="whisper-turbo"),
+    # ── GPU 1 - Qwen 7B (sglang) + Qwen 35B (llama.cpp) + YOLO (Docker) ──
+    ServiceDef("qwen7b", 8004, "docker", 1, "/health", critical=True,
+               container="qwen-7b"),
+    ServiceDef("qwen35b", 8019, "docker", 1, "/health", critical=True,
+               container="qwen-35b-a3b"),
+    ServiceDef("yolo", 8002, "docker", 1, "/health", critical=False,
+               container="yolo-pose"),
     # CPU - ChatRD
     ServiceDef("chatrd.service", 8010, "user", -1, "/health", critical=True),
     ServiceDef("admin_panel.service", 8030, "user", -1, "/health", critical=False),
-    # GPU 2 - CineIA (carga diferida)
-    ServiceDef("comfyui.service", 8006, "user", 2, "/system_stats",
-              critical=False, disabled_restart=True if COMFYUI_MANAGED else False),
-    ServiceDef("movie_server.service", 8090, "user", 2, "/health", critical=True),
-    ServiceDef("cineia_studio_server.service", 8095, "user", -1, "/health", critical=True),
-    ServiceDef("post_server.service", 8014, "user", 2, "/", critical=False),
-    ServiceDef("audio_server.service", 8013, "user", 2, "/", critical=False),
-    ServiceDef("f5_tts_server.service", 8017, "user", 2, "/", critical=False),
+    # NOTA: los servicios CineIA (comfyui, movie_server, post_server, audio_server,
+    # f5_tts_server, cineia_studio_server) viven en el nodo CineIA (10.0.0.103),
+    # no en este nodo. El health-monitor de CineIA los monitorea allá.
 ]
 
 # Directorio de logs
@@ -183,6 +187,40 @@ class HealthMonitor:
         except Exception:
             return "unknown"
 
+    # ---------- Docker support ----------
+
+    async def _docker_active(self, svc: ServiceDef) -> bool:
+        """Devuelve True si el contenedor Docker está corriendo."""
+        if not svc.container:
+            return False
+        try:
+            r = await asyncio.create_subprocess_exec(
+                "docker", "inspect", svc.container,
+                "--format", "{{.State.Running}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(r.communicate(), timeout=5)
+            return out.decode().strip() == "true"
+        except Exception:
+            return False
+
+    async def _docker_state(self, svc: ServiceDef) -> str:
+        """Devuelve el estado Docker: running|exited|dead|restarting|paused|created|absent."""
+        if not svc.container:
+            return "absent"
+        try:
+            r = await asyncio.create_subprocess_exec(
+                "docker", "inspect", svc.container,
+                "--format", "{{.State.Status}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(r.communicate(), timeout=5)
+            return out.decode().strip() or "absent"
+        except Exception:
+            return "absent"
+
     # ---------- GPU monitoring ----------
 
     async def _gpu_status(self) -> list[dict]:
@@ -235,6 +273,10 @@ class HealthMonitor:
             if now - svc.last_restart < delay:
                 return False
 
+        # Docker: restart directo del contenedor
+        if svc.level == "docker":
+            return await self._restart_docker(svc)
+
         # stop first (kill orphan processes on port)
         if svc.port:
             try:
@@ -271,9 +313,38 @@ class HealthMonitor:
             self.log(f"{svc.name}: restart error: {e}", "ERROR")
             return False
 
+    async def _restart_docker(self, svc: ServiceDef):
+        """Reinicia un contenedor Docker con backoff."""
+        if not svc.container:
+            self.log(f"{svc.name}: no container name", "ERROR")
+            return False
+        now = time.time()
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "docker", "restart", svc.container,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await asyncio.wait_for(p.communicate(), timeout=60)
+            if p.returncode == 0:
+                svc.last_restart = now
+                svc.consecutive_failures += 1
+                self.log(f"{svc.name} ({svc.container}): docker restart OK (attempt #{svc.consecutive_failures})")
+                return True
+            else:
+                self.log(f"{svc.name} ({svc.container}): docker restart FAILED: {err.decode()[:200]}", "ERROR")
+                return False
+        except Exception as e:
+            self.log(f"{svc.name} ({svc.container}): docker restart error: {e}", "ERROR")
+            return False
+
     # ---------- per-service check ----------
 
     async def _check_one(self, svc: ServiceDef):
+        # Docker: check directo del contenedor
+        if svc.level == "docker":
+            return await self._check_docker(svc)
+
         # 1) port check
         port_ok = await self._port_open(svc.port) if svc.port else await self._service_active(svc)
         # 2) http health (if port ok and path defined)
@@ -320,6 +391,50 @@ class HealthMonitor:
             else:
                 self.log(f"{svc.name}: DOWN (non-critical, no auto-restart)", "WARN")
 
+    async def _check_docker(self, svc: ServiceDef):
+        """Health check para contenedores Docker."""
+        # 1) container running
+        container_ok = await self._docker_active(svc)
+        # 2) port + http
+        port_ok = await self._port_open(svc.port) if svc.port else container_ok
+        http_ok = True
+        if port_ok and svc.health_path:
+            http_ok = await self._http_ok(f"http://localhost:{svc.port}{svc.health_path}", timeout=3)
+
+        is_healthy = container_ok and port_ok and http_ok
+        svc.last_ok = is_healthy
+
+        if is_healthy:
+            if svc.consecutive_failures > 0 and (time.time() - svc.last_restart) > 120:
+                self.log(f"{svc.name} ({svc.container}): RECOVERED after {svc.consecutive_failures} restarts")
+                svc.consecutive_failures = 0
+            svc.loading_since = 0.0
+        else:
+            # grace window para carga de modelos pesados (qwen-35b tarda minutos)
+            state = await self._docker_state(svc)
+            now = time.time()
+            if state in ("starting", "restarting", "created"):
+                if svc.loading_since == 0.0:
+                    svc.loading_since = now
+                if now - svc.loading_since < 900:  # 15 min de gracia
+                    self.log(f"{svc.name} ({svc.container}): cargando ({state}) — grace {int(now - svc.loading_since)}s", "INFO")
+                    return
+                self.log(f"{svc.name} ({svc.container}): lleva >15min en {state} — reiniciando", "WARN")
+                svc.loading_since = 0.0
+            elif svc.last_restart and (now - svc.last_restart) < 900:
+                self.log(f"{svc.name} ({svc.container}): reiniciado hace {int(now - svc.last_restart)}s — grace", "INFO")
+                return
+            else:
+                svc.loading_since = 0.0
+            svc.failures += 1
+            if svc.critical and svc.consecutive_failures < 6:
+                self.log(f"{svc.name} ({svc.container}): DOWN (container={container_ok}, port={port_ok}, http={http_ok}) — auto-restart", "WARN")
+                await self._restart_service(svc)
+            elif svc.critical:
+                self.log(f"{svc.name} ({svc.container}): DOWN — too many failures", "ERROR")
+            else:
+                self.log(f"{svc.name} ({svc.container}): DOWN (non-critical)", "WARN")
+
     # ---------- main loop ----------
 
     async def _check_all(self):
@@ -364,6 +479,7 @@ class HealthMonitor:
                     "port": s.port,
                     "level": s.level,
                     "gpu": s.gpu,
+                    "container": s.container,
                     "healthy": s.last_ok,
                     "failures": s.failures,
                     "consecutive_failures": s.consecutive_failures,
@@ -416,6 +532,10 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             svc = monitor.services.get(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            elif svc.level == "docker":
+                p = await asyncio.create_subprocess_exec("docker", "stop", svc.container)
+                await p.communicate()
+                writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
             else:
                 cmd = ["systemctl"]
                 if svc.level == "user":
@@ -429,6 +549,10 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             svc = monitor.services.get(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            elif svc.level == "docker":
+                p = await asyncio.create_subprocess_exec("docker", "start", svc.container)
+                await p.communicate()
+                writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
             else:
                 cmd = ["systemctl"]
                 if svc.level == "user":
