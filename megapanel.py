@@ -135,45 +135,53 @@ async def _require_auth(request: Request, call_next):
     return await call_next(request)
 
 
-# ─── Tabla maestra de servicios (idéntica al health_monitor) ─────────────────
+# ─── Tabla maestra de servicios — cineia (este nodo) ────────────────────────
+# Arquitectura de cineia:
+#   GPU 0+1 → H3 ComfyUI workers (h3-gpu0, h3-gpu1, venv_f5 NVMe)
+#   GPU 2   → Flux (docker) + F5-TTS (docker v2) + RealESRGAN (systemd)
+#   CPU/RAM → movie_server, post_server, studio, musicgen, audioldm2,
+#             sadtalker, redis, nginx, tunnel
+#
+# Reglas:
+#   1. Solo servicios con unit file real Y corriendo (active/enabled) en este nodo.
+#   2. Cero duplicados (si hay cineia-X y X, solo cineia-X).
+#   3. Cero servicios de otros nodos (qwen14b, etc.).
+#   4. Cero stubs (service-bus, stable-audio, etc.).
+#   Ver MEGAPANEL_SERVICIOS_CINEIA.md para el inventario completo.
 
 SERVICES = [
+    # ── Red / Infraestructura ──
     {"id": "tunnel.service", "port": 0, "level": "system", "gpu": -1, "name": "Cloudflare Tunnel", "kind": "network"},
-    {"id": "api-eva.service", "port": 8005, "level": "system", "gpu": -1, "name": "OjoIA API Eva", "kind": "api"},
-    {"id": "qwen.service", "port": 8004, "level": "system", "gpu": 0, "name": "Qwen VL-7B (SGLang)", "kind": "llm"},
-    {"id": "whisper.service", "port": 8008, "level": "system", "gpu": 1, "name": "Whisper Turbo ASR", "kind": "asr"},
-    {"id": "yolo-server.service", "port": 8002, "level": "system", "gpu": 1, "name": "YOLO Pose", "kind": "vision"},
-    {"id": "qwen14b.service", "port": 8015, "level": "user", "gpu": 1, "name": "Qwen 14B (SGLang)", "kind": "llm"},
-    {"id": "chatrd.service", "port": 8010, "level": "user", "gpu": -1, "name": "ChatRD API", "kind": "api"},
-    {"id": "admin_panel.service", "port": 8030, "level": "user", "gpu": -1, "name": "ChatRD Admin (legacy)", "kind": "api"},
-    {"id": "comfyui.service", "port": 8006, "level": "user", "gpu": 2, "name": "ComfyUI (Wan)", "kind": "image", "managed": True},
-    {"id": "movie_server.service", "port": 8090, "level": "user", "gpu": 2, "name": "CineIA Movie Server", "kind": "video"},
+    {"id": "redis-ojoia.service", "port": 6379, "level": "system", "gpu": -1, "name": "Redis OjoIA", "kind": "infra"},
+
+    # ── CPU/RAM — CineIA core (Studio, Movie, Post) ──
     {"id": "cineia_studio_server.service", "port": 8095, "level": "user", "gpu": -1, "name": "CineIA Studio API", "kind": "api"},
-    {"id": "post_server.service", "port": 8014, "level": "user", "gpu": 2, "name": "Post-Production (RIFE/Lipsync)", "kind": "post"},
-    {"id": "audio_server.service", "port": 8013, "level": "user", "gpu": 2, "name": "Audio Server (MusicGen)", "kind": "audio"},
-    {"id": "f5_tts_server.service", "port": 8017, "level": "user", "gpu": 2, "name": "F5-TTS", "kind": "audio"},
-    {"id": "health-monitor.service", "port": 9000, "level": "user", "gpu": -1, "name": "Health Monitor (this)", "kind": "infra"},
+    {"id": "movie_server.service", "port": 8090, "level": "user", "gpu": 0, "name": "CineIA Movie Server (Wan)", "kind": "video"},
+    {"id": "post_server.service", "port": 8014, "level": "user", "gpu": 1, "name": "Post-Production (RIFE/Wav2Lip)", "kind": "post"},
 
-    # ── Stack CineIA nuevo (Docker, ver docker-compose.h3.yml) ──
-    # Solo containers que realmente existen en este nodo (cineia):
-    #   cineia-flux (UP, GPU 2). Los demás servicios CineIA (h3-worker, f5tts
-    #   CPU, musicgen, realesrgan, stable-audio, sadtalker, redis) NO están
-    #   definidos en el compose actual y se omiten para no mostrar DOWN fantasma.
-    {"id": "cineia-flux", "port": 8020, "level": "docker", "gpu": 2, "name": "Flux GGUF (master images + batch)", "kind": "image", "managed": "docker", "container": "cineia-flux", "compose_file": "/home/sam/proyecto movie/docker-compose.h3.yml"},
+    # ── CPU/RAM — Modelos auxiliares ──
+    {"id": "cineia-audioldm2.service", "port": 8013, "level": "user", "gpu": -1, "name": "AudioLDM2 SFX", "kind": "audio"},
+    {"id": "cineia-sadtalker.service", "port": 8022, "level": "user", "gpu": -1, "name": "SadTalker Lipsync", "kind": "lipsync"},
+    {"id": "cineia-musicgen.service", "port": 8023, "level": "user", "gpu": -1, "name": "MusicGen", "kind": "audio"},
 
-    # ── Service Bus (OpenAI-compatible) ──
-    {"id": "service-bus", "port": 8200, "level": "system", "gpu": -1, "name": "Service Bus (OpenAI API)", "kind": "infra"},
+    # ── GPU 0+1 — H3 ComfyUI workers ──
+    {"id": "h3-gpu0.service", "port": 8189, "level": "user", "gpu": 0, "name": "H3 ComfyUI Worker GPU 0", "kind": "image"},
+    {"id": "h3-gpu1.service", "port": 8190, "level": "user", "gpu": 1, "name": "H3 ComfyUI Worker GPU 1", "kind": "image"},
+
+    # ── GPU 2 — Flux (docker) + RealESRGAN (systemd) ──
+    {"id": "cineia-flux", "port": 8020, "level": "docker", "gpu": 2, "name": "Flux (docker, también usado por otras instancias)",
+     "kind": "image", "managed": "docker", "container": "cineia-flux", "compose_file": "/home/sam/proyecto movie/docker-compose.h3.yml"},
+    {"id": "cineia-realesrgan.service", "port": 8021, "level": "user", "gpu": 2, "name": "RealESRGAN (GPU 2)", "kind": "upscale"},
+
+    # ── Servicios de control (no de inferencia) ──
+    {"id": "health-monitor.service", "port": 9000, "level": "user", "gpu": -1, "name": "Health Monitor", "kind": "infra"},
+    {"id": "megapanel.service", "port": 9001, "level": "user", "gpu": -1, "name": "Megapanel (este panel)", "kind": "infra"},
+    {"id": "tunnel-killer.service", "port": 0, "level": "user", "gpu": -1, "name": "Tunnel Killer (legacy QUIC)", "kind": "infra"},
 ]
 
-# ── DOCKER_MAP: service_id -> container name (para start/stop via docker) ──
+# ── DOCKER_MAP: service_id -> container name ──
 DOCKER_MAP = {
-    "qwen9b.service":  "ai-qwen-9b-1",
-    "qwen.service":    "qwen-7b",
-    "qwen35b.service": "qwen-35b-a3b",
-    "whisper.service": "whisper-turbo",
-    "yolo-server.service": "yolo-pose",
-    # CineIA Docker (solo los que existen realmente en este nodo)
-    "cineia-flux":     "cineia-flux",
+    "cineia-flux": "cineia-flux",
 }
 
 # ── Nodos remotos configurados (CINEIA_AGENT_URL en ojoia.env apunta al nodo
