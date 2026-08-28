@@ -66,6 +66,14 @@ class ServiceDef:
     last_restart: float = 0.0
     disabled_restart: bool = False  # set True for comfyui-managed
     loading_since: float = 0.0  # timestamp since detected "activating" (grace window)
+    # PAUSED: cuando el operador hace stop desde el panel, este flag queda en True
+    # y el health-monitor NO auto-reinicia. Solo se resetea con /resume o /start.
+    paused: bool = False
+    paused_at: float = 0.0  # timestamp del pause
+    # MUTUALLY_EXCLUSIVE_WITH: lista de servicios que NO pueden correr al mismo
+    # tiempo en la misma GPU (ej: qwen-7b y qwen-35b compiten por 24GB).
+    # Cuando uno arranca, el otro se pausa automáticamente.
+    mutually_exclusive_with: list = field(default_factory=list)
 
 
 # Tabla maestra: fuente de verdad de todos los servicios
@@ -86,11 +94,12 @@ SERVICES = [
     ServiceDef("whisper", 8008, "docker", 1, "/health", critical=True,
                container="whisper-turbo"),
     # ── GPU 1 - Qwen 7B (sglang) + Qwen 35B (llama.cpp) + YOLO (Docker) ──
+    # qwen-7b y qwen-35b son MUTUAMENTE EXCLUSIVOS: juntos no caben en 24GB.
     ServiceDef("qwen7b", 8004, "docker", 1, "/health", critical=True,
-               container="qwen-7b"),
+               container="qwen-7b", mutually_exclusive_with=["qwen35b"]),
     ServiceDef("qwen35b", 8019, "docker", 1, "/health", critical=True,
-               container="qwen-35b-a3b"),
-    ServiceDef("yolo", 8002, "docker", 1, "/health", critical=False,
+               container="qwen-35b-a3b", mutually_exclusive_with=["qwen7b"]),
+    ServiceDef("yolo", 8002, "docker", 1, "/health", critical=True,
                container="yolo-pose"),
     # CPU - ChatRD
     ServiceDef("chatrd.service", 8010, "user", -1, "/health", critical=True),
@@ -266,6 +275,29 @@ class HealthMonitor:
             self.log(f"{svc.name}: restart DISABLED (managed by operator)", "WARN")
             return False
 
+        # Si está pausado por el operador, NO reiniciar.
+        if svc.paused:
+            self.log(f"{svc.name}: restart SKIPPED (paused by operator)", "INFO")
+            return False
+
+        # ── Exclusividad: si tiene exclusivos corriendo en la misma GPU, ──────
+        # pausarlos ANTES de arrancar este. Caso típico: qwen-7b y qwen-35b
+        # no caben juntos en 24GB de GPU1. Si el operador quiere cambiar,
+        # paramos el que está corriendo y arrancamos el otro.
+        for exclusive_name in svc.mutually_exclusive_with:
+            other = self.services.get(exclusive_name)
+            if other and not other.paused and await self._docker_active(other):
+                self.log(
+                    f"{svc.name}: arrancando — pausando {other.name} "
+                    f"(exclusividad GPU{svc.gpu}, no caben juntos)",
+                    "WARN"
+                )
+                other.paused = True
+                other.paused_at = time.time()
+                await self._stop_docker(other)
+                # esperar a que libere VRAM (puede tardar 5-10s)
+                await asyncio.sleep(8)
+
         now = time.time()
         # backoff: 30s, 60s, 120s, 240s, max 600s
         if svc.consecutive_failures > 0:
@@ -337,6 +369,20 @@ class HealthMonitor:
         except Exception as e:
             self.log(f"{svc.name} ({svc.container}): docker restart error: {e}", "ERROR")
             return False
+
+    async def _stop_docker(self, svc: ServiceDef):
+        """Para un contenedor Docker."""
+        if not svc.container:
+            return
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "docker", "stop", svc.container,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(p.communicate(), timeout=30)
+        except Exception:
+            pass
 
     # ---------- per-service check ----------
 
@@ -481,6 +527,8 @@ class HealthMonitor:
                     "gpu": s.gpu,
                     "container": s.container,
                     "healthy": s.last_ok,
+                    "paused": s.paused,
+                    "paused_at": int(s.paused_at) if s.paused_at else None,
                     "failures": s.failures,
                     "consecutive_failures": s.consecutive_failures,
                     "last_restart": int(s.last_restart) if s.last_restart else None,
@@ -532,34 +580,72 @@ async def _api_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             svc = monitor.services.get(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
-            elif svc.level == "docker":
-                p = await asyncio.create_subprocess_exec("docker", "stop", svc.container)
-                await p.communicate()
-                writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
             else:
-                cmd = ["systemctl"]
-                if svc.level == "user":
-                    cmd.append("--user")
-                cmd += ["stop", svc.name]
-                p = await asyncio.create_subprocess_exec(*cmd)
-                await p.communicate()
+                # Marcar como PAUSED para que el health-monitor NO lo auto-reinicie.
+                svc.paused = True
+                svc.paused_at = time.time()
+                monitor.log(f"{svc.name}: PAUSED (stop manual del operador)", "INFO")
+                if svc.level == "docker":
+                    p = await asyncio.create_subprocess_exec("docker", "stop", svc.container)
+                    await p.communicate()
+                else:
+                    cmd = ["systemctl"]
+                    if svc.level == "user":
+                        cmd.append("--user")
+                    cmd += ["stop", svc.name]
+                    p = await asyncio.create_subprocess_exec(*cmd)
+                    await p.communicate()
                 writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
         elif path.startswith("/start/") and method == "POST":
             svc_name = path[len("/start/"):]
             svc = monitor.services.get(svc_name)
             if not svc:
                 writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
-            elif svc.level == "docker":
-                p = await asyncio.create_subprocess_exec("docker", "start", svc.container)
-                await p.communicate()
-                writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
             else:
-                cmd = ["systemctl"]
-                if svc.level == "user":
-                    cmd.append("--user")
-                cmd += ["start", svc.name]
-                p = await asyncio.create_subprocess_exec(*cmd)
-                await p.communicate()
+                # Limpiar el flag de PAUSED al arrancar manualmente.
+                svc.paused = False
+                svc.paused_at = 0.0
+                svc.consecutive_failures = 0  # reset failures
+                # Exclusividad: pausar los exclusivos que estén corriendo.
+                for ex_name in svc.mutually_exclusive_with:
+                    other = monitor.services.get(ex_name)
+                    if other and not other.paused:
+                        st = monitor._docker_state(other)
+                        if st == "running":
+                            monitor.log(
+                                f"{svc.name}: iniciando — pausando exclusivo {other.name}",
+                                "WARN"
+                            )
+                            other.paused = True
+                            other.paused_at = time.time()
+                            try:
+                                p = await asyncio.create_subprocess_exec("docker", "stop", other.container)
+                                await asyncio.wait_for(p.communicate(), timeout=30)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(8)  # esperar a que libere VRAM
+                monitor.log(f"{svc.name}: RESUMED (start manual del operador)", "INFO")
+                if svc.level == "docker":
+                    p = await asyncio.create_subprocess_exec("docker", "start", svc.container)
+                    await p.communicate()
+                else:
+                    cmd = ["systemctl"]
+                    if svc.level == "user":
+                        cmd.append("--user")
+                    cmd += ["start", svc.name]
+                    p = await asyncio.create_subprocess_exec(*cmd)
+                    await p.communicate()
+                writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
+        elif path.startswith("/resume/") and method == "POST":
+            # Resume un servicio pausado (no lo arranca, solo le quita el flag).
+            svc_name = path[len("/resume/"):]
+            svc = monitor.services.get(svc_name)
+            if not svc:
+                writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            else:
+                svc.paused = False
+                svc.paused_at = 0.0
+                monitor.log(f"{svc.name}: RESUMED flag cleared", "INFO")
                 writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
         elif path == "/gpu":
             gpus = await monitor._gpu_status()

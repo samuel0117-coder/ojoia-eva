@@ -474,7 +474,13 @@ async def logs(service_id: str, lines: int = 100):
 
 @app.post("/api/control/{service_id}/{action}")
 async def control(service_id: str, action: str):
-    """Controlar servicio: start | stop | restart | enable | disable."""
+    """Controlar servicio: start | stop | restart | enable | disable.
+
+    Para servicios Docker, coordina con el health-monitor via HTTP para:
+    - stop: marca `paused=True` (no se auto-reinicia)
+    - start: marca `paused=False` y resetea failures
+    - restart: marca `paused=False` antes del docker restart
+    """
     if action not in ("start", "stop", "restart", "enable", "disable"):
         raise HTTPException(400, "action must be start|stop|restart|enable|disable")
     if not service_id.endswith(".service"):
@@ -483,20 +489,47 @@ async def control(service_id: str, action: str):
     # ── Servicio Docker: mapear y ejecutar docker directamente ──────────────
     if service_id in DOCKER_MAP:
         container = DOCKER_MAP[service_id]
-        docker_actions = {
-            "start":   f"docker start {container}",
-            "stop":    f"docker stop {container}",
-            "restart": f"docker restart {container}",
-            "enable":  f"docker start {container}",
-            "disable": f"docker stop {container}",
-        }
-        if action not in docker_actions:
-            raise HTTPException(400, f"action invalida: {action}")
-        cmd = docker_actions[action]
+        # Sincronizar el flag paused con el health-monitor
+        async with httpx.AsyncClient(timeout=5) as c:
+            if action == "stop" or action == "disable":
+                try:
+                    await c.post(f"{HEALTH_MONITOR_URL}/stop/{service_id}")
+                except Exception:
+                    pass
+                cmd = f"docker stop {container}"
+            elif action == "start" or action == "enable":
+                try:
+                    await c.post(f"{HEALTH_MONITOR_URL}/start/{service_id}")
+                except Exception:
+                    pass
+                cmd = f"docker start {container}"
+            elif action == "restart":
+                try:
+                    await c.post(f"{HEALTH_MONITOR_URL}/start/{service_id}")
+                except Exception:
+                    pass
+                cmd = f"docker restart {container}"
+            else:
+                raise HTTPException(400, f"action invalida: {action}")
         out = run_cmd(cmd, timeout=60)
         result = out or "ok"
         return {"service": service_id, "action": action,
                 "type": "docker", "container": container, "result": result}
+
+    # Para servicios systemd (level=system|user), el endpoint /stop y /start
+    # del health-monitor los maneja también.
+    if action == "stop":
+        async with httpx.AsyncClient(timeout=5) as c:
+            try:
+                await c.post(f"{HEALTH_MONITOR_URL}/stop/{service_id}")
+            except Exception:
+                pass
+    elif action == "start" or action == "restart":
+        async with httpx.AsyncClient(timeout=5) as c:
+            try:
+                await c.post(f"{HEALTH_MONITOR_URL}/start/{service_id}")
+            except Exception:
+                pass
 
     level = "user"
     node = "ojoia"
@@ -865,6 +898,8 @@ th { color: var(--muted); font-weight: normal; font-size: 11px; text-transform: 
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
 .dot-on { background: var(--green); }
 .dot-off { background: var(--red); }
+.dot-paused { background: var(--yellow); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 .tag { padding: 2px 6px; border-radius: 3px; background: rgba(88,166,255,.15); color: var(--blue); font-size: 11px; margin-right: 4px; }
 .tag.g0 { background: rgba(188,140,255,.15); color: var(--purple); }
 .tag.g1 { background: rgba(63,185,80,.15); color: var(--green); }
@@ -1164,20 +1199,24 @@ async function refresh(){
     `;
     // services
     document.getElementById('svc-count').textContent = '(' + s.services.length + ')';
-    document.getElementById('services').innerHTML = s.services.map(sv=>`
-      <tr>
-        <td>${sv.name}<div style="color:var(--muted);font-size:11px">${sv.id}</div></td>
+    document.getElementById('services').innerHTML = s.services.map(sv=>{
+      const isPaused = sv.paused;
+      const state = isPaused ? 'PAUSADO' : (sv.active ? 'OK' : (sv.docker ? (sv.docker_state || 'DOWN') : 'DOWN'));
+      const dotClass = isPaused ? 'dot-paused' : (sv.active ? 'dot-on' : 'dot-off');
+      return `<tr ${isPaused?'style="opacity:0.6"':''}>
+        <td>${sv.name}${isPaused?' <span class="pill L5" style="font-size:9px">⏸ paused</span>':''}<div style="color:var(--muted);font-size:11px">${sv.id}</div></td>
         <td>${sv.port||'-'}</td>
         <td>${gpuTag(sv.gpu)}</td>
-        <td><span class="dot ${sv.active?'dot-on':'dot-off'}"></span>${sv.active?'OK':(sv.docker?sv.docker_state:'DOWN')}</td>
+        <td><span class="dot ${dotClass}"></span>${state}</td>
         <td style="color:var(--muted);font-size:11px">${sv.enabled||'-'}</td>
         <td>
-          <button class="s" onclick="control('${sv.id}','start')">▶</button>
-          <button class="r" onclick="control('${sv.id}','stop')">■</button>
-          <button onclick="control('${sv.id}','restart')">↻</button>
+          <button class="s" onclick="control('${sv.id}','start')" title="Iniciar${isPaused?' (resume)':''}">▶</button>
+          <button class="r" onclick="control('${sv.id}','stop')" title="${isPaused?'Ya pausado':'Parar y pausar'}">■</button>
+          <button onclick="control('${sv.id}','restart')" title="${isPaused?'Inicia primero':'Reiniciar'}">↻</button>
           <button onclick="loadSvcLog('${sv.id}')">logs</button>
         </td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
     // overview: servicios criticos resumidos
     if(document.getElementById('ov-svcs-list')){
       const crit = s.services.filter(sv=>sv.id.includes('qwen')||sv.id.includes('tunnel')||sv.id.includes('eva'));
@@ -1417,6 +1456,8 @@ if __name__ == "__main__":
     # Si firebase-key.json está disponible, empuja el estado a /nodes/{id} y
     # pull comandos de /control/{id}/cmds. También sincroniza billing a
     # /billing/global/* para alimentar la SPA web (megapanel-ojoia.web.app).
+    # IMPORTANTE: las frecuencias son conservadoras para evitar 429 Quota
+    # exceeded del free tier de Firestore (~1 write/sec/sustained).
     try:
         from ojoia_sync import OjoiaSync
         _sync = OjoiaSync(node_id=NODE_ID)
@@ -1424,17 +1465,23 @@ if __name__ == "__main__":
             def _sync_worker():
                 import asyncio
                 async def _loop():
+                    SYNC_INTERVAL = 15  # push status cada 15s (era 5s)
+                    BILLING_INTERVAL = 180  # billing cada 3min (era 60s)
                     last_billing = 0.0
+                    last_status = 0.0
                     while True:
-                        # Push status (la función status es async)
-                        try:
-                            status_data = status() if callable(status) else {}
-                            if asyncio.iscoroutine(status_data):
-                                status_data = await status_data
-                            _sync.push_status(status_data)
-                        except Exception as _e:
-                            print(f"[ojoia_sync] push error: {_e}")
-                        # Poll commands (control es async)
+                        now = asyncio.get_event_loop().time()
+                        # Push status
+                        if (now - last_status) >= SYNC_INTERVAL:
+                            try:
+                                status_data = status() if callable(status) else {}
+                                if asyncio.iscoroutine(status_data):
+                                    status_data = await status_data
+                                _sync.push_status(status_data)
+                                last_status = now
+                            except Exception as _e:
+                                print(f"[ojoia_sync] push error: {_e}")
+                        # Poll commands
                         try:
                             ctrl = control if callable(control) else None
                             if ctrl and asyncio.iscoroutinefunction(ctrl):
@@ -1443,19 +1490,19 @@ if __name__ == "__main__":
                                 _sync.poll_control(ctrl)
                         except Exception as _e:
                             print(f"[ojoia_sync] poll error: {_e}")
-                        # Billing sync cada 60s
-                        now = asyncio.get_event_loop().time()
-                        if (now - last_billing) >= 60:
+                        # Billing sync (mucho menos frecuente)
+                        if (now - last_billing) >= BILLING_INTERVAL:
                             try:
                                 _sync.push_billing(_sync.billing_provider())
                                 last_billing = now
                             except Exception as _e:
                                 print(f"[ojoia_sync] billing sync error: {_e}")
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(2)  # pequeño tick para no quemar CPU
                 asyncio.run(_loop())
             t = _threading.Thread(target=_sync_worker, daemon=True)
             t.start()
-            print(f"[megapanel] ojoia_sync iniciado para nodo={NODE_ID}")
+            print(f"[megapanel] ojoia_sync iniciado para nodo={NODE_ID} "
+                  f"(status=15s, billing=3min)")
     except Exception as e:
         print(f"[megapanel] ojoia_sync no disponible: {e}")
 
