@@ -4,18 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OjoIA Megapanel — Cluster</title>
-<!-- Firebase App + Auth + Firestore (compat, v9 via compat) -->
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-:root{--bg:#0f1115;--panel:#1a1d24;--fg:#e6e9ef;--muted:#8b93a3;--g0:#22c55e;--g1:#3b82f6;--g2:#a855f7;--err:#ef4444;--warn:#f59e0b}
+:root{--bg:#0f1115;--panel:#1a1d24;--fg:#e6e9ef;--muted:#8b93a3;--g0:#22c55e;--g1:#3b82f6;--g2:#a855f7;--err:#ef4444;--warn:#f59e0b;--border:#2a2e38}
 *{box-sizing:border-box;margin:0}
-body{background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;padding:20px}
-h1{font-size:20px;margin-bottom:4px}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;padding:0}
+h1{font-size:20px;margin:0 0 4px}
 h3{font-size:15px;margin:10px 0 6px}
 .muted{color:var(--muted);font-size:12px}
-.card{background:var(--panel);border:1px solid #2a2e38;border-radius:10px;padding:16px;margin:12px 0}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin:12px 0}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #262a33}
 th{color:var(--muted);font-weight:600;font-size:12px}
@@ -31,10 +31,13 @@ th{color:var(--muted);font-weight:600;font-size:12px}
 button{background:#262b36;color:var(--fg);border:1px solid #333a47;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
 button:hover{background:#313848}
 button:disabled{opacity:.4;cursor:not-allowed}
-input[type=email],input[type=password],input[type=text],select{padding:7px;border-radius:6px;border:1px solid #333a47;background:#14171c;color:var(--fg)}
+button.s{color:var(--g0)}
+button.r{color:var(--err)}
+input,select{padding:7px;border-radius:6px;border:1px solid #333a47;background:#14171c;color:var(--fg);font-size:13px}
 .gpu-bar{height:6px;background:#262a33;border-radius:3px;margin-top:6px;overflow:hidden}
 .gpu-bar>div{height:100%}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
 .badge{padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600}
 .badge-ok{background:rgba(34,197,94,.15);color:var(--g0)}
 .badge-err{background:rgba(239,68,68,.15);color:var(--err)}
@@ -42,6 +45,26 @@ input[type=email],input[type=password],input[type=text],select{padding:7px;borde
 .result{background:#0d0f13;border:1px solid #262a33;border-radius:6px;padding:10px;font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto}
 .nodename{font-size:16px;font-weight:700;margin-bottom:2px}
 .online{color:var(--g0)} .offline{color:var(--err)}
+/* Top nav */
+header{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;background:var(--panel);position:sticky;top:0;z-index:10}
+header h1{margin:0;font-size:16px}
+nav.main-nav{display:flex;gap:0;border-bottom:1px solid var(--border);padding:0 20px;background:var(--panel);overflow-x:auto}
+.nav-btn{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:12px 16px;cursor:pointer;font-size:13px;white-space:nowrap}
+.nav-btn:hover{color:var(--fg)}
+.nav-btn.active{color:var(--g1);border-bottom-color:var(--g1);font-weight:600}
+.page{padding:20px;max-width:1500px;margin:0 auto;display:none}
+.page.active{display:block}
+.kpi{font-size:26px;font-weight:700;color:var(--g1)}
+.kpi-grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));margin-bottom:16px}
+.kpi-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center}
+.kpi-label{font-size:11px;color:var(--muted);margin-top:2px}
+canvas{max-width:100%}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.row-err{color:var(--err)}
+.pill{padding:1px 6px;border-radius:3px;font-size:11px}
+.pill.L1{background:rgba(34,197,94,.15);color:var(--g0)}
+.pill.L5{background:rgba(245,158,11,.15);color:var(--warn)}
+.pill.L15{background:rgba(239,68,68,.15);color:var(--err)}
 </style>
 </head>
 <body>
@@ -58,21 +81,123 @@ input[type=email],input[type=password],input[type=text],select{padding:7px;borde
 </div>
 
 <div id="app" style="display:none">
-  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+  <header>
     <div>
-      <h1>📊 OjoIA Megapanel <span class="muted">— Cluster multi-nodo</span></h1>
+      <h1>🖥️ OjoIA Megapanel — <span class="muted">Cluster multi-nodo</span></h1>
       <div class="muted">Firebase: ojoia-67216</div>
     </div>
-    <div style="display:flex;gap:8px;align-items:center">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <span id="user-label" class="muted"></span>
       <select id="node-filter" onchange="refreshNodes()">
         <option value="">TODOS los nodos</option>
       </select>
+      <button onclick="refreshAll()">⟳</button>
       <button onclick="logout()">Salir</button>
+    </div>
+  </header>
+
+  <nav class="main-nav">
+    <button class="nav-btn active" onclick="goPage('overview')">📊 Overview</button>
+    <button class="nav-btn" onclick="goPage('infra')">🏗 Infraestructura</button>
+    <button class="nav-btn" onclick="goPage('billing')">💳 Billing</button>
+    <button class="nav-btn" onclick="goPage('clients')">👥 Clientes</button>
+    <button class="nav-btn" onclick="goPage('reqlog')">📋 Request Log</button>
+    <button class="nav-btn" onclick="goPage('prices')">⚙ Precios/Planes</button>
+  </nav>
+
+  <!-- ═══ Overview: resumen rápido de todo ═══ -->
+  <div id="page-overview" class="page active">
+    <div class="kpi-grid">
+      <div class="kpi-card"><div class="kpi" id="ov-reqs">—</div><div class="kpi-label">Requests 24h</div></div>
+      <div class="kpi-card"><div class="kpi" id="ov-tokens">—</div><div class="kpi-label">Tokens 24h</div></div>
+      <div class="kpi-card"><div class="kpi" id="ov-cost">—</div><div class="kpi-label">Costo 24h</div></div>
+      <div class="kpi-card"><div class="kpi" id="ov-errs">—</div><div class="kpi-label">Errores 24h</div></div>
+      <div class="kpi-card"><div class="kpi" id="ov-svcs">—</div><div class="kpi-label">Servicios OK</div></div>
+      <div class="kpi-card"><div class="kpi" id="ov-nodes">—</div><div class="kpi-label">Nodos online</div></div>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>🖥️ Nodos (status reciente)</h3><div id="ov-nodes-list"></div></div>
+      <div class="card"><h3>💰 Tokens por modelo (24h)</h3><div id="ov-models" style="font-size:13px;line-height:1.8"></div></div>
     </div>
   </div>
 
-  <div id="nodes-container"></div>
+  <!-- ═══ Infraestructura ═══ -->
+  <div id="page-infra" class="page">
+    <div class="toolbar">
+      <select id="node-filter-infra" onchange="refreshInfra()">
+        <option value="">TODOS los nodos</option>
+      </select>
+      <button onclick="refreshInfra()">⟳ Actualizar</button>
+    </div>
+    <div id="nodes-container"></div>
+  </div>
+
+  <!-- ═══ Billing ═══ -->
+  <div id="page-billing" class="page">
+    <div class="toolbar">
+      <select id="bill-window" onchange="loadBilling()">
+        <option value="24">24h</option>
+        <option value="168" selected>7d</option>
+        <option value="720">30d</option>
+      </select>
+      <button onclick="loadBilling()">⟳ Actualizar</button>
+    </div>
+    <div class="kpi-grid">
+      <div class="kpi-card"><div class="kpi" id="kpi-reqs">0</div><div class="kpi-label">Requests</div></div>
+      <div class="kpi-card"><div class="kpi" id="kpi-tokens">0</div><div class="kpi-label">Tokens</div></div>
+      <div class="kpi-card"><div class="kpi" id="kpi-cost">$0</div><div class="kpi-label">Costo</div></div>
+      <div class="kpi-card"><div class="kpi" id="kpi-lat">0ms</div><div class="kpi-label">Lat avg</div></div>
+      <div class="kpi-card"><div class="kpi" id="kpi-err">0</div><div class="kpi-label">Errores</div></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3>📈 Tokens por modelo</h3><div id="by-model"></div></div>
+      <div class="card"><h3>👥 Tokens por cliente</h3><div id="by-client"></div></div>
+    </div>
+    <div id="billing-status" class="muted" style="margin-top:12px"></div>
+  </div>
+
+  <!-- ═══ Clientes ═══ -->
+  <div id="page-clients" class="page">
+    <div class="toolbar">
+      <button onclick="loadClients()">⟳ Actualizar</button>
+    </div>
+    <div class="card">
+      <h3>Clientes (uso mensual)</h3>
+      <div id="clients-list"></div>
+    </div>
+    <div id="clients-status" class="muted" style="margin-top:12px"></div>
+  </div>
+
+  <!-- ═══ Request Log ═══ -->
+  <div id="page-reqlog" class="page">
+    <div class="toolbar">
+      <input id="log-filter-client" placeholder="cliente" style="width:15%">
+      <input id="log-filter-model" placeholder="modelo" style="width:15%">
+      <label style="font-size:13px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-filter-errors"> Solo errores</label>
+      <button onclick="loadReqLog(0)">Buscar</button>
+      <button onclick="loadReqLog(offset-50)">← Anterior</button>
+      <button onclick="loadReqLog(offset+50)">Siguiente →</button>
+      <span id="log-page" class="muted"></span>
+    </div>
+    <table>
+      <thead><tr><th>Hora</th><th>Cliente</th><th>Modelo</th><th>Tokens</th><th>Costo</th><th>Lat</th><th>Status</th></tr></thead>
+      <tbody id="log-body"></tbody>
+    </table>
+    <div id="reqlog-status" class="muted" style="margin-top:12px"></div>
+  </div>
+
+  <!-- ═══ Precios y Planes ═══ -->
+  <div id="page-prices" class="page">
+    <div class="card">
+      <h3>Precios por modelo (por 1M tokens)</h3>
+      <div id="prices-list"></div>
+    </div>
+    <div class="card">
+      <h3>Planes</h3>
+      <div id="plans-list"></div>
+    </div>
+    <div id="prices-status" class="muted" style="margin-top:12px"></div>
+  </div>
 </div>
 
 <script>
@@ -89,6 +214,12 @@ const auth = firebase.auth();
 const db = firebase.firestore();
 
 let nodeFilter = '';
+let _nodes = [];
+let _billing = {};
+let _clients = [];
+let _reqlog = [];
+let _config = {};
+let offset = 0;
 
 function esc(s){ if(s==null) return ''; return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -113,7 +244,7 @@ auth.onAuthStateChanged(u=>{
     document.getElementById('login').style.display='none';
     document.getElementById('app').style.display='block';
     document.getElementById('user-label').textContent = u.email;
-    startListener();
+    startListeners();
   } else {
     document.getElementById('login').style.display='block';
     document.getElementById('app').style.display='none';
@@ -127,37 +258,119 @@ function gpuTag(g){
 function nodeTag(nid, cur){
   return `<span class="tag ${nid===cur?'g0':'g1'}">${esc(nid)}</span>`;
 }
+function pct(p){ if(p==null) return ''; return '<span class="muted">'+p+'%</span>'; }
 
-function startListener(){
-  db.collection('nodes').onSnapshot(async snap=>{
-    const nodes=[];
-    snap.forEach(d=>nodes.push({id:d.id, ...d.data()}));
-    nodes.sort((a,b)=>a.id.localeCompare(b.id));
-    // Llenar filtro de nodos
-    const sel=document.getElementById('node-filter');
-    const current=sel.value;
-    sel.innerHTML='<option value="">TODOS los nodos</option>'+
-      nodes.map(n=>`<option value="${esc(n.id)}">${esc(n.id)}</option>`).join('');
-    if(current) sel.value=current;
-    renderNodes(nodes);
+function goPage(name){
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  event && event.target && event.target.classList.add('active');
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  if(name==='overview') loadOverview();
+  if(name==='infra') refreshInfra();
+  if(name==='billing') loadBilling();
+  if(name==='clients') loadClients();
+  if(name==='reqlog') loadReqLog(0);
+  if(name==='prices') loadPrices();
+}
+
+function refreshAll(){ startListeners(); loadOverview(); }
+
+// ── Listeners de Firestore ──────────────────────────────────────────────
+function startListeners(){
+  // Nodos
+  db.collection('nodes').onSnapshot(snap=>{
+    _nodes=[]; snap.forEach(d=>_nodes.push({id:d.id, ...d.data()}));
+    _nodes.sort((a,b)=>a.id.localeCompare(b.id));
+    updateNodeFilters();
+    if(document.getElementById('page-infra').classList.contains('active')) refreshInfra();
+    if(document.getElementById('page-overview').classList.contains('active')) loadOverview();
+  });
+  // Billing
+  db.collection('billing').doc('global').collection('stats').onSnapshot(snap=>{
+    _billing = {};
+    snap.forEach(d=>{ const x = d.data(); _billing[x.window_h || d.id] = x.data; });
+    if(document.getElementById('page-billing').classList.contains('active')) renderBilling();
+    if(document.getElementById('page-overview').classList.contains('active')) renderOverviewKPIs();
+  });
+  // Clientes
+  db.collection('billing').doc('global').collection('clients_meta').doc('current').onSnapshot(doc=>{
+    if(doc.exists){ _clients = (doc.data().clients) || []; }
+    else { _clients = []; }
+    if(document.getElementById('page-clients').classList.contains('active')) renderClients();
+  });
+  // ReqLog
+  db.collection('billing').doc('global').collection('reqlog').onSnapshot(snap=>{
+    _reqlog = [];
+    snap.forEach(d=>_reqlog.push(d.data()));
+    _reqlog.sort((a,b)=>(b.timestamp||b.synced_at?.seconds||0)-(a.timestamp||a.synced_at?.seconds||0));
+    if(document.getElementById('page-reqlog').classList.contains('active')) renderReqLog();
+  });
+  // Config (precios + planes)
+  db.collection('billing').doc('global').collection('config').doc('current').onSnapshot(doc=>{
+    if(doc.exists){ _config = doc.data().config || {}; }
+    if(document.getElementById('page-prices').classList.contains('active')) renderPrices();
   });
 }
 
-function applyFilter(id){
-  return nodeFilter===''||nodeFilter===id;
+function updateNodeFilters(){
+  const sel=document.getElementById('node-filter');
+  const sel2=document.getElementById('node-filter-infra');
+  const current=sel.value;
+  const current2=sel2.value;
+  const opts='<option value="">TODOS los nodos</option>'+_nodes.map(n=>`<option value="${esc(n.id)}">${esc(n.id)}</option>`).join('');
+  sel.innerHTML=opts; if(current) sel.value=current;
+  sel2.innerHTML=opts; if(current2) sel2.value=current2;
 }
 
-function renderNodes(nodes){
+// ── Overview ────────────────────────────────────────────────────────────
+function loadOverview(){ renderOverviewKPIs(); renderOverviewNodes(); }
+
+function renderOverviewKPIs(){
+  // Suma de los nodos
+  let totalSvcs=0, activeSvcs=0;
+  _nodes.forEach(n=>{ const sv=n.status?.services||[]; totalSvcs+=sv.length; activeSvcs+=sv.filter(s=>s.active).length; });
+  document.getElementById('ov-svcs').textContent = `${activeSvcs}/${totalSvcs}`;
+  document.getElementById('ov-nodes').textContent = `${_nodes.filter(n=>effectiveOnline(n)).length}/${_nodes.length}`;
+  // Billing 24h (suma de todos los nodos que reportan)
+  const s24 = _billing['24h'] || _billing['24'] || {};
+  document.getElementById('ov-reqs').textContent = (s24.total_requests||0).toLocaleString();
+  document.getElementById('ov-tokens').textContent = (s24.total_tokens||0).toLocaleString();
+  document.getElementById('ov-cost').textContent = '$'+(s24.total_cost||0).toFixed(4);
+  document.getElementById('ov-errs').textContent = (s24.errors||0);
+  const byM = Object.entries(s24.by_model||{}).map(([m,v])=>
+    `<div><span class="tag g1">${esc(m)}</span> <b>${(v.tokens||0).toLocaleString()}</b> tok · ${v.requests||0} req</div>`).join('');
+  document.getElementById('ov-models').innerHTML = byM || '<span class="muted">sin datos</span>';
+}
+
+function renderOverviewNodes(){
+  const html = _nodes.map(n=>{
+    const st=n.status||{};
+    return `<div style="padding:6px 0;border-bottom:1px solid var(--border)">
+      <b>${esc(n.id)}</b> ${effectiveOnline(n)?'<span class="online">● online</span>':'<span class="offline">● offline</span>'} ${isStale(n)&&n.online?'<span class="muted" title="Push estancado, nodo probablemente caído">(stale)</span>':''}
+      <span class="muted"> · ${esc(n.hostname||st.hostname||'')} · ${(st.gpus||[]).length} GPUs · ${(st.services||[]).length} svcs</span>
+    </div>`;
+  }).join('');
+  document.getElementById('ov-nodes-list').innerHTML = html || '<span class="muted">Sin nodos</span>';
+}
+
+// ── Infraestructura ─────────────────────────────────────────────────────
+function refreshInfra(){
+  nodeFilter=document.getElementById('node-filter-infra').value;
+  renderNodes();
+}
+
+function renderNodes(){
   const container=document.getElementById('nodes-container');
-  container.innerHTML = nodes.map(n=>{
+  const filtered = _nodes.filter(n=>!nodeFilter||nodeFilter===n.id);
+  container.innerHTML = filtered.map(n=>{
     const st=n.status||{};
     const svcs=(st.services||[]).filter(()=>true);
     const gpus=st.gpus||[];
-    return applyFilter(n.id) ? `
+    return `
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
           <div>
-            <div class="nodename">${esc(n.id)} ${effectiveOnline(n)?'<span class="online">●</span>':'<span class="offline">●</span>'} ${isStale(n)&&n.online?'<span class="muted" title="El push a Firestore está estancado, nodo probablemente caído">(stale)</span>':''}</div>
+            <div class="nodename">${esc(n.id)} ${effectiveOnline(n)?'<span class="online">●</span>':'<span class="offline">●</span>'} ${isStale(n)&&n.online?'<span class="muted" title="Push estancado, nodo probablemente caído">(stale)</span>':''}</div>
             <div class="muted">${esc(n.hostname||st.hostname||'')} · uptime ${Math.floor((st.uptime_s||0)/3600)}h</div>
           </div>
           <span class="muted">actualizado ${ago(n.updated_at)}</span>
@@ -203,9 +416,113 @@ function renderNodes(nodes){
             </table>
           </div>
         </div>
-      </div>` : '';
+      </div>`;
+  }).join('') || '<div class="card muted">Sin nodos</div>';
+}
+
+// ── Billing ─────────────────────────────────────────────────────────────
+function loadBilling(){
+  const h = document.getElementById('bill-window').value;
+  // El listener ya carga _billing; solo pedimos re-render.
+  renderBilling();
+  document.getElementById('billing-status').textContent = `Sincronizado desde Firestore (window: ${h}h). Cada nodo sube su billing cada ~60s.`;
+}
+
+function renderBilling(){
+  const h = document.getElementById('bill-window').value;
+  const s = _billing[h] || _billing[String(h)] || {};
+  document.getElementById('kpi-reqs').textContent = (s.total_requests||0).toLocaleString();
+  document.getElementById('kpi-tokens').textContent = (s.total_tokens||0).toLocaleString();
+  document.getElementById('kpi-cost').textContent = '$'+(s.total_cost||0).toFixed(4);
+  document.getElementById('kpi-lat').textContent = (s.avg_latency_ms||0)+'ms';
+  document.getElementById('kpi-err').textContent = (s.errors||0);
+  const byM = Object.entries(s.by_model||{}).map(([m,v])=>
+    `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span><span class="tag g1">${esc(m)}</span></span><span><b>${(v.tokens||0).toLocaleString()}</b> tok · $${(v.cost||0).toFixed(4)} · ${v.requests||0} req</span></div>`).join('');
+  document.getElementById('by-model').innerHTML = byM || '<span class="muted">sin datos</span>';
+  const byC = Object.entries(s.by_client||{}).map(([c,v])=>
+    `<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span><b>${esc(c)}</b></span><span><b>${(v.tokens||0).toLocaleString()}</b> tok · $${(v.cost||0).toFixed(4)} · ${v.requests||0} req</span></div>`).join('');
+  document.getElementById('by-client').innerHTML = byC || '<span class="muted">sin datos</span>';
+}
+
+// ── Clientes ────────────────────────────────────────────────────────────
+function loadClients(){
+  renderClients();
+  document.getElementById('clients-status').textContent = `Sincronizado desde Firestore (${_clients.length} clientes).`;
+}
+function renderClients(){
+  if(!_clients.length){
+    document.getElementById('clients-list').innerHTML = '<span class="muted">Sin clientes aún — esperando sincronización desde el nodo OjoIA.</span>';
+    return;
+  }
+  const html = _clients.map(c=>{
+    const quota = c.quota || {};
+    const pct = quota.pct||0;
+    const color = pct>90?'var(--err)':pct>70?'var(--warn)':'var(--g0)';
+    return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between">
+        <span><b>${esc(c.client_id)}</b> <span class="muted">(${esc(c.plan||'free')})</span></span>
+        <span><b>$${(c.cost_usd||0).toFixed(4)}</b> · ${(c.tokens||0).toLocaleString()} tok · ${c.requests||0} req</span>
+      </div>
+      <div class="gpu-bar"><div style="width:${Math.min(100,pct)}%;background:${color}"></div></div>
+      <div class="muted">Quota: ${pct.toFixed(1)}% usado</div>
+    </div>`;
   }).join('');
-  // actualizar filtro count
+  document.getElementById('clients-list').innerHTML = html;
+}
+
+// ── Request Log ─────────────────────────────────────────────────────────
+function loadReqLog(off){
+  offset = Math.max(0, off||0);
+  renderReqLog();
+}
+function renderReqLog(){
+  const fClient = (document.getElementById('log-filter-client').value||'').toLowerCase();
+  const fModel = (document.getElementById('log-filter-model').value||'').toLowerCase();
+  const fErr = document.getElementById('log-filter-errors').checked;
+  const filtered = _reqlog.filter(r=>{
+    if(fClient && !(r.client_id||'').toLowerCase().includes(fClient)) return false;
+    if(fModel && !(r.model||'').toLowerCase().includes(fModel)) return false;
+    if(fErr && (r.status_code||0)<400) return false;
+    return true;
+  });
+  const slice = filtered.slice(offset, offset+50);
+  const html = slice.map(r=>{
+    const ts = r.timestamp || (r.synced_at?.seconds?new Date(r.synced_at.seconds*1000).toLocaleString():'');
+    const st = r.status_code || 200;
+    const isErr = st>=400;
+    return `<tr class="${isErr?'row-err':''}">
+      <td>${esc(ts)}</td>
+      <td>${esc(r.client_id||'-')}</td>
+      <td>${esc(r.model||'-')}</td>
+      <td>${(r.total_tokens||r.tokens||0).toLocaleString()}</td>
+      <td>$${(r.cost_usd||r.cost||0).toFixed(4)}</td>
+      <td>${r.latency_ms||0}ms</td>
+      <td>${st}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">Sin datos — esperando sync (cada ~60s)</td></tr>';
+  document.getElementById('log-body').innerHTML = html;
+  document.getElementById('log-page').textContent = `${offset+1}-${Math.min(offset+50,filtered.length)} de ${filtered.length}`;
+  document.getElementById('reqlog-status').textContent = `Sincronizado desde Firestore. Total: ${filtered.length} requests.`;
+}
+
+// ── Precios / Planes ────────────────────────────────────────────────────
+function loadPrices(){ renderPrices(); }
+function renderPrices(){
+  const prices = _config.prices || {};
+  const plans = _config.plans || {};
+  const pricesHtml = Object.entries(prices).map(([k,v])=>
+    `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
+      <span><b>${esc(k)}</b></span>
+      <span class="muted">in: $${(v.input_price||0).toFixed(2)}/M · out: $${(v.output_price||0).toFixed(2)}/M</span>
+    </div>`).join('') || '<span class="muted">Sin precios</span>';
+  document.getElementById('prices-list').innerHTML = pricesHtml;
+  const plansHtml = Object.entries(plans).map(([k,v])=>
+    `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
+      <span><b>${esc(k)}</b> <span class="muted">${esc(v.name||'')}</span></span>
+      <span class="muted">${(v.tokens_quota||0).toLocaleString()} tok · ${v.rpm||0} rpm</span>
+    </div>`).join('') || '<span class="muted">Sin planes</span>';
+  document.getElementById('plans-list').innerHTML = plansHtml;
+  document.getElementById('prices-status').textContent = 'Precios y planes sincronizados desde el nodo OjoIA (lectura).';
 }
 
 function ago(ts){
@@ -229,15 +546,9 @@ function isStale(n){
 function effectiveOnline(n){
   return n.online===true && !isStale(n);
 }
-function pct(p){ if(p==null) return ''; return '<span class="muted">'+p+'%</span>'; }
 
 function refreshNodes(){
-  nodeFilter=document.getElementById('node-filter').value;
-  // el listener ya re-renderiza; forzamos re-render con filtro actual
-  db.collection('nodes').get().then(snap=>{
-    const nodes=[]; snap.forEach(d=>nodes.push({id:d.id,...d.data()}));
-    renderNodes(nodes);
-  });
+  refreshInfra();
 }
 
 async function runControl(nodeId, svcId, action){
