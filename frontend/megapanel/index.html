@@ -157,7 +157,7 @@ function renderNodes(nodes){
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
           <div>
-            <div class="nodename">${esc(n.id)} ${n.online?'<span class="online">●</span>':'<span class="offline">●</span>'}</div>
+            <div class="nodename">${esc(n.id)} ${effectiveOnline(n)?'<span class="online">●</span>':'<span class="offline">●</span>'} ${isStale(n)&&n.online?'<span class="muted" title="El push a Firestore está estancado, nodo probablemente caído">(stale)</span>':''}</div>
             <div class="muted">${esc(n.hostname||st.hostname||'')} · uptime ${Math.floor((st.uptime_s||0)/3600)}h</div>
           </div>
           <span class="muted">actualizado ${ago(n.updated_at)}</span>
@@ -215,6 +215,19 @@ function ago(ts){
   if(sec<60) return sec+'s';
   if(sec<3600) return Math.floor(sec/60)+'m';
   return Math.floor(sec/3600)+'h';
+}
+
+// Stale detection: si el último push fue hace más de 90s, el nodo está
+// caído o la red está rota. El push a Firestore es cada 15s, así que 90s
+// = 6 pushes perdidos = claramente offline.
+function isStale(n){
+  if(!n.updated_at) return true;
+  const s=n.updated_at.seconds?n.updated_at.seconds*1000:n.updated_at;
+  const sec=Math.floor((Date.now()-s)/1000);
+  return sec>90;
+}
+function effectiveOnline(n){
+  return n.online===true && !isStale(n);
 }
 function pct(p){ if(p==null) return ''; return '<span class="muted">'+p+'%</span>'; }
 
