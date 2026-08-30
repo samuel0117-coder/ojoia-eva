@@ -143,12 +143,10 @@ const App = {
         firebase.auth().onAuthStateChanged(async u => {
             if (u) {
                 await this._waitForAPI();
-                // Restore access_token SOLO de sessionStorage. sessionStorage se
-                // borra al cerrar la pestaña/pestaña del navegador, lo que reduce
-                // la ventana de exposicion si el dispositivo es compartido.
-                // ANTES: fallback a localStorage (persistente, riesgo de robo
-                // de token via XSS persistente). Quitado por seguridad.
-                const storedToken = sessionStorage.getItem('ojoia_token');
+                // Restore access_token de sessionStorage o localStorage.
+                // sessionStorage: se borra al cerrar pestaña (más seguro)
+                // localStorage: persiste entre sesiones (UX: no re-login cada vez)
+                const storedToken = sessionStorage.getItem('ojoia_token') || localStorage.getItem('ojoia_token');
                 if (storedToken) {
                     this.accessToken = storedToken;
                 }
@@ -163,9 +161,11 @@ const App = {
                 if (d.success) {
                     this.userId = d.user_id;
                     this.accessToken = d.access_token;
-                    // P0 (Fuga #7.2): sessionStorage no localStorage (ver comentario en doLogin)
+                    // Persistir en ambos storages: sessionStorage (sesión actual)
+                    // y localStorage (persiste entre sesiones del navegador)
                     localStorage.setItem('ojoia_uid', this.userId);
                     sessionStorage.setItem('ojoia_token', this.accessToken);
+                    localStorage.setItem('ojoia_token', this.accessToken);
                     this._showApp();
                 } else {
                     // Usuario Firebase OK pero sin registro completo en backend
@@ -291,9 +291,11 @@ const App = {
                 if (d.success) {
                     this.userId = d.user_id;
                     this.accessToken = d.access_token;
-                    // P0 (Fuga #7.2): sessionStorage no localStorage (ver comentario en doLogin)
+                    // Persistir en ambos storages: sessionStorage (sesión actual)
+                    // y localStorage (persiste entre sesiones del navegador)
                     localStorage.setItem('ojoia_uid', this.userId);
                     sessionStorage.setItem('ojoia_token', this.accessToken);
+                    localStorage.setItem('ojoia_token', this.accessToken);
                     this._showApp();
                 } else {
                     // Usuario no registrado en backend — cambiar a registro
@@ -307,13 +309,12 @@ const App = {
                 btn.disabled = false;
                 btn.textContent = 'Entrar';
                 const code = e.code || '';
-                if (code === 'auth/user-not-found' || code === 'auth/invalid-credential' || code === 'auth/wrong-password') {
-                    this._err('⚠️ Usuario no registrado o contraseña incorrecta. Regístrate para acceder.');
-                    // Cambiar a registro después de mostrar el error
-                    setTimeout(() => {
-                        this.setLoginMode('register');
-                        this._err('⚠️ Regístrate para acceder. Completa todos los campos.');
-        }, 1000);
+                if (code === 'auth/invalid-credential' || code === 'auth/wrong-password') {
+                    this._err('⚠️ Contraseña incorrecta. Intenta de nuevo.');
+                } else if (code === 'auth/user-not-found') {
+                    this._err('⚠️ Este correo no está registrado.');
+                } else if (code === 'auth/too-many-requests') {
+                    this._err('⚠️ Demasiados intentos. Espera un momento.');
                 } else {
                     this._err(this._fbErr(e));
                 }
@@ -334,9 +335,11 @@ const App = {
         if (d.success) {
             this.userId = d.user_id;
             this.accessToken = d.access_token;
-            // P0 (Fuga #7.2): sessionStorage no localStorage (ver comentario en doLogin)
+            // Persistir en ambos storages: sessionStorage (sesión actual)
+            // y localStorage (persiste entre sesiones del navegador)
             localStorage.setItem('ojoia_uid', this.userId);
             sessionStorage.setItem('ojoia_token', this.accessToken);
+            localStorage.setItem('ojoia_token', this.accessToken);
             this._showApp();
             return d;
         } else {
@@ -761,6 +764,8 @@ c.style.display = '';
     _homeWatermarkTextByCam: {},
     _homeLastYoloFetchByCam: {},
     _homeStreamStarted: {},  // {camId: true} — MJPEG stream ya iniciado
+    _homeLastFrameTs: {},     // {camId: ts} — último onload del stream (watchdog)
+    _homeWatchdogInterval: null,
     _gridSettingsCamId: null,
 
     _fetchHomeFrames() {
@@ -769,9 +774,13 @@ c.style.display = '';
             const camId = cam.camera_id;
             const targetId = `home-frame-${i}`;
             const key = `${targetId}:${camId}`;
-            // Iniciar MJPEG stream solo una vez por cámara
-            if (!this._homeStreamStarted[key]) {
+            // Watchdog: si el último frame llegó hace >STREAM_STALE_MS, reiniciar
+            const lastTs = this._homeLastFrameTs[key] || 0;
+            const streamStale = lastTs > 0 && (Date.now() - lastTs) > 15000;
+            // Iniciar MJPEG stream solo si no está activo o si está estancado
+            if (!this._homeStreamStarted[key] || streamStale) {
                 this._homeStreamStarted[key] = true;
+                this._homeLastFrameTs[key] = Date.now();
                 this._fetchFrameForCam(camId, targetId);
             } else {
                 // Stream ya activo, solo actualizar YOLO metadata
@@ -1001,6 +1010,55 @@ c.style.display = '';
             ctx.fillRect(lx, ly, tw, th);
             ctx.fillStyle = '#fff';
             ctx.fillText(label, lx + 4, ly + 13);
+            // ── YOLO Pose keypoints: dibujar la silueta de la persona ──
+            if (d.class && d.class.toLowerCase() === 'person' && d.keypoints) {
+                const kps = Array.isArray(d.keypoints) ? d.keypoints : [];
+                const pose = d.pose || {};
+                const visibleKps = kps.filter(kp => {
+                    if (!kp || kp.length < 2) return false;
+                    const [kx, ky] = kp;
+                    return kx > 0 && ky > 0;
+                });
+                if (visibleKps.length > 0) {
+                    const kpColor = (pose.visible || 0) >= 6 ? '#00e5ff' : '#ff6d00';
+                    const kpRadius = Math.max(2, Math.min(drawW, drawH) * 0.005);
+                    const lineWidth = Math.max(1.5, Math.min(drawW, drawH) * 0.004);
+                    // Dibujar conexiones del esqueleto (COCO 17 keypoints)
+                    const skeleton = [
+                        [0,1],[0,2],[1,3],[2,4],
+                        [5,6],[5,7],[7,9],[6,8],[8,10],
+                        [5,11],[6,12],[11,12],
+                        [11,13],[13,15],[12,14],[14,16]
+                    ];
+                    ctx.strokeStyle = kpColor;
+                    ctx.lineWidth = lineWidth;
+                    skeleton.forEach(([a, b]) => {
+                        if (a < visibleKps.length && b < visibleKps.length) {
+                            const [ax, ay] = visibleKps[a];
+                            const [bx, by] = visibleKps[b];
+                            if (ax > 0 && ay > 0 && bx > 0 && by > 0) {
+                                ctx.beginPath();
+                                ctx.moveTo(offsetX + ax * sx, offsetY + ay * sy);
+                                ctx.lineTo(offsetX + bx * sx, offsetY + by * sy);
+                                ctx.stroke();
+                            }
+                        }
+                    });
+                    // Dibujar puntos (keypoints)
+                    visibleKps.forEach(kp => {
+                        const [kx, ky] = kp;
+                        const px = offsetX + kx * sx;
+                        const py = offsetY + ky * sy;
+                        ctx.fillStyle = kpColor;
+                        ctx.beginPath();
+                        ctx.arc(px, py, kpRadius, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.strokeStyle = '#000';
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                    });
+                }
+            }
         });
     },
 
@@ -1049,8 +1107,16 @@ c.style.display = '';
 
             // MJPEG stream en lugar de polling JPEG
             const streamUrl = `${this.API}/cameras/${camId}/stream?user_id=${uid}&fps=5`;
-            const onImgLoad = () => { clearInFlight(); this._drawYoloBoxes(camId, this._homeLastDetectionsByCam[camId] || [], this._homeWatermarkTextByCam[camId] || watermark, targetId); };
-            const onImgError = () => { clearInFlight(); };
+            const onImgLoad = () => {
+                this._homeLastFrameTs[key] = Date.now();
+                clearInFlight();
+                this._drawYoloBoxes(camId, this._homeLastDetectionsByCam[camId] || [], this._homeWatermarkTextByCam[camId] || watermark, targetId);
+            };
+            const onImgError = () => {
+                // Si el stream se rompe, forzar reinicio en el siguiente tick
+                this._homeStreamStarted[key] = false;
+                clearInFlight();
+            };
             const dom = this._ensureLiveFrameDom(camId, streamUrl, watermark, onImgLoad, onImgError, targetId);
             if (!dom) { clearInFlight(); return; }
             const { imgEl } = dom;

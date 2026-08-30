@@ -311,11 +311,24 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
                     try:
                         pt, ct = _extract_usage_from_sse(full_buf)
                         if pt or ct:
-                            model_for_tracking = request_model if request_model else name
+                            # Usar el ID canónico del catálogo (e.g. "qwen36-35b-a3b")
+                            # para que el billing agrupe correctamente.
+                            model_for_tracking = (
+                                MODELS_CATALOG[request_model]["id"]
+                                if request_model in MODELS_CATALOG
+                                else (request_model or name)
+                            )
+                            # Si el cliente mandó un alias (qwen35, qwen35b, etc.),
+                            # normalizar para consistencia.
+                            try:
+                                from billing_log import normalize_model_name
+                                model_for_tracking = normalize_model_name(model_for_tracking)
+                            except ImportError:
+                                pass
                             billing.track_usage(
                                 client_id=client_id, model=model_for_tracking,
                                 prompt_tokens=pt, completion_tokens=ct)
-                            # Log completo en SQLite
+                            # Log completo en SQLite (también normalizado)
                             price = MODEL_PRICES.get(model_for_tracking, MODEL_PRICES.get(name, {"input": 0.0, "output": 0.0}))
                             cost = (pt / 1_000_000 * price["input"] +
                                     ct / 1_000_000 * price["output"])
@@ -385,8 +398,18 @@ async def _enqueue_and_proxy(name: str, request: Request, path: str,
             ct = headers.get("content-type", "")
             usage = extract_usage_from_response(name, content, ct)
             if usage["prompt_tokens"] or usage["completion_tokens"]:
-                # Registrar con el modelo REAL del request (no el backend interno)
-                model_for_tracking = request_model if request_model else name
+                # Usar el ID canónico del catálogo para que el billing agrupe bien.
+                model_for_tracking = (
+                    MODELS_CATALOG[request_model]["id"]
+                    if request_model in MODELS_CATALOG
+                    else (request_model or name)
+                )
+                # Normalizar aliases (qwen35, qwen35b, path .gguf, etc.)
+                try:
+                    from billing_log import normalize_model_name
+                    model_for_tracking = normalize_model_name(model_for_tracking)
+                except ImportError:
+                    pass
                 billing.track_usage(
                     client_id=client_id,
                     model=model_for_tracking,
@@ -495,23 +518,8 @@ async def bus_pricing():
 # ---------------------------------------------------------------------------
 # Modelos expuestos vía /v1/models (formato OpenAI).
 # Cada modelo mapea a un backend interno + su model_id real.
+# Los IDs públicos son los CANÓNICOS (lo que se normaliza en billing_log).
 MODELS_CATALOG = {
-    "qwen35": {
-        "id": "qwen35",
-        "backend": "qwen9b",
-        "model_id": "qwen35",
-        "name": "Qwen 3.5 9B",
-        "owned_by": "ojoia",
-        "description": "Modelo multimodal de 9B parámetros en vLLM. Procesa texto, imágenes y video. Ideal para chat general, código y razonamiento con contexto de 128K. Soporta tool calling y thinking.",
-        "capabilities": ["text", "image", "video", "thinking"],
-        "modalities": {
-            "input": ["text", "image", "video"],
-            "output": ["text"]
-        },
-        "context_length": 131072,
-        "supports_tools": True,
-        "supports_thinking": True,
-    },
     "qwen36-35b-a3b": {
         "id": "qwen36-35b-a3b",
         "backend": "qwen35b",
@@ -528,19 +536,35 @@ MODELS_CATALOG = {
         "supports_tools": True,
         "supports_thinking": True,
     },
-    "qwen3-7b": {
-        "id": "qwen3-7b",
+    "qwen7b": {
+        "id": "qwen7b",
         "backend": "qwen7b",
-        "model_id": "/models/7b",
-        "name": "Qwen 3 7B",
+        "model_id": "qwen7b",
+        "name": "Qwen 3 7B (sglang)",
         "owned_by": "ojoia",
-        "description": "Modelo ligero de 7B parámetros en SGLang. Procesa texto, imágenes y video. Perfecto para tareas rápidas, chat general y prototipado con bajo consumo. Contexto de 16K.",
+        "description": "Modelo de 7B parámetros en SGLang. Procesa texto, imágenes y video. Perfecto para tareas rápidas, chat general y prototipado con bajo consumo. Contexto de 16K.",
         "capabilities": ["text", "image", "video", "thinking"],
         "modalities": {
             "input": ["text", "image", "video"],
             "output": ["text"]
         },
         "context_length": 16000,
+        "supports_tools": True,
+        "supports_thinking": True,
+    },
+    "qwen9b": {
+        "id": "qwen9b",
+        "backend": "qwen9b",
+        "model_id": "qwen9b",
+        "name": "Qwen 3 9B (vLLM)",
+        "owned_by": "ojoia",
+        "description": "Modelo de 9B parámetros en vLLM. Procesa texto, imágenes y video. Ideal para chat general, código y razonamiento con contexto de 128K. Soporta tool calling y thinking.",
+        "capabilities": ["text", "image", "video", "thinking"],
+        "modalities": {
+            "input": ["text", "image", "video"],
+            "output": ["text"]
+        },
+        "context_length": 131072,
         "supports_tools": True,
         "supports_thinking": True,
     },

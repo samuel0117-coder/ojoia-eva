@@ -53,18 +53,14 @@ if not REDIS_URL:
     )
 
 # Precios por 1M tokens (USD) — defaults (se sobreescriben con Redis si existen)
-# Los nombres deben coincidir con los "model" del body OpenAI
+# Solo nombres canónicos. Los aliases (qwen35, qwen35b, etc.) se normalizan
+# automáticamente en log_request() via normalize_model_name().
 DEFAULT_MODEL_PRICES = {
-    "qwen3-7b":  {"input": 0.30, "output": 0.50, "unit": "tokens"},
-    "qwen35":     {"input": 1.50, "output": 2.00, "unit": "tokens"},
-    "qwen36-35b-a3b": {"input": 8.00, "output": 10.00, "unit": "tokens"},
-    # Aliases de backends legacy (compatibilidad hacia atrás)
-    "qwen7b":    {"input": 0.30, "output": 0.50, "unit": "tokens"},
-    "qwen9b":    {"input": 1.50, "output": 2.00, "unit": "tokens"},
-    "qwen35b":   {"input": 8.00, "output": 10.00, "unit": "tokens"},
-    "whisper":   {"input": 0.10, "output": 0.10, "unit": "minutes"},
-    "whisper-turbo": {"input": 0.10, "output": 0.10, "unit": "minutes"},
-    "yolo":      {"input": 0.05, "output": 0.05, "unit": "images"},
+    "qwen7b":           {"input": 0.30, "output": 0.50, "unit": "tokens"},
+    "qwen9b":           {"input": 1.50, "output": 2.00, "unit": "tokens"},
+    "qwen36-35b-a3b":   {"input": 8.00, "output": 10.00, "unit": "tokens"},
+    "whisper-turbo":    {"input": 0.10, "output": 0.10, "unit": "minutes"},
+    "yolo":             {"input": 0.05, "output": 0.05, "unit": "images"},
 }
 
 # Planes: tokens mensuales incluidos — defaults
@@ -235,6 +231,13 @@ class BillingStore:
                     prompt_tokens: int = 0, completion_tokens: int = 0,
                     request_id: str = "") -> dict:
         """Registra el uso de tokens de un request."""
+        # Normalizar aliases (qwen35 -> qwen36-35b-a3b, etc.) para agrupación correcta.
+        try:
+            from billing_log import normalize_model_name
+            model = normalize_model_name(model)
+        except Exception:
+            pass
+
         now = int(time.time())
         day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
         month = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m")

@@ -25,6 +25,101 @@ DB_PATH = os.environ.get(
 RETENTION_DAYS = int(os.environ.get("BILLING_LOG_RETENTION_DAYS", "30"))
 PURGE_INTERVAL_S = int(os.environ.get("BILLING_LOG_PURGE_INTERVAL", "3600"))
 
+# ── Mapeo canónico de modelos ─────────────────────────────────────────────
+# Múltiples nombres representan el mismo modelo físico. Cuando llega un
+# request, normalizamos a un nombre canónico para que las stats, los
+# reportes y la web no tengan duplicados.
+#
+# Formato: lista de aliases que apuntan al nombre canónico (key).
+# - "qwen36-35b-a3b" es el nombre canónico del container qwen-35b (35B)
+# - "qwen35" es el alias genérico que los clientes usan
+# - "qwen35b" es el nombre viejo del servicio systemd (legacy)
+# - "/models/.../Qwen3.6-35B-...gguf" es el path del archivo .gguf que
+#   a veces reporta llama.cpp cuando el cliente no envía el header
+#   "model" correcto
+_MODEL_ALIASES = {
+    # 35B (qwen3.6-35b-a3b)
+    "qwen36-35b-a3b": "qwen36-35b-a3b",
+    "qwen35": "qwen36-35b-a3b",
+    "qwen35b": "qwen36-35b-a3b",
+    # 7B (qwen-vl-7b)
+    "qwen7b": "qwen7b",
+    "qwen-vl-7b": "qwen7b",
+    "qwen.service": "qwen7b",
+    # 9B (qwen-vl-9b)
+    "qwen9b": "qwen9b",
+    "qwen-vl-9b": "qwen9b",
+    "qwen9b.service": "qwen9b",
+    "ai-qwen-9b-1": "qwen9b",
+}
+
+
+def normalize_model_name(model: str) -> str:
+    """Normaliza un nombre de modelo a su forma canónica.
+
+    Casos:
+      - "qwen35"               -> "qwen36-35b-a3b"
+      - "qwen35b"              -> "qwen36-35b-a3b"
+      - "/models/.../Qwen3.6..." -> "qwen36-35b-a3b"
+      - "qwen7b"               -> "qwen7b"
+      - "unknown_model"        -> "unknown_model" (sin cambios)
+    """
+    if not model:
+        return model
+    m = model.strip()
+    # Match exacto
+    if m in _MODEL_ALIASES:
+        return _MODEL_ALIASES[m]
+    # Match por path .gguf (el model de llama.cpp a veces devuelve el path)
+    if ".gguf" in m and "qwen3" in m.lower() and "35b" in m.lower():
+        return "qwen36-35b-a3b"
+    if ".gguf" in m and "qwen3" in m.lower() and "9b" in m.lower():
+        return "qwen9b"
+    if ".gguf" in m and ("qwen" in m.lower()) and "7b" in m.lower():
+        return "qwen7b"
+    # Match por substring (case-insensitive)
+    ml = m.lower()
+    if "qwen3.6" in ml and "35b" in ml:
+        return "qwen36-35b-a3b"
+    if ml == "qwen35" or ml == "qwen-35b":
+        return "qwen36-35b-a3b"
+    if ml == "qwen35b" or ml == "qwen-35b":
+        return "qwen36-35b-a3b"
+    if "qwen-vl-9b" in ml or "qwen9b" in ml:
+        return "qwen9b"
+    if "qwen-vl-7b" in ml or "qwen7b" in ml:
+        return "qwen7b"
+    # Sin match: devolver tal cual
+    return m
+
+
+def normalize_legacy_records() -> int:
+    """Migra registros existentes con nombres viejos a nombres canónicos.
+
+    Idempotente: si un registro ya tiene el nombre canónico, no hace nada.
+    Retorna el número de registros actualizados.
+    """
+    import re
+    updated = 0
+    with _lock:
+        conn = _connect()
+        try:
+            cur = conn.execute("SELECT id, model FROM requests")
+            rows = cur.fetchall()
+            for rid, old_model in rows:
+                new_model = normalize_model_name(old_model)
+                if new_model != old_model:
+                    conn.execute(
+                        "UPDATE requests SET model = ? WHERE id = ?",
+                        (new_model, rid),
+                    )
+                    updated += 1
+            conn.commit()
+            return updated
+        finally:
+            conn.close()
+
+
 _lock = threading.Lock()
 _last_purge = 0.0
 
@@ -71,7 +166,11 @@ def log_request(client_id: str, model: str, backend: str,
                 status_code: int = 200, stream: bool = False,
                 prompt: str = "", response: str = "",
                 api_key_masked: str = "") -> int:
-    """Registra un request. Retorna el id del registro (para rating posterior)."""
+    """Registra un request. Retorna el id del registro (para rating posterior).
+
+    El nombre del modelo se normaliza automáticamente (qwen35/qwen35b/path → qwen36-35b-a3b).
+    """
+    canonical_model = normalize_model_name(model)
     with _lock:
         conn = _connect()
         try:
@@ -81,7 +180,7 @@ def log_request(client_id: str, model: str, backend: str,
                     cost_usd, latency_ms, status_code, stream, prompt, response,
                     rating, api_key_masked)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (time.time(), client_id, model, backend,
+                (time.time(), client_id, canonical_model, backend,
                  prompt_tokens, completion_tokens, cost_usd, latency_ms,
                  status_code, 1 if stream else 0, prompt, response, 0,
                  api_key_masked),
