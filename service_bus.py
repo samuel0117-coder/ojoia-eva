@@ -588,6 +588,17 @@ MODELS_CATALOG = {
 
 # Mapeo de modelos para inyectar en requests si no vienen
 MODEL_TO_BACKEND = {m["id"]: m["backend"] for m in MODELS_CATALOG.values()}
+
+# Mapeo del nombre canónico (tras normalize_model_name) -> backend.
+# Permite que aliases del 7B/9B (qwen-vl-7b, qwen35, etc.) facturen al backend
+# correcto en vez de caer silenciosamente al 9B.
+_BACKEND_BY_CANONICAL = {
+    "qwen7b": "qwen7b",
+    "qwen9b": "qwen9b",
+    "qwen36-35b-a3b": "qwen35b",
+    "whisper-turbo": "whisper",
+    "yolo": "yolo",
+}
 # ---------------------------------------------------------------------------
 @app.get("/v1/models")
 async def list_models():
@@ -626,7 +637,23 @@ async def chat_completions(request: Request):
     if model_id in MODEL_TO_BACKEND:
         backend = MODEL_TO_BACKEND[model_id]
     else:
-        backend = "qwen9b"
+        # Normalizar aliases conocidos antes de decidir el fallback
+        normalized = model_id
+        try:
+            from billing_log import normalize_model_name
+            normalized = normalize_model_name(model_id)
+        except Exception:
+            pass
+        if normalized in _BACKEND_BY_CANONICAL:
+            backend = _BACKEND_BY_CANONICAL[normalized]
+        else:
+            # Modelo desconocido: facturar como 9B es un bug de facturación
+            # (mide el modelo real, no el precio). Registrar alerta.
+            log.warning(
+                f"[billing] modelo no catalogado '{model_id}' -> fallback qwen9b. "
+                f"Si esperabas otro modelo, revisa MODELS_CATALOG."
+            )
+            backend = "qwen9b"
 
     return await proxy_route(backend, "v1/chat/completions", request)
 
