@@ -1397,6 +1397,37 @@ async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = No
             except Exception as e:
                 logger.warning(f"Could not save owner_note: {e}")
 
+        # ── B4 (2026-08-31): auto-ajuste de reglas por falsas alarmas ──
+        # Si la MISMA frase acumula 3 falsas alarmas confirmadas por el dueño,
+        # se agrega sola una owner_note con la palabra clave "falso positivo",
+        # que _detect_attention_hits (orchestrator.py paso 3) usa para suprimir
+        # esa frase en el futuro. Cierra el feedback loop sin intervención.
+        if not is_real and camera_id and original_hit:
+            try:
+                cam_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
+                if os.path.exists(cam_file):
+                    with open(cam_file) as f:
+                        cam_cfg = json.load(f)
+                    vigilance = cam_cfg.get("vigilance", {})
+                    if not isinstance(vigilance, dict):
+                        vigilance = {}
+                    counts = vigilance.get("false_alarm_counts") or {}
+                    key = original_hit.strip().lower()
+                    counts[key] = int(counts.get(key, 0)) + 1
+                    vigilance["false_alarm_counts"] = counts
+                    if counts[key] >= 3:
+                        notes_list = vigilance.get("owner_notes") or []
+                        auto_note = f"Falso positivo frecuente (marcado {counts[key]} veces por el dueño): {original_hit}"
+                        if not any(original_hit in n for n in notes_list):
+                            notes_list.append(auto_note)
+                            vigilance["owner_notes"] = notes_list[-20:]
+                            logger.info(f"[B4] auto owner_note tras 3 falsas alarmas: {original_hit[:50]} ({camera_id})")
+                    cam_cfg["vigilance"] = vigilance
+                    with open(cam_file, "w") as f:
+                        json.dump(cam_cfg, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"[B4] false_alarm_counts error: {e}")
+
         # ── Attention corrections (Fase 4): historial de qué creyó el sistema
         #    vs. qué cree el dueño que pasó realmente. Lo usa el ajuste iterativo
         #    de frases desde el chat.
