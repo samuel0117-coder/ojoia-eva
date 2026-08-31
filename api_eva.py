@@ -4482,6 +4482,7 @@ _INGEST_KEY_WARN_TS: dict = {}  # camera_id -> ts del último warning (rate-limi
 _INGEST_IP_WARN_TS: dict = {}
 _INGEST_TOFU_MAX = int(os.getenv("OJOIA_TOFU_MAX", "2"))
 _INGEST_IP_NOTIFY_TS: dict = {}
+_FW_SEEN: dict = {}  # "user/cam" -> última versión de firmware reportada
 
 
 def _client_real_ip(request: Request) -> str:
@@ -4640,6 +4641,20 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         if not _ingest_rate_ok(camera_id, _cam_cfg_ingest):
             raise HTTPException(status_code=429,
                                 detail=f"Rate limit: máximo {(_cam_cfg_ingest or {}).get('max_fps', 5)} fps por cámara")
+
+        # ── [0c] TELEMETRÍA de firmware (X-Firmware del ESP32) ──────────────
+        # El firmware v9.3.1+ reporta su versión en cada frame. La guardamos
+        # en camera.json (throttled) para saber qué corre cada cámara sin
+        # acceso físico ni OTA.
+        _fw = (request.headers.get("x-firmware") or "").strip()
+        if _fw:
+            _fw_key = f"{user_id}/{camera_id}"
+            _last_fw = _FW_SEEN.get(_fw_key)
+            if _last_fw != _fw:
+                _FW_SEEN[_fw_key] = _fw
+                _persist_cam_cfg_field(user_id, camera_id, "firmware_version", _fw)
+                _persist_cam_cfg_field(user_id, camera_id, "firmware_seen_at", time.time())
+                logger.info(f"[FW] {camera_id} reporta firmware {_fw}")
 
         img_bytes = await image.read()
         frame_size = len(img_bytes)
