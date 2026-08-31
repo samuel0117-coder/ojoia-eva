@@ -197,3 +197,16 @@ N/16 grids/s. C2/C3 quedan como refactors programables cuando se supere
 ~50-100 cámaras concurrentes o se requiera alta disponibilidad multi-nodo.
 Prioridad real inmediata: D (onboarding/prompts) y E (tests/CI).
 | — | OPS pendiente: rotar password Redis y service account Firebase (estuvieron expuestos) | — | ⏳ manual |
+| 2026-08-31 | F3 arquitectura ganadora: ingest ultraligero + workers batched | `9501658` | ✅ certificado 100 cámaras × 90s, 0 drops, pending→0 |
+| — | OPS F3: rebalanceo GPU (qwen9b 96% VRAM en GPU1) + qwen3vl8b unhealthy + instalar units systemd (sudo) + ruta cloudflared /ingest→8013 | — | ⏳ manual |
+
+## Resultado F3 (certificación 2026-08-31)
+
+| Métrica | Antes (F2) | Después (F3) |
+|---|---|---|
+| Latencia ingest p50 | ~500ms (YOLO sync) | **~10ms** serial; 141 req/s burst |
+| 100 cámaras × 1fps | p99 6.2s, cola presionada | **5601/5601, 0 drops, drenaje a 0** |
+| YOLO | 1 forward por frame | **1 forward por tanda de 16** |
+| Qwen grids | 1 grid / 16 frames | 1 grid / 32 frames (OJOIA_GRID_SIZE=32) |
+| Workers | 4 | 12 (OJOIA_WORKER_COUNT) |
+| BUG encontrado y fixeado | — | rescue_stale reclamaba sin procesar → mensajes eternos en pending |
