@@ -106,6 +106,10 @@ Principio rector que guía todo este plan:
 | 2026-08-31 | C1 user.json read-modify-write seguro (13 sitios) | `1701557` | ✅ desplegado (test 200/200 concurrencia) |
 | 2026-08-31 | C4 rate limit ingest (5fps default) | `0e5653a` | ✅ desplegado |
 | 2026-08-31 | C5 script de carga + fix HTTPException tragada | `8e4c10a` | ✅ certificado: 30 cámaras × 1fps, p99 572ms, 0 drops |
+| 2026-08-31 | D1 onboarding tolerante + D3 test-rules bugfix + D4 prompt versionado | (commit feat(onboarding)) | ✅ desplegado |
+| 2026-08-31 | E1 suite pytest 16/16 | (commit test(E1)) | ✅ |
+| — | E2 CI: workflow creado localmente; GitHub exige token con scope `workflow` para pushearlo | — | ⏳ pendiente token |
+| — | D2 soporte RTSP/cámaras IP: requiere servicio puller nuevo; va como feature aparte | — | ⏳ planificado |
 
 ## Resultados de certificación de carga (C5, 2026-08-31)
 
