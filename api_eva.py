@@ -793,6 +793,7 @@ async def rtsp_register(request: dict, authorization: str = Header(None, alias="
     cj = cam_dir / "camera.json"
     cj.write_text(json.dumps(cam_cfg, indent=2, ensure_ascii=False))
     os.chmod(cj, 0o600)  # la URL trae credenciales: solo owner
+    _invalidate_cam_cfg_cache(user_id, camera_id)  # F3
     logger.info(f"[D2] cámara RTSP registrada: {user_id[:6]}…/{camera_id} ({name}, zone={zone})")
     return {"success": True, "camera_id": camera_id, "ingest_key": ingest_key,
             "note": "El puller la descubre en ≤30s. Guarda ingest_key: sirve para auditar la fuente."}
@@ -1371,13 +1372,34 @@ async def add_security_headers(request: Request, call_next):
         )
 
 # Helpers de Almacenamiento
+# F3: caché de camera.json por (user, cam) con TTL 5s. Con N cámaras × N fps
+# se estaba leyendo disco 2 veces por frame. La invalida _write_json_atomic
+# y los writes directos de camera.json son poco frecuentes (config edit).
+_CAM_CFG_CACHE: Dict[str, tuple] = {}  # key -> (ts, cfg)
+_CAM_CFG_TTL = 5.0
+
+
+def _invalidate_cam_cfg_cache(user_id: str = None, camera_id: str = None):
+    if user_id is None:
+        _CAM_CFG_CACHE.clear()
+        return
+    _CAM_CFG_CACHE.pop(f"{user_id}/{camera_id}", None)
+
+
 def get_camera_config_static(user_id: str, camera_id: str) -> dict:
-    """Lee camera.json de una camara."""
+    """Lee camera.json de una camara (cacheado 5s — F3)."""
+    key = f"{user_id}/{camera_id}"
+    hit = _CAM_CFG_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _CAM_CFG_TTL:
+        return hit[1]
     cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
     if cam_file.exists():
         try:
             with open(cam_file) as f:
-                return json.load(f)
+                cfg = json.load(f)
+            _CAM_CFG_CACHE[key] = (now, cfg)
+            return cfg
         except Exception as e_1274:
             # P0 (Sección #8): loggeo en lugar de pass silencioso
             logger.warning(f"[load-cam-config] {camera_id} corrupt: {e_1274}")
@@ -3898,6 +3920,7 @@ async def save_camera_vigilance(camera_id: str, request: dict = None):
                 cam_cfg["vigilance"] = vigilance
                 with open(cam_cfg_path, "w") as f:
                     json.dump(cam_cfg, f, indent=2)
+                _invalidate_cam_cfg_cache(user_id, camera_id)  # F3
             except Exception:
                 logger.debug("silent: {exc}", exc=Exception)
 
@@ -3923,6 +3946,7 @@ async def save_camera_vigilance(camera_id: str, request: dict = None):
             cam_cfg_data["system_prompt"] = new_prompt
             with open(cam_cfg_path, "w") as f:
                 json.dump(cam_cfg_data, f, indent=2)
+            _invalidate_cam_cfg_cache(user_id, camera_id)  # F3
         system_prompt = new_prompt
     except Exception as e:
         logger.warning(f"No se pudo regenerar prompt: {e}")
@@ -4281,10 +4305,25 @@ def _send_vigilance_fcm(user_id: str, camera_id: str, event_id: str, yolo_count:
         logger.error(f"Error sending vigilance FCM: {e}")
 
 
+# F3: throttle de last_frame (por cámara). _LAST_FRAME_WRITE_TS sin lock es
+# aceptable: es solo una heurística de frescura (peor caso = 2 escrituras
+# simultáneas al mismo user.json, ya protegido por _get_user_lock dentro).
+_LAST_FRAME_WRITE_TS: Dict[str, float] = {}
+_LAST_FRAME_MIN_S = float(os.environ.get("OJOIA_LAST_FRAME_MIN_S", "5"))
+
+
 def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = None):
-    """Actualizar last_frame de una cámara en user.json. Auto-registra si no existe."""
+    """Actualizar last_frame de una cámara en user.json. Auto-registra si no existe.
+    F3: throttled — por cámara solo escribe cada _LAST_FRAME_MIN_S (default 5s).
+    El estado online usa umbral de 120s; escribir cada frame era I/O+lock x N cámaras."""
     if not user_id:
         return
+    key = f"{user_id}/{camera_id}"
+    now = time.time()
+    last = _LAST_FRAME_WRITE_TS.get(key, 0)
+    if now - last < _LAST_FRAME_MIN_S:
+        return  # ya actualizado hace poco: el umbral online no lo nota
+    _LAST_FRAME_WRITE_TS[key] = now
     try:
         uf = find_user_json(user_id)
         if uf and uf.exists():
@@ -4354,6 +4393,7 @@ async def rotate_ingest_key(camera_id: str, user_id: Optional[str] = None):
         with open(tmp, "w") as f:
             json.dump(cfg, f, indent=2)
         os.replace(tmp, cam_path)
+    _invalidate_cam_cfg_cache(user_id, camera_id)  # F3
     logger.info(f"[A4] ingest_key rotada para {user_id}/{camera_id}")
     return {"success": True, "camera_id": camera_id, "ingest_key": new_key}
 
@@ -4458,7 +4498,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         now_dt = datetime.now()
         frame_id = f"{camera_id}_{int(time.time()*1000)}"
         mode = "normal"
-        processing = "sync_yolo"
+        processing = "queued"  # F3: YOLO va en el worker
         yolo_count = 0
         yolo_classes = []
         yolo_detections = []
@@ -4507,91 +4547,53 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False), user_id=user_id, camera_id=camera_id)
         mode = "vigilante" if is_vigilante else "normal"
 
-        # ── [3] YOLO SÍNCRONO RÁPIDO (para siluetas y eventos) ──
-        try:
-            # C6: micro-batching (ventana 150ms / máx 16) — fallback a single
-            yolo_count, yolo_classes, yolo_detections = await _yolo_detect(img_bytes, camera_id)
-        except Exception as e:
-            logger.error(f"Error YOLO en endpoint: {e}")
-            yolo_count, yolo_classes, yolo_detections = 0, [], []
+        # ── [3] F3: SIN YOLO SÍNCRONO — el request no paga GPU ─────────────
+        # El frame se encola con yolo_count=-1 (PENDIENTE). El worker hace
+        # YOLO en batches (XREADGROUP count=16 → 1 forward por tanda), aplica
+        # el gate, escribe latest_yolo.json y dispara el centinela.
+        # Resultado: el ingest responde en ~15-30ms aunque haya 200 cámaras.
+        yolo_count = -1  # -1 = pendiente de YOLO en el worker
+        yolo_classes: list = []
+        yolo_detections: list = []
 
-        # ── [4] Actualizar latest_yolo.json y grid para el viewer ──
-        try:
-            frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
-            frames_dir_v.mkdir(parents=True, exist_ok=True)
-            yolo_data = {
-                "timestamp": time.time(),
-                "count": yolo_count,
-                "detections": yolo_detections,
-                "classes": yolo_classes,
-                "mode": mode
-            }
-            # C7: misma razón que arriba — no bloquear el event loop con disco
-            await asyncio.to_thread(_write_json_atomic, frames_dir_v / "latest_yolo.json", yolo_data)
+        # ── [4] (movido al worker) latest_yolo.json lo escribe el worker ──
 
-            # W2 fix (2026-08-09): NO llamar grid.add_frame() aqui. El worker
-            # (yolo_worker, api_eva.py:4062) ya lo hace bajo cam_lock y dispara
-            # process_grid cuando el grid se llena. Si tambien lo hacemos aqui,
-            # cada frame con yolo_count>0 se annade DOS VECES al mismo grid
-            # (mismo dict key {uid}_{cam}) -> 16 frames son en realidad 8 unicos
-            # x 2 copias -> Qwen pierde mitad del rango temporal del analisis.
-            # Verificado en evt_1786311096_OJO-E17604.json: frame_timestamps
-            # vienen en 8 pares consecutivos a ~10ms, frame_sizes 8 unicos/16.
-            # Aqui solo escribimos latest_yolo.json para el viewer (sin tocar grid).
-        except Exception as e:
-            logger.error(f"Error actualizando YOLO para viewer: {e}")
+        # ── [5] (movido al worker) centinela tras YOLO batched ──
 
-        # ── [5] MODO CENTINELA: alerta directa si YOLO detecta algo ──
-        # En modo vigilante SOLO generamos el evento centinela (YOLO + notificacion).
-        # No se encola para Qwen (capa de inteligencia) — el usuario lo pidio asi:
-        # "es solo yolo detecta personas y notifica, sin capa de inteligencia"
-        if is_vigilante and yolo_count > 0:
-            logger.warning(f"MODO CENTINELA: {yolo_count} objects {yolo_classes} → alerta directa")
-            _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count, yolo_classes, client_ip)
-
-        # ── [6] ENCOLAR para grid + Qwen en background ──
-        # YOLO Gate:
-        #   1) count==0 → descartar
-        #   2) is_vigilante → NO encolar (la alerta centinela de [5] ya fue guardada;
-        #      en modo centinela no queremos capa de inteligencia Qwen, solo YOLO)
-        #   3) resto (count>0, modo normal) → encolar
-        if yolo_count > 0 and not is_vigilante:
-            # B5: drop policy. Antes: await FRAME_QUEUE.put() bloqueaba al
-            # ESP32 si queue llena (maxsize=1000). Ahora intentamos put_nowait;
-            # si QueueFull -> descartamos el frame viejo (no bloqueamos al
-            # ESP32) y contamos para metrica/logs. El frame se pierde (grid
-            # + Qwen se saltan uno) pero el ESP32 sigue recibiendo 200.
-            frameData = {
-                "frame_id": frame_id,
-                "user_id": user_id,
-                "camera_id": camera_id,
-                "img_bytes": img_bytes,
-                "timestamp": time.time(),
-                "client_ip": client_ip,
-                "cam_cfg": cam_cfg,
-                "schedule": schedule,
-                "vigilance": vigilance,
-                "mode": mode,
-                "yolo_count": yolo_count,
-                "yolo_classes": yolo_classes,
-                "yolo_detections": yolo_detections
-            }
-            # C2: encolar via bus (Redis Streams o memoria). put() nunca
-            # bloquea al ESP32; si la cola está presionada, descarta + cuenta.
-            ok = await frame_bus.put(frameData)
-            if ok:
-                processing = "queued"
-            else:
-                global FRAME_QUEUE_DROPS, FRAME_QUEUE_DROP_TS
-                FRAME_QUEUE_DROPS += 1
-                processing = "dropped"
-                if time.time() - FRAME_QUEUE_DROP_TS > 30:
-                    FRAME_QUEUE_DROP_TS = time.time()
-                    logger.warning(
-                        f"[FRAME_QUEUE] lleno, frame descartado: {frame_id} "
-                        f"(cam={camera_id} user={user_id} mode={mode}) "
-                        f"total_drops={FRAME_QUEUE_DROPS} bus_mode={frame_bus.mode}"
-                    )
+        # ── [6] ENCOLAR SIEMPRE (el gate de YOLO lo aplica el worker) ─────
+        # Antes: solo se encolaba si yolo_count>0 (gate en request, caro).
+        # Ahora: el gate corre en el worker con batch GPU compartido.
+        frameData = {
+            "frame_id": frame_id,
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "img_bytes": img_bytes,
+            "timestamp": time.time(),
+            "client_ip": client_ip,
+            "cam_cfg": cam_cfg,
+            "schedule": schedule,
+            "vigilance": vigilance,
+            "mode": mode,
+            "yolo_count": -1,   # F3: YOLO pendiente en worker
+            "yolo_classes": [],
+            "yolo_detections": []
+        }
+        # C2: encolar via bus (Redis Streams o memoria). put() nunca
+        # bloquea al ESP32; si la cola está presionada, descarta + cuenta.
+        ok = await frame_bus.put(frameData)
+        if ok:
+            processing = "queued"
+        else:
+            global FRAME_QUEUE_DROPS, FRAME_QUEUE_DROP_TS
+            FRAME_QUEUE_DROPS += 1
+            processing = "dropped"
+            if time.time() - FRAME_QUEUE_DROP_TS > 30:
+                FRAME_QUEUE_DROP_TS = time.time()
+                logger.warning(
+                    f"[FRAME_QUEUE] lleno, frame descartado: {frame_id} "
+                    f"(cam={camera_id} user={user_id} mode={mode}) "
+                    f"total_drops={FRAME_QUEUE_DROPS} bus_mode={frame_bus.mode}"
+                )
 
         # ── [7] Actualizar last_frame de la cámara ──
         _update_camera_last_frame(user_id, camera_id, client_ip)
@@ -4608,7 +4610,9 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             "frame_id": frame_id,
             "processing": processing,
             "queue_size": frame_bus.qsize(),
-            "yolo": {"count": yolo_count, "classes": yolo_classes, "detections": yolo_detections}
+            # F3: YOLO corre en el worker (batched). El viewer consulta
+            # latest_yolo.json via /frames/latest_yolo (poll existente).
+            "yolo": {"count": -1, "pending": True}
         }
 
     except HTTPException:
@@ -4705,6 +4709,29 @@ async def _yolo_detect(img_bytes: bytes, camera_id: str = "") -> tuple:
         return await _run_yolo_detection(img_bytes)
 
 
+async def _yolo_batch_http(imgs: list, cams: list) -> list:
+    """F3: UN forward YOLO para una tanda completa vía /detect_batch.
+    Devuelve lista de resultados EN EL MISMO ORDEN que imgs."""
+    data = [("images", (f"f{i}.jpg", b, "image/jpeg")) for i, b in enumerate(imgs)]
+    data.append(("camera_ids", (None, ",".join(c or f"cam{i}" for i, c in enumerate(cams)))))
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post("http://localhost:8002/detect_batch", files=data)
+        if resp.status_code != 200:
+            raise RuntimeError(f"detect_batch HTTP {resp.status_code}")
+        results = resp.json().get("results", [])
+    if len(results) < len(imgs):
+        results += [{}] * (len(imgs) - len(results))
+    return results
+
+
+def _yolo_parse_result(r: dict) -> tuple:
+    """F3: extrae (count, classes, detections) de UN resultado de batch."""
+    dets = [d for d in (r or {}).get("detections", []) if d.get("confidence", 0) >= 0.25]
+    uniq = {d.get("track_id") for d in dets if d.get("track_id")}
+    count = len(uniq) if uniq else len(dets)
+    return count, [d.get("class", "") for d in dets], dets
+
+
 async def _run_yolo_detection(img_bytes: bytes) -> tuple:
     """Ejecuta YOLO detection y retorna (count, classes, detections)."""
     yolo_count = 0
@@ -4733,117 +4760,140 @@ async def _run_yolo_detection(img_bytes: bytes) -> tuple:
 
 
 async def yolo_worker():
-    """Worker que procesa la cola de frames en background.
+    """F3 — Worker batched: YOLO por tandas + grid + Qwen.
 
-    Flujo:
-    1. Obtiene frame de la cola (con YOLO ya ejecutado en el endpoint)
-    2. TOMA LOCK POR CAMARA (asyncio.Lock). Dentro del lock:
-       - add_frame al grid para acumulacion Qwen
-       - is_full=True => grid.get_and_reset() para capturar frames y vaciar
-    3. Si captured_frames (afuera del lock): await process_grid (lento, GPU)
+    Flujo (arquitectura ganadora, 2026-08-31):
+    1. XREADGROUP count=BATCH (hasta 16 frames de una vez)
+    2. UN solo forward YOLO para toda la tanda (/detect_batch)
+    3. Gate por frame: yolo_count==0 → ack y descartar (no llega a Qwen)
+    4. Centinela: modo vigilante + count>0 → _save_vigilance_event + ack
+    5. Resto → grid por cámara (lock por cámara) → grid lleno → process_grid (Qwen)
+    6. latest_yolo.json por cámara (viewer poll)
 
-    El lock es held SOLO por add_frame + get_and_reset (CPU puro, sin await).
-    El await a process_grid queda FUERA del lock - eso a proposito para
-    no bloquear a otras camaras mientras Qwen corre, pero solo un worker
-    por camara puede "reclamar" un grid lleno, eliminando la race condition.
+    El request HTTP de ingest ya NO paga YOLO (responde ~15-30ms).
     """
     global WORKER_RUNNING
     WORKER_RUNNING = True
-    logger.info("🔧 YOLO Worker iniciado")
+    logger.info("🔧 YOLO Worker (batched F3) iniciado")
 
-    # C2: identidad de consumer para Redis Streams (hostname + pid + "w")
     consumer_name = f"{os.uname().nodename}-{os.getpid()}-w{id(asyncio.current_task()) % 997}"
+    BATCH = 16  # F3: tamaño de tanda YOLO (= máx forward batch del yolo_server)
+    # F3: tamaño del grid por cámara. 16 = análisis cada ~16s por cámara;
+    # 32 = mitad de llamadas Qwen/s (para nodos con muchas cámaras).
+    # El techo real es Qwen: N_cams × fps / GRID_SIZE grids/s, cada uno 2-5s GPU.
+    GRID_SIZE = int(os.getenv("OJOIA_GRID_SIZE", "16"))
+
+    from orchestrator import orchestrator  # import único, no por frame
 
     while True:
-        msg_id = None
+        batch_items = []
         try:
-            got = await frame_bus.get(consumer_name)
-            if got is None:
-                # C2: aprovechar el tick idle para rescatar mensajes huérfanos
-                # de consumers muertos (worker/restart a mitad de frame).
-                await frame_bus.rescue_stale(consumer_name)
-                continue
-            msg_id, frame_data = got
+            # 1. Jalar una tanda del stream (bloquea hasta 1s si no hay nada)
+            got = await frame_bus.get(consumer_name, count=BATCH)
+            if not got:
+                # F3: rescatar huérfanos Y PROCESARLOS (fix: antes quedaban pending)
+                got = await frame_bus.rescue_stale(consumer_name)
+                if not got:
+                    continue
+            batch_items = got
 
-            frame_id = frame_data.get("frame_id")
-            user_id = frame_data.get("user_id")
-            camera_id = frame_data.get("camera_id")
-            img_bytes = frame_data.get("img_bytes")
-            cam_cfg = frame_data.get("cam_cfg") or {}
-            schedule = frame_data.get("schedule") or {}
-            vigilance = frame_data.get("vigilance") or {}
-            mode = frame_data.get("mode", "normal")
-            yolo_count = frame_data.get("yolo_count", 0)
-            yolo_classes = frame_data.get("yolo_classes", [])
-            yolo_detections = frame_data.get("yolo_detections", [])
+            # 2. YOLO batched para TODA la tanda en un solo forward GPU.
+            #    (brightness adjust por imagen, como el path single original)
+            try:
+                imgs = []
+                cams = []
+                for _mid, fd in batch_items:
+                    imgs.append(_adjust_brightness(fd.get("img_bytes") or b""))
+                    cams.append(fd.get("camera_id") or "cam")
+                results = await _yolo_batch_http(imgs, cams)
+            except Exception as e:
+                logger.warning(f"[F3] batch YOLO falló ({e}); frames pasan sin gate")
+                results = [{}] * len(batch_items)
 
-            logger.info(f"Worker procesando frame {frame_id} (bus: {frame_bus.mode})")
+            # 3. Procesar cada frame con su resultado
+            for (msg_id, frame_data), yres in zip(batch_items, results):
+                try:
+                    yolo_count, yolo_classes, yolo_detections = _yolo_parse_result(yres)
+                except Exception:
+                    yolo_count, yolo_classes, yolo_detections = 0, [], []
 
-            if yolo_count <= 0:
-                logger.info(f"YOLO gate: 0 objects → frame REJECTED del grid (frame_id={frame_id})")
-                await frame_bus.ack(msg_id)
-                continue
+                frame_id = frame_data.get("frame_id")
+                user_id = frame_data.get("user_id")
+                camera_id = frame_data.get("camera_id")
+                img_bytes = frame_data.get("img_bytes")
+                cam_cfg = frame_data.get("cam_cfg") or {}
+                schedule = frame_data.get("schedule") or {}
+                vigilance = frame_data.get("vigilance") or {}
+                mode = frame_data.get("mode", "normal")
 
-            from orchestrator import orchestrator
-            grid = orchestrator._get_grid(user_id, camera_id, grid_size=16)
+                # latest_yolo.json para el viewer (por cámara)
+                try:
+                    frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                    await asyncio.to_thread(_write_json_atomic, frames_dir_v / "latest_yolo.json", {
+                        "timestamp": time.time(),
+                        "count": yolo_count,
+                        "detections": yolo_detections,
+                        "classes": yolo_classes,
+                        "mode": mode,
+                    })
+                except Exception as e:
+                    logger.debug(f"latest_yolo write: {e}")
 
-            # RACE FIX: lock por camara - add_frame + get_and_reset atomicos.
-            # is_full=True significa que el que llama debe reclamar (pop/reset).
-            # Varias cameras pueden procesar en paralelo (lock distinto cada una).
-            cam_lock = _get_camera_lock(user_id, camera_id)
-            captured_frames = None
-            async with cam_lock:
-                grid_is_full = grid.add_frame(
-                    image_bytes=img_bytes,
-                    camera_id=camera_id,
-                    user_id=user_id,
-                    yolo_count=yolo_count,
-                    yolo_classes=yolo_classes,
-                    yolo_detections=yolo_detections,
-                    mode=mode
-                )
-                if grid_is_full:
-                    # Atomico: capturar snapshot y vaciar el grid a 0.
-                    # Capturamos los 16 frames aqui; cualquier worker
-                    # posterior encontrara el grid vacio (no duplica).
-                    captured_frames = grid.get_and_reset()
-                current_count = grid.get_frame_count()
+                # Gate YOLO: sin objetos → descartar (no llega al grid/Qwen)
+                if yolo_count <= 0:
+                    logger.info(f"YOLO gate: 0 objects → frame REJECTED (frame_id={frame_id})")
+                    await frame_bus.ack(msg_id)
+                    continue
 
-            current_time = datetime.now().strftime("%H:%M")
-            is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time, cam_cfg.get("night_mode", False), user_id=user_id, camera_id=camera_id)
+                # Centinela (movido del endpoint [5]): modo vigilante + detección
+                current_time = datetime.now().strftime("%H:%M")
+                is_vigilante = _is_vigilante_mode(schedule, vigilance, current_time,
+                                                  cam_cfg.get("night_mode", False),
+                                                  user_id=user_id, camera_id=camera_id)
+                if is_vigilante:
+                    logger.warning(f"MODO CENTINELA: {yolo_count} objects {yolo_classes} → alerta directa")
+                    _save_vigilance_event(user_id, camera_id, img_bytes, yolo_count,
+                                          yolo_classes, frame_data.get("client_ip", ""))
+                    await frame_bus.ack(msg_id)
+                    continue
 
-            logger.info(f"YOLO gate: {yolo_count} objects {yolo_classes} → frame AGREGADO al grid "
-                        f"(captured={bool(captured_frames)}, current_count={current_count})")
+                # Grid por cámara (lock → add_frame → capture si lleno)
+                grid = orchestrator._get_grid(user_id, camera_id, grid_size=GRID_SIZE)
+                cam_lock = _get_camera_lock(user_id, camera_id)
+                captured_frames = None
+                async with cam_lock:
+                    grid_is_full = grid.add_frame(
+                        image_bytes=img_bytes,
+                        camera_id=camera_id,
+                        user_id=user_id,
+                        yolo_count=yolo_count,
+                        yolo_classes=yolo_classes,
+                        yolo_detections=yolo_detections,
+                        mode=mode
+                    )
+                    if grid_is_full:
+                        captured_frames = grid.get_and_reset()
+                    current_count = grid.get_frame_count()
 
-            # Procesar grid solo cuando este lleno (16 frames en modo normal).
-            # En modo vigilante no procesamos Qwen (defensa en profundidad): la
-            # alerta centinela ya fue guardada por _save_vigilance_event en [5]
-            # y los frames vigilantes no se encolaron en [6].
-            #
-            # IMPORTANTE: el await queda FUERA del lock - no bloquea el lock de
-            # la camara mientras Qwen corre. El grid ya esta reseteado y vacio.
-            if captured_frames:
-                # grid-fix (2026-08-09): pasar captured_frames directamente a
-                # process_grid. Antes el worker capturaba los 16 con
-                # get_and_reset() (linea 4075) pero process_grid reeleria el
-                # grid YA VACIO -> "Grid procesado: 0/16 frames" y los 16 frames
-                # se perdian. Ver LEEME.md seccion 11.
-                grid_result = await orchestrator.process_grid(
-                    user_id=user_id,
-                    camera_id=camera_id,
-                    mode="vigilante" if is_vigilante else "normal",
-                    use_grid_image=True,
-                    grid_size=16,
-                    frames=captured_frames
-                )
-                logger.info(f"Grid procesado: {grid_result.get('frame_count', 0)}/16 frames")
-            else:
-                logger.info(f"Grid aún no lleno (current_count={current_count}/16), esperando más frames")
+                if captured_frames:
+                    grid_result = await orchestrator.process_grid(
+                        user_id=user_id,
+                        camera_id=camera_id,
+                        mode="normal",
+                        use_grid_image=True,
+                        grid_size=GRID_SIZE,
+                        frames=captured_frames
+                    )
+                    logger.info(f"Grid procesado: {grid_result.get('frame_count', 0)}/16 frames")
+                else:
+                    logger.debug(f"Grid {camera_id}: {current_count}/16, esperando más frames")
 
-            await frame_bus.ack(msg_id)  # C2: XACK solo tras procesar
+                await frame_bus.ack(msg_id)  # XACK solo tras procesar
 
         except Exception as e:
             logger.error(f"Error en yolo_worker: {e}", exc_info=True)
+            # SIN ack: Redis retiene los mensajes y otro worker los rescata
+            await asyncio.sleep(0.1)
             # C2: SIN ack → Redis retiene el mensaje y otro worker lo rescata
             # via XAUTOCLAIM (rescue_stale). En memory el frame se pierde igual
             # que antes (no hay peor caso nuevo).

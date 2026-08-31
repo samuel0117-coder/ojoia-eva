@@ -106,14 +106,20 @@ class FrameBus:
             self._count_drop("queue llena")
             return False
 
-    async def get(self, consumer: str):
-        """Obtiene (msg_id, data) o None tras ~BLOCK_MS sin mensajes."""
+    async def get(self, consumer: str, count: int = 1):
+        """Obtiene hasta `count` mensajes como [(msg_id, data), ...] (F3).
+
+        Devuelve lista (posiblemente vacía tras ~BLOCK_MS). Cada elemento es
+        (msg_id, data). En modo memoria devuelve [(None, data)] máximo 1
+        (la cola nativa no soporta peek de N)."""
         if self.mode == "redis" and self._r is not None:
             try:
                 resp = await self._r.xreadgroup(
-                    GROUP, consumer, {STREAM_KEY: ">"}, count=1, block=BLOCK_MS)
+                    GROUP, consumer, {STREAM_KEY: ">"}, count=max(1, count),
+                    block=BLOCK_MS)
                 if not resp:
-                    return None
+                    return []
+                out = []
                 for _stream, entries in resp:
                     for msg_id, fields in entries:
                         data = {}
@@ -125,7 +131,6 @@ class FrameBus:
                                 except UnicodeDecodeError:
                                     pass
                             data[kk] = v
-                        # reconstruir tipos conocidos
                         for jk in ("cam_cfg", "schedule", "vigilance", "yolo_detections", "yolo_classes"):
                             if jk in data and isinstance(data[jk], (bytes, str)):
                                 raw = data[jk]
@@ -142,17 +147,17 @@ class FrameBus:
                                     data[ik] = int(data[ik])
                                 except (TypeError, ValueError):
                                     data[ik] = 0
-                        return msg_id, data
-                return None
+                        out.append((msg_id, data))
+                return out
             except Exception as e:
                 logger.warning(f"[C2] redis get error: {e}; reintentando en 2s")
                 await asyncio.sleep(2)
-                return None
+                return []
         try:
             data = await asyncio.wait_for(self._mem.get(), timeout=BLOCK_MS / 1000)
-            return None, data  # memory: sin msg_id (ack no-op)
+            return [(None, data)]  # memory: sin msg_id (ack no-op)
         except asyncio.TimeoutError:
-            return None
+            return []
 
     async def ack(self, msg_id):
         if msg_id and self.mode == "redis" and self._r is not None:
@@ -161,18 +166,32 @@ class FrameBus:
             except Exception as e:
                 logger.warning(f"[C2] ack error: {e}")
 
-    async def rescue_stale(self, consumer: str):
-        """Reclama mensajes de consumers muertos (llamar periódicamente)."""
+    async def rescue_stale(self, consumer: str) -> list:
+        """Reclama mensajes de consumers muertos (llamar periódicamente).
+        F3 FIX: devuelve [(msg_id, data), ...] para que el caller LOS PROCESE
+        (antes solo los reclamaba y quedaban pending bajo el nuevo consumer)."""
         if self.mode != "redis" or self._r is None:
-            return
+            return []
+        out = []
         try:
             res = await self._r.xautoclaim(STREAM_KEY, GROUP, consumer,
                                            min_idle_time=CLAIM_IDLE_MS, start_id="0-0", count=10)
             msgs = res[1] if isinstance(res, (list, tuple)) and len(res) > 1 else []
             for msg_id, fields in msgs:
                 logger.warning(f"[C2] mensaje huérfano reclamado: {msg_id}")
+                data = {}
+                for k, v in fields.items():
+                    kk = k.decode() if isinstance(k, bytes) else k
+                    if isinstance(v, bytes) and kk != "img_bytes":
+                        try:
+                            v = v.decode()
+                        except UnicodeDecodeError:
+                            pass
+                    data[kk] = v
+                out.append((msg_id, data))
         except Exception as e:
             logger.debug(f"[C2] autoclaim: {e}")
+        return out
 
     def qsize(self) -> int:
         if self.mode == "redis" and self._r is not None:
