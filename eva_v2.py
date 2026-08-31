@@ -494,6 +494,111 @@ async def _analyze_frame_for_prompt(b64: str, zone: str, biz_type: str) -> Dict:
         logger.error(f"Error analizando: {e}")
         return {}
 
+
+# ── F2 (2026-08-31): análisis multi-frame del onboarding ──────────────────────
+# Antes: el diagnóstico de calidad usaba 1 solo frame → un instante atípico
+# (sombra de una persona, faro, nube) producía consejos falsos ("hay contraluz,
+# mueve la cámara"). Ahora: se analizan N frames (default 3) y se FUSIONA el
+# veredicto por mayoría/voto ponderado — el consejo es estable.
+
+F2_FRAMES = int(os.getenv("OJOIA_ANALYZE_FRAMES", "3"))     # frames a analizar
+F2_WAIT_S = float(os.getenv("OJOIA_ANALYZE_WAIT_S", "1.2"))  # espera entre frames
+
+
+async def _analyze_frame_multi(camera_id: str, user_id: str, zone: str,
+                               biz_type: str) -> tuple:
+    """F2: analiza N frames consecutivos de la cámara y fusiona veredictos.
+    Devuelve (image_b64_del_último, análisis_fusionado). Si solo hay 1 frame
+    disponible (o los extras fallan), degrada elegantemente al caso de 1."""
+    frames_b64 = []
+    last = None
+    for i in range(max(1, F2_FRAMES)):
+        frame = _get_frame(camera_id, user_id)
+        if frame:
+            small = _resize(frame, 640)
+            frames_b64.append(base64.b64encode(small).decode())
+            last = small
+        if i < F2_FRAMES - 1:
+            await asyncio.sleep(F2_WAIT_S)  # dar tiempo a que llegue frame nuevo
+    if not frames_b64:
+        return None, {}
+
+    analyses = []
+    for fb64 in frames_b64:
+        a = await _analyze_frame_for_prompt(fb64, zone, biz_type)
+        if a:
+            analyses.append(a)
+    if not analyses:
+        return base64.b64encode(last).decode(), {}
+
+    merged = _merge_frame_analyses(analyses)
+    return base64.b64encode(last).decode(), merged
+
+
+def _merge_frame_analyses(analyses: list) -> dict:
+    """Fusiona los veredictos de N frames:
+    - iluminacion/visibilidad: la PEOR vista en ≥ la mitad de los frames
+      (pesimista para no maquillar un problema real intermitente)
+    - contraluz: True solo si aparece en ≥ 2 frames o en todos cuando N=1
+    - coincide_zona / es_zona_correcta: mayoría estricta (> 50%)
+    - zona_real: la moda; sugerencia: la del último análisis con una
+    """
+    n = len(analyses)
+    if n == 1:
+        return dict(analyses[0])
+
+    def _votes(key, values=None):
+        c = {}
+        for a in analyses:
+            v = a.get(key)
+            if values and v not in values:
+                continue
+            c[v] = c.get(v, 0) + 1
+        return c
+
+    out = {}
+    # campos de texto simples: moda (objetos, zona_real)
+    for key in ("zona_real", "orientacion"):
+        c = _votes(key)
+        if c:
+            out[key] = max(c, key=c.get)
+    # coincide_zona: mayoría estricta (más de la mitad)
+    cz = [a.get("coincide_zona") for a in analyses]
+    out["coincide_zona"] = sum(1 for x in cz if x is True) > n / 2
+    out["es_zona_correcta"] = out["coincide_zona"]
+    # iluminacion/visibilidad: pesimista si se repite en >= 50% de frames
+    RANK = {"buena": 0, "regular": 1, "mala": 2}
+    for key in ("iluminacion", "visibilidad_objetivo"):
+        vals = [a.get(key) for a in analyses if a.get(key) in RANK]
+        if not vals:
+            continue
+        worst = max(RANK[v] for v in vals)
+        # promedio entero de los ranks; si sube a 'regular', pesimista
+        avg = sum(RANK[v] for v in vals) / len(vals)
+        rank = max(int(avg), 1) if worst >= 1 and avg >= 0.5 else 0
+        # regla simple: si >= la mitad de los frames muestran problema (>= regular),
+        # reportar el peor nivel visto en esos frames problemáticos
+        bad = [v for v in vals if RANK[v] >= 1]
+        if len(bad) * 2 >= len(vals):
+            out[key] = max(bad, key=lambda v: RANK[v])
+        else:
+            out[key] = "buena"
+    # contraluz: persistente (>= 2 frames) o todos cuando N=1
+    cl = [a.get("contraluz") is True for a in analyses]
+    out["contraluz"] = sum(cl) >= 2 or (n == 1 and cl[0])
+    # sugerencia: la del análisis más reciente que tenga una
+    for a in reversed(analyses):
+        if a.get("sugerencia_posicion"):
+            out["sugerencia_posicion"] = a["sugerencia_posicion"]
+            break
+    # objetos/personas: del último (solo informativo)
+    last_a = analyses[-1]
+    for k in ("objetos", "personas_estimadas", "visibilidad"):
+        if k in last_a:
+            out[k] = last_a[k]
+    out["frames_analizados"] = n
+    return out
+
 def _parse_json_response(content: str) -> dict:
     content = re.sub(r'^```json\s*', '', content)
     content = re.sub(r'\s*```$', '', content).strip()
@@ -2010,7 +2115,21 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
         session["image_b64"] = b64
         session["camera_connected"] = True
         session["image_desc"] = await _describe_frame(b64, session.get("zone",""), session.get("business_type",""))
-        session["image_analysis"] = await _analyze_frame_for_prompt(b64, session.get("zone",""), session.get("business_type","negocio"))
+        # F2: análisis MULTI-frame — promedia N frames para que un instante
+        # atípico (sombra/faro/nube) no dispare un consejo falso de colocación.
+        cam_for_analysis = session.get("camera_id") or frame_camera_id
+        try:
+            b64_last, merged_analysis = await _analyze_frame_multi(
+                cam_for_analysis, user_id,
+                session.get("zone",""), session.get("business_type","negocio"))
+            if b64_last:
+                session["image_b64"] = b64_last  # el más reciente de la serie
+            session["image_analysis"] = merged_analysis or await _analyze_frame_for_prompt(
+                b64, session.get("zone",""), session.get("business_type","negocio"))
+        except Exception as e:
+            logger.warning(f"[F2] multi-frame falló ({e}); fallback a 1 frame")
+            session["image_analysis"] = await _analyze_frame_for_prompt(
+                b64, session.get("zone",""), session.get("business_type","negocio"))
         session["phase"] = SetupPhase.ANALYZE.value
         session["wait_attempts"] = 0
         try:
@@ -2086,6 +2205,10 @@ async def _handle_analyze(session, session_id, first):
     lines = ["📷 Cámara conectada ✅\n", f"Zona configurada: {zone}"]
     if zona_real: lines.append(f"Zona detectada: {zona_real}")
     lines.append(f"\nDescripción: {img_desc}")
+    # F2: transparencia — el diagnóstico promedió varios frames
+    n_frames = img_analysis.get("frames_analizados", 1)
+    if isinstance(n_frames, int) and n_frames > 1:
+        lines.append(f"_(diagnóstico promediado de {n_frames} tomas)_")
 
     # Feedback de calidad (WOW #1)
     quality_notes = []
