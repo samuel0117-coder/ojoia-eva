@@ -1465,6 +1465,7 @@ async def health():
             "size": FRAME_QUEUE.qsize(),
             "maxsize": FRAME_QUEUE.maxsize,
             "drops": FRAME_QUEUE_DROPS,
+            "rate_limit_drops": sum(_INGEST_RATE_DROPS.values()),  # C4
             "workers": WORKER_COUNT,         # C1
             "camera_locks": len(CAMERA_LOCKS),  # C2 (locks activos)
         },
@@ -4288,6 +4289,31 @@ async def rotate_ingest_key(camera_id: str, user_id: Optional[str] = None):
 
 _INGEST_KEY_WARN_TS: dict = {}  # camera_id -> ts del último warning (rate-limit de log)
 
+# C4 (2026-08-31) — Rate limit de ingesta por cámara.
+# Una cámara ESP32 normal envía ~1 fps. Sin límite, una cámara buggueada o
+# un atacante con ingest_key podía saturar FRAME_QUEUE, YOLO y la GPU.
+# Bucket simple: mínimo `interval = 1/max_fps` entre frames aceptados.
+_INGEST_LAST_TS: Dict[str, float] = {}
+_INGEST_RATE_DROPS: Dict[str, int] = {}
+
+
+def _ingest_rate_ok(camera_id: str, cam_cfg: dict) -> bool:
+    """True si el frame entra dentro del rate permitido para esta cámara.
+    max_fps configurable por cámara en camera.json ("max_fps"), default 5.
+    Los rechazados se cuentan para métricas (/health los expone)."""
+    try:
+        max_fps = float((cam_cfg or {}).get("max_fps") or 5)
+    except (TypeError, ValueError):
+        max_fps = 5.0
+    min_interval = 1.0 / max(max_fps, 0.1)
+    now = time.time()
+    last = _INGEST_LAST_TS.get(camera_id, 0.0)
+    if now - last < min_interval:
+        _INGEST_RATE_DROPS[camera_id] = _INGEST_RATE_DROPS.get(camera_id, 0) + 1
+        return False
+    _INGEST_LAST_TS[camera_id] = now
+    return True
+
 
 def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str):
     """A4 — Autenticación de ingesta por cámara.
@@ -4335,6 +4361,11 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         # ingest_key configurada y el header no coincide, se rechaza aquí.
         _cam_cfg_ingest = get_camera_config_static(user_id, camera_id)
         _enforce_ingest_key(request, _cam_cfg_ingest, camera_id)
+
+        # ── [0b] RATE LIMIT por cámara (C4) — antes de leer/gastar nada ──
+        if not _ingest_rate_ok(camera_id, _cam_cfg_ingest):
+            raise HTTPException(status_code=429,
+                                detail=f"Rate limit: máximo {(_cam_cfg_ingest or {}).get('max_fps', 5)} fps por cámara")
 
         img_bytes = await image.read()
         frame_size = len(img_bytes)
