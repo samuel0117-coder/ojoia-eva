@@ -154,6 +154,29 @@ aprovechar batch YOLO (hoy 1 imagen/request; el servidor puede hacer batches).
   orchestrator. systemd `ojoia-ingest.service`, puerto 8006.
 - Cloudflared: `/ingest/*` → 8006; resto → 8005. Rollback = 1 línea de config.
 
+# 🏆 FASE 3 — Arquitectura ganadora (aprobada 2026-08-31)
+
+**Diagnóstico medido del nodo:** 2×3090 (GPU0 21.6GB/24.5 usada, GPU1 23.9/24.5
+— 96%, riesgo OOM), 20 cores, 61GB RAM. Contenedor qwen3vl8b (8019) unhealthy.
+Techo actual: ~50 cámaras estables; el cuello NO es GPU ni red, es YOLO
+síncrono + I/O dentro del request HTTP del ingest.
+
+**Decisión del usuario:** todo el plan, sin cambios de firmware (las cámaras
+siguen golpeando el mismo dominio/túnel).
+
+## Cambios aprobados
+1. **Ingest ultraligero**: /ingest SIN YOLO síncrono → guardar frame (thread
+   pool) + XADD Redis + responder ~15-30ms. Trade-off aceptado: siluetas del
+   viewer con ~1-2s de lag (poll de latest_yolo.json ya existente).
+2. **Workers batched**: XREADGROUP count=16 → 1 forward YOLO por tanda →
+   gate yolo_count>0 → grids → Qwen. (Reemplaza el micro-batch de request.)
+3. **Qwen**: subir concurrencia de grids, medir p95 con 2/4/8 y fijar semáforo.
+4. **Rebalanceo GPU**: YOLO pinned a GPU0, bajar gpu-memory-utilization de
+   qwen9b vLLM para colchón, decidir sobre qwen3vl8b unhealthy.
+5. **Certificación**: 200 cámaras × 1fps + ráfaga 3× + reinicio a mitad.
+
+**Objetivo:** 150-250 cámaras/nodo con latencia de alerta intacta.
+
 ## Certificación objetivo (medir con scripts/load_test_ingest.py)
 - 100 cámaras × 1fps sostenido: 0 crashes, drops < 1%, p99 ingest < 1s.
 - Ráfaga 3×: cola absorbe y drena; ningún timeout 5xx.
