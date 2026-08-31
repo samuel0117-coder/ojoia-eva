@@ -4413,6 +4413,21 @@ def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str):
         raise HTTPException(status_code=401, detail="X-Camera-Key inválida o ausente")
 
 
+def _write_frame_files(frames_dir_v: Path, img_bytes: bytes, user_id: str, camera_id: str):
+    """C7: escritura síncrona del frame (corre en thread pool vía to_thread)."""
+    frames_dir_v.mkdir(parents=True, exist_ok=True)
+    with open(frames_dir_v / "latest_raw.jpg", "wb") as f:
+        f.write(img_bytes)
+
+
+def _write_json_atomic(path: Path, data, **kwargs):
+    """C7: JSON write atómico (tmp+rename) para llamar vía to_thread."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=kwargs.get("indent", 2), ensure_ascii=False))
+    tmp.replace(path)
+
+
 async def _process_ingest(request: Request, camera_id: str, user_id: str, image: UploadFile):
     """Flujo OPTIMIZADO: guardar + YOLO rápido + encolar grid/Qwen + responder.
     
@@ -4450,12 +4465,15 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         is_vigilante = False
 
         # ── [1] GUARDAR FRAME ORIGINAL (siempre) ──
-        try:
+        # C7 (2026-08-31): la escritura a disco va al thread pool. Antes, un
+        # `open+write` bloqueante por frame frenaba el event loop con muchas
+        # cámaras (100 cámaras × 1fps: p99 de ingest llegó a 6.2s por esto).
+        async def _save_frame_disk():
             frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
-            frames_dir_v.mkdir(parents=True, exist_ok=True)
-            frame_path = frames_dir_v / "latest_raw.jpg"
-            with open(frame_path, "wb") as f:
-                f.write(img_bytes)
+            await asyncio.to_thread(_write_frame_files, frames_dir_v, img_bytes,
+                                    user_id, camera_id)
+        try:
+            await _save_frame_disk()
             # Cache en RAM para MJPEG stream
             _cache_frame(user_id, camera_id, img_bytes)
             # ── EVA WIZARD: alimentar el buffer de frames de Eva para que el
@@ -4508,8 +4526,8 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                 "classes": yolo_classes,
                 "mode": mode
             }
-            with open(frames_dir_v / "latest_yolo.json", "w") as f:
-                json.dump(yolo_data, f, indent=2)
+            # C7: misma razón que arriba — no bloquear el event loop con disco
+            await asyncio.to_thread(_write_json_atomic, frames_dir_v / "latest_yolo.json", yolo_data)
 
             # W2 fix (2026-08-09): NO llamar grid.add_frame() aqui. El worker
             # (yolo_worker, api_eva.py:4062) ya lo hace bajo cam_lock y dispara

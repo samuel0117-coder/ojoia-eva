@@ -1,0 +1,17 @@
+[Unit]
+Description=OjoIA Ingest Server — endpoint de cámaras separado (C3, puerto 8013)
+After=network-online.target redis-ojoia.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+EnvironmentFile=/opt/ojoia/config/ojoia.env
+WorkingDirectory=/opt/ojoia/code
+ExecStart=/opt/ojoia/venv/bin/python -u /opt/ojoia/code/ingest_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
