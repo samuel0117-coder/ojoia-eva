@@ -1808,6 +1808,65 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
     phase = session["phase"]
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
 
+    # ── D1 (2026-08-31): tolerancia a preguntas fuera de guion ───────────────
+    # Antes: si el usuario hacía una pregunta en medio del wizard ("¿y eso para
+    # qué?"), la máquina de estados lo interpretaba como RESPUESTA y avanzaba
+    # con basura ("zona = ¿para que sirve esto?") o se trababa.
+    # Ahora: detectamos la pregunta, explicamos qué estamos haciendo y POR QUÉ,
+    # y repetimos la pregunta del paso actual. El wizard no avanza ni se pierde.
+    _msg_raw = (message or "").strip()
+    if _msg_raw and not _msg_raw.startswith("__"):
+        _interrog = ("qué", "cómo", "por qué", "para qué", "para que es",
+                     "cuándo", "dónde", "quién", "quien es", "ya funciona", "sirve")
+        # NOTA: no usamos "que"/"como"/"porque" genéricos — en CONTEXT una
+        # respuesta válida de regla empieza con "que..." ("que nadie abra la
+        # caja") y NUNCA debe tratarse como pregunta.
+        _looks_question = (_msg_raw.endswith("?") or _msg_raw.startswith("¿") or
+                           any(_msg_raw.lower().startswith(w) for w in _interrog))
+        # Excepciones: en CONTEXT una pregunta puede ser una respuesta válida
+        # solo si es corta; y los comandos de TEST_RULES nunca son preguntas.
+        if _looks_question and phase not in (SetupPhase.TEST_RULES.value,):
+            _answers = {
+                SetupPhase.GREET.value: (
+                    "estoy conociéndolos: tu nombre y el de tu negocio, para personalizar todo lo que sigue"),
+                SetupPhase.ZONE.value: (
+                    "estás eligiendo DÓNDE va la cámara (ej. caja, cocina, entrada). "
+                    "De eso depende qué tan bien puedo vigilar lo que te importa"),
+                SetupPhase.HARDWARE.value: (
+                    "estamos conectando la cámara física a la red. Cuando el LED quede fijo, la cámara está lista"),
+                SetupPhase.WAIT_IMAGE.value: (
+                    "estoy esperando la primera imagen de tu cámara para verificar que ve bien"),
+                SetupPhase.ANALYZE.value: (
+                    "estoy analizando la imagen: iluminación, ángulo y qué tan bien se ve la zona importante"),
+                SetupPhase.ZONES.value: (
+                    "estoy marcando las zonas importantes que veo (mostrador, caja, puerta...) "
+                    "para vigilar cada una por separado"),
+                SetupPhase.CONTEXT.value: (
+                    "me estás contando QUÉ quieres que vigile, con tus palabras. "
+                    "Estas serán las reglas que disparan tus notificaciones"),
+                SetupPhase.CONFIRM.value: (
+                    "te estoy mostrando un resumen de la configuración para que la apruebes antes de activarla"),
+            }
+            _expl = _answers.get(phase, "estamos configurando tu cámara paso a paso")
+            # Re-pregunta del paso actual
+            _step_q = _context_question(session, session.get("context_step") or "concern", first) \
+                if phase == SetupPhase.CONTEXT.value else ""
+            if phase == SetupPhase.GREET.value:
+                _step_q = "¿Cómo te llamas y cómo se llama tu negocio?"
+            elif phase == SetupPhase.ZONE.value:
+                _step_q = f"¿Dónde vas a poner la cámara? Por ejemplo: {_get_zone_examples(session.get('business_type',''))}..."
+            elif phase == SetupPhase.HARDWARE.value:
+                _step_q = "Cuando el LED quede fijo, dime 'ok'."
+            elif phase == SetupPhase.WAIT_IMAGE.value:
+                _step_q = "Apenas enciendas la cámara y llegue la imagen, te aviso."
+            elif phase == SetupPhase.ZONES.value:
+                _step_q = "¿Confirmas las zonas que marqué o quieres ajustar alguna?"
+            elif phase == SetupPhase.CONFIRM.value:
+                _step_q = "¿Apruebas la configuración? (di 'sí' o dime qué cambiar)"
+            return _mk_resp(session,
+                f"Buena pregunta, {first}. Ahora mismo {_expl}.\n\n"
+                f"Sigamos: {_step_q}")
+
     # ── GREET ─────────────────────────────────────────────────────────────────
     if phase == SetupPhase.GREET.value:
         owner = session.get("owner_name","")
@@ -2594,6 +2653,39 @@ async def _handle_test_rules(session, session_id, user_id, message, first, stora
         )
         return _mk_resp(session, text)
 
+    # D3 (2026-08-31): comandos de control del wizard de pruebas
+    msg_lower = (message or "").strip().lower()
+    if msg_lower in ("saltar", "skip", "omitir", "después", "despues", "probar después",
+                     "probar despues", "luego", "todas saltar", "terminar"):
+        session["phase"] = SetupPhase.DONE.value
+        session.pop("test_rules", None)
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return _mk_resp(session,
+            f"👍 Sin problema, {first}. Las reglas quedan activas vigilando igual.\n"
+            f"Puedes probarlas cuando quieras desde el chat diciendo: \"probar reglas\".\n\n"
+            f"Tu cámara está **lista y vigilando** ✅")
+
+    if current < len(rules) and rules and msg_lower in ("siguiente", "next", "pasar"):
+        # Saltar SOLO la regla actual (permanece sin probar)
+        current += 1
+        tr = {"rules": rules, "tested": tested, "current": current}
+        session["test_rules"] = tr
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        if current >= len(rules):
+            session["phase"] = SetupPhase.DONE.value
+            _save_session_to_disk(session)
+            return _mk_resp(session,
+                f"🎉 ¡Cámara lista, {first}! Probaste {len([t for t in tested if t.get('triggered')])} de {len(rules)} reglas.\n"
+                f"Las demás las puedes probar después diciendo \"probar reglas\" ✅")
+        return _mk_resp(session,
+            f"⏭️ Regla {current} omitida. Siguiente:\n\n"
+            f"**Regla {current+1}:** \"{rules[current]}\"\n"
+            f"Realiza la acción y dime \"listo\". "
+            f"(o \"siguiente\" para saltar / \"saltar\" para terminar)\n\n"
+            f"**Progreso: {current}/{len(rules)}**")
+
     # Si el usuario dice que probó la regla actual
     if current < len(rules):
         rule = rules[current]
@@ -2615,38 +2707,43 @@ async def _handle_test_rules(session, session_id, user_id, message, first, stora
 
         triggered = result.get("triggered", False)
         tested.append({"rule": rule, "test_action": message, "triggered": triggered})
-        current += 1
+        # D3 bugfix: antes se avanzaba current también cuando FALLABA → regla
+        # quedaba "probada" sin haberse activado nunca y el texto ("¿reintentar
+        # o pasar?") contradecía el contador. Ahora solo avanza si se activó;
+        # si falla, se queda en la misma regla para reintentar, y el usuario
+        # puede decir "siguiente" para saltarla explícitamente.
+        if triggered:
+            current += 1
         session["test_rules"] = {"rules": rules, "tested": tested, "current": current}
         _sessions[session_id] = session
         _save_session_to_disk(session)
 
         if triggered:
-            text = (
-                f"✅ **Regla #{current} probada** — ¡Se activó correctamente!\n\n"
-                f"Recibiste una notificación push con: \"{rule[:60]}\"\n\n"
-                f"**Progreso: {current}/{len(rules)} reglas probadas ✅**"
-            )
+            if current >= len(rules):
+                session["phase"] = SetupPhase.DONE.value
+                _sessions[session_id] = session
+                _save_session_to_disk(session)
+                text = (
+                    f"✅ **Regla #{current} probada** — ¡Se activó!\n\n"
+                    f"🎉 **Todas las reglas funcionan. Tu cámara está lista y vigilando, {first}.**"
+                )
+            else:
+                text = (
+                    f"✅ **Regla #{current} probada** — ¡Se activó correctamente!\n\n"
+                    f"Recibiste una notificación push con: \"{rule[:60]}\"\n\n"
+                    f"Siguiente regla: \"{rules[current][:60]}\" — realiza la acción y dime \"listo\".\n\n"
+                    f"**Progreso: {current}/{len(rules)} reglas probadas ✅**"
+                )
         else:
             text = (
-                f"⚠️ **Regla #{current} no se activó** con la acción: \"{message[:50]}\"\n\n"
-                f"¿Quieres reintentar o pasar a la siguiente?\n\n"
+                f"⚠️ **Regla #{current+1} no se activó** con la acción: \"{message[:50]}\"\n\n"
+                f"Puedes reintentar (realiza la acción otra vez y dime \"listo\"), "
+                f"o decir \"siguiente\" para probar la siguiente regla.\n\n"
                 f"**Progreso: {current}/{len(rules)} reglas probadas**"
             )
 
-        # Si quedan reglas, preguntar por la siguiente
-        if current < len(rules):
-            next_rule = rules[current]
-            text += f"\n\nAhora para la regla #{current + 1}: \"{next_rule[:80]}\"\n¿Qué acción de prueba querés hacer?"
-        else:
-            # Todas las reglas probadas
-            session["phase"] = SetupPhase.DONE.value
-            _sessions[session_id] = session
-            _save_session_to_disk(session)
-            text += (
-                f"\n\n🎉 **¡Todas las reglas están probadas!** {first}, tu cámara está "
-                f"completamente configurada y vigilando.\n\n"
-                f"¿Qué quieres saber?"
-            )
+        # D3: el texto (siguiente regla o cierre) ya se construyó arriba;
+        # la fase DONE se marca solo cuando realmente se completó/saltó todo.
         return _mk_resp(session, text)
 
     # Fallback

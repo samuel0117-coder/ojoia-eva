@@ -19,6 +19,13 @@ import threading
 logger = logging.getLogger(__name__)
 
 STORAGE_ROOT = "/home/sam/storage"
+
+# D4 (2026-08-31) — Versión del pipeline de vigilancia (prompt + detección).
+# Se guarda en cada evento para poder medir falsos positivos por versión y
+# detectar regresiones cuando el prompt o la lógica cambien.
+# Bump: YYYY-MM-DD.N cada vez que cambie el system prompt de vigilancia o
+# _detect_attention_hits.
+VIGILANCE_PIPELINE_VERSION = "2026-08-31.1"  # B1 keyword->candidato + B2 verificador
 DISKS_CONFIG_FILE = f"{STORAGE_ROOT}/disks_config.json"
 
 
@@ -2325,6 +2332,7 @@ class QwenOrchestrator:
                 summary=summary,
                 qwen_json=qwen_json,
                 metadata={
+                    "prompt_version": VIGILANCE_PIPELINE_VERSION,  # D4
                     "frames_count": len(frames),
                     "total_yolo_objects": total_yolo_objects,
                     "yolo_classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
