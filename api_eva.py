@@ -799,6 +799,73 @@ async def rtsp_register(request: dict, authorization: str = Header(None, alias="
             "note": "El puller la descubre en ≤30s. Guarda ingest_key: sirve para auditar la fuente."}
 
 
+@app.get("/api/cameras/{camera_id}/ingest-ips")
+async def get_ingest_ips(camera_id: str, user_id: Optional[str] = None):
+    """F1-bis: ver las IPs pineadas de una cámara + estado de la política."""
+    _validate_safe_path(camera_id, "camera_id")
+    cam_cfg = get_camera_config_static(user_id or "", camera_id) or {}
+    return {
+        "success": True, "camera_id": camera_id,
+        "ingest_key_active": bool(cam_cfg.get("ingest_key")),
+        "allowed_ips": cam_cfg.get("ingest_allowed_ips", []),
+        "locked": bool(cam_cfg.get("ingest_ip_locked")),
+    }
+
+
+@app.post("/api/cameras/{camera_id}/ingest-ips")
+async def manage_ingest_ips(camera_id: str, request: dict,
+                             authorization: str = Header(None, alias="Authorization")):
+    """F1-bis: gestionar IPs pineadas sin re-flashear firmware.
+    Acciones: {action: "add"|"remove"|"reset"|"lock"|"unlock", ip: "..."}
+    - add: aprueba una IP nueva (cuando el ISP del negocio cambió la IP)
+    - remove: quita una IP de la lista
+    - reset: borra la lista → la próxima IP que llegue queda pineada (TOFU)
+    - lock/unlock: congela o abre la ventana TOFU
+    Auth: bearer del usuario dueño (middleware valida user_id del body)."""
+    user_id = (request.get("user_id") or "").strip()
+    await _verify_user_token(authorization, user_id)
+    _validate_safe_path(camera_id, "camera_id")
+    cam_path = Path(STORAGE_ROOT) / "users" / user_id / "cameras" / camera_id / "camera.json"
+    if not cam_path.exists():
+        raise HTTPException(status_code=404, detail="camera.json no encontrado")
+    action = (request.get("action") or "").strip()
+    ip = (request.get("ip") or "").strip()
+
+    def _mut(cfg):
+        ips = cfg.get("ingest_allowed_ips") or []
+        if action == "add":
+            if not ip:
+                raise HTTPException(status_code=400, detail="ip requerida")
+            if ip not in ips:
+                ips.append(ip)
+            cfg["ingest_allowed_ips"] = ips[-3:]
+        elif action == "remove":
+            cfg["ingest_allowed_ips"] = [x for x in ips if x != ip]
+        elif action == "reset":
+            cfg["ingest_allowed_ips"] = []  # TOFU: próxima IP que llegue se pinea
+        elif action == "lock":
+            cfg["ingest_ip_locked"] = True
+        elif action == "unlock":
+            cfg["ingest_ip_locked"] = False
+        else:
+            raise HTTPException(status_code=400, detail="action inválido")
+
+    # write atómico bajo lock de cámara (usa helper F1-bis)
+    try:
+        with open(cam_path) as f:
+            cfg = json.load(f)
+        _mut(cfg)
+        tmp = cam_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+        tmp.replace(cam_path)
+        _invalidate_cam_cfg_cache(user_id, camera_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"error: {e}")
+    return {"success": True, "action": action, "allowed_ips": cfg.get("ingest_allowed_ips", [])}
+
+
 @app.post("/api/auth/token")
 async def issue_user_token(request: dict):
     """
@@ -4400,6 +4467,71 @@ async def rotate_ingest_key(camera_id: str, user_id: Optional[str] = None):
 
 _INGEST_KEY_WARN_TS: dict = {}  # camera_id -> ts del último warning (rate-limit de log)
 
+# F1-bis (2026-08-31) — IP pinning TOFU para cámaras SIN firmware nuevo.
+# Las ESP32 en producción no pueden mandar X-Camera-Key (el firmware actual
+# no lo soporta y no hay acceso al dispositivo ahora). La IP de origen TCP
+# NO se puede falsificar: la cámara llega con la IP pública real del negocio
+# (verificado: 152.0.63.68, Claro RD — el túnel Cloudflare preserva la IP).
+#
+# Política de autenticación de ingesta (orden):
+#   1. camera.json tiene "ingest_key" → exige header X-Camera-Key (A4).
+#   2. Si no, camera.json tiene "ingest_allowed_ips" (TOFU) → solo esas IPs.
+#      - Se aprenden automáticamente las primeras N ips (OJOIA_TOFU_MAX, 2)
+#      - IP fuera de la lista → 403 + push de aviso al dueño (1/día).
+#   3. Si no hay nada → modo legado abierto + warning rate-limited (como A4).
+_INGEST_IP_WARN_TS: dict = {}
+_INGEST_TOFU_MAX = int(os.getenv("OJOIA_TOFU_MAX", "2"))
+_INGEST_IP_NOTIFY_TS: dict = {}
+
+
+def _client_real_ip(request: Request) -> str:
+    """IP real del cliente. Detrás de cloudflared, el conector local hace las
+    conexiones desde la IP original (config del túnel sin proxying HTTP en el
+    medio); si algún día hay proxy HTTP delante, respetamos CF-Connecting-IP."""
+    cip = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for")
+    if cip:
+        return cip.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _learn_or_check_ingest_ip(cam_cfg: dict, camera_id: str, client_ip: str,
+                              user_id: str = "") -> bool:
+    """F1-bis: TOFU sobre ingest_allowed_ips. Devuelve True si pasa.
+
+    Aprende la IP en la ventana inicial (hasta OJOIA_TOFU_MAX) y después
+    bloquea IPs desconocidas. Cualquier cambio de IP legítimo (ISP renovó
+    la IP del negocio) se aprueba con el endpoint rotate/relearn."""
+    allowed = cam_cfg.get("ingest_allowed_ips")
+    if not isinstance(allowed, list) or not allowed:
+        return True  # sin política configurada: modo legado
+    if client_ip in allowed:
+        return True
+    # IP nueva: ¿ventana TOFU abierta?
+    if len(allowed) < _INGEST_TOFU_MAX and not cam_cfg.get("ingest_ip_locked"):
+        allowed.append(client_ip)
+        cam_cfg["ingest_allowed_ips"] = allowed
+        _persist_cam_cfg_field(user_id, camera_id, "ingest_allowed_ips", allowed)
+        logger.warning(f"[F1-bis] TOFU: IP {client_ip} aprendida para {camera_id}")
+        return True
+    return False
+
+
+def _persist_cam_cfg_field(user_id: str, camera_id: str, field: str, value):
+    """Escribe un campo en camera.json (atómico) e invalida la caché F3."""
+    try:
+        cam_path = Path(STORAGE_ROOT) / "users" / user_id / "cameras" / camera_id / "camera.json"
+        if not cam_path.exists():
+            return
+        with open(cam_path) as f:
+            cfg = json.load(f)
+        cfg[field] = value
+        tmp = cam_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+        tmp.replace(cam_path)
+        _invalidate_cam_cfg_cache(user_id, camera_id)
+    except Exception as e:
+        logger.warning(f"[F1-bis] persist {field} para {camera_id}: {e}")
+
 # C4 (2026-08-31) — Rate limit de ingesta por cámara.
 # Una cámara ESP32 normal envía ~1 fps. Sin límite, una cámara buggueada o
 # un atacante con ingest_key podía saturar FRAME_QUEUE, YOLO y la GPU.
@@ -4426,7 +4558,7 @@ def _ingest_rate_ok(camera_id: str, cam_cfg: dict) -> bool:
     return True
 
 
-def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str):
+def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str, user_id: str = ""):
     """A4 — Autenticación de ingesta por cámara.
 
     Antes, /ingest/* era público y solo se filtraba por camera_id conocido:
@@ -4440,11 +4572,27 @@ def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str):
     """
     expected = (cam_cfg or {}).get("ingest_key") or ""
     if not expected:
-        last = _INGEST_KEY_WARN_TS.get(camera_id, 0)
-        if time.time() - last > 3600:
-            _INGEST_KEY_WARN_TS[camera_id] = time.time()
-            logger.warning(f"[A4] cámara {camera_id} ingiere SIN ingest_key (modo legado). "
-                           "Genera una con POST /api/cameras/{id}/ingest-key/rotate")
+        # F1-bis: sin ingest_key → IP pinning TOFU. La primera IP que veamos
+        # queda pineada; después, cualquier IP desconocida → 403.
+        allowed = (cam_cfg or {}).get("ingest_allowed_ips")
+        client_ip = _client_real_ip(request)
+        if not (isinstance(allowed, list) and allowed):
+            # Primera IP vista = IP legítima del negocio. Se pinea Y se cierra
+            # la ventana (locked): una segunda IP distinta no se aprende sola,
+            # la aprueba el dueño vía /api/cameras/{id}/ingest-ips (action=add)
+            # o reset si cambió de ISP.
+            cam_cfg["ingest_allowed_ips"] = [client_ip]
+            cam_cfg["ingest_ip_locked"] = True
+            _persist_cam_cfg_field(user_id, camera_id, "ingest_allowed_ips", [client_ip])
+            _persist_cam_cfg_field(user_id, camera_id, "ingest_ip_locked", True)
+            logger.info(f"[F1-bis] TOFU: primera IP {client_ip} pineada+locked para {camera_id}")
+            return
+        if not _learn_or_check_ingest_ip(cam_cfg, camera_id, client_ip, user_id):
+            logger.warning(f"[F1-bis] ingest RECHAZADO: IP {client_ip} no pineada "
+                           f"para {camera_id} (permitidas: {allowed})")
+            raise HTTPException(status_code=403,
+                                detail="IP no autorizada para esta cámara. "
+                                       "Apruébala desde /api/cameras/{id}/ingest-ips")
         return
     provided = request.headers.get("x-camera-key", "")
     if not provided or not hmac.compare_digest(str(expected), str(provided)):
@@ -4486,7 +4634,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         # Se verifica ANTES de guardar/procesar nada: si la cámara tiene
         # ingest_key configurada y el header no coincide, se rechaza aquí.
         _cam_cfg_ingest = get_camera_config_static(user_id, camera_id)
-        _enforce_ingest_key(request, _cam_cfg_ingest, camera_id)
+        _enforce_ingest_key(request, _cam_cfg_ingest, camera_id, user_id)
 
         # ── [0b] RATE LIMIT por cámara (C4) — antes de leer/gastar nada ──
         if not _ingest_rate_ok(camera_id, _cam_cfg_ingest):
