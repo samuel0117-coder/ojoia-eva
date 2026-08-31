@@ -103,4 +103,22 @@ Principio rector que guía todo este plan:
 | 2026-08-31 | A4 X-Camera-Key + A5 README | `cb6946f` | ✅ |
 | 2026-08-31 | B1+B2+B3 precisión de alertas + cooldown persistente | `0ec02b4` | ✅ desplegado (api-eva reiniciado, health 200) |
 | 2026-08-31 | B4 feedback loop auto-ajuste de reglas | `53ee10f` | ✅ desplegado |
+| 2026-08-31 | C1 user.json read-modify-write seguro (13 sitios) | `1701557` | ✅ desplegado (test 200/200 concurrencia) |
+| 2026-08-31 | C4 rate limit ingest (5fps default) | `0e5653a` | ✅ desplegado |
+| 2026-08-31 | C5 script de carga + fix HTTPException tragada | `8e4c10a` | ✅ certificado: 30 cámaras × 1fps, p99 572ms, 0 drops |
+
+## Resultados de certificación de carga (C5, 2026-08-31)
+
+| Escenario | req/s | p50 | p95 | p99 | Drops |
+|---|---|---|---|---|---|
+| 10 cámaras × 1fps | 10 | 209ms | 231ms | 239ms | 0 |
+| 30 cámaras × 1fps | 30 | 472ms | 556ms | 572ms | 0 |
+| 5 cámaras × 10fps | 49 | 27ms | 103ms | 160ms | 0 (230× HTTP 429 por rate limit) |
+
+**Decisión sobre C2/C3 (cola externa / ingest separado):** con la carga medida,
+el monolito aguanta ~30+ cámaras a 1fps sin drops ni degradación. El verdadero
+cuello de botella a escala es la GPU (Qwen por grid): ~16 frames = 1 grid/cámara →
+N/16 grids/s. C2/C3 quedan como refactors programables cuando se supere
+~50-100 cámaras concurrentes o se requiera alta disponibilidad multi-nodo.
+Prioridad real inmediata: D (onboarding/prompts) y E (tests/CI).
 | — | OPS pendiente: rotar password Redis y service account Firebase (estuvieron expuestos) | — | ⏳ manual |
