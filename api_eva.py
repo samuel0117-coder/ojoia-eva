@@ -471,6 +471,12 @@ WORKER_RUNNING = False
 FRAME_QUEUE_DROPS = 0
 FRAME_QUEUE_DROP_TS = 0.0  # ultimo log de drops (rate-limit de log)
 
+# C2 (2026-08-31) — Bus de frames con backend Redis Streams (default) o
+# memoria (fallback). Si Redis está disponible, los frames sobreviven a
+# reinicios y los workers pueden escalar fuera de este proceso.
+from frame_bus import FrameBus
+frame_bus = FrameBus()
+
 # C1+C2 — Pool de workers + lock por cámara para evitar race condition.
 # ANTES (single worker): 1 task consumia FRAME_QUEUE en serie. Mientras
 # ese worker hacia await orchestrator.process_grid (Qwen GPU, 2-5s),
@@ -1461,13 +1467,13 @@ async def health():
     return {
         "status": status, "service": "eva-api", "version": "7.0",
         # B5: metricas de queue (para observabilidad)
-        "frame_queue": {
-            "size": FRAME_QUEUE.qsize(),
-            "maxsize": FRAME_QUEUE.maxsize,
+        # C2: stats async del bus (incluye size real del stream + pending
+        # del consumer group cuando el modo es redis).
+        "frame_queue": await frame_bus.stats() | {
             "drops": FRAME_QUEUE_DROPS,
             "rate_limit_drops": sum(_INGEST_RATE_DROPS.values()),  # C4
             "workers": WORKER_COUNT,         # C1
-            "camera_locks": len(CAMERA_LOCKS),  # C2 (locks activos)
+            "camera_locks": len(CAMERA_LOCKS),
         },
     }
 
@@ -4486,20 +4492,21 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
                 "yolo_classes": yolo_classes,
                 "yolo_detections": yolo_detections
             }
-            try:
-                FRAME_QUEUE.put_nowait(frameData)
+            # C2: encolar via bus (Redis Streams o memoria). put() nunca
+            # bloquea al ESP32; si la cola está presionada, descarta + cuenta.
+            ok = await frame_bus.put(frameData)
+            if ok:
                 processing = "queued"
-            except asyncio.QueueFull:
+            else:
                 global FRAME_QUEUE_DROPS, FRAME_QUEUE_DROP_TS
                 FRAME_QUEUE_DROPS += 1
                 processing = "dropped"
-                # log rate-limit ~cada 30s para no llenar log de drops
                 if time.time() - FRAME_QUEUE_DROP_TS > 30:
                     FRAME_QUEUE_DROP_TS = time.time()
                     logger.warning(
                         f"[FRAME_QUEUE] lleno, frame descartado: {frame_id} "
-                        f"cam={camera_id} user={user_id} "
-                        f"total_drops={FRAME_QUEUE_DROPS} qsize={FRAME_QUEUE.qsize()}"
+                        f"(cam={camera_id} user={user_id} mode={mode}) "
+                        f"total_drops={FRAME_QUEUE_DROPS} bus_mode={frame_bus.mode}"
                     )
 
         # ── [7] Actualizar last_frame de la cámara ──
@@ -4516,7 +4523,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             "timestamp": now_dt.isoformat(),
             "frame_id": frame_id,
             "processing": processing,
-            "queue_size": FRAME_QUEUE.qsize(),
+            "queue_size": frame_bus.qsize(),
             "yolo": {"count": yolo_count, "classes": yolo_classes, "detections": yolo_detections}
         }
 
@@ -4579,9 +4586,19 @@ async def yolo_worker():
     WORKER_RUNNING = True
     logger.info("🔧 YOLO Worker iniciado")
 
+    # C2: identidad de consumer para Redis Streams (hostname + pid + "w")
+    consumer_name = f"{os.uname().nodename}-{os.getpid()}-w{id(asyncio.current_task()) % 997}"
+
     while True:
+        msg_id = None
         try:
-            frame_data = await FRAME_QUEUE.get()
+            got = await frame_bus.get(consumer_name)
+            if got is None:
+                # C2: aprovechar el tick idle para rescatar mensajes huérfanos
+                # de consumers muertos (worker/restart a mitad de frame).
+                await frame_bus.rescue_stale(consumer_name)
+                continue
+            msg_id, frame_data = got
 
             frame_id = frame_data.get("frame_id")
             user_id = frame_data.get("user_id")
@@ -4595,11 +4612,11 @@ async def yolo_worker():
             yolo_classes = frame_data.get("yolo_classes", [])
             yolo_detections = frame_data.get("yolo_detections", [])
 
-            logger.info(f"Worker procesando frame {frame_id} (queue: {FRAME_QUEUE.qsize()})")
+            logger.info(f"Worker procesando frame {frame_id} (bus: {frame_bus.mode})")
 
             if yolo_count <= 0:
                 logger.info(f"YOLO gate: 0 objects → frame REJECTED del grid (frame_id={frame_id})")
-                FRAME_QUEUE.task_done()
+                await frame_bus.ack(msg_id)
                 continue
 
             from orchestrator import orchestrator
@@ -4658,11 +4675,16 @@ async def yolo_worker():
             else:
                 logger.info(f"Grid aún no lleno (current_count={current_count}/16), esperando más frames")
 
-            FRAME_QUEUE.task_done()
+            await frame_bus.ack(msg_id)  # C2: XACK solo tras procesar
 
         except Exception as e:
             logger.error(f"Error en yolo_worker: {e}", exc_info=True)
-            FRAME_QUEUE.task_done()
+            # C2: SIN ack → Redis retiene el mensaje y otro worker lo rescata
+            # via XAUTOCLAIM (rescue_stale). En memory el frame se pierde igual
+            # que antes (no hay peor caso nuevo).
+            if msg_id is None:
+                pass  # memory mode: no ack que hacer
+            await asyncio.sleep(0.1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4678,6 +4700,10 @@ async def _start_background_tasks():
     global _WORKER_STARTED
     if not _WORKER_STARTED:
         _WORKER_STARTED = True
+        # C2: conectar el bus de frames (Redis Streams si está configurado,
+        # memoria como fallback explícito).
+        await frame_bus.start()
+        logger.info(f"🚌 FrameBus listo en modo '{frame_bus.mode}'")
         # C1: pool de WORKER_COUNT workers (default 4, env OJOIA_WORKER_COUNT).
         # Cada worker consume FRAME_QUEUE de forma independiente y procesa en
         # paralelo (subject al lock por camara - C2). Mas workers = mas cameras
