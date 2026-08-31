@@ -4231,6 +4231,63 @@ def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = Non
         logger.error(f"Error updating camera last_frame: {e}")
 
 
+@app.post("/api/cameras/{camera_id}/ingest-key/rotate")
+async def rotate_ingest_key(camera_id: str, user_id: Optional[str] = None):
+    """Genera una nueva ingest_key para la cámara y la guarda en camera.json.
+    La key se devuelve UNA sola vez; el firmware se reprograma con ella.
+    Auth: bearer del usuario (middleware A1 valida user_id del query)."""
+    _validate_safe_path(camera_id, "camera_id")
+    if not user_id:
+        user_id = resolve_user_id(camera_id, None, None)
+    if not user_id:
+        raise HTTPException(status_code=404, detail="camera_id sin usuario asociado")
+    cam_path = Path(STORAGE_ROOT) / "users" / user_id / "cameras" / camera_id / "camera.json"
+    if not cam_path.exists():
+        raise HTTPException(status_code=404, detail="camera.json no encontrado")
+    new_key = secrets.token_urlsafe(32)
+    async with _get_camera_lock(user_id, camera_id):
+        with open(cam_path) as f:
+            cfg = json.load(f)
+        cfg["ingest_key"] = new_key
+        cfg["ingest_key_rotated_at"] = time.time()
+        tmp = cam_path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, cam_path)
+    logger.info(f"[A4] ingest_key rotada para {user_id}/{camera_id}")
+    return {"success": True, "camera_id": camera_id, "ingest_key": new_key}
+
+
+_INGEST_KEY_WARN_TS: dict = {}  # camera_id -> ts del último warning (rate-limit de log)
+
+
+def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str):
+    """A4 — Autenticación de ingesta por cámara.
+
+    Antes, /ingest/* era público y solo se filtraba por camera_id conocido:
+    cualquiera que adivinara un camera_id podía inyectar frames falsos
+    (alertas falsas) o saturar la cola (DoS).
+
+    Ahora: si camera.json tiene `ingest_key`, el frame debe traer el header
+    `X-Camera-Key` con el mismo valor (comparación constante). Si la cámara
+    aún no tiene key configurada, se permite (retrocompatible con firmware
+    actual) pero se loguea un warning rate-limited para forzar la migración.
+    """
+    expected = (cam_cfg or {}).get("ingest_key") or ""
+    if not expected:
+        last = _INGEST_KEY_WARN_TS.get(camera_id, 0)
+        if time.time() - last > 3600:
+            _INGEST_KEY_WARN_TS[camera_id] = time.time()
+            logger.warning(f"[A4] cámara {camera_id} ingiere SIN ingest_key (modo legado). "
+                           "Genera una con POST /api/cameras/{id}/ingest-key/rotate")
+        return
+    provided = request.headers.get("x-camera-key", "")
+    if not provided or not hmac.compare_digest(str(expected), str(provided)):
+        logger.warning(f"[A4] ingest RECHAZADO: X-Camera-Key inválida para {camera_id} "
+                       f"desde {request.client.host if request.client else '?'}")
+        raise HTTPException(status_code=401, detail="X-Camera-Key inválida o ausente")
+
+
 async def _process_ingest(request: Request, camera_id: str, user_id: str, image: UploadFile):
     """Flujo OPTIMIZADO: guardar + YOLO rápido + encolar grid/Qwen + responder.
     
@@ -4244,6 +4301,12 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         user_id = resolve_user_id(camera_id, user_id, client_ip)
         if camera_id == "unknown":
             camera_id = await _resolve_unknown_camera(user_id, client_ip)
+
+        # ── [0] AUTENTICACIÓN DE INGESTA POR CÁMARA (A4) ──
+        # Se verifica ANTES de guardar/procesar nada: si la cámara tiene
+        # ingest_key configurada y el header no coincide, se rechaza aquí.
+        _cam_cfg_ingest = get_camera_config_static(user_id, camera_id)
+        _enforce_ingest_key(request, _cam_cfg_ingest, camera_id)
 
         img_bytes = await image.read()
         frame_size = len(img_bytes)

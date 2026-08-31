@@ -134,12 +134,10 @@ Configuración del túnel: `/etc/cloudflared/config.yml`
   - 9001 — Server admin
   - 8012 — Proyecto
 
-## Token de GitHub
+## GitHub
 
-El token de GitHub está en:
-`/home/sam/planes de accion y documentos/tokens/github_token_samuel0117-coder.txt`
-
-Cuenta: `samuel0117-coder`. Repo: `ojoia`.
+Repo: `github.com/samuel0117-coder/ojoia-eva`.
+Las credenciales de acceso NO se documentan aquí (opsec): pedírselas al operador.
 
 ## No commitear
 
