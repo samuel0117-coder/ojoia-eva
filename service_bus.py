@@ -50,6 +50,7 @@ BACKENDS = {
     "qwen7b":  {"url": "http://127.0.0.1:8004", "sem": 150, "backlog": 5000},
     "qwen9b":  {"url": "http://127.0.0.1:8018", "sem": 64,  "backlog": 5000},
     "qwen35b": {"url": "http://127.0.0.1:8019", "sem": 2,   "backlog": 1000},
+    "qwen38":  {"url": "http://127.0.0.1:18020", "sem": 64, "backlog": 5000},
     "whisper": {"url": "http://127.0.0.1:8008", "sem": 12,  "backlog": 5000},
     "yolo":    {"url": "http://127.0.0.1:8002", "sem": 12,  "backlog": 5000},
 }
@@ -536,6 +537,22 @@ MODELS_CATALOG = {
         "supports_tools": True,
         "supports_thinking": True,
     },
+    "qwen38": {
+        "id": "qwen38",
+        "backend": "qwen38",
+        "model_id": "qwen3.8-27b",
+        "name": "Qwen 3.8 27B A3B+",
+        "owned_by": "ojoia",
+        "description": "Modelo denso de 27B con atención híbrida (linear+full). Máxima calidad para razonamiento complejo, código agéntico y tareas de contexto largo. Contexto de 150K (hasta 262K). Servido con vLLM optimizado (W4A16 int8 + fp16 state + MTP speculative).",
+        "capabilities": ["text", "thinking"],
+        "modalities": {
+            "input": ["text"],
+            "output": ["text"]
+        },
+        "context_length": 150000,
+        "supports_tools": True,
+        "supports_thinking": True,
+    },
     "qwen7b": {
         "id": "qwen7b",
         "backend": "qwen7b",
@@ -596,6 +613,8 @@ _BACKEND_BY_CANONICAL = {
     "qwen7b": "qwen7b",
     "qwen9b": "qwen9b",
     "qwen36-35b-a3b": "qwen35b",
+    "qwen38": "qwen38",
+    "qwen3.8-27b": "qwen38",
     "whisper-turbo": "whisper",
     "yolo": "yolo",
 }

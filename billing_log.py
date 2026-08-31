@@ -46,6 +46,10 @@ _MODEL_ALIASES = {
     "qwen7b": "qwen7b",
     "qwen-vl-7b": "qwen7b",
     "qwen.service": "qwen7b",
+    # 27B (Qwen3.8-27B)
+    "qwen38": "qwen38",
+    "qwen3.8-27b": "qwen38",
+    "qwen3.8-27b-a3b+": "qwen38",
     # 9B (qwen-vl-9b)
     "qwen9b": "qwen9b",
     "qwen-vl-9b": "qwen9b",

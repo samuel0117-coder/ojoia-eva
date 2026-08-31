@@ -579,6 +579,11 @@ def _resolve_service(name: str):
         "yolo-server.service": "yolo",
         "qwen14b.service": "qwen14b",
     }
+    # Buscar por nombre original (con .service) o por clean (sin .service)
+    if name in PANEL_TO_HEALTH:
+        mapped = PANEL_TO_HEALTH[name]
+        if mapped in monitor.services:
+            return monitor.services[mapped]
     if clean in PANEL_TO_HEALTH:
         mapped = PANEL_TO_HEALTH[clean]
         if mapped in monitor.services:

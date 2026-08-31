@@ -59,6 +59,7 @@ DEFAULT_MODEL_PRICES = {
     "qwen7b":           {"input": 0.30, "output": 0.50, "unit": "tokens"},
     "qwen9b":           {"input": 1.50, "output": 2.00, "unit": "tokens"},
     "qwen36-35b-a3b":   {"input": 8.00, "output": 10.00, "unit": "tokens"},
+    "qwen38":           {"input": 6.00, "output": 8.00, "unit": "tokens"},
     "whisper-turbo":    {"input": 0.10, "output": 0.10, "unit": "minutes"},
     "yolo":             {"input": 0.05, "output": 0.05, "unit": "images"},
 }
