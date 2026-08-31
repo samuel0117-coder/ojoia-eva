@@ -4491,7 +4491,8 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 
         # ── [3] YOLO SÍNCRONO RÁPIDO (para siluetas y eventos) ──
         try:
-            yolo_count, yolo_classes, yolo_detections = await _run_yolo_detection(img_bytes)
+            # C6: micro-batching (ventana 150ms / máx 16) — fallback a single
+            yolo_count, yolo_classes, yolo_detections = await _yolo_detect(img_bytes, camera_id)
         except Exception as e:
             logger.error(f"Error YOLO en endpoint: {e}")
             yolo_count, yolo_classes, yolo_detections = 0, [], []
@@ -4604,6 +4605,87 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
 # ═══════════════════════════════════════════════════════════════════════════
 # WORKER YOLO — Procesamiento asíncrono en background
 # ═══════════════════════════════════════════════════════════════════════════
+
+# C6 (2026-08-31) — Micro-batching YOLO.
+# Antes: cada frame hacía 1 llamada YOLO individual (1 imagen = 1 forward GPU).
+# En ráfagas (N cámaras a la vez) eso desperdicia la GPU: ultralytics puede
+# hacer UN forward con N imágenes. Este batcher colecta los frames que llegan
+# en una ventana de ~150ms y los manda juntos a /detect_batch.
+# La latencia extra por frame es ≤150ms; el throughput sube hasta ~8x(16/batch).
+_YOLO_BATCH_MAX = 16
+_YOLO_BATCH_WINDOW_S = 0.15
+_YOLO_PENDING: list = []          # [(img_bytes, camera_id, future)]
+_YOLO_PENDING_LOCK = asyncio.Lock() if sys.version_info >= (3, 10) else None
+_YOLO_BATCH_TASK = None
+_YOLO_BATCH_STATS = {"batches": 0, "images": 0, "errors": 0}
+
+
+async def _yolo_batch_flush_items(items):
+    """Ejecuta /detect_batch con una lista de (img_bytes, cam, future) y
+    resuelve cada future con (count, classes, detections). Fallback: single."""
+    if not items:
+        return
+    try:
+        data = [("images", (f"f{i}.jpg", b, "image/jpeg")) for i, (b, _c, _f) in enumerate(items)]
+        data.append(("camera_ids", (None, ",".join(c or f"cam{i}" for i, (_b, c, _f) in enumerate(items)))))
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post("http://localhost:8002/detect_batch", files=data)
+            results = resp.json().get("results", []) if resp.status_code == 200 else []
+        # /detect_batch devuelve results EN EL MISMO ORDEN que las imágenes
+        # enviadas → mapeo posicional (una cámara puede aparecer 2 veces en
+        # un batch durante ráfagas; con by_cam colisionarían).
+        for idx, (_b, cam, fut) in enumerate(items):
+            r = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {}
+            dets = [d for d in r.get("detections", []) if d.get("confidence", 0) >= 0.25]
+            uniq = {d.get("track_id") for d in dets if d.get("track_id")}
+            if not fut.done():
+                fut.set_result((len(uniq) if uniq else len(dets),
+                                [d.get("class", "") for d in dets], dets))
+        _YOLO_BATCH_STATS["batches"] += 1
+        _YOLO_BATCH_STATS["images"] += len(items)
+    except Exception as e:
+        _YOLO_BATCH_STATS["errors"] += 1
+        logger.warning(f"[C6] batch YOLO falló ({e}); fallback individual")
+        for b, cam, fut in items:
+            if not fut.done():
+                try:
+                    fut.set_result(await _run_yolo_detection(b))
+                except Exception as e2:
+                    fut.set_exception(e2)
+
+
+async def _yolo_batch_loop():
+    """Vacía la ventana de micro-batching cada _YOLO_BATCH_WINDOW_S."""
+    while True:
+        await asyncio.sleep(_YOLO_BATCH_WINDOW_S)
+        try:
+            async with _YOLO_PENDING_LOCK:
+                items, _YOLO_PENDING[:] = _YOLO_PENDING[:], []
+            await _yolo_batch_flush_items(items)
+        except Exception as e:
+            logger.error(f"[C6] batch loop error: {e}")
+
+
+async def _yolo_detect(img_bytes: bytes, camera_id: str = "") -> tuple:
+    """YOLO con micro-batching. Si el batcher no está activo, fallback directo."""
+    global _YOLO_BATCH_TASK
+    try:
+        if _YOLO_BATCH_TASK is None or _YOLO_BATCH_TASK.done():
+            _YOLO_BATCH_TASK = asyncio.create_task(_yolo_batch_loop())
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        burst = None
+        async with _YOLO_PENDING_LOCK:
+            _YOLO_PENDING.append((img_bytes, camera_id or "cam", fut))
+            if len(_YOLO_PENDING) >= _YOLO_BATCH_MAX:
+                burst, _YOLO_PENDING[:] = _YOLO_PENDING[:], []
+        if burst:
+            asyncio.create_task(_yolo_batch_flush_items(burst))
+        return await asyncio.wait_for(fut, timeout=15)
+    except Exception as e:
+        logger.warning(f"[C6] batch path error ({e}); directo")
+        return await _run_yolo_detection(img_bytes)
+
 
 async def _run_yolo_detection(img_bytes: bytes) -> tuple:
     """Ejecuta YOLO detection y retorna (count, classes, detections)."""
