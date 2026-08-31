@@ -4520,6 +4520,10 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             "yolo": {"count": yolo_count, "classes": yolo_classes, "detections": yolo_detections}
         }
 
+    except HTTPException:
+        # Errores intencionales (401 key inválida, 429 rate limit) deben
+        # llegar al cliente con su código real, no tragarse como 200.
+        raise
     except Exception as e:
         logger.error(f"Error en _process_ingest: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
