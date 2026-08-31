@@ -111,6 +111,54 @@ Principio rector que guía todo este plan:
 | — | E2 CI: workflow creado localmente; GitHub exige token con scope `workflow` para pushearlo | — | ⏳ pendiente token |
 | — | D2 soporte RTSP/cámaras IP: requiere servicio puller nuevo; va como feature aparte | — | ⏳ planificado |
 
+---
+
+# 🚀 Fase 2 — Escala masiva y cámaras IP (decisión 2026-08-31)
+
+**Decisión del usuario:** orden C2 → D2 → C3. Cámaras remotas por internet.
+**Objetivo declarado:** aguantar la mayor cantidad de cámaras posible, recibir
+ráfagas sin colapsar, imágenes lo más estables posible (tipo streaming),
+aprovechar batch YOLO (hoy 1 imagen/request; el servidor puede hacer batches).
+
+## C2 — Cola externa Redis Streams (PRIMERO)
+- `INGEST_QUEUE=redis` (default) / `memory` (fallback si Redis cae).
+- Endpoint hace XADD a stream `ojoia:frames` (MAXLEN ~2000, trimming aproximado).
+- Workers con consumer group `workers` (XREADGROUP + XACK + XAUTOCLAIM para
+  frames huérfanos) → at-least-once, sobrevive reinicios, workers escalables.
+- Métricas en /health: pending, lag del group, drops.
+- Test: matar API a mitad de ráfaga → frames siguen en Redis; al volver, se procesan.
+
+## D2 — Cámaras RTSP remotas por internet (SEGUNDO)
+- `rtsp_puller.py`: proceso que mantiene 1 conexión por cámara, extrae 1 fps
+  (configurable), inyecta al pipeline vía la cola Redis (depende de C2).
+- Pull directo sobre internet (el comercio abre puerto/DDNS en su router) —
+  el agente en-local queda como variante futura para cámaras sin IP pública.
+- Anti-SSRF: se bloquean loopback/link-local/metadata (169.254.169.254);
+  resto permitido (caso remoto).
+- Credenciales: url con user:pass guardada solo en camera.json (permisos 600),
+  nunca en logs ni eventos.
+- Watchdog: si no llega frame en N min → evento "cámara caída" + push al usuario.
+- Wizard: rama en HARDWARE para "cámara IP que ya tengo" → pide URL RTSP →
+  probe (primer frame) → muestra imagen → sigue flujo normal (ANALYZE/ZONES...).
+
+## C6 (nuevo, sale del análisis) — Batching YOLO
+- Hoy cada frame hace 1 POST /detect al yolo_server. Con ráfagas esto es el
+  cuello CPU/GPU más inmediato.
+- `yolo_server.py`: endpoint /detect_batch que acepta N imágenes y ejecuta
+  un solo forward del modelo (ultralytics soporta batches hasta 32).
+- El ingest agrupa frames en micro-batches (ventana 100-200ms o 16 imágenes)
+  antes de llamar a YOLO → throughput ×N con la misma latencia perceptible.
+
+## C3 — Servicio de ingest separado (TERCERO)
+- `ingest_server.py` mínimo (auth A4 + rate limit C4 + XADD). Sin eva_v2 ni
+  orchestrator. systemd `ojoia-ingest.service`, puerto 8006.
+- Cloudflared: `/ingest/*` → 8006; resto → 8005. Rollback = 1 línea de config.
+
+## Certificación objetivo (medir con scripts/load_test_ingest.py)
+- 100 cámaras × 1fps sostenido: 0 crashes, drops < 1%, p99 ingest < 1s.
+- Ráfaga 3×: cola absorbe y drena; ningún timeout 5xx.
+- Reinicio de API en plena ráfaga: 0 frames perdidos (C2), alertas continúan.
+
 ## Resultados de certificación de carga (C5, 2026-08-31)
 
 | Escenario | req/s | p50 | p95 | p99 | Drops |

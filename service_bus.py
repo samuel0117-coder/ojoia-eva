@@ -49,8 +49,10 @@ from billing_log import log_request, purge_old
 BACKENDS = {
     "qwen7b":  {"url": "http://127.0.0.1:8004", "sem": 150, "backlog": 5000},
     "qwen9b":  {"url": "http://127.0.0.1:8018", "sem": 64,  "backlog": 5000},
-    "qwen35b": {"url": "http://127.0.0.1:8019", "sem": 2,   "backlog": 1000},
+    # qwen35b está frío en disco (imagen intacta). El puerto 8019 ahora es qwen3vl8b.
+    # "qwen35b": {"url": "http://127.0.0.1:8019", "sem": 2,   "backlog": 1000},
     "qwen38":  {"url": "http://127.0.0.1:18020", "sem": 64, "backlog": 5000},
+    "qwen3vl8b": {"url": "http://127.0.0.1:8019", "sem": 4,  "backlog": 1000},
     "whisper": {"url": "http://127.0.0.1:8008", "sem": 12,  "backlog": 5000},
     "yolo":    {"url": "http://127.0.0.1:8002", "sem": 12,  "backlog": 5000},
 }
@@ -585,6 +587,22 @@ MODELS_CATALOG = {
         "supports_tools": True,
         "supports_thinking": True,
     },
+    "qwen3vl8b": {
+        "id": "qwen3vl8b",
+        "backend": "qwen3vl8b",
+        "model_id": "Qwen3VL-8B-Instruct",
+        "name": "Qwen 3 VL 8B (llama.cpp)",
+        "owned_by": "ojoia",
+        "description": "El VLM open-source más capaz a 8B. Superó a Qwen2.5-VL en todos los benchmarks. OCR en 32 idiomas, análisis espacial, robusto en baja luz y ángulos adversos. Ideal para análisis de cámaras de seguridad y visión de alto rendimiento. Contexto 16K.",
+        "capabilities": ["text", "image", "video"],
+        "modalities": {
+            "input": ["text", "image", "video"],
+            "output": ["text"]
+        },
+        "context_length": 16384,
+        "supports_tools": False,
+        "supports_thinking": False,
+    },
     "whisper-turbo": {
         "id": "whisper-turbo",
         "backend": "whisper",
@@ -615,6 +633,9 @@ _BACKEND_BY_CANONICAL = {
     "qwen36-35b-a3b": "qwen35b",
     "qwen38": "qwen38",
     "qwen3.8-27b": "qwen38",
+    "qwen3vl8b": "qwen3vl8b",
+    "qwen3vl": "qwen3vl8b",
+    "qwen3-vl-8b": "qwen3vl8b",
     "whisper-turbo": "whisper",
     "yolo": "yolo",
 }

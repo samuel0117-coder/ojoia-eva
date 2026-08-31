@@ -2,33 +2,34 @@
 # start-models.sh — Arranque ordenado de modelos GPU para producción
 #
 # Distribución de VRAM (24GB por GPU, 2 GPUs):
-#   GPU 0 → qwen-9b (vLLM)            ~20GB
-#   GPU 1 → qwen-7b (sglang)  ~10GB
+#   GPU 0 → qwen-7b (sglang)  ~10GB
 #          → yolo-pose         ~1GB
 #          → whisper-turbo     ~1GB
-#          → qwen-35b (llama)  ~22GB   (necesita casi toda la GPU 1)
+#   GPU 1 → qwen-3.8 27B (kvarn)  ~23GB
+#          → qwen-9b (disponible, NO auto — perfil manual)
+#          → qwen-35b (quitado del arranque, frio en disco)
 #
-# ORDEN OBLIGATORIO: qwen-7b PRIMERO en GPU1, después qwen-35b.
-# Si qwen-35b arranca antes que qwen-7b, no le queda VRAM.
-# Si arrancamos yolo/whisper ANTES de qwen-35b, no hay problema porque
-# son ligeros. PERO si arrancamos qwen-9b en GPU0 después de qwen-35b,
-# este último podría haber consumido VRAM de GPU0 por defecto.
+# ORDEN OBLIGATORIO: qwen-7b PRIMERO en GPU0, después yolo, después whisper.
+# Esto reserva VRAM en GPU0 antes de que los demás compitan por ella.
+# El 3.8 27B corre en GPU1 (manejado por systemd ojoia-bus, no por este script).
 #
-# Estrategia: arrancar en este orden para máxima estabilidad:
-#   1. qwen-7b (GPU1)  - reserva 10GB en GPU1
-#   2. qwen-35b (GPU1) - ocupa los 14GB restantes
-#   3. yolo (GPU1)     - se queda en CPU o usa poca GPU
-#   4. whisper (GPU1)   - idem
-#   5. qwen-9b (GPU0)  - independiente, GPU0
+# Estrategia:
+#   1. qwen-7b (GPU0)  - reserva 10GB en GPU0
+#   2. yolo-pose (GPU0) - ligero
+#   3. whisper-turbo (GPU0) - ligero
+#   (qwen-9b y qwen-35b NO se arrancan automaticamente)
 set -euo pipefail
+
+COMPOSE_DIR="/srv/ai"
+COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
 
 echo "=== Arranque ordenado de modelos (producción) ==="
 
-# 1. qwen-7b PRIMERO (GPU1) - reserva VRAM en GPU1
-echo "[1/5] Iniciando qwen-7b (GPU1)..."
-docker start qwen-7b 2>/dev/null || echo "  (ya corriendo)"
+# 1. qwen-7b PRIMERO (GPU0) - reserva VRAM
+echo "[1/3] Iniciando qwen-7b (GPU0)..."
+docker compose -f "$COMPOSE_FILE" up -d qwen-7b 2>&1 | tail -3
 echo "  Esperando healthy..."
-for i in $(seq 1 30); do
+for i in $(seq 1 40); do
   sleep 3
   ST=$(docker inspect qwen-7b --format '{{.State.Health.Status}}' 2>/dev/null)
   if [ "$ST" = "healthy" ]; then echo "  qwen-7b healthy ✅"; break; fi
@@ -38,40 +39,19 @@ for i in $(seq 1 30); do
   fi
 done
 
-# 2. qwen-35b INMEDIATAMENTE DESPUÉS de qwen-7b (misma GPU1)
-#    Necesita ~8.6GB; quedan ~14GB libres en GPU1.
-echo "[2/5] Iniciando qwen-35b (GPU1)..."
-docker start qwen-35b-a3b 2>/dev/null || echo "  (ya corriendo)"
-echo "  Esperando healthy..."
-for i in $(seq 1 30); do
-  sleep 3
-  ST=$(docker inspect qwen-35b-a3b --format '{{.State.Health.Status}}' 2>/dev/null)
-  if [ "$ST" = "healthy" ]; then echo "  qwen-35b healthy ✅"; break; fi
-  if [ "$ST" = "unhealthy" ]; then
-    echo "  qwen-35b UNHEALTHY — logs:"; docker logs qwen-35b-a3b --tail 8 2>&1 | tail -5
-    echo "  ⚠ Si falla por OOM, parar ai-qwen-9b-1 primero (libera GPU0 como fallback)"
-    exit 1
-  fi
-done
-
-# 3. yolo-pose (GPU1) - ligero, ~1GB VRAM
-echo "[3/5] Iniciando yolo-pose (GPU1)..."
-docker start yolo-pose 2>/dev/null || echo "  (ya corriendo)"
+# 2. yolo-pose (GPU0) - ligero
+echo "[2/3] Iniciando yolo-pose (GPU0)..."
+docker compose -f "$COMPOSE_FILE" up -d yolo-pose 2>&1 | tail -3
 sleep 5
 
-# 4. whisper-turbo (GPU1) - ligero, ~1GB VRAM
-echo "[4/5] Iniciando whisper-turbo (GPU1)..."
-docker start whisper-turbo 2>/dev/null || echo "  (ya corriendo)"
-sleep 5
-
-# 5. qwen-9b (GPU0) - usa toda la GPU0 (independiente)
-echo "[5/5] Iniciando qwen-9b (GPU0)..."
-docker start ai-qwen-9b-1 2>/dev/null || echo "  (ya corriendo)"
+# 3. whisper-turbo (GPU0) - ligero
+echo "[3/3] Iniciando whisper-turbo (GPU0)..."
+docker compose -f "$COMPOSE_FILE" up -d whisper-turbo 2>&1 | tail -3
 sleep 5
 
 # Verificación final
 echo "=== Verificación final ==="
-for endpoint in "qwen-7b:8004:/health" "qwen-35b-a3b:8019:/health" "ai-qwen-9b-1:8018:/v1/models" "whisper-turbo:8008:/health" "yolo-pose:8002:/health"; do
+for endpoint in "qwen-7b:8004:/health" "whisper-turbo:8008:/health" "yolo-pose:8002:/health"; do
   c=$(echo $endpoint | cut -d: -f1)
   p=$(echo $endpoint | cut -d: -f2)
   h=$(echo $endpoint | cut -d: -f3)
@@ -82,4 +62,18 @@ for endpoint in "qwen-7b:8004:/health" "qwen-35b-a3b:8019:/health" "ai-qwen-9b-1
     echo "  ❌ $c (port $p) FAIL"
   fi
 done
+
+# Verificar el 3.8 (manejado por docker run, no compose)
+echo "--- GPU 1 (qwen-3.8 27B) ---"
+code=$(curl -sf --max-time 5 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18020/v1/models" 2>/dev/null)
+if [ -n "$code" ] && [ "$code" != "000" ]; then
+  echo "  ✅ qwen38-syv (port 18020) HTTP $code"
+else
+  echo "  ❌ qwen38-syv (port 18020) FAIL"
+fi
+
+echo ""
+echo "NOTA: qwen-9b y qwen-35b NO se arrancan automaticamente."
+echo "  - qwen-9b: docker compose -f $COMPOSE_FILE --profile manual up -d qwen-9b"
+echo "  - qwen-35b: frio en disco (imagen y modelo intactos, no en compose)"
 echo "=== Modelos listos para producción ==="

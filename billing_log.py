@@ -50,6 +50,12 @@ _MODEL_ALIASES = {
     "qwen38": "qwen38",
     "qwen3.8-27b": "qwen38",
     "qwen3.8-27b-a3b+": "qwen38",
+    # 8B (Qwen3-VL-8B — llama.cpp puerto 8019)
+    "qwen3vl8b": "qwen3vl8b",
+    "qwen3-vl-8b": "qwen3vl8b",
+    "qwen3vl": "qwen3vl8b",
+    "qwen38-9b": "qwen3vl8b",
+    "qwen3.8-9b-distill": "qwen3vl8b",
     # 9B (qwen-vl-9b)
     "qwen9b": "qwen9b",
     "qwen-vl-9b": "qwen9b",

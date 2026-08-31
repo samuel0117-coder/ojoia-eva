@@ -88,19 +88,23 @@ SERVICES = [
     # los revive solo via Restart=on-failure. El monitor sigue chequeando el estado
     # (visible en megapanel) pero NO intenta reiniciarlos.
     ServiceDef("api-eva.service", 8005, "system", -1, "/health", critical=True, disabled_restart=True),
-    # ── GPU 0 - Qwen 9B (vLLM) + Whisper (Docker) ──
-    ServiceDef("qwen9b", 8018, "docker", 0, "/v1/models", critical=True,
-               container="ai-qwen-9b-1"),
-    ServiceDef("whisper", 8008, "docker", 1, "/health", critical=True,
-               container="whisper-turbo"),
-    # ── GPU 1 - Qwen 7B (sglang) + Qwen 35B (llama.cpp) + YOLO (Docker) ──
-    # qwen-7b y qwen-35b son MUTUAMENTE EXCLUSIVOS: juntos no caben en 24GB.
-    ServiceDef("qwen7b", 8004, "docker", 1, "/health", critical=True,
-               container="qwen-7b", mutually_exclusive_with=["qwen35b"]),
-    ServiceDef("qwen35b", 8019, "docker", 1, "/health", critical=True,
-               container="qwen-35b-a3b", mutually_exclusive_with=["qwen7b"]),
-    ServiceDef("yolo", 8002, "docker", 1, "/health", critical=True,
+    # ── GPU 0 - Qwen 7B (sglang) + YOLO + Whisper (Docker) ──
+    ServiceDef("qwen7b", 8004, "docker", 0, "/health", critical=True,
+               container="qwen-7b"),
+    ServiceDef("qwen3vl8b", 8019, "docker", 0, "/v1/models", critical=True,
+               container="qwen3vl8b"),
+    ServiceDef("yolo", 8002, "docker", 0, "/health", critical=True,
                container="yolo-pose"),
+    ServiceDef("whisper", 8008, "docker", 0, "/health", critical=True,
+               container="whisper-turbo"),
+    # ── GPU 1 - Qwen 3.8 27B (kvarn) + Qwen 9B disponible (NO auto, solo manual) ──
+    ServiceDef("qwen38", 18020, "docker", 1, "/v1/models", critical=True,
+               container="qwen38-syv"),
+    # qwen-9b disponible en GPU 1, arranca solo manual (docker compose --profile manual up qwen-9b)
+    ServiceDef("qwen9b", 8018, "docker", 1, "/v1/models", critical=False,
+               container="qwen-9b", disabled_restart=True),
+    # qwen-35b: QUITADO del arranque automatico. Imagen y modelo en disco (frio).
+    # Para reactivarlo: docker compose --profile legacy up qwen-35b-a3b
     # CPU - ChatRD
     ServiceDef("chatrd.service", 8010, "user", -1, "/health", critical=True),
     ServiceDef("admin_panel.service", 8030, "user", -1, "/health", critical=False),
@@ -499,11 +503,13 @@ class HealthMonitor:
             await asyncio.gather(*tasks, return_exceptions=True)
 
             # GPU OOM detection
+            # NOTA: qwen38-syv (GPU1) opera a 97-98% por diseño (KV cache asignado).
+            # Solo alertar si >99% (presión real, no uso fijo).
             gpus = await self._gpu_status()
             for g in gpus:
                 if g["total_mb"] > 0:
                     pct = (g["used_mb"] / g["total_mb"]) * 100
-                    if pct > 97:
+                    if pct > 99:
                         self.log(f"GPU {g['index']}: OOM risk ({pct:.1f}%) — cleaning cache", "WARN")
                         await self._clean_gpu_cache(g["index"])
 
