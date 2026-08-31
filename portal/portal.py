@@ -23,7 +23,14 @@ app = FastAPI(title="OjoIA Portal", version="1.0")
 templates = Jinja2Templates(directory="/opt/ojoia/code/portal/templates")
 app.mount("/static", StaticFiles(directory="/opt/ojoia/code/portal/static"), name="static")
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://:hq1V4pQr1c99AWYYAIGBnCu7695jL75@127.0.0.1:6379/0")
+# SEGURIDAD: jamás fallback con credenciales hardcodeadas. Si falta la env var,
+# fallar ruidosamente al iniciar (billing.py hace lo mismo).
+REDIS_URL = os.environ.get("REDIS_URL")
+if not REDIS_URL:
+    raise RuntimeError(
+        "REDIS_URL no está configurada. Defínela en /opt/ojoia/config/ojoia.env "
+        "antes de iniciar el portal."
+    )
 SERVICE_BUS = "http://127.0.0.1:8200"
 
 def get_billing():
