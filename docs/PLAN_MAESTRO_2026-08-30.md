@@ -96,4 +96,9 @@ Principio rector que guía todo este plan:
 
 | Fecha | Sprint | Commit | Estado |
 |---|---|---|---|
-| 2026-08-31 | Baseline (qwen38 etc.) + este plan | — | ✅ |
+| 2026-08-31 | Baseline (qwen38 etc.) + este plan | `79f6f35` | ✅ |
+| 2026-08-31 | A1 Redis password portal | `02ff116` | ✅ |
+| 2026-08-31 | A2 firebase-key fuera del repo | `16ecc1b` | ✅ |
+| 2026-08-31 | A3 deduplicación (~2.9MB) | `08a68e0` | ✅ |
+| 2026-08-31 | A4 X-Camera-Key + A5 README | `cb6946f` | ✅ |
+| — | OPS pendiente: rotar password Redis y service account Firebase (estuvieron expuestos) | — | ⏳ manual |

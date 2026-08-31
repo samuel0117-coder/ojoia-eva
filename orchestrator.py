@@ -1440,7 +1440,11 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
                     "zone_name": _zone_for_phrase(frase),
                 })
 
-    # 2. Verificar phrases de atención (respaldo por keywords)
+    # 2. Frases de atención por keywords — B1 (2026-08-31): ya NO son hits
+    # directos. El substring matchea también negaciones ("no se observa que el
+    # empleado se lleve la mano al bolsillo") → falsos positivos masivos.
+    # Ahora se marcan como CANDIDATOS que requieren verificación (B2, 2ª pasada
+    # con modelo barato) antes de poder notificar al usuario.
     if attention_phrases:
         for phrase in attention_phrases:
             phrase_lower = phrase.lower()
@@ -1450,6 +1454,7 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
                         "frase": phrase,
                         "momento": "",
                         "source": "keyword_match",
+                        "needs_verification": True,
                         "zone_name": _zone_for_phrase(phrase),
                     })
 
@@ -1506,6 +1511,7 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
         "anomalias": anomalias,
         "attention_hits": [h["frase"] for h in hits],
         "attention_hits_zones": [h.get("zone_name") or None for h in hits],
+        "hits_detail": hits,  # B1/B2: incluye source y needs_verification
         "false_positives_detected": len(false_positive_notes),
         "summary": summary,
         "evidence": [a["descripcion"] for a in anomalias] if anomalias else ["Sin observaciones relevantes"],
@@ -1734,6 +1740,129 @@ class QwenOrchestrator:
         if self._shared_client is not None and not self._shared_client.is_closed:
             await self._shared_client.aclose()
             self._shared_client = None
+
+    # ── B3 (2026-08-31): cooldown persistente por cámara+regla ─────────────
+    # Antes: self._last_notification_ts solo en RAM → al reiniciar el servicio,
+    # todas las cámaras re-notificaban (tormenta de push duplicados).
+    # Ahora: persiste en <STORAGE_ROOT>/.runtime/notification_cooldowns.json
+    # con escritura atómica + lock. Clave: {user}_{cam}::{hash(regla)} — así
+    # dos reglas distintas de la misma cámara NO se silencian entre sí.
+    _cooldown_file_lock = threading.Lock()
+
+    def _cooldown_store_path(self) -> str:
+        d = os.path.join(STORAGE_ROOT, ".runtime")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "notification_cooldowns.json")
+
+    @staticmethod
+    def _cooldown_key(user_id: str, camera_id: str, frase: str = "") -> str:
+        import hashlib
+        base = f"{user_id}_{camera_id}"
+        if frase:
+            base += "::" + hashlib.sha1(frase.strip().lower().encode()).hexdigest()[:10]
+        return base
+
+    def _cooldown_get(self, key: str) -> float:
+        """Último ts notificado para la clave. Memoria con respaldo en disco."""
+        with self._cooldown_file_lock:
+            if key in self._last_notification_ts:
+                return self._last_notification_ts[key]
+            try:
+                path = self._cooldown_store_path()
+                if os.path.exists(path):
+                    with open(path) as f:
+                        data = json.load(f)
+                    ts = float(data.get(key, 0) or 0)
+                    self._last_notification_ts[key] = ts
+                    return ts
+            except Exception as e:
+                logging.warning(f"[B3] cooldown read error: {e}")
+            return 0.0
+
+    def _cooldown_save(self, key: str, ts: float):
+        with self._cooldown_file_lock:
+            self._last_notification_ts[key] = ts
+            try:
+                path = self._cooldown_store_path()
+                data = {}
+                if os.path.exists(path):
+                    with open(path) as f:
+                        data = json.load(f)
+                data[key] = ts
+                # Poda: entradas > 7 días (evita crecimiento infinito)
+                cutoff = ts - 7 * 86400
+                data = {k: v for k, v in data.items() if float(v) > cutoff}
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+            except Exception as e:
+                logging.warning(f"[B3] cooldown write error: {e}")
+
+    # ── B2 (2026-08-31): verificación de 2ª pasada antes de notificar ──────
+    async def _verify_attention_candidates(
+        self, hits_detail: list, vision_json: dict, summary: str
+    ) -> list:
+        """Verifica candidatos keyword_match con el modelo barato (qwen7b).
+
+        Devuelve la lista de hits CONFIRMADOS. Los hits estructurados de Qwen
+        (qwen_flag / qwen_explicit / system_after_hours) pasan sin verificar:
+        ya vienen de una salida estructurada, no de substring.
+
+        Si el verificador falla (modelo caído), política conservadora:
+        se DROPEAN los keyword_match no verificados (mejor perder una alerta
+        dudosa que spamear falsos positivos). Los hits estructurados pasan.
+        """
+        confirmed = [h for h in hits_detail if not h.get("needs_verification")]
+        candidates = [h for h in hits_detail if h.get("needs_verification")]
+        if not candidates:
+            return [h["frase"] for h in hits_detail]
+
+        scene = (vision_json.get("vision", {}) or {}).get("scene", "") or summary or ""
+        scene = scene[:800]
+        frases = [h["frase"] for h in candidates]
+        prompt = (
+            "Eres un verificador estricto de alertas de videovigilancia.\n"
+            "Te doy una descripción de una escena y una lista de reglas candidatas.\n"
+            "Para CADA regla decide si la escena describe que REALMENTE OCURRIÓ\n"
+            "(afirmado), o si solo se menciona para negarlo / como posibilidad / no aplica.\n\n"
+            f"ESCENA:\n{scene}\n\n"
+            "REGLAS CANDIDATAS:\n" + "\n".join(f"{i+1}. {f}" for i, f in enumerate(frases)) +
+            "\n\nResponde SOLO JSON: {\"resultados\": [{\"regla\": 1, \"ocurrio\": true|false, "
+            "\"evidencia\": \"frase corta de la escena que lo confirma\"}]}"
+        )
+        try:
+            client = await self._client()
+            resp = await client.post(
+                "http://localhost:8004/v1/chat/completions",
+                json={
+                    "model": "qwen7b",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 400,
+                    "temperature": 0.0,
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            parsed = _parse_qwen_json(content)
+            resultados = parsed.get("resultados", []) if isinstance(parsed, dict) else []
+            ok_idx = set()
+            for r in resultados:
+                if isinstance(r, dict) and r.get("ocurrio") is True:
+                    try:
+                        ok_idx.add(int(r.get("regla", 0)) - 1)
+                    except (TypeError, ValueError):
+                        continue
+            for i, h in enumerate(candidates):
+                if i in ok_idx:
+                    confirmed.append(h)
+                    logging.info(f"[B2] keyword hit VERIFICADO: {h['frase'][:60]}")
+                else:
+                    logging.info(f"[B2] keyword hit RECHAZADO por verificador: {h['frase'][:60]}")
+        except Exception as e:
+            logging.warning(f"[B2] verificador no disponible ({e}); "
+                            f"dropeando {len(candidates)} keyword candidates no verificados")
+        return [h["frase"] for h in confirmed]
     
     def _get_grid(self, user_id: str, camera_id: str, grid_size: int = 16) -> FrameGrid:
         """Obtener o crear grid para una cámara específica."""
@@ -2116,9 +2245,33 @@ class QwenOrchestrator:
             attention_detected = rule_result["violation"]
             attention_hits = rule_result.get("attention_hits", [])
     
-            # ── Cooldown de notificación por cámara ────────────────────────────
-            cam_key = f"{user_id}_{camera_id}"
-            last_notif = self._last_notification_ts.get(cam_key, 0)
+            # ── B2: verificación de 2ª pasada para candidatos keyword ────────
+            # Los hits con source=keyword_match (substring frágil, falsos
+            # positivos por negación) deben ser confirmados por el modelo
+            # barato antes de poder marcar violación real y notificar.
+            hits_detail = rule_result.get("hits_detail") or []
+            if rule_result["violation"] and any(h.get("needs_verification") for h in hits_detail):
+                verified_hits = await self._verify_attention_candidates(
+                    hits_detail, qwen_json, qwen_json.get("summary", ""))
+                attention_detected = bool(verified_hits)
+                attention_hits = verified_hits
+                if not attention_detected:
+                    logging.info(f"[B2] todos los hits eran falsos positivos "
+                                 f"keyword → evento queda como 'normal' (no notifica)")
+                    qwen_json["verifier"] = "all_rejected"
+                qwen_json["attention_hits"] = attention_hits
+                qwen_json["attention_hits_zones"] = [
+                    (h.get("zone_name") or None) for h in hits_detail
+                    if h["frase"] in attention_hits
+                ]
+
+            # ── Cooldown PERSISTENTE por cámara+regla (B3) ───────────────────
+            # Clave por regla: dos reglas distintas no se silencian entre sí;
+            # la misma regla sí (anti-spam). Persistente en disco: un reinicio
+            # ya no causa tormenta de notificaciones repetidas.
+            first_hit_text = attention_hits[0] if attention_hits else ""
+            cam_key = self._cooldown_key(user_id, camera_id, first_hit_text)
+            last_notif = self._cooldown_get(cam_key)
             cooldown_ok = (time.time() - last_notif) > self._notification_cooldown
     
             # ── Datos del evento ─────────────────────────────────────────────────
@@ -2216,7 +2369,7 @@ class QwenOrchestrator:
                         lambda t: logging.info(f"FCM sent: {title[:40]}") if not t.exception()
                         else logging.error(f"FCM error: {t.exception()}")
                     )
-                    self._last_notification_ts[cam_key] = time.time()
+                    self._cooldown_save(cam_key, time.time())
                 except Exception as _fcm_err:
                     logging.error(f"FCM error: {_fcm_err}")
             elif attention_detected:
