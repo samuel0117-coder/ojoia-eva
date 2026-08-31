@@ -101,4 +101,6 @@ Principio rector que guía todo este plan:
 | 2026-08-31 | A2 firebase-key fuera del repo | `16ecc1b` | ✅ |
 | 2026-08-31 | A3 deduplicación (~2.9MB) | `08a68e0` | ✅ |
 | 2026-08-31 | A4 X-Camera-Key + A5 README | `cb6946f` | ✅ |
+| 2026-08-31 | B1+B2+B3 precisión de alertas + cooldown persistente | `0ec02b4` | ✅ desplegado (api-eva reiniciado, health 200) |
+| 2026-08-31 | B4 feedback loop auto-ajuste de reglas | `53ee10f` | ✅ desplegado |
 | — | OPS pendiente: rotar password Redis y service account Firebase (estuvieron expuestos) | — | ⏳ manual |

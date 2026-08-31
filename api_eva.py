@@ -81,6 +81,39 @@ def _atomic_write_user_json(uf: Path, ud: dict) -> None:
     tmp.replace(uf)
 
 
+def update_user_json(user_id: str, mutator):
+    """C1 (2026-08-31) — Read-modify-write SEGURO de user.json.
+
+    Patrón único para los ~18 sitios que antes hacían:
+        read json → mutar → write (sin lock, sin atomicidad)
+    Con concurrencia (last_frame cada segundo + FCM + billing), eso
+    perdía escrituras y podía dejar el JSON corrupto.
+
+    Uso:
+        def _mut(ud):
+            ud["fcm_tokens"] = [...]
+        update_user_json(user_id, _mut)
+
+    - Lock por usuario (threading) alrededor de TODO el read+write.
+    - Escritura atómica (tmp + rename). Un crash nunca deja JSON a medias.
+    - mutator recibe el dict y lo muta in-place; si lanza excepción,
+      NO se escribe nada (estado previo intacto).
+    Devuelve el dict resultante.
+    """
+    uf = find_user_json(user_id)
+    if not uf:
+        uf = Path(STORAGE_ROOT) / "users" / user_id / "user.json"
+    lock = _get_user_lock(user_id)
+    with lock:
+        ud = {}
+        if uf.exists():
+            with open(uf) as f:
+                ud = json.load(f)
+        mutator(ud)
+        _atomic_write_user_json(uf, ud)
+        return ud
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # UN SOLO CHAT por usuario (EVA-UNIFY) — helpers de sesión unificada
 #
@@ -1973,12 +2006,12 @@ async def verify_firebase(request: Request):
             user_data["vigilance_prompt"] = _build_initial_prompt(business_type, main_concerns, initial_rules, schedule_open, schedule_close)
             user_data["rules_es"] = _generate_rules_es(business_type, main_concerns)
         storage_path.mkdir(parents=True, exist_ok=True)
-        with open(storage_path / "user.json", "w") as f:
-            json.dump(user_data, f, indent=2, ensure_ascii=False)
-        compat_dir = STORAGE_ROOT / "users" / uid
-        compat_dir.mkdir(parents=True, exist_ok=True)
-        with open(compat_dir / "user.json", "w") as f:
-            json.dump(user_data, f, indent=2, ensure_ascii=False)
+        storage_path.mkdir(parents=True, exist_ok=True)
+        with _get_user_lock(uid):  # C1
+            _atomic_write_user_json(storage_path / "user.json", user_data)
+            compat_dir = STORAGE_ROOT / "users" / uid
+            compat_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_write_user_json(compat_dir / "user.json", user_data)
         return {
             "success": True,
             "user_id": uid,
@@ -3138,22 +3171,20 @@ async def update_user_profile(request: Request):
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
-    with open(user_file) as f:
-        user_data = json.load(f)
     updatable_fields = ["vigilance_prompt", "vigilance_rules", "name", "business_name", "business_type", "schedule", "what_to_monitor", "schedule_open", "schedule_close", "employee_count", "main_concerns", "phone"]
-    for field in updatable_fields:
-        if field in data:
-            if field in ["schedule_open", "schedule_close"]:
-                if "schedule" not in user_data:
-                    user_data["schedule"] = {}
-                user_data["schedule"]["open" if field == "schedule_open" else "close"] = data[field]
-            elif field == "main_concerns" and isinstance(data[field], str):
-                user_data["main_concerns"] = [c.strip() for c in data[field].split(",") if c.strip()]
-            else:
-                user_data[field] = data[field]
-    with open(user_file, "w") as f:
-        json.dump(user_data, f, indent=2)
-        return {"success": True}
+    def _mut_profile(user_data):
+        for field in updatable_fields:
+            if field in data:
+                if field in ["schedule_open", "schedule_close"]:
+                    if "schedule" not in user_data:
+                        user_data["schedule"] = {}
+                    user_data["schedule"]["open" if field == "schedule_open" else "close"] = data[field]
+                elif field == "main_concerns" and isinstance(data[field], str):
+                    user_data["main_concerns"] = [c.strip() for c in data[field].split(",") if c.strip()]
+                else:
+                    user_data[field] = data[field]
+    update_user_json(user_id, _mut_profile)  # C1: lock + atomic write
+    return {"success": True}
 
 @app.get("/api/user/events")
 async def get_user_events(user_id: str, date: str = None, filter: str = None, limit: int = 50, camera_id: str = None, exclude_vigilance: bool = False):
@@ -3561,10 +3592,7 @@ async def get_cameras(user_id: str):
         discovered = [c for c in cams if c.get("camera_id") not in known_ids]
         if discovered:
             try:
-                ud_existing = ud if isinstance(ud, dict) else {}
-                ud_existing["cameras"] = cams
-                with open(user_file, "w") as f:
-                    json.dump(ud_existing, f, indent=2)
+                update_user_json(user_id, lambda ud2: ud2.__setitem__("cameras", cams))  # C1
             except Exception:
                 logger.debug("silent: {exc}", exc=Exception)
 
@@ -5609,8 +5637,8 @@ async def admin_create_user(request: dict, authorization: str = Header(None)):
         "vigilance_rules": [], "vigilance_prompt": "", "rules_es": [],
         "eva_sessions": []
     }
-    with open(user_dir / "user.json", "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
+    with _get_user_lock(user_id):  # C1
+        _atomic_write_user_json(user_dir / "user.json", ud)
     logger.info(f"Admin: user created {user_id}")
     return {"success": True, "user_id": user_id}
 
@@ -5687,14 +5715,12 @@ async def admin_update_user(user_id: str, request: dict, authorization: str = He
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    with open(user_file) as f:
-        ud = json.load(f)
-    for k in ("name", "email", "phone", "business_name", "business_type", "plan", "status",
-              "plan_end", "trial_end", "next_due", "access_token"):
-        if k in request:
-            ud[k] = request[k]
-    with open(user_file, "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
+    def _mut_admin(ud):
+        for k in ("name", "email", "phone", "business_name", "business_type", "plan", "status",
+                  "plan_end", "trial_end", "next_due", "access_token"):
+            if k in request:
+                ud[k] = request[k]
+    update_user_json(user_id, _mut_admin)  # C1
     logger.info(f"Admin: user updated {user_id}")
     return {"success": True}
 
@@ -5747,17 +5773,17 @@ async def admin_renew_user(user_id: str, request: dict, authorization: str = Hea
         "status": "confirmed", "created_at": now_ts, "confirmed_at": now_ts, "confirmed_by": "admin",
         "duration_days": duration_days
     }
-    ud["plan"] = plan
-    ud["plan_end"] = new_end
-    ud["next_due"] = new_end
-    ud["status"] = "active"
-    ud["trial_end"] = None
-    payments = ud.get("payments", [])
-    payments.append(payment)
-    ud["payments"] = payments
-    ud["last_payment"] = payment
-    with open(user_file, "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
+    def _mut_renew(ud):
+        ud["plan"] = plan
+        ud["plan_end"] = new_end
+        ud["next_due"] = new_end
+        ud["status"] = "active"
+        ud["trial_end"] = None
+        payments = ud.get("payments", [])
+        payments.append(payment)
+        ud["payments"] = payments
+        ud["last_payment"] = payment
+    update_user_json(user_id, _mut_renew)  # C1
     logger.info(f"User renewed: {user_id} plan={plan} end={new_end} amount={amount}")
     return {"success": True, "plan": plan, "plan_end": new_end, "payment_id": payment_id}
 
@@ -5768,37 +5794,41 @@ async def admin_confirm_payment(user_id: str, payment_id: str, request: dict, au
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
-    with open(user_file) as f:
-        ud = json.load(f)
-    payments = ud.get("payments", [])
-    found = False
-    for p in payments:
-        if p.get("id") == payment_id:
-            p["status"] = "confirmed"
-            p["confirmed_at"] = int(time.time())
-            p["confirmed_by"] = "admin"
-            p["notes"] = request.get("notes", p.get("notes", ""))
-            found = True
-            break
-    if not found:
+    result_holder = {}
+
+    def _mut_confirm(ud):
+        payments = ud.get("payments", [])
+        found = False
+        for p in payments:
+            if p.get("id") == payment_id:
+                p["status"] = "confirmed"
+                p["confirmed_at"] = int(time.time())
+                p["confirmed_by"] = "admin"
+                p["notes"] = request.get("notes", p.get("notes", ""))
+                found = True
+                break
+        if not found:
+            return  # se valida abajo con result_holder
+        result_holder["found"] = True
+        # Al confirmar pago: reactivar servicio + extender plan_end si trae duration_days
+        ud["status"] = "active"
+        dur = 0
+        for p in payments:
+            if p.get("id") == payment_id:
+                dur = int(p.get("duration_days", 0))
+                break
+        if dur > 0:
+            now_ts = int(time.time())
+            current_end = ud.get("plan_end", 0) or 0
+            base = now_ts if current_end < now_ts else current_end
+            ud["plan_end"] = base + (dur * 86400)
+            ud["next_due"] = ud["plan_end"]
+        ud["payments"] = payments
+        ud["last_payment"] = next((p for p in payments if p["id"] == payment_id), None)
+
+    ud = update_user_json(user_id, _mut_confirm)  # C1: lock + atomic
+    if not result_holder.get("found"):
         raise HTTPException(status_code=404, detail="Payment not found")
-    # Al confirmar pago: reactivar servicio + extender plan_end si el pago trae duration_days
-    ud["status"] = "active"
-    dur = 0
-    for p in payments:
-        if p.get("id") == payment_id:
-            dur = int(p.get("duration_days", 0))
-            break
-    if dur > 0:
-        now_ts = int(time.time())
-        current_end = ud.get("plan_end", 0) or 0
-        base = now_ts if current_end < now_ts else current_end
-        ud["plan_end"] = base + (dur * 86400)
-        ud["next_due"] = ud["plan_end"]
-    ud["payments"] = payments
-    ud["last_payment"] = next((p for p in payments if p["id"] == payment_id), None)
-    with open(user_file, "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
     logger.info(f"Payment confirmed: {user_id} {payment_id} -> servicio activo")
     return {"success": True, "payment_id": payment_id, "status": "confirmed",
             "service": "active", "plan_end": ud.get("plan_end")}
@@ -5810,11 +5840,7 @@ async def admin_suspend_user(user_id: str, request: dict, authorization: str = H
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
-    with open(user_file) as f:
-        ud = json.load(f)
-    ud["status"] = "suspended"
-    with open(user_file, "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
+    update_user_json(user_id, lambda ud: ud.__setitem__("status", "suspended"))  # C1
     logger.info(f"User suspended: {user_id}")
     return {"success": True, "status": "suspended"}
 
@@ -5825,11 +5851,7 @@ async def admin_reactivate_user(user_id: str, request: dict, authorization: str 
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
-    with open(user_file) as f:
-        ud = json.load(f)
-    ud["status"] = "active"
-    with open(user_file, "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
+    update_user_json(user_id, lambda ud: ud.__setitem__("status", "active"))  # C1
     logger.info(f"User reactivated: {user_id}")
     return {"success": True, "status": "active"}
 
@@ -5840,12 +5862,8 @@ async def admin_regen_token(user_id: str, authorization: str = Header(None)):
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
-    with open(user_file) as f:
-        ud = json.load(f)
     new_token = "oj_live_" + secrets.token_urlsafe(32)
-    ud["access_token"] = new_token
-    with open(user_file, "w") as f:
-        json.dump(ud, f, indent=2, ensure_ascii=False)
+    update_user_json(user_id, lambda ud: ud.__setitem__("access_token", new_token))  # C1
     return {"success": True, "access_token": new_token}
 
 
@@ -6331,14 +6349,12 @@ async def admin_update_user_storage(user_id: str, request: dict, authorization: 
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    with open(user_file) as f:
-        user_data = json.load(f)
-    if "plan" in request:
-        user_data["plan"] = request["plan"]
-    if "quota_gb" in request:
-        user_data["quota_gb"] = request["quota_gb"]
-    with open(user_file, "w") as f:
-        json.dump(user_data, f, indent=2)
+    def _mut_storage(user_data):
+        if "plan" in request:
+            user_data["plan"] = request["plan"]
+        if "quota_gb" in request:
+            user_data["quota_gb"] = request["quota_gb"]
+    update_user_json(user_id, _mut_storage)  # C1
     return {"success": True}
 
 
@@ -6354,12 +6370,11 @@ async def admin_migrate_user(user_id: str, request: dict, authorization: str = H
             existing = json.load(f)
     existing["disk_mount"] = new_disk
     new_dir.mkdir(parents=True, exist_ok=True)
-    with open(new_dir / "user.json", "w") as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
-    compat = STORAGE_ROOT / "users" / user_id
-    compat.mkdir(parents=True, exist_ok=True)
-    with open(compat / "user.json", "w") as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
+    with _get_user_lock(user_id):  # C1
+        _atomic_write_user_json(new_dir / "user.json", existing)
+        compat = STORAGE_ROOT / "users" / user_id
+        compat.mkdir(parents=True, exist_ok=True)
+        _atomic_write_user_json(compat / "user.json", existing)
     return {"success": True, "new_path": str(new_dir)}
 
 
