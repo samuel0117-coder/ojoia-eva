@@ -3,6 +3,7 @@
 eva/daily_summary_cron.py - Genera resumen diario y envía push notification.
 Se ejecuta a las 8:00 AM para enviar el resumen del día anterior.
 """
+import os
 import asyncio
 import json
 import logging
@@ -20,7 +21,7 @@ async def send_fcm_notification(user_id: str, title: str, body: str):
     try:
         import httpx
         # Cargar Firebase credentials
-        cred_path = Path("/opt/ojoia/code/firebase-key.json")
+        cred_path = Path(os.environ.get("FIREBASE_KEY_PATH", "/opt/ojoia/config/firebase-key.json"))
         if not cred_path.exists():
             logger.warning("Firebase key not found, skipping push")
             return
