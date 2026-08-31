@@ -733,6 +733,71 @@ async def register_push_token(request: Request):
 # ─────────────────────────────────────────────────────────────────────────
 # S1: Auth API de usuario (token propio random, soft rollout)
 # ─────────────────────────────────────────────────────────────────────────
+@app.post("/api/cameras/rtsp/probe")
+async def rtsp_probe(request: dict, authorization: str = Header(None, alias="Authorization")):
+    """D2 — Probar una URL RTSP antes de registrar la cámara.
+    Devuelve un frame JPEG en base64 para que el usuario CONFIRME qué ve
+    la cámara antes de guardarla. Auth: bearer del usuario (user_id en body)."""
+    user_id = (request.get("user_id") or "").strip()
+    url = (request.get("rtsp_url") or "").strip()
+    await _verify_user_token(authorization, user_id)
+    from rtsp_puller import validate_rtsp_url, grab_one_frame, RtspUrlError
+    try:
+        url = validate_rtsp_url(url)
+    except RtspUrlError as e:
+        raise HTTPException(status_code=400, detail=f"URL rechazada: {e}")
+    frame = await asyncio.to_thread(grab_one_frame, url, 15)
+    if frame is None:
+        raise HTTPException(status_code=502, detail="No se pudo conectar o no llegó video (revisa URL, usuario/clave y que el puerto esté abierto)")
+    return {"success": True, "frame_b64": base64.b64encode(frame).decode(),
+            "bytes": len(frame)}
+
+
+@app.post("/api/cameras/rtsp/register")
+async def rtsp_register(request: dict, authorization: str = Header(None, alias="Authorization")):
+    """D2 — Registrar una cámara RTSP remota en la cuenta del usuario.
+    Crea la entrada en user.json.cameras + camera.json con rtsp_url.
+    El rtsp_puller (daemon) la descubre en el próximo scan (≤30s)."""
+    user_id = (request.get("user_id") or "").strip()
+    url = (request.get("rtsp_url") or "").strip()
+    name = (request.get("name") or "Cámara IP").strip()[:60]
+    zone = (request.get("zone") or "").strip()[:40]
+    await _verify_user_token(authorization, user_id)
+    from rtsp_puller import validate_rtsp_url, RtspUrlError
+    try:
+        url = validate_rtsp_url(url)
+    except RtspUrlError as e:
+        raise HTTPException(status_code=400, detail=f"URL rechazada: {e}")
+
+    camera_id = f"IPCAM-{secrets.token_hex(4).upper()}"
+    ingest_key = secrets.token_urlsafe(32)
+
+    # Entrada en user.json (seguro: lock + atómico — C1)
+    def _mut(ud):
+        cams = ud.setdefault("cameras", [])
+        cams.append({
+            "camera_id": camera_id, "name": name, "zone": zone,
+            "type": "rtsp", "created_at": int(time.time()),
+        })
+    update_user_json(user_id, _mut)
+
+    # camera.json con la config del puller
+    cam_dir = Path(STORAGE_ROOT) / "users" / user_id / "cameras" / camera_id
+    cam_dir.mkdir(parents=True, exist_ok=True)
+    cam_cfg = {
+        "camera_id": camera_id, "type": "rtsp", "rtsp_url": url,
+        "ingest_key": ingest_key, "zone": zone, "name": name,
+        "fps": 1, "enabled": True, "rtsp_enabled": True,
+        "created_at": time.time(),
+    }
+    cj = cam_dir / "camera.json"
+    cj.write_text(json.dumps(cam_cfg, indent=2, ensure_ascii=False))
+    os.chmod(cj, 0o600)  # la URL trae credenciales: solo owner
+    logger.info(f"[D2] cámara RTSP registrada: {user_id[:6]}…/{camera_id} ({name}, zone={zone})")
+    return {"success": True, "camera_id": camera_id, "ingest_key": ingest_key,
+            "note": "El puller la descubre en ≤30s. Guarda ingest_key: sirve para auditar la fuente."}
+
+
 @app.post("/api/auth/token")
 async def issue_user_token(request: dict):
     """

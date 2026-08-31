@@ -1,0 +1,17 @@
+[Unit]
+Description=OjoIA RTSP Puller — cámaras IP remotas (D2)
+After=network-online.target api-eva.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sam
+Group=sam
+EnvironmentFile=/opt/ojoia/config/ojoia.env
+WorkingDirectory=/opt/ojoia/code
+ExecStart=/opt/ojoia/venv/bin/python -u /opt/ojoia/code/rtsp_puller.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
