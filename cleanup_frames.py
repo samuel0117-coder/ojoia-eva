@@ -16,6 +16,7 @@ como fallback y los sobreescribimos con admin_config.json["retention"] si existe
 
 import os
 import sys
+import os
 import time
 import json
 from pathlib import Path
@@ -332,10 +333,80 @@ def cleanup_old_event_metadata(retention: dict):
     log("=" * 60 + "\n")
 
 
+def cleanup_deleted_cameras(max_age_days: int = 7):
+    """F-cleanup (2026-09-01): purga carpetas de cámaras borradas
+    (cam_*.deleted_*) con más de max_age_days. En producción había una de
+    524MB muerta desde hace semanas."""
+    import re as _re
+    log("=" * 60)
+    log("Iniciando limpieza de cámaras borradas (cam_*.deleted_*)")
+    users_dir = STORAGE_ROOT / "users"
+    if not users_dir.exists():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    total = 0
+    for cam_glob in users_dir.glob("*/cameras/*.deleted_*"):
+        try:
+            if cam_glob.is_dir() and cam_glob.stat().st_mtime < cutoff:
+                import shutil
+                shutil.rmtree(cam_glob)
+                total += 1
+                log(f"  Purgada: {cam_glob}")
+        except Exception as e:
+            log(f"  Error purgando {cam_glob}: {e}")
+    log(f"Cámaras borradas purgadas: {total}")
+    log("=" * 60 + "\n")
+
+
+def cleanup_backups(keep: int = 5):
+    """F-cleanup: conserva solo los últimos N backups tar.gz del panel."""
+    bdir = Path(os.environ.get("OJOIA_BACKUP_DIR", "/home/sam/storage/backups"))
+    if not bdir.is_dir():
+        return
+    old = sorted(bdir.glob("*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
+    removed = 0
+    for f in old[keep:]:
+        try:
+            f.unlink(); removed += 1
+        except Exception:
+            pass
+    if removed:
+        log(f"Backups antiguos eliminados: {removed} (conservados: {keep})")
+
+
+def disk_usage_alert(threshold_pct: float = 80.0) -> dict:
+    """F-cleanup: mide el disco; devuelve info para alerta del panel.
+    >80% = warning, >90% = critical (lo consume /admin/health/summary)."""
+    try:
+        st = os.statvfs(STORAGE_ROOT)
+        free_gb = st.f_bavail * st.f_frsize / 1e9
+        total_gb = (st.f_blocks * st.f_frsize) / 1e9
+        pct_used = 100 * (1 - st.f_bavail / st.f_blocks) if st.f_blocks else 0
+        return {"free_gb": round(free_gb, 1), "total_gb": round(total_gb, 1),
+                "used_pct": round(pct_used, 1),
+                "level": "critical" if pct_used > 90 else
+                         ("warning" if pct_used > threshold_pct else "ok")}
+    except Exception as e:
+        return {"level": "error", "error": str(e)}
+
+
 if __name__ == "__main__":
     retention = load_retention_config()
     log(f"Config retention cargada: days_by_plan={retention['days_by_plan']} "
         f"frames_hours_by_plan={retention['frames_hours_by_plan']}")
     cleanup_old_frames(retention)
     cleanup_old_events(retention)
+    # FIX (2026-09-01): esta función EXISTÍA pero nunca se llamaba desde el
+    # __main__ — el disco crecía sin control (evt_*.json + jpgs sueltos de
+    # eventos acumulándose desde junio). Era el bug del "limpiador que no
+    # limpia".
+    cleanup_old_event_metadata(retention)
+    cleanup_deleted_cameras(max_age_days=7)
+    cleanup_backups(keep=5)
+    du = disk_usage_alert()
+    log(f"Disco tras limpieza: {du.get('used_pct', '?')}% usado "
+        f"({du.get('free_gb', '?')} GB libres) — nivel: {du.get('level')}")
+    if du.get("level") != "ok":
+        log(f"⚠️ ALERTA: disco en nivel {du['level']} — revisar retención")
+    log("Limpieza v2 completada.")
     cleanup_old_event_metadata(retention)
