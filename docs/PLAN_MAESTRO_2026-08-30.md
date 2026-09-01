@@ -188,6 +188,17 @@ camera desde este nodo con PlatformIO (boot limpio, frames en pipeline).
 | Fecha | Fase | Commit | Estado |
 |---|---|---|---|
 | 2026-09-01 | F0 congelar base firmware | `7adbd82` (esp32cam) | ✅ |
+| 2026-09-01 | F1 announce + OTA rollout — E2E certificado en lab camera (fix bucle infinito OTA) | api_eva | ✅ |
+
+## 📌 AGENDA POSTERIOR (cuando termine el plan F3+ — NO ahora)
+1. **Panel admin ojoia.com.do/admin** (base ya existe):
+   - Gestionar OTA desde la UI: publicar bin, rollout por cámara, versión
+     de cada cámara, historial de actualizaciones
+   - "Conectarse a una cámara" para arreglarla: estado vivo (frames, WDT,
+     heap, RSSI, IP LAN), aplicar config remotamente, reiniciarla
+2. **Panel de detecciones en tiempo real**: stream de alertas/eventos en
+   vivo (websocket o polling) con grids y lo que "ve" Qwen en pantalla.
+3. (Ya en agenda como F6): gateway de video MJPEG v9.4 en ESP32.
 
 ---
 
