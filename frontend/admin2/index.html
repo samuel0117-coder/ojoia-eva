@@ -826,25 +826,38 @@ function saveSupportContact() {
         }).catch(() => toast('❌ Error', false));
 }
 
-// ── AUTO-CONNECT ──
+// ── AUTO-CONNECT (2026-09-01: fijo al dominio canónico) ──
+// Antes: localStorage podía tener una URL vieja (ngrok/localhost) y el
+// panel quedaba mudo con 0 en todo. Ahora: se valida SIEMPRE contra
+// api.ojoia.com.do; el localStorage solo se usa si su valor coincide.
 function autoConnect() {
+    const CANONICAL = 'https://api.ojoia.com.do';
     const saved = localStorage.getItem('ojoia_admin_api');
-    if (saved) { API = saved; reloadStatus(); initAuth(); return; }
-    setTimeout(() => {
-        if (!API) {
-            const knownUrl = 'https://api.ojoia.com.do';
-            fetch(knownUrl + '/health', {mode:'cors'})
-                .then(r => r.json())
-                .then(d => {
+    if (saved === CANONICAL) { API = saved; reloadStatus(); initAuth(); return; }
+    if (saved && saved !== CANONICAL) localStorage.removeItem('ojoia_admin_api');
+    fetch(CANONICAL + '/health', {mode:'cors'})
+        .then(r => r.json())
+        .then(d => {
+            if (d.status === 'ok') {
+                API = CANONICAL;
+                localStorage.setItem('ojoia_admin_api', API);
+                reloadStatus();
+                initAuth();
+            } else setHeader(false);
+        })
+        .catch(() => {
+            // fallback: si el canónico falla, probar la URL del location
+            // (útil en despliegues self-hosted)
+            const loc = location.origin;
+            if (loc !== CANONICAL && location.protocol.startsWith('http')) {
+                fetch(loc + '/health', {mode:'cors'}).then(r => r.json()).then(d => {
                     if (d.status === 'ok') {
-                        API = knownUrl;
-                        localStorage.setItem('ojoia_admin_api', API);
-                        reloadStatus();
-                        initAuth();
-                    }
+                        API = loc; localStorage.setItem('ojoia_admin_api', API);
+                        reloadStatus(); initAuth();
+                    } else setHeader(false);
                 }).catch(() => setHeader(false));
-        }
-    }, 2000);
+            } else setHeader(false);
+        });
 }
 
 // ── UI HELPERS ──
