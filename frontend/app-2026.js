@@ -3369,9 +3369,9 @@ c.style.display = '';
 
                     <!-- Drawing tools -->
                     <div class="zone-drawer-tools" id="zone-tools">
-                        <button class="zone-tool-btn" data-tool="draw" onclick="App._setZoneTool('draw', this)">✏️ Dibujar</button>
-                        <button class="zone-tool-btn" data-tool="edit" onclick="App._setZoneTool('edit', this)">✏️ Editar</button>
-                        <button class="zone-tool-btn" data-tool="delete" onclick="App._setZoneTool('delete', this)">🗑️ Borrar</button>
+                        <button class="zone-tool-btn" data-tool="draw" onclick="App._setZoneTool('draw', this)">✏️ Dibujar zona</button>
+                        <button class="zone-tool-btn" data-tool="edit" onclick="App._setZoneTool('edit', this)">✋ Mover / Redimensionar</button>
+                        <button class="zone-tool-btn" data-tool="delete" onclick="App._setZoneTool('delete', this)">🗑️ Borrar zona</button>
                     </div>
 
                     <!-- Zone type selection -->
@@ -3456,6 +3456,12 @@ c.style.display = '';
         let startX = 0, startY = 0;
         let currentRect = null;
 
+        // F0.3: estado de edición (mover / redimensionar / borrar por clic)
+        let editAction = null;      // 'move' | 'resize'
+        let editZone = null;        // zona objetivo
+        let editStartCoords = null; // coords relativas al iniciar edición
+        let editStartPos = null;    // posición del mouse al iniciar (px canvas)
+
         const getRelativePos = (e) => {
             const rect = canvas.getBoundingClientRect();
             const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
@@ -3463,16 +3469,112 @@ c.style.display = '';
             return { x, y };
         };
 
+        // Convierte px de canvas → coords relativas 0-1 sobre la imagen
+        const pxToRel = (x, y) => {
+            const nw = imgEl.naturalWidth, nh = imgEl.naturalHeight;
+            const scale = this._zoneDrawScale || 1;
+            const ox = this._zoneOffsetX || 0, oy = this._zoneOffsetY || 0;
+            return {
+                x: (x - ox) / (nw * scale),
+                y: (y - oy) / (nh * scale),
+            };
+        };
+
+        // Rect de una zona en px de canvas
+        const zoneRectPx = (zone) => {
+            const nw = imgEl.naturalWidth, nh = imgEl.naturalHeight;
+            const scale = this._zoneDrawScale || 1;
+            const ox = this._zoneOffsetX || 0, oy = this._zoneOffsetY || 0;
+            const c = zone.coords || {};
+            return {
+                x: ox + c.x * nw * scale,
+                y: oy + c.y * nh * scale,
+                w: c.w * nw * scale,
+                h: c.h * nh * scale,
+            };
+        };
+
+        // Zona bajo un punto (px canvas), priorizando la última dibujada
+        const zoneAt = (x, y) => {
+            const zones = this._zoneZones || [];
+            for (let i = zones.length - 1; i >= 0; i--) {
+                const r = zoneRectPx(zones[i]);
+                if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+                    return zones[i];
+                }
+            }
+            return null;
+        };
+
+        const HANDLE = 12; // px de la esquina de resize
+
         const startDraw = (e) => {
-            if (this._zoneEditMode !== 'draw') return;
-            e.preventDefault();
             const pos = getRelativePos(e);
+            const mode = this._zoneEditMode;
+
+            // F0.3: modo borrar — clic sobre una zona la elimina
+            if (mode === 'delete') {
+                e.preventDefault();
+                const z = zoneAt(pos.x, pos.y);
+                if (z) {
+                    this._zoneZones = this._zoneZones.filter(zz => zz.id !== z.id);
+                    this._redrawZones();
+                    this._updateZoneList();
+                }
+                return;
+            }
+
+            // F0.3: modo editar — mover o redimensionar la zona bajo el cursor
+            if (mode === 'edit') {
+                e.preventDefault();
+                const z = zoneAt(pos.x, pos.y);
+                if (!z) return;
+                const r = zoneRectPx(z);
+                const nearBR = (Math.abs(pos.x - (r.x + r.w)) <= HANDLE &&
+                                Math.abs(pos.y - (r.y + r.h)) <= HANDLE);
+                editAction = nearBR ? 'resize' : 'move';
+                editZone = z;
+                editStartCoords = { ...z.coords };
+                editStartPos = pos;
+                return;
+            }
+
+            if (mode !== 'draw') return;
+            e.preventDefault();
             startX = pos.x;
             startY = pos.y;
             isDrawing = true;
         };
 
         const updateDraw = (e) => {
+            // F0.3: arrastre en modo edición
+            if (this._zoneEditMode === 'edit' && editZone && editAction) {
+                e.preventDefault();
+                const pos = getRelativePos(e);
+                const nw = imgEl.naturalWidth, nh = imgEl.naturalHeight;
+                const scale = this._zoneDrawScale || 1;
+                const dx = (pos.x - editStartPos.x) / (nw * scale);
+                const dy = (pos.y - editStartPos.y) / (nh * scale);
+                const c0 = editStartCoords;
+                if (editAction === 'move') {
+                    editZone.coords = {
+                        x: Math.max(0, Math.min(1 - c0.w, c0.x + dx)),
+                        y: Math.max(0, Math.min(1 - c0.h, c0.y + dy)),
+                        w: c0.w,
+                        h: c0.h,
+                    };
+                } else { // resize (esquina inferior-derecha)
+                    editZone.coords = {
+                        x: c0.x,
+                        y: c0.y,
+                        w: Math.max(0.02, Math.min(1 - c0.x, c0.w + dx)),
+                        h: Math.max(0.02, Math.min(1 - c0.y, c0.h + dy)),
+                    };
+                }
+                this._redrawZones();
+                return;
+            }
+
             if (this._zoneEditMode !== 'draw' || !isDrawing) return;
             e.preventDefault();
             const pos = getRelativePos(e);
@@ -3481,13 +3583,26 @@ c.style.display = '';
             const w = Math.abs(startX - pos.x);
             const h = Math.abs(startY - pos.y);
             currentRect = { x, y, w, h, startX, startY, endX: pos.x, endY: pos.y };
+            this._zoneCurrentDrawRect = currentRect; // F0.3: feedback visual
             this._redrawZones();
         };
 
         const finishDraw = (e) => {
+            // F0.3: terminar edición
+            if (this._zoneEditMode === 'edit' && editZone) {
+                e.preventDefault();
+                editZone = null;
+                editAction = null;
+                editStartCoords = null;
+                editStartPos = null;
+                this._redrawZones();
+                this._updateZoneList();
+                return;
+            }
             if (this._zoneEditMode !== 'draw' || !isDrawing) return;
             e.preventDefault();
             isDrawing = false;
+            this._zoneCurrentDrawRect = null; // F0.3
             if (currentRect && currentRect.w > 10 && currentRect.h > 10) {
                 const imgEl = document.getElementById('zone-frame-img');
                 if (imgEl && imgEl.naturalWidth) {
@@ -3510,11 +3625,14 @@ c.style.display = '';
                     // Get color from palette or use default
                     const color = this._zoneSelectedColor || '#ff0a4e';
 
+                    // F0.1: antes se llamaba round() global (inexistente) → ReferenceError
+                    // y la zona nunca se agregaba. Usar helper local.
+                    const _r4 = (n) => Math.round(n * 10000) / 10000;
                     const newZone = {
                         id: 'zone_' + Date.now(),
                         name: name,
                         type: type,
-                        coords: {x: round(relX, 4), y: round(relY, 4), w: round(relW, 4), h: round(relH, 4)},
+                        coords: {x: _r4(relX), y: _r4(relY), w: _r4(relW), h: _r4(relH)},
                         color: color,
                         created_at: Date.now() / 1000
                     };
@@ -3524,10 +3642,16 @@ c.style.display = '';
                     currentRect = null;
                     this._redrawZones();
                     this._updateZoneList();
-                    
+
                     // Reset inputs
                     document.getElementById('zone-name-input').value = '';
+                } else {
+                    currentRect = null;
+                    this._redrawZones();
                 }
+            } else {
+                currentRect = null;
+                this._redrawZones();
             }
         };
 
@@ -3549,24 +3673,26 @@ c.style.display = '';
         if (!canvas) return;
         const ctx = this._zoneCanvasCtx || canvas.getContext('2d');
         if (!ctx) return;
-        
+
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const offsetX = this._zoneOffsetX || 0;
         const offsetY = this._zoneOffsetY || 0;
         const scale = this._zoneDrawScale || 1;
+        const frameW = this._zoneFrameW || 640;
+        const frameH = this._zoneFrameH || 360;
 
         (this._zoneZones || []).forEach(zone => {
             if (zone.coords && zone.coords.x !== undefined) {
                 const c = zone.coords;
-                const x = offsetX + c.x * (this._zoneFrameW || 640) * scale;
-                const y = offsetY + c.y * (this._zoneFrameH || 360) * scale;
-                const w = c.w * (this._zoneFrameW || 640) * scale;
-                const h = c.h * (this._zoneFrameH || 360) * scale;
+                const x = offsetX + c.x * frameW * scale;
+                const y = offsetY + c.y * frameH * scale;
+                const w = c.w * frameW * scale;
+                const h = c.h * frameH * scale;
 
                 ctx.strokeStyle = zone.color || '#ff0a4e';
                 ctx.lineWidth = 3;
                 ctx.strokeRect(x, y, w, h);
-                
+
                 // Fill with semi-transparent
                 ctx.fillStyle = this._hexToRgba(zone.color || '#ff0a4e', 0.3);
                 ctx.fillRect(x, y, w, h);
@@ -3576,8 +3702,27 @@ c.style.display = '';
                 ctx.fillStyle = '#fff';
                 ctx.textBaseline = 'top';
                 ctx.fillText(zone.name || 'Zona', x + 4, y + 4);
+
+                // F0.3: en modo editar, dibujar handle de resize (esquina inf-der)
+                if (this._zoneEditMode === 'edit') {
+                    ctx.fillStyle = zone.color || '#ff0a4e';
+                    ctx.fillRect(x + w - 6, y + h - 6, 12, 12);
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(x + w - 6, y + h - 6, 12, 12);
+                }
             }
         });
+
+        // F0.3: rectángulo en curso durante el dibujo
+        const handlers = this._zoneCurrentDrawRect;
+        if (this._zoneEditMode === 'draw' && handlers) {
+            ctx.setLineDash([6, 4]);
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(handlers.x, handlers.y, handlers.w, handlers.h);
+            ctx.setLineDash([]);
+        }
     },
 
     _hexToRgba(hex, alpha = 1) {
@@ -3620,6 +3765,13 @@ c.style.display = '';
         this._zoneEditMode = tool;
         document.querySelectorAll('.zone-tool-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
+        // F0.3: cursor contextual según herramienta
+        const canvas = document.getElementById('zone-canvas');
+        if (canvas) {
+            canvas.style.cursor = tool === 'draw' ? 'crosshair'
+                : tool === 'edit' ? 'move'
+                : tool === 'delete' ? 'not-allowed' : 'default';
+        }
     },
 
     _selectZoneColor(color, swatch) {

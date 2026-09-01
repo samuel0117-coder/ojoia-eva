@@ -1,0 +1,9 @@
+CUARENTENA (2026-09-01, Fase 0 del plan de mejora de vigilancia):
+Este archivo tiene un IndentationError (línea ~1654) y estaba desincronizado
+con el orquestador real que corre en producción: /opt/ojoia/code/orchestrator.py
+(api_eva.py importa `from orchestrator import orchestrator`).
+
+Ningún servicio ni script importa ai_system.orchestrator (verificado con grep
+sobre *.py, *.service, *.sh). Si necesitas el orquestador, usa code/orchestrator.py.
+
+NO EDITAR ESTE ARCHIVO. Se conserva solo por referencia histórica.

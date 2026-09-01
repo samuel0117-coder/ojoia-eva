@@ -205,6 +205,28 @@ def normalize_camera_vigilance_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _derive_attention_phrases(session: Dict[str, Any]) -> list:
+    """F0.5: deriva attention_phrases desde las tareas/preocupaciones del wizard.
+
+    El wizard guarda camera_tasks (lo que el dueño pidió vigilar) y concerns
+    (preocupaciones del negocio). El pipeline de vigilancia lee
+    attention_phrases de camera.json — antes nunca se conectaban.
+    """
+    phrases = list(session.get("attention_phrases") or [])
+    if phrases:
+        return phrases
+    for t in (session.get("camera_tasks") or []):
+        t = str(t).strip()
+        if t and len(t) > 3 and t.lower() not in ("otra cosa", "todo lo anterior", "nada"):
+            phrases.append(t.lower())
+    if not phrases:
+        for c in (session.get("concerns") or session.get("main_concerns") or []):
+            c = str(c).strip()
+            if c and len(c) > 3:
+                phrases.append(c.lower())
+    return phrases[:8]
+
+
 def build_camera_config(session: Dict[str, Any]) -> Dict[str, Any]:
     """Construye camera.json desde datos de sesión."""
     camera_id = session.get("camera_id") or f"cam_{int(time.time())}"
@@ -214,7 +236,7 @@ def build_camera_config(session: Dict[str, Any]) -> Dict[str, Any]:
     schedule = session.get("schedule", {"open": "08:00", "close": "22:00"})
     concern = session.get("concern", "")
 
-    attention_phrases = session.get("attention_phrases", [])
+    attention_phrases = _derive_attention_phrases(session)
     owner_notes = session.get("owner_notes", [])
 
     yolo_triggers = ["person"]

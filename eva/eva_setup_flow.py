@@ -248,20 +248,74 @@ def get_eva_response(phase: str, session: dict, user_message: str) -> dict:
     
     elif phase == "WIZARD_ZONES_DRAW":
         # El frontend mostrará el overlay para dibujar zonas
-        # Simplemente esperamos a que el usuario regrese
+        # Esperamos a que el usuario regrese
+        user_id = session.get("user_id", "")
+        cam_id = session.get("camera_id", "")
         if user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "ok", "terminé", "terminado", "hecho"]:
             # Verificar si tiene zonas
-            user_id = session.get("user_id", "")
             zones = []
-            if user_id:
-                from camera_zones import get_camera_zones
-                zones = get_camera_zones(user_id, session.get("camera_id", ""))
-            zone_str = f" {len(zones)} zonas dibujadas" if zones else ""
-            response_text = f"¡Perfecto!{zone_str} ¡Eva ya está vigilando!\n\nTe avisaré si algo importante pasa. Puedes volver al chat en cualquier momento y preguntarme '¿qué pasó hoy?' o 'muéstrame las alertas'.\n\n¿Tienes otra cámara para configurar?"
+            if user_id and cam_id:
+                try:
+                    from camera_zones import get_camera_zones
+                    zones = get_camera_zones(user_id, cam_id)
+                except Exception:
+                    zones = []
+            if not zones:
+                # F0.4: no dejar finalizar sin zonas — el pipeline de vigilancia
+                # necesita las coordenadas para el análisis por zona.
+                return {
+                    "response": ("Todavía no veo zonas dibujadas para esta cámara 😅. "
+                                 "Antes de continuar, dibuja al menos una zona importante "
+                                 "(caja, entrada, cocina, pasillo, etc.) con el botón de abajo.\n\n"
+                                 "Si de verdad no quieres dibujar zonas ahora, escribe 'sin zonas' y seguimos "
+                                 "(la cámara vigilará la escena completa, sin distinción de áreas)."),
+                    "next_phase": "WIZARD_ZONES_DRAW",
+                    "data": {"zones_count": 0},
+                }
+            session["wizard_zones_count"] = len(zones)
+            # F0.5: consolidar camera.json real para que el pipeline de vigilancia
+            # tenga attention_phrases/owner_notes/zones desde el día cero (antes el
+            # setup solo escribía business.json y el orquestador leía camera.json).
+            try:
+                from eva.camera_builder import build_camera_config, save_camera_config
+                from pathlib import Path as _P
+                cam_cfg = build_camera_config({
+                    **session,
+                    "camera_id": cam_id,
+                    "zone": session.get("camera_zone") or session.get("zone") or "zona principal",
+                })
+                cam_cfg["zones"] = zones
+                save_camera_config(user_id, cam_cfg, _P("/home/sam/storage"))
+            except Exception as _e:
+                logger.warning(f"F0.5 save_camera_config falló: {_e}")
+            response_text = f"¡Perfecto! {len(zones)} zona(s) configurada(s) ✅. ¡Eva ya está vigilando!\n\nTe avisaré si algo importante pasa. Puedes volver al chat en cualquier momento y preguntarme '¿qué pasó hoy?' o 'muéstrame las alertas'.\n\n¿Tienes otra cámara para configurar?"
             return {
                 "response": response_text,
                 "next_phase": "MORE_CAMERAS",
                 "data": {"zones_count": len(zones)},
+            }
+        elif user_message.lower().strip() in ["sin zonas", "sinzonas", "no zones", "continuar sin zonas"]:
+            # F0.4: escape hatch explícito — el usuario decidió no dibujar zonas.
+            cam_id = cam_id or f"cam_{session.get('camera_count', 1):03d}"
+            session["wizard_zones_count"] = 0
+            try:
+                from eva.camera_builder import build_camera_config, save_camera_config
+                from pathlib import Path as _P
+                cam_cfg = build_camera_config({
+                    **session,
+                    "camera_id": cam_id,
+                    "zone": session.get("camera_zone") or session.get("zone") or "zona principal",
+                })
+                cam_cfg["zones"] = []
+                save_camera_config(user_id, cam_cfg, _P("/home/sam/storage"))
+            except Exception as _e:
+                logger.warning(f"F0.5 save_camera_config (sin zonas) falló: {_e}")
+            return {
+                "response": ("Entendido — la cámara vigilará la escena completa sin zonas específicas. "
+                             "¡Eva ya está vigilando!\n\nTe avisaré si algo importante pasa.\n\n"
+                             "¿Tienes otra cámara para configurar?"),
+                "next_phase": "MORE_CAMERAS",
+                "data": {"zones_count": 0},
             }
         else:
             return {
