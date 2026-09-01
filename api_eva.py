@@ -2931,6 +2931,16 @@ async def verify_firebase(request: Request):
             existing_payments = existing.get("payments", [])
             existing_last_payment = existing.get("last_payment", None)
             existing_next_due = existing.get("next_due", 0)
+            # P1-billing (2026-09-01): preservar TODO el estado que el job de
+            # vencimientos y el panel escriben — antes un re-login lo BORRABA
+            # (user_data se reconstruía desde cero y estos campos se perdían:
+            # avisos re-enviados, trial re-asignado, cuotas reseteadas).
+            existing_state = {k: existing[k] for k in (
+                "last_expiry_notice", "grace_notified", "suspended_at",
+                "suspended_reason", "trial_used", "quota_gb", "disk_mount",
+                "max_cameras", "fcm_tokens", "cameras", "retention",
+                "migrated_at", "is_test",
+            ) if k in existing}
         else:
             existing_plan = plan
             existing_status = "active"
@@ -2940,6 +2950,7 @@ async def verify_firebase(request: Request):
             existing_payments = []
             existing_last_payment = None
             existing_next_due = 0
+            existing_state = {}
 
         now_ts = int(time.time())
         plan_def = available_plans.get(plan, {})
@@ -2951,11 +2962,22 @@ async def verify_firebase(request: Request):
             duration = plan_def.get("duration_days", 30)
             plan_end = now_ts + (duration * 86400)
 
-        # Trial handling — only set if plan offers trial and user never had one
+        # Trial handling — only set if plan offers trial and user never had one.
+        # P1-billing fix: el flag trial_used persiste aunque trial_end se
+        # pierda — antes un re-login re-regalaba 14 días (el usuario real
+        # z6q lo sufrió: trial_end re-asignado el 31-ago tras re-login).
         trial_days = plan_def.get("trial_days", 0)
+        trial_used = bool(existing_state.get("trial_used") or existing_trial_end)
         trial_end = None
-        if trial_days > 0 and not existing_payments and not existing_trial_end:
+        if trial_days > 0 and not existing_payments and not trial_used:
             trial_end = now_ts + (trial_days * 86400)
+            existing_state["trial_used"] = True
+        else:
+            # preservar el trial_end histórico (aunque esté vencido) —
+            # el job de vencimientos y el panel lo usan como referencia
+            trial_end = existing_trial_end
+            if trial_used:
+                existing_state["trial_used"] = True  # sello persistente
 
         # Access token
         access_token = existing_access_token or ("oj_live_" + secrets.token_urlsafe(32))
@@ -2978,6 +3000,8 @@ async def verify_firebase(request: Request):
             "consent_network_scan": consent_network_scan or existing.get("consent_network_scan", False),
             "consent_terms_version": CONSENT_TERMS_VERSION if consent_network_scan else existing.get("consent_terms_version", ""),
             "consent_terms_at": now_ts if consent_network_scan else existing.get("consent_terms_at", 0),
+            # P1-billing: estado del job de vencimientos/panel preservado
+            **existing_state,
             "name": name or existing.get("name", ""),
             "email": email or existing.get("email", ""),
             "phone": phone or existing.get("phone", ""),
