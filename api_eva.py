@@ -1130,6 +1130,83 @@ async def admin_monitoring_alerts(limit: int = 12, hours: int = 24, authorizatio
     return {"alerts": out[:limit]}
 
 
+# ── F-admin: Backups del panel (Sistema → 📦 Backups) ─────────────────────────
+_BACKUP_DIR = Path(os.environ.get("OJOIA_BACKUP_DIR", "/home/sam/storage/backups"))
+
+
+@app.get("/admin/backups")
+async def admin_backups_list(authorization: str = Header(None, alias="Authorization")):
+    """Lista los backups .tar.gz existentes (nombre, tamaño, fecha)."""
+    _verify_admin(authorization)
+    _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f in sorted(_BACKUP_DIR.glob("*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True):
+        st = f.stat()
+        out.append({"name": f.name, "size_mb": round(st.st_size / 1048576, 1),
+                    "created_at": st.st_mtime})
+    return {"backups": out, "dir": str(_BACKUP_DIR)}
+
+
+@app.post("/admin/backups/create")
+async def admin_backup_create(authorization: str = Header(None, alias="Authorization")):
+    """Crea un backup tar.gz de user.json/camera.json/configs (sin frames/eventos
+    — eso es lo que cambia; el resto es reproducible). Corre en thread pool."""
+    _verify_admin(authorization)
+    import tarfile
+    ts = int(time.time())
+    _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    out = _BACKUP_DIR / f"ojoia_config_{ts}.tar.gz"
+
+    def _make():
+        users_dir = STORAGE_ROOT / "users"
+        with tarfile.open(out, "w:gz") as tar:
+            for uf in users_dir.glob("*/user.json"):
+                tar.add(uf, arcname=str(uf.relative_to(STORAGE_ROOT)))
+            for cj in users_dir.glob("*/cameras/*/camera.json"):
+                tar.add(cj, arcname=str(cj.relative_to(STORAGE_ROOT)))
+            admin_cfg = Path("/home/sam/storage/admin_config.json")
+            if admin_cfg.exists():
+                tar.add(admin_cfg, arcname="admin_config.json")
+        return out.stat().st_size
+    size = await asyncio.to_thread(_make)
+    logger.info(f"[admin] backup creado {out.name} ({size} bytes)")
+    return {"success": True, "backup": out.name, "size_bytes": size}
+
+
+@app.get("/admin/system/analysis-interval")
+async def admin_get_analysis_interval(authorization: str = Header(None, alias="Authorization")):
+    """Slider del tab Sistema. Mapeado a la realidad v7: el 'intervalo de
+    análisis' real es el grid (OJOIA_GRID_SIZE frames por análisis Qwen)."""
+    _verify_admin(authorization)
+    grid_size = int(os.getenv("OJOIA_GRID_SIZE", "16"))
+    fps = 1  # fps estándar del ESP32
+    return {"analysis_interval_s": grid_size * fps, "grid_size": grid_size,
+            "note": "Intervalo real = tamaño de grid × fps de cámara"}
+
+
+@app.post("/admin/system/analysis-interval")
+async def admin_set_analysis_interval(request: dict, authorization: str = Header(None, alias="Authorization")):
+    """Ajusta OJOIA_GRID_SIZE derivándolo del intervalo pedido (segundos @1fps).
+    Requiere reinicio de la API para aplicarse (los workers leen el env al inicio)."""
+    _verify_admin(authorization)
+    val = float(request.get("analysis_interval_s") or 0)
+    if not (4 <= val <= 120):
+        raise HTTPException(status_code=400, detail="intervalo debe estar entre 4 y 120 s")
+    grid_size = max(4, min(64, int(round(val))))
+    # persistir en ojoia.env para que sobreviva reinicios
+    env_path = Path("/opt/ojoia/config/ojoia.env")
+    try:
+        lines = env_path.read_text().splitlines()
+        lines = [l for l in lines if not l.startswith("OJOIA_GRID_SIZE=")]
+        lines.append(f"OJOIA_GRID_SIZE={grid_size}")
+        env_path.write_text("\n".join(lines) + "\n")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"no pude escribir ojoia.env: {e}")
+    return {"success": True, "grid_size": grid_size,
+            "analysis_interval_s": grid_size,
+            "note": "Aplicado en ojoia.env — surte efecto al reiniciar la API (o reiníciala desde el panel)"}
+
+
 @app.get("/admin/ota/status")
 async def ota_status(authorization: str = Header(None, alias="Authorization")):
     """Panel admin: estado del bin publicado + versión de cada cámara."""
