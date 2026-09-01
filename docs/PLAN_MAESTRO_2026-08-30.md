@@ -193,6 +193,36 @@ camera desde este nodo con PlatformIO (boot limpio, frames en pipeline).
 | 2026-09-01 | F3 wizard Eva SCAN_CONSENT/WAIT/RESULTS + registro IP cams — 22/22 tests | api_eva+eva_v2 | ✅ |
 | 2026-09-01 | F4 consent paraguas registro (checkbox + POLITICAS_V2 + persist v2) | api_eva+frontend | ✅ |
 
+## 📌 AGENDA: Gestor de Almacenamiento desde Admin (pedido 2026-09-01)
+META: el tab Almacenamiento del panel se vuelve el gestor REAL de discos:
+elegir en qué disco se guardan los frames por usuario/cámara, cuota de
+espacio por plan (free/pro/founder), mover usuarios entre discos, y que
+el cleanup corra a la hora configurada ahí.
+
+ESTADO FÍSICO MEDIDO (2026-09-01):
+- NVMe 465GB (WDS500G2B0C): SO + storage actual — 84% usado, 73GB libres
+- HDD 1TB (ST1000LM035, sda): LVM con 2 volúmenes — ubuntu--lv 400GB y
+  'models' 529GB — ACTUALMENTE NO MONTADOS (/home/sam/models vacío).
+  MONTAR requiere sudo del operador: lvchange + mount + fstab.
+
+FASES:
+- ST-1 (sudo tuyo, 5 min): montar el LVM 'models' (o crear un LV
+  'ojoia-storage' nuevo en el 1TB) en /mnt/ojoia-hdd + entrada fstab.
+- ST-2: backend /admin/storage v2 — inventario real de discos
+  (statvfs por punto de montaje), cuota_gb ya existe en user.json
+  (ampliar: quota por plan default + por cámara), elección de
+  storage_path por usuario (get_user_storage_path ya soporta discos:
+  hay admin/disks/add|remove|save|scan en el panel — verificar y
+  conectar).
+- ST-3: migración asistida: mover users/{uid} al HDD desde el panel
+  (cámaras nuevas van al disco elegido; migrar datos existentes con
+  rsync + atomic switch de user.json.storage_path).
+- ST-4: cleanup integrado: la hora del cron configurable desde el tab
+  (hoy fija 3AM), y purga que RESPETA cuota (borra más agresivo al
+  usuario que excede su cuota_gb).
+- ST-5: panel: semáforo por disco (uso/cuota), asignación por
+  drag/drop o select, alerta a 80% de cuota por usuario.
+
 ## 📌 AGENDA: Megapanel Billing Hub (pedido del operador 2026-09-01)
 Conectar megapanel-ojoia.web.app ↔ billing para facturar uso del servidor
 y gestionar clientes. Diagnóstico: el nodo YA sube billing a Firestore cada
