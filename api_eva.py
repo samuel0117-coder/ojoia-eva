@@ -1134,6 +1134,113 @@ async def admin_monitoring_cameras(limit: int = 100, authorization: str = Header
     return {"cameras": cams[:limit]}
 
 
+@app.get("/admin/monitoring/cameras/{camera_id}")
+async def admin_monitoring_camera_detail(camera_id: str, user_id: str = None,
+                                        recent_frames: int = 12,
+                                        recent_alerts: int = 12,
+                                        authorization: str = Header(None, alias="Authorization")):
+    """F-panel: detalle de cámara del tab Monitoreo (el modal estaba en 404
+    desde siempre → 'undefined' en todos los campos). Devuelve estado vivo
+    (usa latest_raw.jpg como latido real), datos, frames y alertas recientes."""
+    _verify_admin(authorization)
+    _validate_safe_path(camera_id, "camera_id")
+    # localizar dueño si no viene
+    if not user_id:
+        for udir in (STORAGE_ROOT / "users").iterdir() if (STORAGE_ROOT / "users").is_dir() else []:
+            if (udir / "cameras" / camera_id / "camera.json").exists():
+                user_id = udir.name
+                break
+    if not user_id:
+        raise HTTPException(status_code=404, detail="cámara no encontrada")
+    base = user_root(user_id)
+    cam_dir = base / "cameras" / camera_id
+    if not cam_dir.exists():
+        # buscar en discos alternos por si el usuario migró
+        cfgd = get_disk_config()
+        for disk in cfgd.get("disks", []):
+            alt = Path(disk["mount"]) / disk.get("user_folder", "users") / user_id / "cameras" / camera_id
+            if alt.exists():
+                cam_dir = alt
+                break
+    cam_cfg = {}
+    cj = cam_dir / "camera.json"
+    if cj.exists():
+        try:
+            cam_cfg = json.loads(cj.read_text())
+        except Exception:
+            pass
+    ud = {}
+    uf = _compat_user_json_path(user_id)
+    if uf:
+        try:
+            ud = json.loads(uf.read_text())
+        except Exception:
+            pass
+    now = time.time()
+    raw = cam_dir / "frames" / "latest_raw.jpg"
+    frame_age = None
+    last_frame = None
+    if raw.exists():
+        frame_age = int(now - raw.stat().st_mtime)
+        last_frame = datetime.fromtimestamp(raw.stat().st_mtime).isoformat()
+    last_announce = cam_cfg.get("last_announce") or 0
+    offline_seconds = (now - max(raw.stat().st_mtime if raw.exists() else 0,
+                                  last_announce)) if (raw.exists() or last_announce) else None
+    # comandos pendientes (scan/reboot one-shot no consumidos)
+    pending = any(c.get("scan_request") or c.get("reboot_request")
+                  for c in ud.get("cameras", []) if c.get("camera_id") == camera_id)
+    # frames recientes: los últimos evt_* con imagen
+    recent = []
+    edir = cam_dir / "events"
+    if edir.is_dir():
+        files = sorted(edir.glob("evt_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in files[:recent_frames]:
+            try:
+                ev = json.loads(f.read_text())
+                img = f.with_suffix(".jpg")
+                recent.append({
+                    "event_id": ev.get("event_id", f.stem),
+                    "timestamp": ev.get("timestamp", int(f.stat().st_mtime)),
+                    "event_type": ev.get("event_type", ""),
+                    "image_url": (f"/frames/{user_id}/{camera_id}/events/{img.name}"
+                                  if img.exists() else None),
+                    "description": (ev.get("description") or "")[:120],
+                })
+            except Exception:
+                continue
+    # alertas recientes (solo attention/violation)
+    alerts = [r for r in recent if r["event_type"] in ("attention", "violation")][:recent_alerts]
+    return {
+        "camera_id": camera_id,
+        "name": cam_cfg.get("name") or camera_id,
+        "user_id": user_id,
+        "user_name": ud.get("name", ""),
+        "business_name": ud.get("business_name", ""),
+        "disk_mount": str(cam_dir.parents[1]),
+        "type": cam_cfg.get("type", "esp32"),
+        "firmware_version": cam_cfg.get("firmware_version", ""),
+        "local_ip": cam_cfg.get("local_ip", ""),
+        "active": frame_age is not None and frame_age < 180,
+        "status": "online" if (frame_age is not None and frame_age < 180) else "offline",
+        "last_frame": last_frame,
+        "frame_age_s": frame_age,
+        "announce_age_s": int(now - last_announce) if last_announce else None,
+        "offline_seconds": int(offline_seconds) if offline_seconds else None,
+        "pending_commands": pending,
+        "latest_frame_url": f"/frames/{user_id}/{camera_id}/latest.jpg",
+        "recent_frames": recent,
+        "recent_alerts": alerts,
+        "config": {
+            "cooldown_min": cam_cfg.get("cooldown_min", 5),
+            "rules": cam_cfg.get("vigilance", {}).get("attention_phrases", []),
+            "rules_es": cam_cfg.get("vigilance", {}).get("attention_phrases", []),
+            "vigilance_prompt": cam_cfg.get("system_prompt", ""),
+            "yolo_triggers": cam_cfg.get("vigilance", {}).get("yolo_triggers", []),
+        },
+        "audit": {"events_total": len(list(edir.glob("evt_*.json"))) if edir.is_dir() else 0},
+    }
+
+
 @app.get("/admin/monitoring/alerts")
 async def admin_monitoring_alerts(limit: int = 12, hours: int = 24, authorization: str = Header(None, alias="Authorization")):
     """Tab Monitoreo: últimas alertas con imagen y descripción."""
