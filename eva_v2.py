@@ -250,6 +250,10 @@ class SetupPhase(str, Enum):
     PROMPT_BUILD = "prompt_build"
     CONFIRM = "confirm"
     TEST_RULES = "test_rules"  # ← v16: probar reglas con notificación real (WOW #3)
+    # F3 (2026-09-01): escaneo de red para cámaras IP de terceros
+    SCAN_CONSENT = "scan_consent"   # explicar + pedir permiso (1ª vez)
+    SCAN_WAIT = "scan_wait"         # esperando resultados del ESP32
+    SCAN_RESULTS = "scan_results"   # presentar cámaras encontradas
     DONE = "done"
 
 # =============================================================================
@@ -1286,6 +1290,22 @@ async def handle_eva_v2(user_id, message, session_id, cam_id=None, include_frame
         if cam_id:
             session["camera_id"] = cam_id
         return await _handle_os_mode(session, user_id, message, sid)
+    # F3 (2026-09-01): "escanear red" / "buscar cámaras IP" — desde el chat
+    # general (con wizard terminado o no). Respeta el consentimiento.
+    if _is_scan_intent(msg_norm):
+        esp = _esp32_of_user(user_id)
+        if not esp:
+            return _mk_resp({"session_id": session_id, "user_id": user_id, "msgs": [], "phase": "done"},
+                "Para escanear tu red necesito una cámara OjoIA conectada — ella es la "
+                "que busca desde adentro. 📷\n\nDime 'instalar cámara' cuando la tengas.")
+        sid = session_id or f"chat_{user_id}"
+        session = _load_session(sid) or {"session_id": sid, "user_id": user_id, "msgs": [],
+                                         "phase": SetupPhase.DONE.value}
+        session["session_id"] = sid
+        session["user_id"] = user_id
+        _sessions[sid] = session
+        return await _handle_scan_consent(session, sid, user_id, message, _first_name(user_id))
+
     if _is_new_camera_intent(msg_norm):
         pending = _pending_session_for_user(user_id)
         if pending and cam_count == 0:
@@ -1930,7 +1950,7 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
                            any(_msg_raw.lower().startswith(w) for w in _interrog))
         # Excepciones: en CONTEXT una pregunta puede ser una respuesta válida
         # solo si es corta; y los comandos de TEST_RULES nunca son preguntas.
-        if _looks_question and phase not in (SetupPhase.TEST_RULES.value,):
+        if _looks_question and phase not in (SetupPhase.TEST_RULES.value, SetupPhase.SCAN_RESULTS.value, SetupPhase.SCAN_WAIT.value):
             _answers = {
                 SetupPhase.GREET.value: (
                     "estoy conociéndolos: tu nombre y el de tu negocio, para personalizar todo lo que sigue"),
@@ -2034,10 +2054,28 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
     # ── HARDWARE ─────────────────────────────────────────────────────────────
     if phase == SetupPhase.HARDWARE.value:
         session["msgs"].append({"role":"user","content":message})
+        # F3 (2026-09-01): si el usuario YA tiene una cámara IP (Hikvision, Dahua...)
+        # ofrecer el escaneo de red en vez de esperar una ESP32 nueva.
+        msg_lower = message.strip().lower()
+        has_ipcam_intent = any(w in msg_lower for w in (
+            "hikvision", "dahua", "tapo", "cámara ip", "camara ip", "cámara que ya",
+            "camara que ya", "ya tengo una", "otra marca", "cámara normal", "camara normal"))
+        if has_ipcam_intent:
+            ud = _load_user_data(user_id)
+            esp = _esp32_of_user(user_id)
+            if esp:
+                session["phase"] = SetupPhase.SCAN_CONSENT.value
+                _sessions[session_id] = session
+                return await _handle_scan_consent(session, session_id, user_id, message, first)
+            return _mk_resp(session,
+                "¡Puedo vigilar cámaras IP de otras marcas! 🎉\n\n"
+                "Pero necesito que primero tengas **una cámara OjoIA conectada**: ella "
+                "es la que escanea tu red desde adentro.\n\n"
+                "Conecta tu cámara OjoIA (dime 'listo' cuando el LED quede fijo) y "
+                "después escaneamos las demás.")
         # v16: Match directo para "listo"/"ok" antes de usar Qwen.
         # _is_intent_confirmed usa Qwen y puede fallar, dejando el flujo
         # trabado en HARDWARE para siempre.
-        msg_lower = message.strip().lower()
         is_done = any(w in msg_lower for w in ("listo", "ok", "si", "sí", "ya", "hecho", "terminé", "terminé", "conecté", "conecte", "ready"))
         if is_done or await _is_intent_confirmed(message, "Usuario completando pasos de conexión"):
             session["phase"] = SetupPhase.WAIT_IMAGE.value
@@ -2063,6 +2101,14 @@ async def _handle_setup(session, user_id, message, session_id, cam_id, storage_r
 
     if phase == SetupPhase.TEST_RULES.value:
         return await _handle_test_rules(session, session_id, user_id, message, first, storage_root)
+
+    # F3 (2026-09-01): fases del escáner de red
+    if phase == SetupPhase.SCAN_CONSENT.value:
+        return await _handle_scan_consent(session, session_id, user_id, message, first)
+    if phase == SetupPhase.SCAN_WAIT.value:
+        return await _handle_scan_wait(session, session_id, user_id, message, first)
+    if phase == SetupPhase.SCAN_RESULTS.value:
+        return await _handle_scan_results(session, session_id, user_id, message, first)
 
     return _mk_resp(session, f"No entendí, {first}. ¿Puedes repetir?")
 
@@ -2744,6 +2790,308 @@ async def _handle_confirm(session, session_id, user_id, message, first, storage_
 # =============================================================================
 # TEST_RULES (v16 — WOW #3: probar reglas con notificación real)
 # =============================================================================
+
+# =============================================================================
+# F3 (2026-09-01): ESCÁNER DE RED — cámaras IP de terceros vía ESP32
+# =============================================================================
+
+def _read_last_scan(camera_id: str, max_age_s: int = 300) -> dict | None:
+    """Lee last_scan.json de la cámara escáner (fresco = <5 min)."""
+    import glob
+    for p in glob.glob(f"{STORAGE_ROOT}/users/*/cameras/{camera_id}/last_scan.json"):
+        try:
+            d = json.loads(Path(p).read_text())
+            if time.time() - d.get("scanned_at", 0) <= max_age_s:
+                return d
+        except Exception:
+            continue
+    return None
+
+
+async def _trigger_esp32_scan(camera_id: str, user_id: str = "") -> bool:
+    """Marca scan_request:true en la config del ESP32 (polling ≤30s).
+    Llamada DIRECTA a api_eva (sin HTTP): Eva corre en el mismo proceso
+    y así no necesita propagar el Authorization del usuario."""
+    try:
+        from api_eva import trigger_scan_for_camera
+        return trigger_scan_for_camera(user_id, camera_id)
+    except Exception as e:
+        logger.warning(f"[F3] trigger scan: {e}")
+        return False
+
+
+def _is_scan_intent(msg: str) -> bool:
+    m = msg.lower()
+    return any(w in m for w in (
+        "escanear red", "escanea la red", "escanear mi red", "escanear camaras",
+        "escanear cámaras", "buscar camaras ip", "buscar cámaras ip",
+        "buscar mis camaras", "buscar mis cámaras", "mis camaras ip", "mis cámaras ip"))
+
+
+def _first_name(user_id: str) -> str:
+    ud = _load_user_data(user_id)
+    n = ud.get("owner_name") or ud.get("name") or ""
+    return n.split()[0] if n else "amigo"
+
+
+def _esp32_of_user(user_id: str) -> str:
+    """La primera cámara ESP32 del usuario (la que actúa de escáner)."""
+    ud = _load_user_data(user_id)
+    for c in ud.get("cameras", []):
+        if not str(c.get("type", "esp32")).startswith("rtsp"):
+            return c.get("camera_id", "")
+    return ""
+
+
+async def _handle_scan_consent(session, session_id, user_id, message, first):
+    """F3 paso 1: explicar QUÉ se va a escanear y pedir permiso explícito.
+    Privacidad por diseño: solo protocolos de cámara (SSDP/ONVIF), nada
+    de otros dispositivos, nada automático sin pedido del usuario."""
+    msg = (message or "").strip().lower()
+    # PRIMERO verificar que hay un ESP32 que pueda escanear — sin esto
+    # el consentimiento se pide para después fallar (orden incorrecto).
+    if not _esp32_of_user(user_id):
+        return _mk_resp(session,
+            "Para escanear tu red necesito una cámara OjoIA conectada — ella es "
+            "la que busca desde adentro. 📷\n\nDime 'instalar cámara' cuando la tengas.")
+    ud = _load_user_data(user_id)
+
+    if not ud.get("consent_network_scan"):
+        # aún sin paraguas del registro (F4) → pedir aquí y persistir
+        # matching por PALABRA (no substring): 'escanear' NO debe contar como
+        # aceptación ('escanea' era substring de 'escanear' y contaba como sí)
+        msg_words = set(re.findall(r"[a-záéíóúñ]+", msg))
+        if msg_words & {"si", "sí", "ok", "dale", "acepto", "aceptar", "escanea",
+                        "busca", "adelante", "claro", "por supuesto"}:
+            ud["consent_network_scan"] = True
+            ud["consent_network_scan_at"] = time.time()
+            _save_user_data(user_id, ud)
+            return await _start_scan(session, session_id, user_id, first)
+        return _mk_resp(session,
+            f"{first}, para encontrar tus cámaras IP necesito escanear tu red local. 📡\n\n"
+            f"**Qué hago exactamente:** busco SOLO dispositivos de cámara (protocolo estándar "
+            f"de cámaras ONVIF/SSDP) desde tu cámara OjoIA, que está dentro de tu red.\n"
+            f"**Qué NO hago:** no reviso otros aparatos (TV, teléfonos, computadoras), "
+            f"no guardo claves de tu red, y solo se ejecuta cuando me lo pides.\n\n"
+            f"¿Me das permiso para buscar cámaras en tu red? (si/no)")
+
+    # ya tiene paraguas → directo
+    return await _start_scan(session, session_id, user_id, first)
+
+
+async def _start_scan(session, session_id, user_id, first):
+    esp = _esp32_of_user(user_id)
+    if not esp:
+        return _mk_resp(session,
+            "Necesitas primero una cámara OjoIA conectada para que pueda escanear tu red "
+            "desde adentro. 📷\n\nDime 'instalar cámara' cuando la tengas lista.")
+    ok = await _trigger_esp32_scan(esp, user_id)
+    if not ok:
+        return _mk_resp(session, "No pude iniciar el escaneo ahora. Intenta de nuevo en un momento. 🔄")
+    session["scan_by_camera"] = esp
+    session["scan_started_at"] = time.time()
+    session["phase"] = SetupPhase.SCAN_WAIT.value
+    _sessions[session_id] = session
+    _save_session_to_disk(session)
+    return _mk_resp(session,
+        f"¡Perfecto! 🔍 Escaneando tu red con la cámara OjoIA...\n\n"
+        f"Tarda unos 30 segundos. Te aviso aquí mismo cuando tenga los resultados.")
+
+
+async def _handle_scan_wait(session, session_id, user_id, message, first):
+    """F3 paso 2: esperar resultados (el ESP32 tarda ≤30s en poll+escanear)."""
+    waited = time.time() - session.get("scan_started_at", time.time())
+    scan = _read_last_scan(session.get("scan_by_camera", ""), max_age_s=120)
+    if scan and scan.get("scanned_at", 0) >= session.get("scan_started_at", 0) - 5:
+        return await _present_scan_results(session, session_id, user_id, first, scan)
+
+    if waited < 75:
+        return _mk_resp(session,
+            "Escaneando tu red... 📡 (unos segundos más)\n\n"
+            "Si me escribes algo mientras espero, lo ignoro sin problema.")
+    # timeout: resultados viejos o nada
+    session["phase"] = SetupPhase.CONTEXT.value
+    session["context_step"] = "concern"
+    _sessions[session_id] = session
+    _save_session_to_disk(session)
+    return _mk_resp(session,
+        "El escaneo tardó más de lo normal (quizá tu cámara OjoIA está ocupada). 🔄\n\n"
+        "Podemos seguir con la configuración y escaneamos después — dime 'escanear red' "
+        "cuando quieras reintentarlo. Ahora: " + _context_question(session, "concern", first))
+
+
+async def _present_scan_results(session, session_id, user_id, first, scan):
+    """F3 paso 3: presentar las cámaras encontradas."""
+    devices = scan.get("devices", []) or []
+    if not devices:
+        session["phase"] = SetupPhase.CONTEXT.value
+        session["context_step"] = "concern"
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return _mk_resp(session,
+            "Terminé el escaneo: **no encontré cámaras IP** en tu red. 🤷\n\n"
+            "Si tienes una Hikvision, Dahua o similar: (1) verifica que esté encendida "
+            "y conectada al mismo WiFi, (2) algunas marcas traen el descubrimiento "
+            "apagado de fábrica — actívalo en su app.\n\n"
+            "Seguimos con la configuración: " + _context_question(session, "concern", first))
+
+    # construir menú numerado
+    lines = [f"¡Encontré {len(devices)} cámara(s) IP en tu red! 🎉", ""]
+    for i, d in enumerate(devices):
+        v = d.get("vendor", "cámara")
+        v_name = {"hikvision": "Hikvision", "dahua": "Dahua", "tplink": "TP-Link",
+                  "foscam": "Foscam", "axis": "Axis", "dlink": "D-Link",
+                  "vivotek": "Vivotek", "onvif": "ONVIF (estándar)",
+                  "ipcam": "Cámara IP", "other": "Cámara"}.get(v, "Cámara")
+        lines.append(f"**{i+1}. {v_name}** — {d.get('ip')}:{d.get('port')}")
+    lines.append("")
+    lines.append("¿Cuál quieres que vigile? Dime el número (o 'todas').")
+    lines.append("_(Necesitaré el usuario y clave de la cámara para verla)_")
+    session["scan_devices"] = devices
+    session["phase"] = SetupPhase.SCAN_RESULTS.value
+    _sessions[session_id] = session
+    _save_session_to_disk(session)
+    return _mk_resp(session, "\n".join(lines))
+
+
+async def _handle_scan_results(session, session_id, user_id, message, first):
+    """F3 paso 4: elección + captura de credenciales + probe + registro."""
+    msg = (message or "").strip()
+    devices = session.get("scan_devices") or []
+
+    # 1) elegir número
+    if "pending_cam_choice" not in session and devices:
+        m = re.search(r"\b(\d+)\b", msg)
+        idx = int(m.group(1)) - 1 if m else -1
+        all_cams = "todas" in msg.lower() or "todos" in msg.lower()
+        if all_cams:
+            chosen = devices
+        elif 0 <= idx < len(devices):
+            chosen = [devices[idx]]
+        else:
+            return _mk_resp(session, "Dime el número de la cámara (1-" + str(len(devices)) + ") o 'todas'.")
+        session["pending_cam_choice"] = chosen
+        if len(chosen) == 1:
+            d = chosen[0]
+            v = d.get("vendor", "")
+            hint = ""
+            if v == "hikvision": hint = " (normalmente admin + la clave de la etiqueta)"
+            elif v == "dahua": hint = " (normalmente admin/admin si no la has cambiado)"
+            elif v == "tplink": hint = " (la de tu app Tapo)"
+            return _mk_resp(session,
+                f"Cámara {d.get('ip')} 📷\n\n"
+                f"Dame el **usuario y clave** para verla, separados por espacio "
+                f"(ej: `admin MiClave123`){hint}:")
+        # 'todas': pedir credenciales (asumimos las mismas en todas por ahora)
+        return _mk_resp(session,
+            "Vamos una por una para no confundirnos. 👍\n\n"
+            "Dame el **usuario y clave** de la primera (separados por espacio):")
+
+    # 2) capturar credenciales
+    if "pending_cam_choice" in session:
+        parts = msg.split()
+        if len(parts) < 2:
+            return _mk_resp(session, "Formato: `usuario clave` — ej: `admin MiClave123`")
+        username, password = parts[0], " ".join(parts[1:])  # clave puede tener espacios
+        chosen = session.pop("pending_cam_choice")
+        results = []
+        for d in chosen:
+            ip, port = d.get("ip"), d.get("port") or 80
+            vendor = d.get("vendor", "onvif")
+            # construir URL de snapshot según vendor (MJPEG/HTTP local)
+            url = _snapshot_url_for(vendor, ip, port, username, password)
+            ok, frame_b64 = await _probe_ip_camera(url)
+            if ok:
+                cam_id = await _register_ip_camera(user_id, d, url)
+                results.append((d, cam_id, True))
+            else:
+                results.append((d, None, False))
+        # responder según resultados
+        good = [r for r in results if r[2]]
+        bad = [r for r in results if not r[2]]
+        lines = []
+        for d, cam_id, okres in results:
+            icon = "✅" if okres else "❌"
+            why = "" if okres else " — no pude verla (revisa usuario/clave o si tiene RTSP activo)"
+            lines.append(f"{icon} {d.get('ip')} ({d.get('vendor','cámara')}){why}")
+        if good:
+            session["scan_devices"] = [d for d, _, _ in bad]  # quedan por configurar?
+            # registrar en user.json con tipo rtsp + estado pendiente de v9.4
+            lines.append("")
+            lines.append(f"**{len(good)} cámara(s) registrada(s).** 🎉")
+            lines.append("_(El video continuo de cámaras IP llega con la próxima actualización "
+                         "del firmware — te aviso. Por ahora quedan configuradas y listas.)_")
+            session["phase"] = SetupPhase.CONTEXT.value
+            session["context_step"] = "concern"
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            lines.append("")
+            lines.append("Ahora: " + _context_question(session, "concern", first))
+        else:
+            session["pending_cam_choice"] = chosen  # reintentar credenciales
+            lines.append("Revisa las credenciales y pásamelas de nuevo (`usuario clave`).")
+        return _mk_resp(session, "\n".join(lines))
+
+    # sin estado — volver a contexto
+    session["phase"] = SetupPhase.CONTEXT.value
+    _sessions[session_id] = session
+    return _mk_resp(session, _context_question(session, "concern", first))
+
+
+def _snapshot_url_for(vendor: str, ip: str, port: int, user: str, pw: str) -> str:
+    """URL de snapshot MJPEG/HTTP por vendor (substream)."""
+    auth = f"{user}:{pw}@"
+    if vendor == "hikvision":
+        return f"http://{auth}{ip}:{port}/ISAPI/Streaming/channels/102/picture"
+    if vendor == "dahua":
+        return f"http://{auth}{ip}:{port}/cgi-bin/snapshot.cgi"
+    if vendor == "tplink":
+        return f"http://{auth}{ip}:{port}/stream/snapshot.cgi"
+    if vendor == "foscam":
+        return f"http://{ip}:{port}/cgi-bin/CGIProxy.fcgi?cmd=snapPicture2&usr={user}&pwd={pw}"
+    if vendor == "axis":
+        return f"http://{auth}{ip}:{port}/axis-cgi/jpg/image.cgi?resolution=320x240"
+    if vendor == "dlink":
+        return f"http://{auth}{ip}:{port}/image/jpeg.cgi"
+    # onvif/ipcam/other: probar snapshot genérico más común
+    return f"http://{auth}{ip}:{port}/onvif-http/snapshot"
+
+
+async def _probe_ip_camera(url: str) -> tuple:
+    """Intenta bajar 1 frame de la cámara IP (timeout 8s). Devuelve (ok, b64)."""
+    try:
+        async with httpx.AsyncClient(timeout=8, verify=False) as client:
+            r = await client.get(url)
+            if r.status_code == 200 and len(r.content) > 1000 and r.content[:2] == b"\xff\xd8":
+                return True, base64.b64encode(r.content).decode()
+    except Exception:
+        pass
+    return False, ""
+
+
+async def _register_ip_camera(user_id: str, dev: dict, snapshot_url: str) -> str:
+    """Registra la cámara IP en user.json + camera.json (estado pendiente v9.4)."""
+    camera_id = f"IPCAM-{dev.get('ip','0.0.0.0').replace('.','-')}"
+    ud = _load_user_data(user_id)
+    cams = ud.setdefault("cameras", [])
+    if not any(c.get("camera_id") == camera_id for c in cams):
+        cams.append({"camera_id": camera_id, "name": f"{dev.get('vendor','cámara')} {dev.get('ip')}",
+                     "type": "ipcam", "pending_gateway": True,
+                     "created_at": int(time.time())})
+    _save_user_data(user_id, ud)
+    cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+    cam_dir.mkdir(parents=True, exist_ok=True)
+    cfg = {"camera_id": camera_id, "type": "ipcam", "vendor": dev.get("vendor"),
+           "ip": dev.get("ip"), "port": dev.get("port"),
+           "snapshot_url": snapshot_url,  # incluye credenciales: chmod 600 abajo
+           "pending_gateway": True, "enabled": False,
+           "created_at": time.time()}
+    p = cam_dir / "camera.json"
+    p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    try: os.chmod(p, 0o600)
+    except Exception: pass
+    return camera_id
+
 
 async def _handle_test_rules(session, session_id, user_id, message, first, storage_root):
     """WOW #3 — El usuario prueba cada regla y recibe una notificación real."""

@@ -1075,6 +1075,53 @@ async def devices_scan_results(request: dict):
     return {"ok": True, "saved": True, "found": len(clean)}
 
 
+def trigger_scan_for_camera(user_id: str, camera_id: str) -> bool:
+    """F3 — llamada DIRECTA (sin HTTP) para Eva v2. Misma lógica que el
+    endpoint REST pero para uso interno del proceso."""
+    try:
+        def _mut(ud):
+            found = False
+            for c in ud.get("cameras", []):
+                if c.get("camera_id") == camera_id:
+                    c["scan_request"] = True
+                    found = True
+            if not found:
+                ud.setdefault("cameras", []).append({
+                    "camera_id": camera_id, "name": camera_id, "type": "esp32",
+                    "scan_request": True})
+        update_user_json(user_id, _mut)
+        logger.info(f"[F3] scan trigger interno: user {user_id[:6]}… cam {camera_id}")
+        return True
+    except Exception as e:
+        logger.warning(f"[F3] trigger interno: {e}")
+        return False
+
+
+@app.post("/api/cameras/{camera_id}/scan/trigger")
+async def api_scan_trigger(camera_id: str, request: dict,
+                           authorization: str = Header(None, alias="Authorization")):
+    """F3 — Eva pide a una cámara ESP32 que escanee su red (auth de usuario).
+    Misma mecánica que /admin/scan/trigger pero para el dueño de la cámara."""
+    user_id = (request.get("user_id") or "").strip()
+    await _verify_user_token(authorization, user_id)
+    _validate_safe_path(camera_id, "camera_id")
+
+    def _mut(ud):
+        found = False
+        for c in ud.get("cameras", []):
+            if c.get("camera_id") == camera_id:
+                c["scan_request"] = True
+                found = True
+        if not found:
+            # la cámara puede no estar en user.json aún — añadirla mínima
+            ud.setdefault("cameras", []).append({
+                "camera_id": camera_id, "name": camera_id, "type": "esp32",
+                "scan_request": True})
+    update_user_json(user_id, _mut)
+    logger.info(f"[F3] scan trigger por Eva: user {user_id[:6]}… cam {camera_id}")
+    return {"success": True, "camera_id": camera_id}
+
+
 @app.post("/admin/scan/trigger")
 async def admin_scan_trigger(request: dict, authorization: str = Header(None, alias="Authorization")):
     """F2 — Pedir a una cámara ESP32 que escanee su red local.
