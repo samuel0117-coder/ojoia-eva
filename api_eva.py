@@ -50,7 +50,7 @@ EVA_CONFIG_FILE = STORAGE_ROOT / "eva_config.json"
 # A9: path canonico de firebase-key.json (antes /home/sam/Downloads/, que es un
 # directorio de descargas no controlado). El archivo vive en ai_system/ con
 # permisos 600. Las 3 referencias en este archivo apuntan aqui ahora.
-FIREBASE_KEY_PATH = Path("/home/sam/ai_system/firebase-key.json")
+FIREBASE_KEY_PATH = Path(os.environ.get("FIREBASE_KEY_PATH", "/opt/ojoia/config/firebase-key.json"))
 
 # ─────────────────────────────────────────────────────────────────────────
 # S4: Lock de user.json — protege escrituras concurrentes.
@@ -654,7 +654,7 @@ async def _prune_stale_push_tokens():
     while True:
         try:
             creds = service_account.Credentials.from_service_account_file(
-                "/home/sam/ai_system/firebase-key.json",
+                os.environ.get("FIREBASE_KEY_PATH", "/opt/ojoia/config/firebase-key.json"),
                 scopes=["https://www.googleapis.com/auth/firebase.messaging"]
             )
             creds.refresh(google.auth.transport.requests.Request())
@@ -1973,7 +1973,7 @@ async def send_report_v2(user_id: str, request: Request = None):
                 tokens = ud.get("fcm_tokens", []) or []
                 if tokens:
                     creds = service_account.Credentials.from_service_account_file(
-                        "/home/sam/ai_system/firebase-key.json",
+                        os.environ.get("FIREBASE_KEY_PATH", "/opt/ojoia/config/firebase-key.json"),
                         scopes=["https://www.googleapis.com/auth/firebase.messaging"]
                     )
                     creds.refresh(google.auth.transport.requests.Request())

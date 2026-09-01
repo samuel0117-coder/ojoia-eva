@@ -347,7 +347,7 @@ def _send_night_fcm(cam_cfg, user_id, camera_id, frame_bytes, event_id, persons)
         if not tokens:
             return
         creds = service_account.Credentials.from_service_account_file(
-            "/home/sam/ai_system/firebase-key.json",
+            os.environ.get("FIREBASE_KEY_PATH", "/opt/ojoia/config/firebase-key.json"),
             scopes=["https://www.googleapis.com/auth/firebase.messaging"],
         )
         creds.refresh(_greq.Request())
@@ -436,7 +436,7 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
         
         # Obtener access token OAuth2 con scope de FCM
         _creds = service_account.Credentials.from_service_account_file(
-            "/home/sam/ai_system/firebase-key.json",
+            os.environ.get("FIREBASE_KEY_PATH", "/opt/ojoia/config/firebase-key.json"),
             scopes=["https://www.googleapis.com/auth/firebase.messaging"]
         )
         _creds.refresh(google.auth.transport.requests.Request())
@@ -1897,6 +1897,10 @@ class QwenOrchestrator:
         # F3.4: smoothing 2-grids — hits de severidad baja vistos en el grid
         # anterior (frase → True) que requieren repetirse para notificar.
         self._pending_low_hits: Dict[str, set] = {}
+        # C3: circuit breaker del narrador Qwen3-VL-8B (:8019). 3 fallos
+        # seguidos → _vlm8b_tripped=ts; durante 10 min se usa solo el 7B.
+        self._vlm8b_fails = 0
+        self._vlm8b_tripped = 0.0
         # C4: AsyncClient compartido. Antes se creaba por llamada (pool
         # de conexiones efímero -> overhead TLS + connection setup cada vez).
         # Ahora lazy-init: se crea en el primer uso y se reusa en todas las
@@ -2279,14 +2283,57 @@ class QwenOrchestrator:
             "max_tokens": 900
         }
 
+        # ── C3 (2026-09-01): narrador principal = Qwen3-VL-8B (:8019, llama.cpp)
+        # Benchmark con 6 eventos reales (docs/benchmark_vlm_1788306408.json):
+        #   - 8B copia la regla del dueño letra-por-letra (flag 2.67/3 vs 1.0 del 7B)
+        #   - 7B parafrasea la regla ("se lleva algo del bolsillo tras recibir
+        #     dinero") → el matcher A1 lo baja a hit dudoso
+        #   - 8B 2.3s vs 7B 1.3s: el delta 1s es aceptable por grid (~16s)
+        # Fallback automático al 7B (:8004, sglang) si 8019 falla. Circuit
+        # breaker: 3 fallos seguidos → 10 min usando solo el 7B antes de
+        # reintentar el 8B (evita pagar timeout en cada grid si el contenedor
+        # se cae).
+        client = await self._client()  # C4: AsyncClient compartido
+        # C3: reset del circuit breaker tras 10 min
+        if self._vlm8b_tripped and (time.time() - self._vlm8b_tripped) > 600:
+            self._vlm8b_tripped = 0.0
+            self._vlm8b_fails = 0
+            logger.info("[C3] circuit breaker qwen3vl8b REARMADO — reintentando 8B")
+        raw_content = None
+        used_backend = None
+        if not self._vlm8b_tripped:
+            try:
+                resp = await client.post("http://localhost:8019/v1/chat/completions", json={
+                    **payload,
+                    "model": "/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+                }, timeout=45)
+                resp.raise_for_status()
+                raw_content = resp.json()["choices"][0]["message"].get("content")
+                used_backend = "qwen3vl8b"
+                self._vlm8b_fails = 0
+                if not raw_content:
+                    raise ValueError("respuesta vacía de qwen3vl8b")
+            except Exception as e8:
+                self._vlm8b_fails += 1
+                if self._vlm8b_fails >= 3:
+                    self._vlm8b_tripped = time.time()
+                    logger.warning(f"[C3] qwen3vl8b falló {self._vlm8b_fails}x → circuit breaker abierto 10 min: {e8}")
+                logger.warning(f"[C3] qwen3vl8b falló ({e8}) → fallback a qwen7b")
+                raw_content = None
+
+        if raw_content is None:
+            try:
+                resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
+                resp.raise_for_status()
+                raw_content = resp.json()["choices"][0]["message"]["content"]
+                used_backend = used_backend or "qwen7b-fallback"
+            except Exception as e:
+                logger.error(f"Vision Analyst error (ambos backends): {e}")
+                return {}
+
         try:
-            # C4: reusar AsyncClient compartido (no crear por llamada).
-            client = await self._client()
-            resp = await client.post("http://localhost:8004/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            raw_content = resp.json()["choices"][0]["message"]["content"]
             # LOGGING CRUDO - Capa 2: respuesta cruda de Qwen
-            logger.info(f"[QWEN_RAW] {raw_content[:600]}")
+            logger.info(f"[QWEN_RAW] backend={used_backend} {raw_content[:600]}")
             parsed = _parse_qwen_json(raw_content)
             # LOGGING CRUDO - Capa 3: JSON parseado
             logger.info(f"[QWEN_PARSED] {json.dumps(parsed, ensure_ascii=False)[:600]}")
