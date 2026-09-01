@@ -150,6 +150,17 @@ async def generate_daily_summary(user_id, target_date=None):
     for evt, cam_name in _iter_events(user_id, date_filter=yesterday_str):
         yesterday_events.append(evt)
 
+    # RD-2 (2026-09-01): MISMO DÍA de la semana anterior — la comparación
+    # que importa ("un lunes normal"), no el día anterior (domingo vs
+    # lunes es ruido para un negocio).
+    week_before_str = (date.fromisoformat(date_str) - timedelta(days=7)).isoformat()
+    week_before_events = list(_iter_events(user_id, date_filter=week_before_str))
+    # tendencia: 3 días hacia atrás
+    trend_days = []
+    for i in range(2, 5):
+        d = (date.fromisoformat(date_str) - timedelta(days=i)).isoformat()
+        trend_days.append({"date": d, "events": sum(1 for _ in _iter_events(user_id, date_filter=d))})
+
     if not today_events:
         return {
             "date": date_str,
@@ -239,9 +250,21 @@ async def generate_daily_summary(user_id, target_date=None):
     for cam in user_data.get("cameras", []):
         cam_id = cam.get("camera_id", "")
         last_frame = cam.get("last_frame", 0)
-        age_min = (int(time.time()) - last_frame) / 60 if last_frame else 9999
+        age_min = (int(time.time() - last_frame)) / 60 if last_frame else 9999
         cam_events = [e for e in today_events if e.get("camera_id") == cam_id]
         status = "online" if age_min < 10 else ("stale" if age_min < 60 else "offline")
+        # RD-2: huecos de cobertura del día — horas del día sin NINGÚN evento
+        # de esta cámara (con eventos YOLO gate: sin personas no hay evt; un
+        # hueco largo puede ser cámara caída O negocio vacío — se reporta
+        # solo si supera 4h para no alarmar en días muertos).
+        hours_seen = sorted({int((e.get("timestamp", 0) % 86400) / 3600)
+                             for e in cam_events if e.get("timestamp")})
+        gaps = []
+        if hours_seen:
+            for h in range(8, 21):  # jornada típica 8AM-9PM
+                if h not in hours_seen:
+                    gaps.append(h)
+        cam_gaps = [h for h in gaps] if len(gaps) > 4 else []
         camera_health[cam_id] = {
             "name": cam.get("name", cam_id),
             "zone": cam.get("zone", ""),
@@ -249,6 +272,7 @@ async def generate_daily_summary(user_id, target_date=None):
             "last_frame_ago_min": round(age_min, 1),
             "events_today": len(cam_events),
             "status": status,
+            "coverage_gaps_hours": cam_gaps,  # RD-2
         }
 
     timestamps = [e.get("timestamp", 0) for e in today_events if e.get("timestamp")]
@@ -326,6 +350,16 @@ async def generate_daily_summary(user_id, target_date=None):
             "yesterday_alerts": yesterday_alerts,
             "delta_alerts": delta_alerts,
             "yesterday_persons": yesterday_persons,
+            # RD-2: mismo día semana anterior (la referencia real del negocio)
+            "week_before_date": week_before_str,
+            "week_before_events": len(week_before_events),
+            "week_before_persons": sum(_event_persons(e) for e in week_before_events),
+            "delta_week": total_events - len(week_before_events),
+            # RD-2: tendencia simple de 3 días
+            "trend_days": trend_days,
+            "trend_direction": ("up" if len(trend_days) >= 2 and
+                                trend_days[0]["events"] > trend_days[-1]["events"]
+                                else "down" if len(trend_days) >= 2 else "flat"),
         },
         "notable_events": notable,
     }

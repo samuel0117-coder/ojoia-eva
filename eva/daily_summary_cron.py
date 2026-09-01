@@ -129,21 +129,54 @@ async def generate_and_notify():
             p = summary.get("people", {})
             biz_name = user_data.get("business_name", "tu negocio")
             
-            title = f"Resumen de ayer — {biz_name}"
-            parts = [f"{t.get('events', 0)} análisis"]
-            
+            # RD-3 (2026-09-01): Reporte Matutino de 6 bloques (30s de lectura).
+            # Filosofía (investigación 2026): cada número debe mover una
+            # decisión; máximo 6, sin ruido POS.
+            tm = summary.get("time", {})
+            cmp_ = summary.get("comparison", {})
+            cams = summary.get("cameras", {}).get("health", {})
+            fecha_humana = date.fromisoformat(yesterday).strftime("%a %d %b")
+
+            title = f"🌅 Así estuvo tu negocio ayer ({fecha_humana})"
+            L = []
+            # 1) Personas + comparación vs MISMO DÍA semana previa
+            persons = p.get("total_persons", 0)
+            delta_w = cmp_.get("delta_week")
+            delta_txt = ""
+            if delta_w is not None:
+                if delta_w > 0:
+                    delta_txt = f" (▲{delta_w} vs {cmp_.get('week_before_date','')[-5:]})"
+                elif delta_w < 0:
+                    delta_txt = f" (▼{abs(delta_w)} vs {cmp_.get('week_before_date','')[-5:]})"
+            L.append(f"👥 {persons} personas detectadas{delta_txt}")
+            # 2) Hora pico (staffing)
+            peak = tm.get("peak_hour")
+            if peak is not None:
+                L.append(f"⏰ Hora pico: {peak}:00–{int(peak)+1}:00")
+            # 3) Alertas del día
             alerts = t.get("alerts", 0)
             if alerts > 0:
-                parts.append(f"⚠️ {alerts} alerta{'s' if alerts != 1 else ''}")
+                det = summary.get("notable_events", [])
+                primera = (det[0].get("description", "") or "")[:45] if det else ""
+                L.append(f"🚨 {alerts} alerta{'s' if alerts != 1 else ''}"
+                         + (f" — primera: {primera}…" if primera else ""))
             else:
-                parts.append("sin alertas ✅")
-            
-            if p.get("clientes_estimado", 0) > 0:
-                parts.append(f"~{p['clientes_estimado']} clientes")
-            
-            body = ", ".join(parts) + "."
-            
-            # Enviar push
+                L.append("🚨 0 alertas — día tranquilo ✅")
+            # 4) Cobertura (honestidad: si hubo hueco, decirlo)
+            total_cams = len(cams)
+            ok_cams = sum(1 for c in cams.values() if c.get("status") in ("online", "stale"))
+            if total_cams:
+                L.append(f"📷 {'✅ todas' if ok_cams == total_cams else f'{ok_cams}/{total_cams}'} las cámaras activas")
+            # 5) Tendencia
+            tr = cmp_.get("trend_direction")
+            if tr == "up":
+                L.append("📈 3 días con tráfico subiendo")
+            elif tr == "down":
+                L.append("📉 3 días con tráfico bajando")
+            # 6) CTA
+            L.append("👀 Abre la app para el detalle completo")
+
+            body = "\n".join(L)
             await send_fcm_notification(user_id, title, body)
             
         except Exception as e:
