@@ -230,6 +230,8 @@ const App = {
         document.getElementById('reg-fields').style.display = isReg ? 'block' : 'none';
         const pw2group = document.getElementById('pw2-group');
         if (pw2group) pw2group.style.display = isReg ? 'block' : 'none';
+        const consentGrp = document.getElementById('consent-group');
+        if (consentGrp) consentGrp.style.display = isReg ? 'block' : 'none';
         document.getElementById('btn-auth').textContent = isReg ? 'Crear cuenta' : 'Entrar';
         document.getElementById('auth-hint').textContent = isReg
             ? 'Eva configurará tu primera cámara después.'
@@ -256,13 +258,16 @@ const App = {
             if (!biz) { this._err('🏢 Escribe el nombre de tu negocio'); btn.disabled = false; btn.textContent = 'Crear cuenta'; return; }
             if (pw.length < 6) { this._err('🔒 La contraseña debe tener al menos 6 caracteres'); btn.disabled = false; btn.textContent = 'Crear cuenta'; return; }
             if (pw !== pw2) { this._err('🔒 Las contraseñas no coinciden'); btn.disabled = false; btn.textContent = 'Crear cuenta'; return; }
+            const consentEl = document.getElementById('reg-consent');
+            if (consentEl && !consentEl.checked) { this._err('✅ Debes aceptar las políticas de uso para crear tu cuenta'); btn.disabled = false; btn.textContent = 'Crear cuenta'; return; }
             btn.textContent = 'Creando cuenta...';
             try {
                 const cred = await firebase.auth().createUserWithEmailAndPassword(email, pw);
                 await cred.user.updateProfile({ displayName: name });
                 const ok = await this._verifyFB(cred.user, {
                     name, business_name: biz, email, business_type: bizType || 'other',
-                    schedule_open: '08:00', schedule_close: '20:00'
+                    schedule_open: '08:00', schedule_close: '20:00',
+                    consent_network_scan: !!(document.getElementById('reg-consent') || {}).checked
                 });
                 if (!ok) {
                     btn.disabled = false;

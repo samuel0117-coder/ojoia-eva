@@ -41,7 +41,7 @@
 <link rel="apple-touch-icon" href="img/icon-192.png">
 <link rel="icon" href="favicon.ico">
 <title>OjoIA - Tu guardia inteligente</title>
-<link rel="stylesheet" href="app.css?cb=20260822">
+<link rel="stylesheet" href="app.css?cb=20260901">
 <style>#app-content{overflow-y:auto;-webkit-overflow-scrolling:touch;}#app-content.eva-page{position:absolute;top:48px;bottom:60px;left:0;right:0;display:flex!important;flex-direction:column!important;height:auto!important;min-height:0!important;padding:0!important;overflow:hidden!important;}#app-content.eva-page>#eva-chat-container{flex:1!important;min-height:0!important;height:100%!important;}</style>
 
     <!-- LOGIN SCREEN -->
@@ -79,6 +79,14 @@
         <div class="input-group"><label>Correo electrónico</label><input id="login-email" type="email" placeholder="tu@correo.com" autocomplete="email"></div>
         <div class="input-group"><label>Contraseña</label><input id="login-pw" type="password" placeholder="Mínimo 6 caracteres" autocomplete="current-password"></div>
         <div class="input-group" id="pw2-group" style="display:none"><label>Confirmar contraseña</label><input id="login-pw2" type="password" placeholder="Repite la contraseña" autocomplete="new-password"></div>
+        <div class="input-group" id="consent-group" style="display:none">
+          <label style="display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:1.4">
+            <input type="checkbox" id="reg-consent" style="margin-top:2px">
+            <span>Autorizo a OjoIA a <b>descubrir dispositivos de cámara en mi propia red local</b>
+            (cámaras IP como Hikvision/Dahua, mediante protocolos estándar de cámara).
+            Solo se detectan cámaras, cuando yo lo solicite. <a href="docs/POLITICAS_V2.md" target="_blank">Ver políticas</a>.</span>
+          </label>
+        </div>
 
         <div class="error" id="login-err"></div>
         <div class="success" id="login-success"></div>
@@ -107,8 +115,8 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
-<script src="app-2026.js?cb=20260822-z"></script>
-    <script src="chat-2026.js?cb=20260822-z"></script>
+<script src="app-2026.js?cb=20260901-a"></script>
+    <script src="chat-2026.js?cb=20260901-a"></script>
     <!-- P0 (Fuga #7.3): QR generado localmente via qrcode.js para no filtrar
          claim_token al servicio externo api.qrserver.com -->
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>

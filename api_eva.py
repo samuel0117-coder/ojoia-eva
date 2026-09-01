@@ -2362,6 +2362,11 @@ async def verify_firebase(request: Request):
         camera_expected_count = data.get("camera_expected_count", "1")
         schedule_open = data.get("schedule_open", "08:00")
         schedule_close = data.get("schedule_close", "22:00")
+        # F4 (2026-09-01): consentimiento paraguas del escaneo de red.
+        # El registro envía consent_network_scan=true con el checkbox de
+        # las políticas (v2). Se persiste versionado para auditoría.
+        consent_network_scan = bool(data.get("consent_network_scan"))
+        CONSENT_TERMS_VERSION = "v2"
         # Validate plan against config — only allow public plans
         cfg = get_disk_config()
         available_plans = cfg.get("plans", {})
@@ -2432,6 +2437,10 @@ async def verify_firebase(request: Request):
 
         user_data = {
             "user_id": uid,
+            # F4: consentimientos (auditable: versión + timestamp)
+            "consent_network_scan": consent_network_scan or existing.get("consent_network_scan", False),
+            "consent_terms_version": CONSENT_TERMS_VERSION if consent_network_scan else existing.get("consent_terms_version", ""),
+            "consent_terms_at": now_ts if consent_network_scan else existing.get("consent_terms_at", 0),
             "name": name or existing.get("name", ""),
             "email": email or existing.get("email", ""),
             "phone": phone or existing.get("phone", ""),
