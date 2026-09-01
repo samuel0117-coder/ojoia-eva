@@ -57,10 +57,32 @@ COMFYUI_MANAGED = os.environ.get("COMFYUI_MANAGED", "1") == "1"
 
 
 def _send_alert(title: str, body: str) -> bool:
-    """P1-docker: notificar al operador por FCM (tokens del admin_config)
-    y webhook opcional (OJOIA_ALERT_WEBHOOK=URL de Telegram/Slack genérico).
-    Silencioso: si no hay nada configurado, solo log."""
+    """P1-docker: notificar al operador. Canales (todos opcionales, degrada
+    en silencio): 1) EMAIL (SMTP Gmail) a ALERT_EMAIL_TO, 2) FCM tokens del
+    admin_config, 3) webhook OJOIA_ALERT_WEBHOOK (Telegram/Slack genérico).
+    Credenciales: ALERT_SMTP_USER + ALERT_SMTP_PASS (Gmail app-password) en
+    ojoia.env; sin ellas el email se omite sin romper nada."""
     ok = False
+    # ── 1) EMAIL (pedido del operador: samuel0117@gmail.com por ahora) ──
+    try:
+        smtp_user = os.environ.get("ALERT_SMTP_USER", "")
+        smtp_pass = os.environ.get("ALERT_SMTP_PASS", "")
+        to_addr = os.environ.get("ALERT_EMAIL_TO", "samuel0117@gmail.com")
+        if smtp_user and smtp_pass:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(f"{body}\n\n— Health Monitor OjoIA\n{time.strftime('%Y-%m-%d %H:%M:%S')}")
+            msg["Subject"] = f"[OjoIA] {title}"
+            msg["From"] = smtp_user
+            msg["To"] = to_addr
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
+                s.starttls()
+                s.login(smtp_user, smtp_pass)
+                s.send_message(msg)
+            ok = True
+    except Exception:
+        pass
+    # ── 2) FCM + 3) webhook (futuro) ──
     try:
         import json as _json, requests
         cfgp = "/home/sam/storage/admin_config.json"
