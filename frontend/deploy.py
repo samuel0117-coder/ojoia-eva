@@ -3,7 +3,7 @@ import json, time, base64, os, gzip, hashlib, requests
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-with open('/home/sam/Downloads/firebase-key.json') as f:
+with open(os.environ.get('FIREBASE_KEY_PATH', '/opt/ojoia/config/firebase-key.json')) as f:
     sa = json.load(f)
 key = serialization.load_pem_private_key(sa['private_key'].encode(), password=None)
 
@@ -25,7 +25,7 @@ def get_token():
 
 tok = get_token()
 h = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
-base = '/home/sam/ojoia-eva/frontend/'
+base = os.path.join(os.path.dirname(os.path.abspath(__file__)), '')
 
 config = {'headers':[{'headers':{'Cache-Control':'no-cache, no-store, must-revalidate'},'glob':'**/*.@(js|css|html)'},{'headers':{'Cache-Control':'max-age=86400'},'glob':'**/*.@(png|jpg|jpeg|gif|svg|ico)'}],'rewrites':[{'glob':'/api/**','path':'https://api.ojoia.com.do/'},{'glob':'/admin/**','path':'/admin2/index.html'},{'glob':'/admin2/**','path':'/admin2/index.html'},{'glob':'/**','path':'/index.html'}]}
 
