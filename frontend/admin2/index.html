@@ -267,13 +267,13 @@
             <div style="overflow-x:auto">
             <table style="min-width:900px">
                 <thead><tr>
+                    <th>Vista</th>
                     <th>Cámara</th>
                     <th>Nombre</th>
                     <th>Usuario</th>
                     <th>Estado</th>
-                    <th>Último anuncio</th>
-                    <th>Último frame</th>
-                    <th>Token</th>
+                    <th>Edad frame</th>
+                    <th>Firmware</th>
                     <th>Acciones</th>
                 </tr></thead>
                 <tbody id="cams-tbody"><tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Cargando...</td></tr></tbody>
@@ -1451,14 +1451,17 @@ function loadCameras() {
             const statusIcon = c.active ? '🟢' : '🔴';
             const statusText = c.active ? 'Online' : 'Offline';
             const la = c.last_announce ? fmtDate(c.last_announce) : '—';
-            const lf = c.last_frame ? fmtDate(c.last_frame) : '—';
+            const age = c.frame_age_s != null ? (c.frame_age_s < 90 ? c.frame_age_s + 's' : Math.round(c.frame_age_s/60) + 'm') : '—';
+            const fw = c.firmware_version ? '<span class="badge badge-ok">' + c.firmware_version + '</span>' : '<span style="color:var(--text-secondary);font-size:0.7rem">—</span>';
+            const img = c.latest_frame_url ? '<img src="' + API + c.latest_frame_url + '" loading="lazy" style="width:52px;height:40px;object-fit:cover;border-radius:4px;border:1px solid var(--border)">' : '📹';
             return '<tr>' +
+                '<td>' + img + '</td>' +
                 '<td style="font-family:monospace;font-size:0.8rem">' + c.camera_id + '</td>' +
                 '<td>' + (c.name || '—') + '</td>' +
                 '<td style="font-size:0.8rem">' + (c.user_id || c.business_name || '—') + '</td>' +
                 '<td>' + statusIcon + ' ' + statusText + '</td>' +
-                '<td style="font-size:0.75rem">' + la + '</td>' +
-                '<td style="font-size:0.75rem">' + lf + '</td>' +
+                '<td style="font-size:0.75rem">' + age + '</td>' +
+                '<td style="font-size:0.75rem">' + fw + '</td>' +
                 '<td><button class="btn btn-sm btn-outline" onclick="editCamera(\'' + c.camera_id + '\')">✏️</button> <button class="btn btn-sm btn-outline" onclick="cameraCommand(\'' + c.camera_id + '\')">🎮</button> <button class="btn btn-sm btn-warning" onclick="cameraOTA(\'' + c.camera_id + '\')">OTA</button> <button class="btn btn-sm btn-danger" onclick="deleteCamera(\'' + c.camera_id + '\')">🗑️</button></td>' +
             '</tr>';
         }).join('');

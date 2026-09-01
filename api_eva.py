@@ -7171,21 +7171,50 @@ async def admin_list_cameras(authorization: str = Header(None)):
                 continue
             for cam in udata.get("cameras", []):
                 cid = cam.get("camera_id", "") or ""
-                last_announce = cam.get("last_announce") or 0
-                last_frame = cam.get("last_frame") or 0
+                # F-panel: camera.json es la fuente de verdad de telemetría
+                # (last_frame/last_announce/fw/local_ip se actualizan ahí por
+                # ingest/announce). El user.json NO lleva last_frame desde el
+                # throttle F3 → leía 0 → "Offline" con la cámara transmitiendo.
+                cam_cfg = {}
+                cj = uid / "cameras" / cid / "camera.json"
+                if cj.exists():
+                    try:
+                        cam_cfg = json.loads(cj.read_text())
+                    except Exception:
+                        cam_cfg = {}
+                last_announce = cam_cfg.get("last_announce") or cam.get("last_announce") or 0
+                last_frame = cam.get("last_frame") or cam_cfg.get("last_frame") or 0
                 announce_age = now - last_announce if last_announce else None
-                frame_age = now - last_frame if last_frame else None
-                is_online = (announce_age is not None and announce_age < 120) or (frame_age is not None and frame_age < 120)
+                # F-panel: señal de vida REAL = mtime de latest_raw.jpg (se
+                # reescribe en CADA frame del ingest). El last_frame de
+                # user.json está throttled y el de camera.json no se escribe.
+                raw_jpg = uid / "cameras" / cid / "frames" / "latest_raw.jpg"
+                try:
+                    frame_age = now - raw_jpg.stat().st_mtime
+                    last_frame = raw_jpg.stat().st_mtime
+                except OSError:
+                    frame_age = now - last_frame if last_frame else None
+                is_online = (announce_age is not None and announce_age < 180) or (frame_age is not None and frame_age < 180)
                 last_seen_ts = max(last_announce or 0, last_frame or 0)
                 cameras.append({
-                    "camera_id": cid, "name": cam.get("name", cid), "zone": cam.get("zone", ""),
+                    "camera_id": cid, "name": cam_cfg.get("name") or cam.get("name", cid),
+                    "zone": cam_cfg.get("zone") or cam.get("zone", ""),
                     "user_id": uid.name, "business_name": udata.get("business_name", ""),
                     "status": "online" if is_online else "offline", "active": is_online,
                     "last_announce": datetime.fromtimestamp(last_announce).isoformat() if last_announce else None,
                     "last_frame": datetime.fromtimestamp(last_frame).isoformat() if last_frame else None,
                     "last_seen": datetime.fromtimestamp(last_seen_ts).isoformat() if last_seen_ts else None,
                     "announce_age_s": int(announce_age) if announce_age else None,
-                    "frame_age_s": int(frame_age) if frame_age else None
+                    "frame_age_s": int(frame_age) if frame_age else None,
+                    # F-panel: telemetría completa (para columna fw y modal)
+                    "firmware_version": cam_cfg.get("firmware_version", ""),
+                    "local_ip": cam_cfg.get("local_ip", ""),
+                    "rssi": cam_cfg.get("rssi"),
+                    "type": cam_cfg.get("type", "esp32"),
+                    "ingest_key": bool(cam_cfg.get("ingest_key")),
+                    "stream_down": bool(cam_cfg.get("stream_down", False)),
+                    "latest_frame_url": f"/frames/{uid.name}/{cid}/latest.jpg",
+                    "disk_mount": str(uid.parent),
                 })
     return {"cameras": cameras}
 
