@@ -2165,21 +2165,67 @@ def _dir_used_mb(path) -> float:
         logger.warning(f"[dir-used-mb] du failed for {path}: {e_1313}")
     return 0.0
 
+_USER_DISK_CACHE: Dict[str, tuple] = {}  # uid -> (ts, path_str)
+
+
+def invalidate_user_disk_cache(user_id: str = None):
+    if user_id is None:
+        _USER_DISK_CACHE.clear()
+    else:
+        _USER_DISK_CACHE.pop(user_id, None)
+
+
 def get_user_storage_path(user_id: str, plan: str = "founder") -> Path:
-    """Resolver ruta de almacenamiento del usuario segun config de discos."""
+    """Resolver ruta de almacenamiento del usuario.
+
+    ST-2 (2026-09-01): ORDEN DE RESOLUCIÓN —
+      1. user.json.disk_mount del propio usuario (elegido desde el panel o
+         por migrate) — ES la fuente de verdad, respeta la decisión humana.
+      2. priority_disk del plan (config de discos del admin).
+      3. Disco con más espacio libre.
+    Cacheado 5s por usuario (se llama en cada frame del ingest)."""
+    import time as _t
+    now = _t.time()
+    hit = _USER_DISK_CACHE.get(user_id)
+    if hit and now - hit[0] < 5.0:
+        return Path(hit[1])
     cfg = get_disk_config()
     disks = cfg.get("disks", [])
     plans = cfg.get("plans", {})
-    target = plans.get(plan, plans.get("founder", {}))
     selected = None
-    priority = target.get("priority_disk")
-    if priority:
-        selected = next((d for d in disks if d.get("mount") == priority), None)
-    if not selected:
-        selected = max(disks, key=lambda d: d.get("free_gb", 0), default=disks[0] if disks else None)
-    if not selected:
+    # 1) disk_mount explícito del usuario (persistido por el panel)
+    uf = _compat_user_json_path(user_id)
+    if uf and uf.exists():
+        try:
+            dm = json.loads(uf.read_text()).get("disk_mount")
+            if dm:
+                selected = next((d for d in disks if d.get("mount") == dm), None)
+                if selected is None and Path(dm).exists():
+                    selected = {"mount": dm, "user_folder": "users"}
+        except Exception:
+            pass
+    # 2) priority_disk del plan
+    if selected is None:
+        target = plans.get(plan, plans.get("founder", {}))
+        priority = target.get("priority_disk")
+        if priority:
+            selected = next((d for d in disks if d.get("mount") == priority), None)
+    # 3) más espacio libre
+    if selected is None:
+        selected = max(disks, key=lambda d: d.get("free_gb", 0),
+                       default=disks[0] if disks else None)
+    if selected is None:
         selected = {"mount": str(STORAGE_ROOT), "user_folder": "users"}
-    return Path(selected["mount"]) / selected["user_folder"].strip("/") / user_id
+    out = Path(selected["mount"]) / str(selected.get("user_folder", "users")).strip("/") / user_id
+    _USER_DISK_CACHE[user_id] = (now, str(out))
+    return out
+
+
+def _compat_user_json_path(user_id: str) -> Optional[Path]:
+    """user.json de compat (STORAGE_ROOT/users/uid) — es el que se mantiene
+    sincronizado en todos los writes (patrón dual ya existente)."""
+    p = STORAGE_ROOT / "users" / user_id / "user.json"
+    return p if p.exists() else None
 
 def find_user_json(user_id: str) -> Optional[Path]:
     """Buscar user.json de un usuario en todos los discos."""
@@ -7506,30 +7552,72 @@ async def admin_update_user_storage(user_id: str, request: dict, authorization: 
     def _mut_storage(user_data):
         if "plan" in request:
             user_data["plan"] = request["plan"]
-        if "quota_gb" in request:
-            user_data["quota_gb"] = request["quota_gb"]
+        # el panel envía storage_quota_gb; aceptar ambas claves
+        q = request.get("quota_gb", request.get("storage_quota_gb"))
+        if q:
+            try:
+                user_data["quota_gb"] = float(q)
+            except (TypeError, ValueError):
+                pass
+        if request.get("disk_mount"):
+            user_data["disk_mount"] = request["disk_mount"]
+        if request.get("max_cameras"):
+            try:
+                user_data["max_cameras"] = int(request["max_cameras"])
+            except (TypeError, ValueError):
+                pass
     update_user_json(user_id, _mut_storage)  # C1
+    invalidate_user_disk_cache(user_id)
+    _q = request.get("quota_gb", request.get("storage_quota_gb"))
+    logger.info(f"[ST-2] storage update {user_id}: "
+                f"plan={request.get('plan')} quota={_q} disk={request.get('disk_mount')}")
     return {"success": True}
 
 
 @app.post("/admin/storage/{user_id}/migrate")
 async def admin_migrate_user(user_id: str, request: dict, authorization: str = Header(None)):
+    """ST-2: migración REAL de un usuario a otro disco.
+    1. rsync de todos sus datos (cámaras/eventos/frames) al disco destino
+    2. disk_mount en user.json (compat + nuevo) → resolución apunta al nuevo
+    3. sin borrar el origen hasta que el operador lo confirme (safe)
+    El ingest empieza a escribir en el nuevo disco apenas cambia el
+    disk_mount (caché de 5s)."""
     _verify_admin(authorization)
-    new_disk = request.get("disk_mount", str(STORAGE_ROOT))
-    new_dir = Path(new_disk) / "users" / user_id
+    new_disk = request.get("disk_mount", "")
+    if not new_disk or not Path(new_disk).exists():
+        raise HTTPException(status_code=400, detail="disk_mount inexistente")
     old_file = find_user_json(user_id)
-    existing = {}
-    if old_file and old_file.exists():
-        with open(old_file) as f:
-            existing = json.load(f)
+    if not old_file or not old_file.exists():
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    existing = json.loads(old_file.read_text())
+    old_dir = old_file.parent  # carpeta users/<uid> real (puede ser otra)
+
+    new_dir = Path(new_disk) / "users" / user_id
+
+    def _rsync():
+        import subprocess
+        new_dir.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            ["rsync", "-a", "--exclude", "user.json", str(old_dir) + "/", str(new_dir) + "/"],
+            capture_output=True, text=True, timeout=3600)
+        return r.returncode == 0, r.stderr[-500:] if r.returncode else ""
+    ok, err = await asyncio.to_thread(_rsync)
+    if not ok:
+        raise HTTPException(status_code=500, detail=f"rsync falló: {err}")
+
     existing["disk_mount"] = new_disk
-    new_dir.mkdir(parents=True, exist_ok=True)
-    with _get_user_lock(user_id):  # C1
+    existing["migrated_at"] = time.time()
+    with _get_user_lock(user_id):
         _atomic_write_user_json(new_dir / "user.json", existing)
         compat = STORAGE_ROOT / "users" / user_id
         compat.mkdir(parents=True, exist_ok=True)
         _atomic_write_user_json(compat / "user.json", existing)
-    return {"success": True, "new_path": str(new_dir)}
+    invalidate_user_disk_cache(user_id)
+    logger.info(f"[ST-2] usuario {user_id} migrado a {new_dir} "
+                f"(origen conservado en {old_dir})")
+    return {"success": True, "new_path": str(new_dir), "old_path": str(old_dir),
+            "note": "Datos copiados; el origen se conserva. Bórralo manualmente "
+                    "cuando confirmes que todo funciona."}
 
 
 # ── Admin: Queue & Eva config ────────────────────────────────────────────
