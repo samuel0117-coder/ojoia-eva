@@ -6563,14 +6563,54 @@ def _save_admin_config(cfg: dict):
             json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
+def _admin_session_redis() -> Optional[object]:
+    """R5: cliente Redis síncrono para sesiones admin (lazy, opcional)."""
+    global _ADMIN_REDIS
+    if _ADMIN_REDIS is False:
+        return None
+    try:
+        import redis as _redis_mod
+        if _ADMIN_REDIS is None:
+            url = os.environ.get("REDIS_URL")
+            if not url:
+                _ADMIN_REDIS = False
+                return None
+            _ADMIN_REDIS = _redis_mod.from_url(url, socket_timeout=2)
+        _ADMIN_REDIS.ping()
+        return _ADMIN_REDIS
+    except Exception:
+        return None  # Redis caído → fallback JSON (no romper el login)
+
+
+_ADMIN_REDIS = None  # None=ni probado, cliente=conectado, False=no disponible
+
+
 def _verify_admin(authorization: str = Header(None)) -> dict:
-    """Valida sesion admin contra admin_config.json. Lanza 401 si invalido."""
+    """Valida sesión admin. R5: Redis-first (sobrevive reinicios de API) con
+    fallback a admin_config.json (compat con sesiones viejas)."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization requerido")
     token = authorization.replace("Bearer ", "").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Token invalido")
     cfg = _load_admin_config()
+    # R5: Redis primero
+    r = _admin_session_redis()
+    if r is not None:
+        try:
+            raw = r.get(f"admin_sess:{token}")
+            if raw:
+                import json as _json
+                s = _json.loads(raw)
+                if int(time.time()) > s.get("expires_at", 0):
+                    r.delete(f"admin_sess:{token}")
+                    raise HTTPException(status_code=401, detail="Sesion expirada")
+                return {"session_token": token, "cfg": cfg, "store": "redis"}
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # Redis falló → seguir con JSON
+    # fallback JSON (legado)
     sessions = cfg.get("sessions", {})
     # A6: comparar token en tiempo constante (anti timing-attack).
     s = None
@@ -6579,12 +6619,13 @@ def _verify_admin(authorization: str = Header(None)) -> dict:
             s = sess_data
             break
     if s is None:
+        # migrar: si existe en Redis pero no en JSON ya se manejó arriba
         raise HTTPException(status_code=401, detail="Sesion no encontrada")
     if int(time.time()) > s.get("expires_at", 0):
         sessions.pop(token, None)
         _save_admin_config(cfg)
         raise HTTPException(status_code=401, detail="Sesion expirada")
-    return {"session_token": token, "cfg": cfg}
+    return {"session_token": token, "cfg": cfg, "store": "json"}
 
 
 @app.post("/admin/auth/login")
@@ -6598,13 +6639,26 @@ async def admin_auth_login(request: dict):
     if not hmac.compare_digest(token, str(cfg.get("admin_token") or "")):
         raise HTTPException(status_code=401, detail="Credencial invalida")
     session_token = secrets.token_urlsafe(32)
-    cfg.setdefault("sessions", {})[session_token] = {
+    sess = {
         "created_at": int(time.time()),
         "expires_at": int(time.time()) + ADMIN_SESSION_TTL,
         "user_agent": request.get("user_agent", "admin")
     }
-    _save_admin_config(cfg)
-    logger.info("Admin login OK")
+    # R5: sesión en Redis con TTL (sobrevive reinicios de la API; expira sola)
+    r = _admin_session_redis()
+    stored = "json"
+    if r is not None:
+        try:
+            r.setex(f"admin_sess:{session_token}", ADMIN_SESSION_TTL,
+                    json.dumps(sess))
+            stored = "redis"
+        except Exception:
+            pass
+    # legacy JSON: solo como respaldo si Redis no está (no crecer aquí)
+    if r is None:
+        cfg.setdefault("sessions", {})[session_token] = sess
+        _save_admin_config(cfg)
+    logger.info(f"Admin login OK (store: {stored})")
     return {"success": True, "session_token": session_token}
 
 
@@ -6613,6 +6667,12 @@ async def admin_auth_logout(authorization: str = Header(None)):
     cfg = _load_admin_config()
     token = (authorization or "").replace("Bearer ", "").strip()
     if token:
+        r = _admin_session_redis()
+        if r is not None:
+            try:
+                r.delete(f"admin_sess:{token}")
+            except Exception:
+                pass
         cfg.get("sessions", {}).pop(token, None)
         _save_admin_config(cfg)
     return {"success": True}
@@ -6749,6 +6809,17 @@ async def admin_delete_plan(plan_id: str, authorization: str = Header(None)):
 
 
 # ── Admin: Billing Management ──────────────────────────────────────────
+
+@app.post("/admin/billing/run-expirations")
+async def admin_run_expirations(authorization: str = Header(None, alias="Authorization")):
+    """F-billing: ejecutar el job de vencimientos AHORA (avisos push al
+    usuario a 3d/1d, aviso de gracia, suspensión real al acabar gracia,
+    y resumen al admin). También corre diario por cron."""
+    _verify_admin(authorization)
+    from expirations_job import process_all
+    result = await asyncio.to_thread(process_all)
+    return {"success": True, "result": result}
+
 
 @app.get("/admin/billing")
 async def admin_billing_overview(authorization: str = Header(None)):

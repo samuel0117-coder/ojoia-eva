@@ -299,6 +299,7 @@
             <div class="card-title">💳 Facturación por Usuario</div>
             <div class="btn-group" style="margin-bottom:12px">
                 <button class="btn btn-sm filter-btn active" onclick="filterBilling('all')">Todos</button>
+                <button class="btn btn-sm" onclick="runExpirationsNow()">⏰ Procesar vencimientos</button>
                 <button class="btn btn-sm filter-btn" onclick="filterBilling('active')">🟢 Activos</button>
                 <button class="btn btn-sm filter-btn" onclick="filterBilling('warning')">🟡 Por vencer</button>
                 <button class="btn btn-sm filter-btn" onclick="filterBilling('expired')">🔴 Vencidos</button>
@@ -1771,6 +1772,16 @@ function planSave() {
 // BILLING
 // ═══════════════════════════════════════════════════════════════════════════════
 let _billingData = [], _billingFilter = 'all';
+
+function runExpirationsNow() {
+    if (!confirm('¿Ejecutar ahora el job de vencimientos? (avisos a usuarios por vencer, suspensión de gracia vencida)')) return;
+    toast('⏳ Procesando vencimientos…', true);
+    apiFetch('/admin/billing/run-expirations', {method:'POST'}).then(r => r.json()).then(d => {
+        const r2 = d.result || {};
+        toast('✅ Chequeados: ' + (r2.checked||0) + ' · avisos: ' + (r2.notified_user||0) + ' · suspendidos: ' + (r2.suspended||0), true);
+        loadBilling();
+    }).catch(() => toast('❌ Error', false));
+}
 
 function loadBilling() {
     apiGetJSON('/admin/billing').then(d => {
