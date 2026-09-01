@@ -2831,6 +2831,29 @@ async def _handle_confirm(session, session_id, user_id, message, first, storage_
             "yolo_triggers": ["person"],
             "grid_size": 12, "cooldown_min": 5, "active": True, "configured_at": int(time.time()),
         }
+        # F4.2: PRESERVAR zonas dibujadas en la fase ZONES (y frases por zona)
+        # al consolidar camera.json — antes este save las perdía si el archivo
+        # ya existía con zones del drawer.
+        try:
+            import camera_zones as _cz
+            _existing = _cz.get_camera_zones(user_id, cam)
+            if _existing:
+                cfg["zones"] = _existing
+            _cfg_path = storage_root / "users" / user_id / "cameras" / cam / "camera.json"
+            if _cfg_path.exists():
+                try:
+                    _old = json.loads(_cfg_path.read_text())
+                    # frases de atención por zona ya configuradas desde el drawer
+                    _apz = (_old.get("vigilance") or {}).get("attention_phrases_zones")
+                    if isinstance(_apz, dict) and _apz:
+                        cfg.setdefault("vigilance", {})
+                        if not isinstance(cfg["vigilance"], dict):
+                            cfg["vigilance"] = {}
+                        cfg["vigilance"]["attention_phrases_zones"] = _apz
+                except Exception:
+                    pass
+        except Exception as _e_z:
+            logger.debug(f"[F4.2] preservar zonas falló: {_e_z}")
         from eva.camera_builder import save_camera_config
         save_camera_config(user_id, cfg, storage_root)
 

@@ -183,6 +183,10 @@ def normalize_camera_vigilance_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "important_objects": vigilance.get("important_objects") or context.get("important_objects") or "objetos visibles",
         "attention_phrases": attention_phrases,
         "owner_notes": owner_notes,
+        # F4.2: preservar frases de atención por zona (del drawer) en re-saves
+        "attention_phrases_zones": vigilance.get("attention_phrases_zones")
+            or config.get("attention_phrases_zones")
+            or {},
         "normal_mode": _merge_dict({
             "enabled": True,
             "grid_size": config.get("grid_size", 12),
@@ -202,6 +206,9 @@ def normalize_camera_vigilance_config(config: Dict[str, Any]) -> Dict[str, Any]:
     config["vigilance"] = normalized
     config["attention_phrases"] = attention_phrases
     config["owner_notes"] = owner_notes
+    # F4.2: exponer apz también a nivel raíz (la lee el PUT /vigilance y el drawer)
+    if normalized["attention_phrases_zones"]:
+        config["attention_phrases_zones"] = normalized["attention_phrases_zones"]
     return config
 
 
