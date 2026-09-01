@@ -193,6 +193,15 @@ camera desde este nodo con PlatformIO (boot limpio, frames en pipeline).
 | 2026-09-01 | F3 wizard Eva SCAN_CONSENT/WAIT/RESULTS + registro IP cams — 22/22 tests | api_eva+eva_v2 | ✅ |
 | 2026-09-01 | F4 consent paraguas registro (checkbox + POLITICAS_V2 + persist v2) | api_eva+frontend | ✅ |
 
+## 📌 AGENDA: Megapanel Billing Hub (pedido del operador 2026-09-01)
+Conectar megapanel-ojoia.web.app ↔ billing para facturar uso del servidor
+y gestionar clientes. Diagnóstico: el nodo YA sube billing a Firestore cada
+10min (billing.db: 574 requests, costos/clientes); falta unificar client_id
+con user_id OjoIA, aplicar quotas por plan EN service_bus, estados de cuenta
+y acciones de cobro desde el panel. Bloqueo activo: 429 Quota exceeded de
+Firestore (332/hora) — saneamiento del sync es prerequisito (MB-1).
+Fases MB-1..MB-4 detalladas arriba de esta nota.
+
 ## 📌 AGENDA POSTERIOR (cuando termine el plan F3+ — NO ahora)
 1. **Panel admin ojoia.com.do/admin** (base ya existe):
    - Gestionar OTA desde la UI: publicar bin, rollout por cámara, versión
