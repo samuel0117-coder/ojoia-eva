@@ -4953,7 +4953,7 @@ async def save_camera_vigilance(camera_id: str, request: dict = None):
         is_after = _is_vigilante_mode(schedule, vigilance or ud.get("vigilance", {}), datetime.now().strftime("%H:%M"), cam_cfg.get("night_mode", False))
         new_prompt = _regen(
             business_type=ud.get("business_type", ""),
-            zone=cam.get("zone", ""),
+            zone=cam_cfg.get("zone", ""),
             business_name=ud.get("business_name", ""),
             is_after_hours=is_after,
             owner_notes=ud.get("owner_notes", [])
@@ -5893,28 +5893,6 @@ def _yolo_parse_result(r: dict) -> tuple:
 # la intersección bbox∩zona y la inyecta como DATO DE SENSOR (ya confirmado).
 # El modelo no deduce: recibe el hecho. Menos alucinación, más precisión.
 
-_zone_assign_cache: dict = {}  # camera_key → (zones, cached_at)
-_ZONE_CACHE_TTL = 30.0         # seg
-
-
-def _get_camera_zones_cached(user_id: str, camera_id: str) -> list:
-    """Lee zonas de la cámara con cache corto (evita JSON parse por frame)."""
-    key = f"{user_id}_{camera_id}"
-    now = time.time()
-    cached = _zone_assign_cache.get(key)
-    if cached and (now - cached[1]) < _ZONE_CACHE_TTL:
-        return cached[0]
-    try:
-        zones = camera_zones.get_camera_zones(user_id, camera_id) or []
-    except Exception:
-        zones = []
-    _zone_assign_cache[key] = (zones, now)
-    # Limpieza oportunista del cache
-    if len(_zone_assign_cache) > 512:
-        _zone_assign_cache.clear()
-    return zones
-
-
 def _detect_zone_for_bbox(bbox: list, img_w: int, img_h: int, zones: list) -> Optional[dict]:
     """Devuelve la zona con mayor solape con el bbox (intersección sobre área del bbox).
 
@@ -5961,7 +5939,7 @@ def _assign_zones_to_detections(user_id: str, camera_id: str,
     out = {"per_detection": {}, "zone_counts": {}, "img_size": [0, 0]}
     if not yolo_detections:
         return out
-    zones = _get_camera_zones_cached(user_id, camera_id)
+    zones = camera_zones.get_camera_zones_cached(user_id, camera_id)
     if not zones:
         return out
     img_w = img_h = 0
@@ -6204,15 +6182,26 @@ async def _start_background_tasks():
 
 @app.on_event("shutdown")
 async def _shutdown_tasks():
-    """Cerrar recursos asíncronos compartidos al detener el servicio."""
+    """Cerrar recursos asíncronos compartidos al detener el servicio.
+    P-shutdown: TODO lo que quede vivo retrasa el cierre — con cámaras
+    haciendo keep-alive el proceso retenía el puerto infinitamente."""
     try:
-        # C4: cerrar el httpx.AsyncClient compartido del QwenOrchestrator
-        # para liberar conexiones keepalive limpiamente (no colgar el proc).
+        # C4: httpx.AsyncClient compartido del QwenOrchestrator
         from orchestrator import orchestrator
         await orchestrator.close()
         logger.info("🛑 AsyncClient compartido cerrado (C4)")
     except Exception as e:
         logger.warning(f"shutdown orchestrator.close() falló: {e}")
+    try:
+        # C2: cerrar cliente Redis del bus (conexiones pendientes del pool)
+        await frame_bus.close()
+        logger.info("🛑 FrameBus cerrado (C2)")
+    except Exception as e:
+        logger.warning(f"shutdown frame_bus falló: {e}")
+    # detener loop de workers (el flag corta el while tras el ciclo actual)
+    global WORKER_RUNNING
+    WORKER_RUNNING = False
+    logger.info("🛑 Workers señalados a parar (graceful 10s máx)")
 
 
 @app.get("/api/business/is_open")
@@ -8485,4 +8474,10 @@ if __name__ == "__main__":
     # escucha en 127.0.0.1:8005; todo el trafico legitimo llega via nginx
     # (upstream backend_eva -> 127.0.0.1:8005) o desde cloudflared/tunel.
     # No se pierde acceso: backend_eva en nginx.conf apunta a 127.0.0.1:8005.
-    uvicorn.run(app, host="127.0.0.1", port=8005, loop="asyncio")
+    # P-shutdown (2026-09-01): timeout_graceful=10s. El shutdown de uvicorn
+    # espera INDEFINIDAMENTE conexiones keep-alive abiertas — las cámaras
+    # ESP32 mantienen el socket vivo y el proceso viejo retiene el puerto
+    # 8005 tras cada deploy (hubo que kill -9 dos veces hoy). Con esto:
+    # 10s de gracia para terminar requests en vuelo y cierre forzado limpio.
+    uvicorn.run(app, host="127.0.0.1", port=8005, loop="asyncio",
+                timeout_graceful_shutdown=10)

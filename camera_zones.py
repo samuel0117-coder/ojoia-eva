@@ -14,6 +14,24 @@ from typing import List, Dict, Any
 
 STORAGE_ROOT = Path("/home/sam/storage")
 
+# ── F2.2: cache corto de zonas por cámara (evita JSON parse por frame) ──
+_zone_assign_cache: dict = {}  # camera_key → (zones, cached_at)
+_ZONE_CACHE_TTL = 30.0         # seg
+
+
+def get_camera_zones_cached(user_id: str, camera_id: str) -> List[Dict[str, Any]]:
+    """F2.2: get_camera_zones con cache de 30s (lectura por frame del worker)."""
+    key = f"{user_id}_{camera_id}"
+    now = time.time()
+    cached = _zone_assign_cache.get(key)
+    if cached and (now - cached[1]) < _ZONE_CACHE_TTL:
+        return cached[0]
+    zones = get_camera_zones(user_id, camera_id)
+    _zone_assign_cache[key] = (zones, now)
+    if len(_zone_assign_cache) > 512:
+        _zone_assign_cache.clear()
+    return zones
+
 
 def get_camera_zones(user_id: str, camera_id: str) -> List[Dict[str, Any]]:
     """Lee las zonas de una cámara desde camera.json."""

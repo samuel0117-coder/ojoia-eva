@@ -598,12 +598,16 @@ class FrameGrid:
     
     def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
                   yolo_classes: list = None, yolo_detections: list = None, mode: str = "normal",
-                  vigilance_prompt: str = None, vigilance_rules: str = None) -> bool:
+                  vigilance_prompt: str = None, vigilance_rules: str = None,
+                  zone_assignment: dict = None) -> bool:
         """Add frame to grid. Returns True when grid is full and ready for analysis.
-        
+
         Args:
             vigilance_prompt: Prompt for Qwen analysis (now stored per frame)
             vigilance_rules: Rules for attention detection
+            zone_assignment: F2.2 — {per_detection: {track: zone_name},
+                zone_counts: {zone: n}, img_size: [w,h]} calculado
+                geométricamente en el worker (bbox∩zona).
         """
         yolo_classes = yolo_classes or []
         yolo_detections = yolo_detections or []
@@ -624,7 +628,8 @@ class FrameGrid:
                 "mode": mode,
                 "timestamp": time.time(),
                 "vigilance_prompt": vigilance_prompt,
-                "vigilance_rules": vigilance_rules
+                "vigilance_rules": vigilance_rules,
+                "zone_assignment": zone_assignment or {},
             })
             is_full = len(self.frames) >= 16  # Changed from 8 to 16 for 4x4 grid
             self.last_frame_bytes = image_bytes
@@ -1926,8 +1931,9 @@ class QwenOrchestrator:
          cam_cfg: dict, frames: list = None, concern: str = "",
          attention_phrases: list = None, owner_notes: list = None,
          attention_phrases_zones: dict = None,
-         tracking_summary: dict = None, user_id: str = "", camera_id: str = ""
-     ) -> dict:
+         tracking_summary: dict = None, user_id: str = "", camera_id: str = "",
+         zone_assign_grid: dict = None
+      ) -> dict:
         """Etapa 1: Qwen describe la escena de forma natural para el libro de eventos.
 
         Eje 1: recibe panels 2x2 (4 imágenes grandes con numeración amarilla 1-4 por panel).
@@ -1935,11 +1941,14 @@ class QwenOrchestrator:
         Eje 3: dos prompts (preambulo generico + vigilancia con contexto del negocio) + salida JSON.
         Eje 4: inyecta ZONAS CONFIGURADAS por el usuario (áreas de interés dibujadas).
         Eje 5 (Fase 4): frases de atención vinculadas a zonas (avisame si... en Zona X).
+        Eje 6 (F2.2): asignación GEOMÉTRICA de zonas (bbox∩rect calculada en el
+        servidor) — Qwen recibe la zona de cada track como hecho confirmado.
         """
         tracking_summary = tracking_summary or {"unique_persons": 0, "tracks": []}
         attention_phrases = attention_phrases or []
         owner_notes = owner_notes or []
         attention_phrases_zones = attention_phrases_zones or {}
+        zone_assign_grid = zone_assign_grid or {}
         n_frames = len(frames) if frames else 0
 
         # ── Eje 4: ZONAS CONFIGURADAS POR EL USUARIO ──
@@ -1968,6 +1977,17 @@ class QwenOrchestrator:
         ) or "ninguno estable"
         yolo_seq = yolo_stats.get("count_by_frame", [])
 
+        # ── Eje 6 (F2.2): zonas por track — HECHO geométrico, no deducción ──
+        zones_tracks_desc = ""
+        per_det = zone_assign_grid.get("per_detection") or {}
+        if per_det:
+            parts = []
+            for trk, znames in list(per_det.items())[:10]:
+                zstr = ", ".join(znames) if isinstance(znames, list) else str(znames)
+                parts.append(f"#{trk} en zona {zstr}")
+            zones_tracks_desc = ", ".join(parts)
+        zc_max = zone_assign_grid.get("zone_counts_max") or {}
+
         context_block = (
             f"DATOS DE SENSORES (ya confirmados, no los infieras):\n"
             f"- Cámara observando zona \"{zone}\" en {business_name or 'el negocio'} (tipo: {business_type or 'negocio'}).\n"
@@ -1977,6 +1997,20 @@ class QwenOrchestrator:
             f"- Tracks: {tracks_desc}.\n"
             f"- Detecciones YOLO por frame: {yolo_seq}.\n"
         )
+        if zones_tracks_desc or zc_max:
+            context_block += (
+                f"- UBICACIÓN POR ZONAS (calculada geométricamente bbox∩zona, YA CONFIRMADA):\n"
+            )
+            if zones_tracks_desc:
+                context_block += f"  · {zones_tracks_desc}\n"
+            if zc_max:
+                zc_str = ", ".join(f"{z}: máx {n} simultánea(s)" for z, n in list(zc_max.items())[:8])
+                context_block += f"  · {zc_str}\n"
+            context_block += (
+                "  Usa ESTOS nombres de zona para el campo \"zone\" de cada persona "
+                "(matchea por id de track cuando exista). No deduzcas la zona por "
+                "apariencia de la imagen si el track ya tiene zona asignada.\n"
+            )
 
         # ── Eje 3A: preambulo generico (independiente del dueño) ──
         n_panels = len(panels_b64) if isinstance(panels_b64, list) else 0
@@ -2174,7 +2208,27 @@ class QwenOrchestrator:
                 "classes": sorted(set(cls for f in frames for cls in (f.get("yolo_classes") or []))),
                 "count_by_frame": [f.get("yolo_count", 0) for f in frames],
             }
-    
+
+            # ── F2.2: agregado de zone_assignment de TODO el grid ───────────
+            # per_detection: {track: [zone..]} — zonas por track a lo largo del
+            # grid; zone_counts_max: máximo de personas simultáneas por zona.
+            zone_assign_grid = {"per_detection": {}, "zone_counts_max": {}}
+            try:
+                _zc_running: dict = {}
+                for f in frames:
+                    za = f.get("zone_assignment") or {}
+                    for trk, zname in (za.get("per_detection") or {}).items():
+                        zone_assign_grid["per_detection"].setdefault(str(trk), set()).add(str(zname))
+                    for zname, n in (za.get("zone_counts") or {}).items():
+                        _zc_running[str(zname)] = max(_zc_running.get(str(zname), 0), int(n or 0))
+                zone_assign_grid["zone_counts_max"] = _zc_running
+                zone_assign_grid["per_detection"] = {
+                    k: sorted(v) for k, v in zone_assign_grid["per_detection"].items()
+                }
+            except Exception as _e_za:
+                logger.debug(f"[F2.2] agregado zone_assignment falló: {_e_za}")
+                zone_assign_grid = {"per_detection": {}, "zone_counts_max": {}}
+
             use_grid_image = True
     
             grid_result = None
@@ -2214,7 +2268,8 @@ class QwenOrchestrator:
                          total_yolo_objects, yolo_stats, cam_cfg, frames=frames, concern=concern,
                          attention_phrases=attention_phrases, owner_notes=owner_notes,
                          attention_phrases_zones=attention_phrases_zones,
-                         tracking_summary=tracking_summary, user_id=user_id, camera_id=camera_id
+                         tracking_summary=tracking_summary, user_id=user_id, camera_id=camera_id,
+                         zone_assign_grid=zone_assign_grid,
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
                     logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
@@ -2226,6 +2281,34 @@ class QwenOrchestrator:
                 logger.info(f"[GRID] Skipping Qwen: use_grid={use_grid_image} frames={len(frames)}")
 
             # ── Etapa 2: Attention Hit Detection (no reglas, solo observación) ──
+            # F3.2: REGLA DETERMINÍSTICA pre-LLM — persona en zona restringida
+            # fuera de horario. No depende de keywords ni narrativa: el hecho
+            # geométrico (bbox∩zona) + reloj bastan. Se agrega como hit
+            # estructurado (source=geo_restricted_after_hours).
+            if is_after_hours and mode == "normal":
+                try:
+                    _zc = zone_assign_grid.get("zone_counts_max") or {}
+                    from camera_zones import get_camera_zones_cached as _get_camera_zones_cached
+                    _zones_geo = _get_camera_zones_cached(user_id, camera_id)
+                    _restricted = {z.get("name") for z in _zones_geo
+                                   if (z.get("type") in ("restricted", "cashier", "register", "inventory", "storage", "office"))
+                                   or any(w in str(z.get("name", "")).lower() for w in ("restringid", "caja", "bodega", "almacén", "almacen", "oficina"))}
+                    _hits_geo = [f"persona en zona restringida '{zn}' fuera de horario"
+                                 for zn, n in _zc.items() if n > 0 and zn in _restricted]
+                    if _hits_geo:
+                        if "geo_after_hours" not in (vision_json.get("attention_hits") or []):
+                            vision_json.setdefault("attention_hits", [])
+                        # Pasamos el hit como datos estructurados que _detect_attention_hits
+                        # reconoce vía attention_hits_raw (source qwen_explicit path).
+                        for _h in _hits_geo:
+                            _already = any(
+                                isinstance(h, dict) and h.get("frase") == _h
+                                for h in vision_json["attention_hits"])
+                            if not _already:
+                                vision_json["attention_hits"].append({"frase": _h, "momento": "fuera de horario"})
+                except Exception as _e_geo:
+                    logger.debug(f"[F3.2] regla geo falló: {_e_geo}")
+
             rule_result = _detect_attention_hits(vision_json, attention_phrases, owner_notes, zone, is_after_hours, mode, attention_phrases_zones)
     
             # ── Armar qwen_json final ─────────────────────────────────────────────
@@ -2584,11 +2667,13 @@ class QwenOrchestrator:
     def add_frame(self, image_bytes: bytes, camera_id: str, user_id: str, yolo_count: int = 0,
                   yolo_classes: list = None, yolo_detections: list = None, vigilance_prompt: str = None,
                   vigilance_rules: str = None, burst_mode: bool = False,
-                  mode: str = "normal", grid_size: int = 16) -> Dict[str, Any]:
+                  mode: str = "normal", grid_size: int = 16,
+                  zone_assignment: dict = None) -> Dict[str, Any]:
         """Add frame to the specific grid for this camera. When grid is full, triggers analysis."""
         grid = self._get_grid(user_id, camera_id, grid_size=grid_size)
         is_full = grid.add_frame(image_bytes, camera_id, user_id, yolo_count=yolo_count, yolo_classes=yolo_classes, yolo_detections=yolo_detections, mode=mode,
-                             vigilance_prompt=vigilance_prompt, vigilance_rules=vigilance_rules)
+                             vigilance_prompt=vigilance_prompt, vigilance_rules=vigilance_rules,
+                             zone_assignment=zone_assignment)
         result = {
             "frame_count": grid.get_frame_count(),
             "grid_size": grid.max_frames,

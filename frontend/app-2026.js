@@ -3393,6 +3393,7 @@ c.style.display = '';
                     </div>
                 </div>
                 <div class="zone-drawer-footer">
+                    <button class="btn btn-sm btn-outline" onclick="App._suggestZones('${this._escAttr(camId)}', this)">✨ Eva sugiere zonas</button>
                     <button class="btn btn-sm btn-outline" onclick="App._clearAllZones('${this._escAttr(camId)}')">🗑️ Borrar todas</button>
                     <button class="btn btn-sm btn-primary" style="flex:1" onclick="App._saveZoneDrawer('${this._escAttr(camId)}')">💾 Guardar</button>
                 </div>
@@ -3797,15 +3798,27 @@ c.style.display = '';
         zoneTypes.forEach(t => { typeMap[t.id] = t; });
         return zones.map(zone => {
             const typeObj = typeMap[zone.type] || {name: zone.type, icon: '📍'};
-            return `<div class="zone-list-item" style="border-left-color:${zone.color || '#0a84ff'}">
-                <div class="zone-type-icon">${typeObj.icon || '📍'}</div>
-                <div class="zone-info">
-                    <div class="zone-name">${zone.name || 'Sin nombre'}</div>
-                    <div class="zone-type-name">${typeObj.name || zone.type}</div>
+            return `<div class="zone-list-item" style="border-left-color:${zone.color || '#0a84ff'};flex-direction:column;gap:6px">
+                <div style="display:flex;align-items:center;width:100%">
+                    <div class="zone-type-icon">${typeObj.icon || '📍'}</div>
+                    <div class="zone-info">
+                        <div class="zone-name">${zone.name || 'Sin nombre'}</div>
+                        <div class="zone-type-name">${typeObj.name || zone.type}</div>
+                    </div>
+                    <button class="zone-delete" onclick="App._deleteZoneDrawer('${zone.id}')" title="Eliminar zona">✕</button>
                 </div>
-                <button class="zone-delete" onclick="App._deleteZoneDrawer('${zone.id}')" title="Eliminar zona">✕</button>
+                <input type="text" class="zone-attention-input" data-zone-id="${this._escAttr(zone.id)}"
+                       placeholder="¿Qué vigilo en ${this._escAttr(zone.name || 'esta zona')}? (ej: que nadie pase detrás del mostrador)"
+                       value="${this._escAttr(zone.attention || '')}"
+                       style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:12px;background:var(--bg-secondary);color:var(--text-primary)"
+                       oninput="App._setZoneAttention('${this._escAttr(zone.id)}', this.value)">
             </div>`;
         }).join('');
+    },
+
+    _setZoneAttention(zoneId, value) {
+        const z = (this._zoneZones || []).find(zz => zz.id === zoneId);
+        if (z) z.attention = value;
     },
 
     _updateZoneList() {
@@ -3818,6 +3831,42 @@ c.style.display = '';
         this._zoneZones = (this._zoneZones || []).filter(z => z.id !== zoneId);
         this._redrawZones();
         this._updateZoneList();
+    },
+
+    // F2.1: Eva sugiere zonas (endpoint /suggest-zones con Qwen) — pre-llenado editable
+    async _suggestZones(camId, btn) {
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Analizando imagen...'; }
+        try {
+            const cam = this._currentCamConfig || {};
+            const r = await apiFetch(`${this.API}/api/cameras/${camId}/suggest-zones`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    user_id: this.userId,
+                    zone: cam.zone || '',
+                    business_type: cam.business_type || ''
+                })
+            });
+            const d = await r.json();
+            if (!d.success || !d.zones || !d.zones.length) {
+                this._toast('', d.error || 'Eva no pudo sugerir zonas ahora. Dibújalas manualmente.', 'danger');
+                return;
+            }
+            // Pre-llenar: respetar zonas existentes (no duplicar tipos ya dibujados)
+            const existingTypes = new Set((this._zoneZones || []).map(z => z.type));
+            const newZones = d.zones.filter(z => !existingTypes.has(z.type));
+            if (!newZones.length) {
+                this._toast('', `Ya tienes dibujadas zonas de los tipos que Eva sugeriría (${d.zones.length})`, 'success');
+                return;
+            }
+            this._zoneZones = (this._zoneZones || []).concat(newZones);
+            this._redrawZones();
+            this._updateZoneList();
+            this._toast('', `✨ Eva sugirió ${newZones.length} zona(s) — ajústalas o bórralas`, 'success');
+        } catch (e) {
+            this._toast('', 'Error de conexión: ' + e.message, 'danger');
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = '✨ Eva sugiere zonas'; }
+        }
     },
 
     async _clearAllZones(camId) {
@@ -3839,6 +3888,32 @@ c.style.display = '';
             });
             const d = await r.json();
             if (d.success || d.zones) {
+                // F2.3: guardar frases de atención por zona (attention_phrases_zones)
+                // y derivar attention_phrases de nivel cámara en camera.json
+                try {
+                    const apz = {};
+                    (this._zoneZones || []).forEach(z => {
+                        if (z.attention && z.attention.trim()) {
+                            apz[z.attention.trim()] = z.name || 'zona';
+                        }
+                    });
+                    const phrases = Object.keys(apz);
+                    if (phrases.length) {
+                        await apiFetch(`${this.API}/api/cameras/${camId}/vigilance?user_id=${this.userId}`, {
+                            method: 'PUT',
+                            body: JSON.stringify({
+                                user_id: this.userId,
+                                vigilance: {
+                                    attention_phrases_zones: apz,
+                                    attention_phrases: phrases,
+                                    enabled: true
+                                }
+                            })
+                        });
+                    }
+                } catch (e) {
+                    console.warn('[Zones] vigilance update silent fail:', e);
+                }
                 this._closeZoneDrawer();
                 this._refreshZonesList(camId);
                 alert('✅ Zonas guardadas correctamente');
