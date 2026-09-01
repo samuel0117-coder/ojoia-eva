@@ -733,7 +733,7 @@ async def register_push_token(request: Request):
             return {"success": False, "error": "user_id y token requeridos"}
         # Buscar user.json con el helper existente para soportar paths custom
         uf = None
-        for cand in [STORAGE_ROOT / "users" / user_id / "user.json"]:
+        for cand in [user_root(user_id) / "user.json"]:
             if cand.exists():
                 uf = cand
         if not uf:
@@ -935,7 +935,7 @@ async def devices_announce(request: dict):
         if fw:
             cfg["firmware_version"] = fw
     try:
-        cam_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+        cam_path = user_root(user_id) / "cameras" / camera_id / "camera.json"
         with open(cam_path) as f:
             cfg = json.load(f)
         _mut(cfg)
@@ -1453,7 +1453,7 @@ async def devices_scan_results(request: dict):
     }
     # guardar junto al escáner (la cámara que escaneó)
     try:
-        cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        cam_dir = user_root(user_id) / "cameras" / camera_id
         _write_json_atomic(cam_dir / "last_scan.json", result)
     except Exception as e:
         logger.warning(f"[scan] persist error: {e}")
@@ -1684,7 +1684,7 @@ async def list_user_tokens(user_id: str):
 async def unregister_push_token(user_id: str, token: str):
     """Baja token (logout o NotRegistered)."""
     try:
-        uf = STORAGE_ROOT / "users" / user_id / "user.json"
+        uf = user_root(user_id) / "user.json"
         if not uf.exists():
             return {"success": False, "error": "usuario no encontrado"}
         # S4: lock durante read+mutate+write
@@ -1809,7 +1809,7 @@ async def send_report_v2(user_id: str, request: Request = None):
 
         # 4b) guardar también en eva_chat_history.json (legacy, sin uso por frontend)
         try:
-            hf = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
+            hf = user_root(user_id) / "eva_chat_history.json"
             hdata = {"history": [], "summary": ""} if not hf.exists() else json.loads(hf.read_text())
             if not any(m.get("report_url") == html_url for m in hdata.get("history", [])):
                 hdata["history"].append({"role": "assistant", "content": message, "timestamp": time.time(), "summary": True, "is_daily_report": True, "report_url": html_url})
@@ -1824,7 +1824,7 @@ async def send_report_v2(user_id: str, request: Request = None):
             from google.oauth2 import service_account
             import google.auth.transport.requests
             import requests as _req
-            uf = STORAGE_ROOT / "users" / user_id / "user.json"
+            uf = user_root(user_id) / "user.json"
             if uf.exists():
                 ud = json.loads(uf.read_text())
                 tokens = ud.get("fcm_tokens", []) or []
@@ -1904,7 +1904,7 @@ async def serve_vigilance_frame(user_id: str, event_id: str):
     # en rutas fs. Sin validar, event_id="../../etc/passwd" escapaba. Validar.
     _validate_safe_path(user_id, "user_id")
     _validate_safe_path(event_id, "event_id")
-    cam_dir = STORAGE_ROOT / "users" / user_id / "cameras"
+    cam_dir = user_root(user_id) / "cameras"
     # Buscar el event_id.jpg en cualquier carpeta de cámara
     for cam_sub in cam_dir.iterdir() if cam_dir.exists() else []:
         cand = (cam_sub / "events" / f"{event_id}.jpg").resolve()
@@ -2147,7 +2147,7 @@ def get_camera_config_static(user_id: str, camera_id: str) -> dict:
     now = time.time()
     if hit and now - hit[0] < _CAM_CFG_TTL:
         return hit[1]
-    cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+    cam_file = user_root(user_id) / "cameras" / camera_id / "camera.json"
     if cam_file.exists():
         try:
             with open(cam_file) as f:
@@ -2266,9 +2266,19 @@ def get_user_storage_path(user_id: str, plan: str = "founder") -> Path:
     return out
 
 
+def user_root(user_id: str) -> Path:
+    """ST-3: RAÍZ del usuario según su disco (get_user_storage_path).
+    TODO el pipeline de frames/eventos debe usar esto — no STORAGE_ROOT
+    directo — para que la migración de disco (panel) tenga efecto real.
+    Cacheado 5s por usuario (se llama en cada frame)."""
+    return get_user_storage_path(user_id, "free")
+
+
 def _compat_user_json_path(user_id: str) -> Optional[Path]:
-    """user.json de compat (STORAGE_ROOT/users/uid) — es el que se mantiene
-    sincronizado en todos los writes (patrón dual ya existente)."""
+    """user.json de compat (STORAGE_ROOT/users/uid LITERAL, sin resolución) —
+    es el que se mantiene sincronizado en todos los writes (patrón dual).
+    OJO: NO usar user_root() aquí — crearía recursión infinita con
+    get_user_storage_path (bug ST-3, corregido al detectarlo)."""
     p = STORAGE_ROOT / "users" / user_id / "user.json"
     return p if p.exists() else None
 
@@ -2278,7 +2288,7 @@ def find_user_json(user_id: str) -> Optional[Path]:
         path = get_user_storage_path(user_id, plan) / "user.json"
         if path.exists():
             return path
-    compat = STORAGE_ROOT / "users" / user_id / "user.json"
+    compat = user_root(user_id) / "user.json"
     return compat if compat.exists() else None
 
 def resolve_user_events_dirs(user_id: str) -> List[tuple]:
@@ -2397,7 +2407,7 @@ async def get_camera_latest_jpg(user_id: str, camera_id: str):
     sin conocer user_id+camera_id (GUIDs no secuenciales)."""
     _validate_safe_path(user_id, "user_id")
     _validate_safe_path(camera_id, "camera_id")
-    raw = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "latest_raw.jpg"
+    raw = user_root(user_id) / "cameras" / camera_id / "frames" / "latest_raw.jpg"
     if not raw.exists():
         raise HTTPException(status_code=404, detail="sin frames")
     return Response(content=raw.read_bytes(), media_type="image/jpeg")
@@ -2412,7 +2422,7 @@ async def get_camera_event_image(user_id: str, camera_id: str, image_name: str):
     _validate_safe_path(image_name, "image_name")
     if not image_name.endswith(".jpg"):
         raise HTTPException(status_code=400, detail="solo jpg")
-    img = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / image_name
+    img = user_root(user_id) / "cameras" / camera_id / "events" / image_name
     if not img.exists():
         # algunos eventos guardan carpeta evt_*/grid.jpg
         alt = img.with_suffix("") / "grid.jpg"
@@ -2432,13 +2442,13 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
         frame_bytes = b""
     if not frame_bytes and camera_id and user_id:
         try:
-            events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+            events_dir = user_root(user_id) / "cameras" / camera_id / "events"
             latest_vig = events_dir / "latest_vigilance.jpg"
             if latest_vig.exists():
                 frame_bytes = latest_vig.read_bytes()
                 last_cam = camera_id
             else:
-                frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
                 latest_raw = frames_dir / "latest_raw.jpg"
                 if latest_raw.exists():
                     frame_bytes = latest_raw.read_bytes()
@@ -2480,12 +2490,12 @@ async def get_latest_frame_jpg(camera_id: Optional[str] = None, user_id: Optiona
         frame_bytes = b""
     if not frame_bytes and camera_id and user_id:
         try:
-            events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+            events_dir = user_root(user_id) / "cameras" / camera_id / "events"
             latest_vig = events_dir / "latest_vigilance.jpg"
             if latest_vig.exists():
                 frame_bytes = latest_vig.read_bytes()
             else:
-                frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
                 latest_raw = frames_dir / "latest_raw.jpg"
                 if latest_raw.exists():
                     frame_bytes = latest_raw.read_bytes()
@@ -2502,7 +2512,7 @@ async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[
     if not camera_id or not user_id:
         return Response(status_code=204)
     try:
-        frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+        frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
         latest_raw = frames_dir / "latest_raw.jpg"
         if latest_raw.exists():
             frame_bytes = latest_raw.read_bytes()
@@ -2528,7 +2538,7 @@ async def get_eva_frame_endpoint(user_id: str, camera_id: str):
     """Sirve la imagen que Eva guardó para el chat de configuración (eva_frame.jpg)."""
     try:
         # 1. Buscar en la cámara configurada
-        frame_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "eva_frame.jpg"
+        frame_path = user_root(user_id) / "cameras" / camera_id / "frames" / "eva_frame.jpg"
         if frame_path.exists():
             return Response(content=frame_path.read_bytes(), media_type="image/jpeg", headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -2537,7 +2547,7 @@ async def get_eva_frame_endpoint(user_id: str, camera_id: str):
             })
 
         # 2. Fallback: latest_raw.jpg
-        raw_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "latest_raw.jpg"
+        raw_path = user_root(user_id) / "cameras" / camera_id / "frames" / "latest_raw.jpg"
         if raw_path.exists():
             return Response(content=raw_path.read_bytes(), media_type="image/jpeg", headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -2546,7 +2556,7 @@ async def get_eva_frame_endpoint(user_id: str, camera_id: str):
             })
 
         # 3. Fallback: latest_vigilance.jpg
-        vig_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / "latest_vigilance.jpg"
+        vig_path = user_root(user_id) / "cameras" / camera_id / "events" / "latest_vigilance.jpg"
         if vig_path.exists():
             return Response(content=vig_path.read_bytes(), media_type="image/jpeg", headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -2622,7 +2632,7 @@ async def camera_health_endpoint(camera_id: str, user_id: Optional[str] = None):
     if not user_id or not camera_id:
         return {"success": False, "error": "user_id y camera_id requeridos"}
     try:
-        cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        cam_dir = user_root(user_id) / "cameras" / camera_id
         cam_cfg_path = cam_dir / "camera.json"
         cam = {}
         if cam_cfg_path.exists():
@@ -2691,7 +2701,7 @@ def _read_latest_frame_bytes(user_id: str, camera_id: str) -> Optional[bytes]:
     if cached:
         return cached
     try:
-        frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+        frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
         latest_raw = frames_dir / "latest_raw.jpg"
         if latest_raw.exists():
             data = latest_raw.read_bytes()
@@ -3039,7 +3049,7 @@ async def verify_firebase(request: Request):
         storage_path.mkdir(parents=True, exist_ok=True)
         with _get_user_lock(uid):  # C1
             _atomic_write_user_json(storage_path / "user.json", user_data)
-            compat_dir = STORAGE_ROOT / "users" / uid
+            compat_dir = user_root(uid)
             compat_dir.mkdir(parents=True, exist_ok=True)
             _atomic_write_user_json(compat_dir / "user.json", user_data)
         return {
@@ -3182,7 +3192,7 @@ async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, l
                 _lm = int(_sessions_ts.get(unified_sid, {}).get("last_message_at", 0) or 0)
                 server_ts = _lm
             if not server_ts:
-                chat_history_file = STORAGE_ROOT / "users" / user_id / "eva_chat_history.json"
+                chat_history_file = user_root(user_id) / "eva_chat_history.json"
                 if chat_history_file.exists():
                     server_ts = int(chat_history_file.stat().st_mtime)
         except Exception:
@@ -3946,12 +3956,12 @@ async def _get_latest_frame_b64(user_id: str, camera_id: str) -> str:
         if last_cam and last_cam != camera_id:
             frame_bytes = b""
         if not frame_bytes:
-            events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+            events_dir = user_root(user_id) / "cameras" / camera_id / "events"
             latest_vig = events_dir / "latest_vigilance.jpg"
             if latest_vig.exists():
                 frame_bytes = latest_vig.read_bytes()
             else:
-                frames_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
                 latest_raw = frames_dir / "latest_raw.jpg"
                 if latest_raw.exists():
                     frame_bytes = latest_raw.read_bytes()
@@ -4299,7 +4309,7 @@ async def delete_camera_endpoint(camera_id: str, user_id: str = ""):
         with open(uf, "w") as f:
             json.dump(ud, f, indent=2, ensure_ascii=False)
         # Renombrar el directorio de la cámara a .deleted_<ts> (no borrar).
-        cam_root = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        cam_root = user_root(user_id) / "cameras" / camera_id
         moved_to = None
         if cam_root.exists():
             ts = int(time.time())
@@ -4703,7 +4713,7 @@ async def get_cameras(user_id: str):
             ud = json.load(f)
         cams = ud.get("cameras", []) or []
         # ── Auto-discovery: registrar cámaras del FS que no estén en user.json ──
-        cams_dir = STORAGE_ROOT / "users" / user_id / "cameras"
+        cams_dir = user_root(user_id) / "cameras"
         known_ids = {c.get("camera_id") for c in cams if c.get("camera_id")}
         if cams_dir.exists():
             for d in cams_dir.iterdir():
@@ -4752,7 +4762,7 @@ async def get_cameras(user_id: str):
             # Metrics para el frontend
             try:
                 cam_id = cam.get("camera_id", "")
-                ev_dir = STORAGE_ROOT / "users" / user_id / "cameras" / cam_id / "events"
+                ev_dir = user_root(user_id) / "cameras" / cam_id / "events"
                 total_ev = 0
                 total_al = 0
                 today_ev = 0
@@ -5275,7 +5285,7 @@ def _is_vigilante_mode(schedule: dict, vigilance: dict, current_time: str, night
     if (not schedule or not schedule.get("open") or not schedule.get("close")) and user_id:
         try:
             from pathlib import Path
-            _uf = STORAGE_ROOT / "users" / user_id / "user.json"
+            _uf = user_root(user_id) / "user.json"
             if _uf.exists():
                 with open(_uf) as _f:
                     _ud = json.load(_f)
@@ -5349,7 +5359,7 @@ def _save_vigilance_event(user_id: str, camera_id: str, img_bytes: bytes, yolo_c
     try:
         ts = now
         event_id = f"vigilance_{camera_id}_{ts}"
-        events_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events"
+        events_dir = user_root(user_id) / "cameras" / camera_id / "events"
         events_dir.mkdir(parents=True, exist_ok=True)
         with open(events_dir / f"{event_id}.jpg", "wb") as f:
             f.write(img_bytes)
@@ -5746,7 +5756,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         # `open+write` bloqueante por frame frenaba el event loop con muchas
         # cámaras (100 cámaras × 1fps: p99 de ingest llegó a 6.2s por esto).
         async def _save_frame_disk():
-            frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+            frames_dir_v = user_root(user_id) / "cameras" / camera_id / "frames"
             await asyncio.to_thread(_write_frame_files, frames_dir_v, img_bytes,
                                     user_id, camera_id)
         try:
@@ -6149,7 +6159,7 @@ async def yolo_worker():
 
                 # latest_yolo.json para el viewer (por cámara)
                 try:
-                    frames_dir_v = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames"
+                    frames_dir_v = user_root(user_id) / "cameras" / camera_id / "frames"
                     await asyncio.to_thread(_write_json_atomic, frames_dir_v / "latest_yolo.json", {
                         "timestamp": time.time(),
                         "count": yolo_count,
@@ -6425,7 +6435,7 @@ async def list_reports(user_id: str, limit: int = 10):
         limit: int - Cantidad máxima de reportes a retornar
     """
     try:
-        reports_dir = STORAGE_ROOT / "users" / user_id / "daily_reports"
+        reports_dir = user_root(user_id) / "daily_reports"
         
         if not reports_dir.exists():
             return {"success": True, "reports": [], "count": 0}
@@ -6469,7 +6479,7 @@ async def get_report_stats(user_id: str):
         config = await get_user_report_config(user_id)
         
         # Contar reportes generados
-        reports_dir = STORAGE_ROOT / "users" / user_id / "daily_reports"
+        reports_dir = user_root(user_id) / "daily_reports"
         total_files = len(list(reports_dir.glob("*.html"))) if reports_dir.exists() else 0
         
         return {
@@ -6500,7 +6510,7 @@ async def get_notifications(user_id: str, limit: int = 10):
     El frontend puede pollerar este endpoint cada 30 segundos.
     """
     try:
-        notifications_dir = STORAGE_ROOT / "users" / user_id / "notifications"
+        notifications_dir = user_root(user_id) / "notifications"
         
         if not notifications_dir.exists():
             return {"success": True, "notifications": [], "count": 0}
@@ -6545,7 +6555,7 @@ async def get_notifications(user_id: str, limit: int = 10):
 async def mark_notification_read(user_id: str, notification_id: str):
     """Marca una notificación como leída."""
     try:
-        notifications_dir = STORAGE_ROOT / "users" / user_id / "notifications"
+        notifications_dir = user_root(user_id) / "notifications"
         notification_file = notifications_dir / f"{notification_id}.json"
         
         if notification_file.exists():
@@ -6603,7 +6613,7 @@ async def send_report_to_channel(user_id: str, request: dict):
         
         # Actualizar historial con info de WhatsApp
         if result.get("chat_injected") or result.get("push_sent"):
-            notifications_dir = STORAGE_ROOT / "users" / user_id / "notifications"
+            notifications_dir = user_root(user_id) / "notifications"
             notif_files = sorted(notifications_dir.glob("report_*.json"), 
                                  key=lambda f: f.stat().st_mtime, 
                                  reverse=True)
@@ -6650,7 +6660,7 @@ async def _send_daily_report_whatsapp(user_id: str, message: str, pdf_url: str =
         
         # Si no se pasó phone, leerlo del user.json
         if not phone:
-            user_file = STORAGE_ROOT / "users" / user_id / "user.json"
+            user_file = user_root(user_id) / "user.json"
             if user_file.exists():
                 with open(user_file) as f:
                     user_data = json.loads(f.read_text())
@@ -7306,7 +7316,7 @@ async def admin_billing_overview(authorization: str = Header(None)):
 async def admin_create_user(request: dict, authorization: str = Header(None)):
     _verify_admin(authorization)
     user_id = request.get("user_id") or ("u_" + secrets.token_hex(6))
-    user_dir = STORAGE_ROOT / "users" / user_id
+    user_dir = user_root(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
     now_ts = int(time.time())
     ud = {
@@ -8233,7 +8243,7 @@ async def admin_migrate_user(user_id: str, request: dict, authorization: str = H
     existing["migrated_at"] = time.time()
     with _get_user_lock(user_id):
         _atomic_write_user_json(new_dir / "user.json", existing)
-        compat = STORAGE_ROOT / "users" / user_id
+        compat = user_root(user_id)
         compat.mkdir(parents=True, exist_ok=True)
         _atomic_write_user_json(compat / "user.json", existing)
     invalidate_user_disk_cache(user_id)

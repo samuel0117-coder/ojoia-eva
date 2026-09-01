@@ -27,6 +27,7 @@ STORAGE_ROOT = "/home/sam/storage"
 # _detect_attention_hits.
 VIGILANCE_PIPELINE_VERSION = "2026-08-31.1"  # B1 keyword->candidato + B2 verificador
 DISKS_CONFIG_FILE = f"{STORAGE_ROOT}/disks_config.json"
+_USER_PATH_CACHE = {}  # uid -> (ts, path) — 5s TTL
 
 
 def get_disk_config() -> dict:
@@ -44,8 +45,17 @@ def get_disk_config() -> dict:
 def get_user_storage_path(user_id: str, plan: str = "founder") -> str:
     """
     Resuelve la ruta de almacenamiento del usuario consultando la config de discos.
-    Usa el disco con más espacio libre por defecto.
+    ST-3 (2026-09-01): orden de resolución —
+      1. disk_mount EXPLÍCITO del usuario en user.json (decisión del panel/
+         migrate) — la fuente de verdad, respeta la decisión humana.
+      2. priority_disk del plan.
+      3. Disco con más espacio libre.
+    Cacheado 5s por usuario (se llama por evento/frame).
     """
+    now = time.time()
+    hit = _USER_PATH_CACHE.get(user_id)
+    if hit and now - hit[0] < 5.0:
+        return hit[1]
     cfg = get_disk_config()
     disks = cfg.get("disks", [])
     plans = cfg.get("plans", {})
@@ -54,7 +64,22 @@ def get_user_storage_path(user_id: str, plan: str = "founder") -> str:
     priority_disk = target_plan.get("priority_disk", "")
 
     selected = None
-    if priority_disk:
+    # 1) disk_mount explícito del usuario
+    try:
+        uf = f"{STORAGE_ROOT}/users/{user_id}/user.json"
+        if os.path.exists(uf):
+            with open(uf) as f:
+                dm = json.load(f).get("disk_mount")
+            if dm:
+                for d in disks:
+                    if d.get("mount") == dm:
+                        selected = d
+                        break
+                if selected is None and os.path.isdir(dm):
+                    selected = {"mount": dm, "user_folder": "users"}
+    except Exception:
+        pass
+    if selected is None and priority_disk:
         for d in disks:
             if d.get("mount") == priority_disk:
                 selected = d
@@ -74,7 +99,9 @@ def get_user_storage_path(user_id: str, plan: str = "founder") -> str:
     if not selected:
         selected = {"mount": STORAGE_ROOT, "user_folder": "users"}
 
-    return f"{selected['mount']}/{selected['user_folder'].strip('/')}/{user_id}"
+    out = f"{selected['mount']}/{selected['user_folder'].strip('/')}/{user_id}"
+    _USER_PATH_CACHE[user_id] = (now, out)
+    return out
 
 def get_camera_config(user_id: str, camera_id: str) -> dict:
     """Lee la configuración de una cámara desde camera.json"""
