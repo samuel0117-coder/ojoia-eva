@@ -586,6 +586,34 @@ def _enforce_plan_on_create_camera(user_data: dict) -> dict:
     return {"allowed": True}
 
 
+_UD_INGEST_CACHE: Dict[str, tuple] = {}  # uid -> (ts, data) — 60s TTL
+
+
+def _load_user_data_for_ingest(user_id: str) -> Optional[dict]:
+    """Carga user.json para enforcement (cacheada 60s: el ingest es N fps
+    y no puede leer disco en cada frame)."""
+    now = time.time()
+    hit = _UD_INGEST_CACHE.get(user_id)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    uf = find_user_json(user_id)
+    if not uf or not uf.exists():
+        return None
+    try:
+        data = json.loads(uf.read_text())
+    except Exception:
+        return None
+    _UD_INGEST_CACHE[user_id] = (now, data)
+    return data
+
+
+def _invalidate_ud_ingest_cache(user_id: str = None):
+    if user_id is None:
+        _UD_INGEST_CACHE.clear()
+    else:
+        _UD_INGEST_CACHE.pop(user_id, None)
+
+
 def _enforce_plan_on_ingest(user_data: dict) -> dict:
     """Check if user can ingest frames (soft check — never blocks ESP32)."""
     check = _plan_check(user_data)
@@ -763,6 +791,13 @@ async def rtsp_register(request: dict, authorization: str = Header(None, alias="
     name = (request.get("name") or "Cámara IP").strip()[:60]
     zone = (request.get("zone") or "").strip()[:40]
     await _verify_user_token(authorization, user_id)
+    # P0-billing: enforcement de plan al crear cámara
+    uf = find_user_json(user_id)
+    if uf and uf.exists():
+        ud_plan = json.loads(uf.read_text())
+        chk = _enforce_plan_on_create_camera(ud_plan)
+        if not chk.get("allowed"):
+            raise HTTPException(status_code=403, detail=chk.get("reason", "Plan no permite más cámaras"))
     from rtsp_puller import validate_rtsp_url, RtspUrlError
     try:
         url = validate_rtsp_url(url)
@@ -5413,7 +5448,24 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             raise HTTPException(status_code=429,
                                 detail=f"Rate limit: máximo {(_cam_cfg_ingest or {}).get('max_fps', 5)} fps por cámara")
 
-        # ── [0c] TELEMETRÍA de firmware (X-Firmware del ESP32) ──────────────
+        # ── [0c] ENFORCEMENT DE PLAN (P0-billing) ──────────────────────────
+        # Un suspendido/vencido-sin-gracia ya NO consume YOLO/Qwen ni disco:
+        # se rechaza el frame ANTES de guardar/gastar. Política suave en
+        # gracia y trial (allowed) — solo corta el servicio realmente
+        # suspendido. El ESP32 recibe 403 con reason y reintenta luego.
+        try:
+            _ud_pf = _load_user_data_for_ingest(user_id)
+            if _ud_pf is not None:
+                _pf = _enforce_plan_on_ingest(_ud_pf)
+                if not _pf.get("allowed"):
+                    logger.info(f"[plan-enforce] ingest bloqueado user={user_id[:8]}… "
+                                f"cam={camera_id}: {_pf.get('reason','')}")
+                    raise HTTPException(status_code=403,
+                                        detail=f"Servicio suspendido: {_pf.get('reason','plan vencido')}")
+        except HTTPException:
+            raise
+
+        # ── [0d] TELEMETRÍA de firmware (X-Firmware del ESP32) ──────────────
         # El firmware v9.3.1+ reporta su versión en cada frame. La guardamos
         # en camera.json (throttled) para saber qué corre cada cámara sin
         # acceso físico ni OTA.
@@ -7037,14 +7089,22 @@ async def admin_renew_user(user_id: str, request: dict, authorization: str = Hea
     notes = request.get("notes", "")
     cfg = get_disk_config()
     plan_def = cfg.get("plans", {}).get(plan, {})
-    if not duration_days:
-        duration_days = plan_def.get("duration_days", 30)
+    # P0-4 fix: duration_days=0 significa CAMBIAR plan SIN extender (el
+    # panel changePlan lo usa así). Antes se rellenaba con el duration del
+    # plan destino → cambiar de plan regalaba 30/365 días sin cobro.
+    extend_days = duration_days
+    if not extend_days and not request.get("extend", False):
+        extend_days = 0
+    elif not extend_days:
+        extend_days = plan_def.get("duration_days", 30)
     now_ts = int(time.time())
     current_end = ud.get("plan_end", 0) or 0
-    if current_end < now_ts:
-        new_end = now_ts + (duration_days * 86400)
+    if extend_days > 0:
+        new_end = (now_ts if current_end < now_ts else current_end) + (extend_days * 86400)
     else:
-        new_end = current_end + (duration_days * 86400)
+        # solo cambio de plan: el fin se mantiene; si nunca hubo, arranca HOY
+        # con el duration del plan SOLO si no tenía uno previo válido
+        new_end = current_end if current_end > now_ts else now_ts
     payment_id = f"pay_admin_{now_ts}_{secrets.token_hex(4)}"
     payment = {
         "id": payment_id, "user_id": user_id, "amount": amount,
@@ -7066,6 +7126,7 @@ async def admin_renew_user(user_id: str, request: dict, authorization: str = Hea
         ud["last_payment"] = payment
     update_user_json(user_id, _mut_renew)  # C1
     logger.info(f"User renewed: {user_id} plan={plan} end={new_end} amount={amount}")
+    _invalidate_ud_ingest_cache(user_id)  # P0-billing
     return {"success": True, "plan": plan, "plan_end": new_end, "payment_id": payment_id}
 
 
@@ -7122,17 +7183,31 @@ async def admin_suspend_user(user_id: str, request: dict, authorization: str = H
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
     update_user_json(user_id, lambda ud: ud.__setitem__("status", "suspended"))  # C1
+    _invalidate_ud_ingest_cache(user_id)  # P0-billing
     logger.info(f"User suspended: {user_id}")
     return {"success": True, "status": "suspended"}
 
 
 @app.post("/admin/users/{user_id}/reactivate")
 async def admin_reactivate_user(user_id: str, request: dict, authorization: str = Header(None)):
+    """P0-3 fix: reactivar ya no es un no-op engañoso. Si el plan_end ya
+    venció, reactivar sin renovar solo devolvería a 'suspended' al momento
+    (o dejaría el servicio cortado por el enforcement). Se exige renovar
+    primero, salvo gracia vigente."""
     _verify_admin(authorization)
     user_file = find_user_json(user_id)
     if not user_file or not user_file.exists():
         raise HTTPException(status_code=404, detail="User not found")
-    update_user_json(user_id, lambda ud: ud.__setitem__("status", "active"))  # C1
+    with open(user_file) as f:
+        ud = json.loads(f.read())
+    chk = _plan_check(ud)
+    if chk["status"] == "expired":
+        raise HTTPException(
+            status_code=409,
+            detail="El plan ya venció (gracia agotada). Renueva primero con "
+                   "/renew — reactivar no extiende el plan.")
+    update_user_json(user_id, lambda u: u.__setitem__("status", "active"))  # C1
+    _invalidate_ud_ingest_cache(user_id)  # P0-billing
     logger.info(f"User reactivated: {user_id}")
     return {"success": True, "status": "active"}
 
