@@ -154,6 +154,43 @@ aprovechar batch YOLO (hoy 1 imagen/request; el servidor puede hacer batches).
   orchestrator. systemd `ojoia-ingest.service`, puerto 8006.
 - Cloudflared: `/ingest/*` → 8006; resto → 8005. Rollback = 1 línea de config.
 
+# 🚀 FASE 3+ — Escáner de red en ESP32 + Eva con consentimiento (aprobado 2026-09-01)
+
+**Decisiones del usuario:** paraguas legal al registrarse + confirmación 1ª vez;
+streaming de terceros NO en v9.3.2 (va en v9.4 aparte); OTA activado en
+producción con el mismo bin; OJO-D1C560 designada cámara LAB permanente.
+
+**Cadena certificada 2026-09-01:** main.cpp GitHub (tag `v9.2.2-prod`) =
+firmware en producción (D1CC08 reporta v9.2.2) = compilado+flasheado a lab
+camera desde este nodo con PlatformIO (boot limpio, frames en pipeline).
+
+## Fases
+- **F0 Congelar base** ✅ repo en /home/sam/esp32cam_project, tag v9.2.2-prod,
+  bin v9.3.1 huérfano archivado como referencia
+- **F1 Endpoints que el firmware YA pide (404 hoy):** /devices/announce,
+  /ota/check/{id} (rollout gradual), /ota/firmware.bin (servir bin estable
+  autenticado por IP pineada F1-bis)
+- **F2 Firmware v9.3.2 escáner:** SSDP M-SEARCH → clasificar vendor →
+  probe HTTP MJPEG → POST /devices/scan-results (lista+fotos, máx 5).
+  Trigger por el polling de config existente (campo scan_request) — sin
+  puertos nuevos. Watchdog 15s. Reglas de privacidad hardcodeadas:
+  solo protocolos de cámara, solo IP/marca/puerto, purge 48h.
+- **F3 Eva wizard SCAN_WAIT/SCAN_RESULTS:** consentimiento (consent_terms_v2
+  en registro + confirmación 1ª vez), resultados con foto, credenciales
+  por cámara, probe → registro → flujo normal (ANALYZE F2 → ZONES → reglas).
+  Incompatibles: mensaje claro + estado pending_gateway para v9.4.
+- **F4 Consentimiento en registro:** checkbox + cláusula versionada.
+- **F5 Certificación:** E2E en lab camera + OTA rollout gradual
+  (lab → 24h → D1CC08 → resto). Criterios: 0 WDT resets/24h, scan <10s.
+- **F6 v9.4 gateway video:** ESP32 extrae 1fps MJPEG de cada cámara
+  registrada → /ingest con X-Camera-Key de cada una (A4 ya existe).
+
+| Fecha | Fase | Commit | Estado |
+|---|---|---|---|
+| 2026-09-01 | F0 congelar base firmware | `7adbd82` (esp32cam) | ✅ |
+
+---
+
 # 🏆 FASE 3 — Arquitectura ganadora (aprobada 2026-08-31)
 
 **Diagnóstico medido del nodo:** 2×3090 (GPU0 21.6GB/24.5 usada, GPU1 23.9/24.5
