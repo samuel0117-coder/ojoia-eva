@@ -154,9 +154,17 @@
             <div class="card-title">🟢 Por plan</div>
             <div id="dash-planes"><p style="color:var(--text-secondary);font-size:0.85rem">Cargando...</p></div>
         </div>
-        <div class="card">
-            <div class="card-title">🔴 Alertas recientes</div>
-            <div id="dash-alerts"><p style="color:var(--text-secondary);font-size:0.85rem">Cargando...</p></div>
+        <div class="card" style="grid-column:1/-1">
+            <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+                <span>🔴 Muro de detecciones en vivo <span class="badge" id="wall-live-badge" style="background:rgba(239,68,68,.15);color:var(--danger)">● EN VIVO</span></span>
+                <span style="display:flex;gap:8px;align-items:center">
+                    <label style="font-size:0.75rem;color:var(--text-secondary)"><input type="checkbox" id="wall-auto" checked> auto 10s</label>
+                    <button class="btn btn-sm btn-outline" onclick="loadWall()">⟳</button>
+                    <button class="btn btn-sm btn-danger" id="wall-pause" onclick="toggleWallPause()" style="display:none">⏸ Pausar</button>
+                    <button class="btn btn-sm" id="wall-resume" onclick="toggleWallPause()">▶ Reanudar</button>
+                </span>
+            </div>
+            <div id="dash-wall" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;max-height:420px;overflow-y:auto;padding:4px"></div>
         </div>
     </div>
 </div>
@@ -991,6 +999,58 @@ function switchTab(t) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Muro de detecciones en vivo (F-panel) ─────────────────────────────
+let _wallTimer = null;
+let _wallPaused = false;
+let _lastWallTs = 0;
+
+function toggleWallPause() {
+    _wallPaused = !_wallPaused;
+    document.getElementById('wall-pause').style.display = _wallPaused ? '' : 'none';
+    document.getElementById('wall-resume').style.display = _wallPaused ? 'none' : '';
+    if (!_wallPaused) loadWall();
+}
+
+async function loadWall() {
+    try {
+        const d = await apiGetJSON('/admin/monitoring/alerts?limit=30&hours=12');
+        const alerts = d.alerts || [];
+        const el = document.getElementById('dash-wall');
+        if (!el) return;
+        if (!alerts.length) {
+            el.innerHTML = '<p style="color:var(--text-secondary);padding:12px">Sin detecciones en las últimas 12h — el sistema está tranquilo.</p>';
+            return;
+        }
+        // marcar nuevas desde el último refresh (borde destacado)
+        el.innerHTML = alerts.map(a => {
+            const isNew = (a.timestamp || 0) > _lastWallTs;
+            const img = a.image_url ? (API + a.image_url) : '';
+            const desc = (a.description || a.summary || 'Alerta').substring(0, 110);
+            const t = a.timestamp ? fmtDate(a.timestamp) : '—';
+            const border = isNew ? 'border:1px solid var(--danger)' : 'border:1px solid var(--border)';
+            return '<div style="' + border + ';border-radius:8px;overflow:hidden;background:var(--bg-secondary)">' +
+                (img
+                    ? '<img src="' + img + '" alt="detección" loading="lazy" style="width:100%;height:130px;object-fit:cover">'
+                    : '<div style="height:130px;background:#111;display:flex;align-items:center;justify-content:center;color:var(--text-secondary);font-size:1.5rem">📹</div>') +
+                '<div style="padding:7px 9px">' +
+                '<div style="font-size:0.7rem;color:var(--text-secondary);display:flex;justify-content:space-between">' +
+                '<span>🚨 ' + (a.camera_name || a.camera_id || '?') + '</span><span>' + t + '</span></div>' +
+                '<div style="font-size:0.72rem;line-height:1.35;color:var(--fg);margin-top:4px">' + desc + '</div>' +
+                '</div></div>';
+        }).join('');
+        _lastWallTs = Math.max(...alerts.map(a => a.timestamp || 0), _lastWallTs);
+    } catch (e) { /* silencioso: el muro no debe romper el dashboard */ }
+}
+
+function startWall() {
+    if (_wallTimer) clearInterval(_wallTimer);
+    if (document.getElementById('wall-auto')?.checked && !_wallPaused) loadWall();
+    _wallTimer = setInterval(() => {
+        const visible = document.getElementById('panel-dashboard')?.classList.contains('active');
+        if (visible && !_wallPaused && document.getElementById('wall-auto')?.checked) loadWall();
+    }, 10000);
+}
+
 function loadDashboard() {
     Promise.all([
         apiGetJSON('/admin/users'),
@@ -1031,6 +1091,7 @@ function loadDashboard() {
         
         setHeader(true);
     }).catch(() => setHeader(false));
+    startWall();
 }
 
 let _monitoringFilter = 'all';
