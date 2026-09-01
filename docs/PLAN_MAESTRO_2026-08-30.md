@@ -189,6 +189,8 @@ camera desde este nodo con PlatformIO (boot limpio, frames en pipeline).
 |---|---|---|---|
 | 2026-09-01 | F0 congelar base firmware | `7adbd82` (esp32cam) | ✅ |
 | 2026-09-01 | F1 announce + OTA rollout — E2E certificado en lab camera (fix bucle infinito OTA) | api_eva | ✅ |
+| 2026-09-01 | F2 firmware v9.3.2 escáner SSDP + endpoints — E2E certificado | `esp32cam` v9.3.2-lab | ✅ |
+| 2026-09-01 | F3 wizard Eva SCAN_CONSENT/WAIT/RESULTS + registro IP cams — 22/22 tests | api_eva+eva_v2 | ✅ |
 
 ## 📌 AGENDA POSTERIOR (cuando termine el plan F3+ — NO ahora)
 1. **Panel admin ojoia.com.do/admin** (base ya existe):
