@@ -364,13 +364,21 @@ def _pending_session_for_user(user_id: str) -> Optional[Dict]:
                 best = d
     if best:
         best.setdefault("msgs", [])
-        # Solo indexar si no hay ya una sesión MÁS AVANZADA para el MISMO sid en
-        # memoria (para no pisar una sesión en progreso con una del disco menos
-        # avanzada). Si el sid del best es distinto a _sessions en memoria, OK.
+        # FIX (2026-09-01, hallado en test en vivo): NO pisar una sesión RAM
+        # activa del mismo sid con una de disco "más avanzada". La sesión RAM
+        # es la conversación ACTUAL (ej: el usuario acaba de empezar un wizard
+        # nuevo con "quiero instalar una cámara" → phase zone); la de disco es
+        # un wizard VIEJO que quedó en confirm. Antes el rank (confirm=8 >
+        # zone=2) hacía que el disco pisara la RAM y el wizard nuevo moría al
+        # segundo mensaje (respondía el menú de edición del wizard viejo).
+        # Regla nueva: si ya hay sesión RAM con este sid, gana SIEMPRE la RAM
+        # (es lo que el usuario está viviendo ahora); solo indexamos la de
+        # disco si el sid no está en RAM. Con sessiones legacy (sid distinto),
+        # el comportamiento de rank se conserva vía _resume_pending_setup.
         best_sid = best.get("session_id") or f"pending_{user_id}"
         existing = _sessions.get(best_sid)
-        if existing and existing.get("user_id") == user_id and _phase_rank(existing.get("phase")) > _phase_rank(best.get("phase")):
-            # La sesión en memoria está más avanzada: devolver esa en vez del disco.
+        if existing is not None and existing.get("user_id") == user_id:
+            # RAM viva para este sid: devolverla (no indexar el disco encima).
             return existing
         _sessions[best_sid] = best
     return best
@@ -2671,6 +2679,41 @@ async def _handle_context(session, session_id, user_id, message, first):
 
     if _is_show_frame(message) and session.get("image_b64"):
         return _mk_resp(session, f"Imagen de la cámara:\n{session.get('image_desc','')}", img_b64=session.get("image_b64",""), force_image=True)
+
+    # FIX (test en vivo 2026-09-01): el menú de edición ofrece "Empezar de
+    # nuevo" y "La zona" pero el handler de edit NO los procesaba — cualquier
+    # texto re-respondía el menú en loop (sesión trabada). Ahora:
+    # · "empezar de nuevo" → reiniciar wizard de instalación desde ZONE.
+    # · "la zona" → volver a preguntar la zona (phase ZONE).
+    _edit_msg = _normalize_text(message or "")
+    if session.get("context_step") == "edit" and any(w in _edit_msg for w in (
+            "empezar de nuevo", "desde cero", "reiniciar", "reintentar")):
+        ud = _load_user_data(user_id)
+        session.update({
+            "phase": SetupPhase.ZONE.value,
+            "zone": "", "concern": "", "context_step": "position",
+            "position_confirmed": False, "camera_connected": False,
+            "image_b64": "", "image_sent": False, "image_desc": "",
+            "image_analysis": {}, "wait_attempts": 0,
+            "owner_name": _owner_name(ud),
+            "business_name": ud.get("business_name",""),
+            "business_type": ud.get("business_type",""),
+        })
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return _mk_resp(session,
+            f"¡Dale, {first}! Empezamos de cero la instalación.\n\n"
+            f"¿Dónde vas a poner la cámara? Por ejemplo: "
+            f"{_get_zone_examples(session.get('business_type',''))}...")
+    if session.get("context_step") == "edit" and any(w in _edit_msg for w in (
+            ("la zona", "cambiar zona", "otra zona"))):
+        session["phase"] = SetupPhase.ZONE.value
+        session["context_step"] = "position"
+        _sessions[session_id] = session
+        _save_session_to_disk(session)
+        return _mk_resp(session,
+            f"Perfecto, {first}. ¿Cuál es la zona nueva? Dime dónde va la cámara "
+            f"(por ejemplo: {_get_zone_examples(session.get('business_type',''))}...)")
 
     if session.get("context_step") == "edit":
         if session.get("awaiting_schedule") or any(w in message.lower() for w in ["horario", "hora", "abre", "cierra"]):
