@@ -1599,10 +1599,47 @@ const _origSwitchTab = switchTab;
 // USER DETAIL
 // ═══════════════════════════════════════════════════════════════════════════════
 function showUserDetail(userId) {
-    apiGetJSON('/admin/users/' + userId).then(d => {
-        document.getElementById('user-detail-content').innerHTML = '<pre class="json-box">' + JSON.stringify(d, null, 2) + '</pre>';
+    Promise.all([
+        apiGetJSON('/admin/users/' + userId),
+        apiGetJSON('/admin/users/' + userId + '/payments').catch(() => ({payments: []}))
+    ]).then(([d, pay]) => {
+        const p = pay.payments || [];
+        const s = pay.summary || {};
+        let payHtml = '<h4 style="margin:14px 0 6px">💳 Pagos (total confirmado: $' + (s.total_confirmed||0).toFixed(2) + ' · pendientes: ' + (s.pending_count||0) + ')</h4>';
+        if (p.length) {
+            payHtml += '<table style="font-size:0.75rem"><thead><tr><th>Fecha</th><th>Monto</th><th>Método</th><th>Estado</th><th>Notas</th></tr></thead><tbody>';
+            payHtml += p.slice(0, 15).map(x => {
+                const st = x.status === 'confirmed' ? '<span class="badge badge-ok">✓ confirmado</span>'
+                         : x.status === 'pending' ? '<span class="badge badge-err" style="background:rgba(245,158,11,.15);color:var(--warning)">⏳ pendiente</span>'
+                         : x.status;
+                return '<tr><td>' + fmtDate(x.created_at || x.confirmed_at) + '</td><td><b>$' + (x.amount||0).toFixed(2) + '</b></td><td>' + (x.method||'—') + '</td><td>' + st + '</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">' + (x.notes||'').toString().replace(/[<>]/g,'') + '</td></tr>';
+            }).join('');
+            payHtml += '</tbody></table>';
+        } else {
+            payHtml += '<p style="color:var(--text-secondary);font-size:0.8rem">Sin pagos registrados.</p>';
+        }
+        payHtml += '<div class="btn-group" style="margin-top:10px">' +
+            '<input id="np-amount" type="number" placeholder="Monto $" style="width:100px;padding:6px">' +
+            '<input id="np-method" placeholder="método (transfer...)" style="width:160px;padding:6px">' +
+            '<input id="np-notes" placeholder="notas" style="flex:1;padding:6px">' +
+            '<button class="btn btn-sm btn-success" onclick="registerPayment(\'' + userId + '\')">＋ Registrar pago</button></div>';
+        const info = '<pre class="json-box" style="max-height:200px">' + JSON.stringify(d, null, 2) + '</pre>';
+        document.getElementById('user-detail-content').innerHTML = info + payHtml;
         document.getElementById('user-detail').classList.add('show');
     }).catch(() => toast('❌ Error cargando usuario', false));
+}
+function registerPayment(userId) {
+    const amount = parseFloat(document.getElementById('np-amount').value) || 0;
+    const method = document.getElementById('np-method').value.trim() || 'transfer';
+    const notes = document.getElementById('np-notes').value.trim();
+    if (amount <= 0) { toast('Monto inválido', false); return; }
+    apiFetch('/admin/users/' + userId + '/payments', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({amount, method, notes})})
+        .then(r => r.json()).then(d => {
+            if (d.success) { toast('✅ Pago registrado (pendiente de confirmar)', true); showUserDetail(userId); loadBilling(); }
+            else toast('❌ ' + (d.detail || 'Error'), false);
+        }).catch(() => toast('❌ Error', false));
 }
 function editExistingUser(userId) { showUserEditor(userId); }
 function closeUserDetail() { document.getElementById('user-detail').classList.remove('show'); }

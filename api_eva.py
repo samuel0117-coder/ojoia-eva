@@ -5885,6 +5885,112 @@ def _yolo_parse_result(r: dict) -> tuple:
     return count, [d.get("class", "") for d in dets], dets
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# FASE 2 (F2.2): asignación GEOMÉTRICA de zonas — bbox YOLO ∩ rect zona
+# ═══════════════════════════════════════════════════════════════════════════
+# Antes las zonas viajaban al prompt de Qwen solo como texto con coords y el
+# modelo deducía "en qué zona está cada persona". Ahora el servidor calcula
+# la intersección bbox∩zona y la inyecta como DATO DE SENSOR (ya confirmado).
+# El modelo no deduce: recibe el hecho. Menos alucinación, más precisión.
+
+_zone_assign_cache: dict = {}  # camera_key → (zones, cached_at)
+_ZONE_CACHE_TTL = 30.0         # seg
+
+
+def _get_camera_zones_cached(user_id: str, camera_id: str) -> list:
+    """Lee zonas de la cámara con cache corto (evita JSON parse por frame)."""
+    key = f"{user_id}_{camera_id}"
+    now = time.time()
+    cached = _zone_assign_cache.get(key)
+    if cached and (now - cached[1]) < _ZONE_CACHE_TTL:
+        return cached[0]
+    try:
+        zones = camera_zones.get_camera_zones(user_id, camera_id) or []
+    except Exception:
+        zones = []
+    _zone_assign_cache[key] = (zones, now)
+    # Limpieza oportunista del cache
+    if len(_zone_assign_cache) > 512:
+        _zone_assign_cache.clear()
+    return zones
+
+
+def _detect_zone_for_bbox(bbox: list, img_w: int, img_h: int, zones: list) -> Optional[dict]:
+    """Devuelve la zona con mayor solape con el bbox (intersección sobre área del bbox).
+
+    bbox: [x1, y1, x2, y2] en píxeles. zones: rects relativos 0-1 {x,y,w,h}.
+    Umbral mínimo: 25% del bbox dentro de la zona para considerarla.
+    """
+    if not bbox or len(bbox) != 4 or not zones or not img_w or not img_h:
+        return None
+    x1, y1, x2, y2 = bbox
+    if x2 <= x1 or y2 <= y1:
+        return None
+    bbox_area = (x2 - x1) * (y2 - y1)
+    best = None
+    best_ratio = 0.0
+    for z in zones:
+        c = z.get("coords") or {}
+        try:
+            zx1 = float(c.get("x", 0)) * img_w
+            zy1 = float(c.get("y", 0)) * img_h
+            zx2 = zx1 + float(c.get("w", 0)) * img_w
+            zy2 = zy1 + float(c.get("h", 0)) * img_h
+        except (TypeError, ValueError):
+            continue
+        iw = max(0.0, min(x2, zx2) - max(x1, zx1))
+        ih = max(0.0, min(y2, zy2) - max(y1, zy1))
+        inter = iw * ih
+        if inter <= 0:
+            continue
+        ratio = inter / bbox_area
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best = z
+    return best if best_ratio >= 0.25 else None
+
+
+def _assign_zones_to_detections(user_id: str, camera_id: str,
+                                yolo_detections: list, img_bytes: bytes) -> dict:
+    """F2.2: anota cada detección con zone_name y construye resumen por zonas.
+
+    Devuelve {"per_detection": {track_id|idx: zone_name},
+              "zone_counts": {zone_name: n_personas},
+              "img_size": [w, h]} — listo para inyectar al frame del grid.
+    """
+    out = {"per_detection": {}, "zone_counts": {}, "img_size": [0, 0]}
+    if not yolo_detections:
+        return out
+    zones = _get_camera_zones_cached(user_id, camera_id)
+    if not zones:
+        return out
+    img_w = img_h = 0
+    try:
+        import io as _io
+        from PIL import Image as _PILImage
+        with _PILImage.open(_io.BytesIO(img_bytes)) as im:
+            img_w, img_h = im.size
+    except Exception:
+        # Fallback: estimar del primer bbox (mala opción, pero mejor que nada)
+        return out
+    if not img_w or not img_h:
+        return out
+    out["img_size"] = [img_w, img_h]
+
+    zone_counts = {}
+    for i, det in enumerate(yolo_detections):
+        if str(det.get("class", "")).lower() != "person":
+            continue
+        z = _detect_zone_for_bbox(det.get("bbox"), img_w, img_h, zones)
+        if z:
+            zname = z.get("name") or z.get("type") or "zona"
+            key = det.get("track_id") if det.get("track_id") is not None else i
+            out["per_detection"][str(key)] = zname
+            zone_counts[zname] = zone_counts.get(zname, 0) + 1
+    out["zone_counts"] = zone_counts
+    return out
+
+
 async def _run_yolo_detection(img_bytes: bytes) -> tuple:
     """Ejecuta YOLO detection y retorna (count, classes, detections)."""
     yolo_count = 0
@@ -6010,6 +6116,15 @@ async def yolo_worker():
                     await frame_bus.ack(msg_id)
                     continue
 
+                # F2.2: asignación GEOMÉTRICA de zonas (bbox∩rect) — el hecho
+                # calculado viaja al grid; Qwen lo recibe como dato de sensor.
+                zone_assignment = {}
+                try:
+                    zone_assignment = _assign_zones_to_detections(
+                        user_id, camera_id, yolo_detections, img_bytes or b"")
+                except Exception as _e_zone:
+                    logger.debug(f"[F2.2] zone assign falló: {_e_zone}")
+
                 # Grid por cámara (lock → add_frame → capture si lleno)
                 grid = orchestrator._get_grid(user_id, camera_id, grid_size=GRID_SIZE)
                 cam_lock = _get_camera_lock(user_id, camera_id)
@@ -6022,7 +6137,8 @@ async def yolo_worker():
                         yolo_count=yolo_count,
                         yolo_classes=yolo_classes,
                         yolo_detections=yolo_detections,
-                        mode=mode
+                        mode=mode,
+                        zone_assignment=zone_assignment or None,
                     )
                     if grid_is_full:
                         captured_frames = grid.get_and_reset()
