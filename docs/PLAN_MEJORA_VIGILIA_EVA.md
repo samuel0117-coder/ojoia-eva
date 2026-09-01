@@ -1,7 +1,23 @@
 # Plan de Mejora — Configuración de Cámaras y Vigilancia EVA
 
 > Área: configuración de cámaras + módulo de vigilancia (NO admin — el admin lo trabaja otro agente).
-> Fecha: 2026-09-01. Estado: EN EJECUCIÓN.
+> Fecha: 2026-09-01. Estado: COMPLETADO (Fases 0-4 implementadas y commiteadas).
+
+## Commits
+- `6abe8c5` F0 — bugs P0 (round(), persons, drawer editar, wizard 0-zonas, camera.json, cuarentena)
+- `869c98b` F1 — placement check score 0-100 (endpoint + wizard ANALYZE)
+- `0a25dd6` F2 — zonas asistidas + asignación geométrica determinística
+- `c4eaa76` F3 — precisión primero (scene-unchanged, severidad, smoothing, KPIs)
+- `1412117` F4 — preservar zonas/frases al confirmar wizard
+
+## Notas de implementación
+- El wizard REAL es eva_v2.py (SetupPhase enum); eva_setup_flow.py es legacy
+  (se mantiene por compatibilidad, se le añadió WIZARD_PLACEMENT igualmente).
+- WIZARD_QR/claim_token del frontend es código defensivo legacy (v14/v15),
+  sin productor actual; no rompe nada.
+- Tests ejecutados: geometría bbox∩zona (4 casos), severidad (4 niveles,
+  flag+keyword), scene-unchanged (6 casos), preservación zonas/apz (2 flujos),
+  derive attention_phrases (tasks + concerns fallback).
 
 ## Diagnóstico (resumen)
 
