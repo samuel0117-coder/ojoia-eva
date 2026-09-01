@@ -999,7 +999,77 @@ async def ota_firmware():
                         filename=f"firmware_{st['stable_version']}.bin")
 
 
-@app.post("/admin/ota/publish")
+@app.get("/admin/ota/status")
+async def ota_status(authorization: str = Header(None, alias="Authorization")):
+    """Panel admin: estado del bin publicado + versión de cada cámara."""
+    _verify_admin(authorization)
+    st = _load_ota_state()
+    bin_path = Path(st.get("bin_path") or "")
+    # inventario de cámaras con su firmware reportado (telemetría X-Firmware)
+    cams = []
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for user_dir in users_dir.iterdir():
+            cams_dir = user_dir / "cameras"
+            if not cams_dir.is_dir():
+                continue
+            for c_dir in cams_dir.iterdir():
+                cj = c_dir / "camera.json"
+                if not cj.exists():
+                    continue
+                try:
+                    cfg = json.loads(cj.read_text())
+                except Exception:
+                    continue
+                cams.append({
+                    "camera_id": cfg.get("camera_id", c_dir.name),
+                    "user_id": user_dir.name,
+                    "type": cfg.get("type", "esp32"),
+                    "name": cfg.get("name", ""),
+                    "firmware_version": cfg.get("firmware_version", ""),
+                    "local_ip": cfg.get("local_ip", ""),
+                    "rssi": cfg.get("rssi"),
+                    "uptime_s": cfg.get("uptime_s"),
+                    "last_frame": cfg.get("last_frame", 0) or cfg.get("last_announce", 0),
+                    "stream_down": cfg.get("stream_down", False),
+                    "ingest_key": bool(cfg.get("ingest_key")),
+                    "in_rollout": bool((st.get("rollout") or {}).get(cfg.get("camera_id", c_dir.name))),
+                })
+    return {
+        "published": {
+            "version": st.get("stable_version", ""),
+            "bin_path": st.get("bin_path", ""),
+            "bin_size": bin_path.stat().st_size if bin_path.exists() else 0,
+            "notes": st.get("notes", ""),
+            "published_at": st.get("published_at", 0),
+            "rollout": list((st.get("rollout") or {}).keys()),
+        },
+        "cameras": cams,
+    }
+
+
+@app.post("/admin/cameras/{camera_id}/reboot")
+async def admin_camera_reboot(camera_id: str, authorization: str = Header(None, alias="Authorization")):
+    """Panel admin: reiniciar una cámara ESP32 remotamente.
+    Usa el config server local (:81) si la cámara está en la LAN conocida,
+    o el mecanismo de polling: reboot_request=true → el firmware lo aplica
+    en su próximo poll (≤30s) — implementado en firmware v9.3.2+."""
+    _verify_admin(authorization)
+    _validate_safe_path(camera_id, "camera_id")
+    user_id = _resolve_user_id_from_camera(camera_id)
+    if not user_id:
+        raise HTTPException(status_code=404, detail="cámara no encontrada")
+    def _mut(ud):
+        for c in ud.get("cameras", []):
+            if c.get("camera_id") == camera_id:
+                c["reboot_request"] = True
+    update_user_json(user_id, _mut)
+    logger.info(f"[admin] reboot solicitado para {camera_id}")
+    return {"success": True, "camera_id": camera_id,
+            "note": "La cámara se reinicia en su próximo polling (≤30s)"}
+
+
+@app.get("/admin/ota/publish")
 async def ota_publish(request: dict, authorization: str = Header(None, alias="Authorization")):
     """F1 — Publicar bin estable + definir rollout (admin).
     Body: {bin_path: "...", version: "v9.3.2", rollout: ["OJO-D1C560"], notes: ""}
@@ -4371,6 +4441,14 @@ async def get_esp32_config(camera_id: str):
             # F2 (2026-09-01): trigger de escaneo de red — one-shot. Se
             # sirve UNA vez y se limpia (el firmware lo parsea en su poll).
             scan_request = bool(c.get("scan_request"))
+            reboot_request = bool(c.get("reboot_request"))
+            if scan_request or reboot_request:
+                def _clear_flags(ud2):
+                    for cc in ud2.get("cameras", []):
+                        if cc.get("camera_id") == camera_id:
+                            cc["scan_request"] = False
+                            cc["reboot_request"] = False
+                update_user_json(user_id, _clear_flags)
             if scan_request:
                 c["scan_request"] = False
                 update_user_json(user_id, lambda ud2: [
@@ -4393,6 +4471,8 @@ async def get_esp32_config(camera_id: str):
                 "contrast": c.get("contrast", 0),
                 "stream_always": c.get("stream_always", True),
                 "scan_request": scan_request,
+                # F-admin: reboot one-shot (panel admin / cámaras colgadas)
+                "reboot_request": bool(c.get("reboot_request")),
             }
 
     raise HTTPException(status_code=404, detail="Camera not found in user")

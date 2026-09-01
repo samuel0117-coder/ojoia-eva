@@ -129,6 +129,7 @@
     <button class="admin-tab" id="tab-plans" onclick="switchTab('plans')">📦 Planes</button>
     <button class="admin-tab" id="tab-system" onclick="switchTab('system')">⚙️ Sistema</button>
     <button class="admin-tab" id="tab-support" onclick="switchTab('support')">💬 Soporte</button>
+    <button class="admin-tab" id="tab-ota" onclick="switchTab('ota')">🔄 OTA / Firmware</button>
     <button class="admin-tab" id="tab-logs" onclick="switchTab('logs')">📜 Logs</button>
     <button class="admin-tab" id="tab-identity" onclick="switchTab('identity')">👤 Identity</button>
 </div>
@@ -531,6 +532,23 @@
         </div>
     </div>
 </div>
+<div class="panel" id="panel-ota">
+    <h2>🔄 OTA / Firmware</h2>
+    <div id="ota-published" style="margin-bottom:16px;padding:12px;border:1px solid var(--border);border-radius:8px"></div>
+    <div class="btn-group" style="margin-bottom:16px">
+        <input id="ota-bin-path" type="text" placeholder="/home/sam/esp32cam_project/.pio/build/esp32cam/firmware.bin" style="flex:1;padding:8px">
+        <input id="ota-version" type="text" placeholder="v9.3.2" style="width:110px;padding:8px">
+        <button class="btn btn-success" onclick="otaPublish()">🚀 Publicar</button>
+    </div>
+    <table>
+        <thead><tr><th>Cámara</th><th>Tipo</th><th>Usuario</th><th>Firmware</th><th>IP LAN</th><th>RSSI</th><th>En rollout</th><th>Acciones</th></tr></thead>
+        <tbody id="ota-cams-tbody"></tbody>
+    </table>
+    <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:10px">
+        Publica un bin y selección de cámaras → las elegidas se actualizan solas en su próximo check (≤1h, o reinicia para forzar).
+        Rollout recomendado: 1 cámara lab → 24h estable → resto.
+    </p>
+</div>
 <div class="panel" id="panel-logs">
     <div class="grid">
         <div class="card" style="grid-column:1/-1">
@@ -860,8 +878,63 @@ function escapeHtml(v) {
 }
 
 // ── TABS ──
+// ═══════════════════════════════════════════════════════════════════════════════
+// OTA / FIRMWARE (2026-09-01)
+// ═══════════════════════════════════════════════════════════════════════════════
+let _otaRollout = new Set();
+function loadOTA() {
+    apiGetJSON('/admin/ota/status').then(d => {
+        const p = d.published || {};
+        _otaRollout = new Set(p.rollout || []);
+        document.getElementById('ota-published').innerHTML =
+            '<b>' + (p.version || '— sin bin publicado —') + '</b>' +
+            (p.version ? ' · ' + (p.bin_size/1024).toFixed(0) + ' KB · publicado ' + fmtDate(p.published_at) + (p.notes ? ' · <i>' + p.notes + '</i>' : '') : '');
+        const cams = d.cameras || [];
+        const tb = document.getElementById('ota-cams-tbody');
+        if (!cams.length) { tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">Sin cámaras</td></tr>'; return; }
+        tb.innerHTML = cams.map(c => {
+            const inRoll = _otaRollout.has(c.camera_id) ? '✅' : '<button class="btn btn-sm btn-outline" onclick="otaToggle(\'' + c.camera_id + '\')">Añadir</button>';
+            const fw = c.firmware_version ? '<b>' + c.firmware_version + '</b>' : '—';
+            const live = (c.last_frame && (Date.now()/1000 - c.last_frame) < 180) ? '🟢' : '🔴';
+            return '<tr>' +
+                '<td style="font-family:monospace;font-size:0.8rem">' + live + ' ' + c.camera_id + '</td>' +
+                '<td>' + (c.type || 'esp32') + '</td>' +
+                '<td style="font-size:0.75rem">' + (c.user_id || '').slice(0,8) + '</td>' +
+                '<td>' + fw + '</td>' +
+                '<td style="font-size:0.75rem">' + (c.local_ip || '—') + '</td>' +
+                '<td style="font-size:0.75rem">' + (c.rssi !== undefined && c.rssi !== null ? c.rssi + ' dBm' : '—') + '</td>' +
+                '<td>' + inRoll + '</td>' +
+                '<td><button class="btn btn-sm btn-warning" onclick="otaReboot(\'' + c.camera_id + '\')">🔄 Reiniciar</button></td>' +
+            '</tr>';
+        }).join('');
+    }).catch(() => {});
+}
+function otaToggle(camId) {
+    if (_otaRollout.has(camId)) _otaRollout.delete(camId); else _otaRollout.add(camId);
+    toast('Cámara ' + (_otaRollout.has(camId) ? 'añadida a' : 'quitada de') + ' rollout. Publica para aplicar.', true);
+    loadOTA();
+}
+function otaPublish() {
+    const bin = document.getElementById('ota-bin-path').value.trim();
+    const ver = document.getElementById('ota-version').value.trim();
+    if (!bin || !ver) { toast('Completa ruta del bin y versión', false); return; }
+    if (!_otaRollout.size) { toast('⚠️ Rollout vacío: nadie se actualizará (publica primero el bin y luego añade cámaras)', false); }
+    apiFetch('/admin/ota/publish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bin_path: bin, version: ver, rollout: Array.from(_otaRollout) })
+    }).then(() => { toast('✅ Publicado ' + ver + ' → ' + _otaRollout.size + ' cámara(s)', true); loadOTA(); })
+      .catch(() => toast('❌ Error publicando', false));
+}
+function otaReboot(camId) {
+    if (!confirm('¿Reiniciar ' + camId + ' remotamente?')) return;
+    apiFetch('/admin/cameras/' + camId + '/reboot', { method: 'POST' })
+        .then(() => toast('✅ Reinicio solicitado (≤30s)', true))
+        .catch(() => toast('❌ Error', false));
+}
+
 function switchTab(t) {
-    ['dashboard','monitoring','users','events','cameras','billing','storage','plans','system','support','logs','identity'].forEach(x => {
+    ['dashboard','monitoring','users','events','cameras','billing','storage','plans','system','support','ota','logs','identity'].forEach(x => {
         const tab = document.getElementById('tab-' + x);
         const panel = document.getElementById('panel-' + x);
         if (tab) tab.classList.toggle('active', x === t);
@@ -877,6 +950,7 @@ function switchTab(t) {
     if (t === 'plans') loadPlans();
     if (t === 'system') { reloadStatus(); loadEvaPrompt(); loadEvaDocs(); loadAnalysisInterval(); }
     if (t === 'support') loadSupportContact();
+    if (t === 'ota') loadOTA();
     if (t === 'identity') { checkIdentityHealth(); loadIdentityFaces(); }
     if (t === 'logs') loadLogs();
 }
