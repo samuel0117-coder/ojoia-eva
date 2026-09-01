@@ -1207,6 +1207,81 @@ async def admin_set_analysis_interval(request: dict, authorization: str = Header
             "note": "Aplicado en ojoia.env — surte efecto al reiniciar la API (o reiníciala desde el panel)"}
 
 
+# ── F-admin: procesos + reinicio de servicios (tab Sistema) ───────────────────
+@app.get("/admin/system/processes")
+async def admin_system_processes(authorization: str = Header(None, alias="Authorization")):
+    """Lista los procesos OjoIA (api, workers, modelos, puller) con estado."""
+    _verify_admin(authorization)
+    def _ps():
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["ps", "-eo", "pid,etime,rss,args", "--sort", "-rss"],
+                capture_output=True, text=True, timeout=5)
+            procs = []
+            for line in r.stdout.splitlines()[1:]:
+                parts = line.split(None, 3)
+                if len(parts) < 4:
+                    continue
+                args = parts[3]
+                if any(k in args for k in ("api_eva.py", "ingest_server.py", "rtsp_puller.py",
+                                            "yolo_server", "whisper", "vllm", "sglang",
+                                            "llama-server", "megapanel", "portal.py")) \
+                   and "grep" not in args:
+                    procs.append({"pid": int(parts[0]), "uptime": parts[1],
+                                  "rss_mb": round(int(parts[2]) / 1024, 0),
+                                  "cmd": args[:90]})
+            return procs
+        except Exception as e:
+            return [{"pid": 0, "uptime": "?", "rss_mb": 0, "cmd": f"error: {e}"}]
+    procs = await asyncio.to_thread(_ps)
+    return {"processes": procs}
+
+
+def _restart_service(unit: str):
+    """Reinicia un servicio systemd vía systemctl (requiere polkit/sudoers;
+    si no hay permisos, cae a kill -TERM del proceso para Restart=always)."""
+    import subprocess, signal
+    try:
+        r = subprocess.run(["systemctl", "restart", unit],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return {"success": True, "method": "systemctl", "unit": unit}
+    except Exception:
+        pass
+    # fallback: kill del proceso principal (systemd lo levanta de nuevo)
+    try:
+        import subprocess
+        r = subprocess.run(["pgrep", "-f", unit.replace(".service", "")],
+                           capture_output=True, text=True, timeout=5)
+        pids = [int(x) for x in r.stdout.split()]
+        for pid in pids[:1]:  # solo el principal
+            os.kill(pid, signal.SIGTERM)
+        return {"success": True, "method": "sigterm+systemd-restart", "unit": unit,
+                "note": "señal enviada; systemd lo levanta (Restart=always)"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"no pude reiniciar {unit}: {e}")
+
+
+@app.post("/admin/system/restart/backend")
+async def admin_restart_backend(authorization: str = Header(None, alias="Authorization")):
+    """Reinicia la API (api-eva). Nota: la respuesta puede no llegar si el
+    restart es rápido — el panel la interpreta como éxito tras reconnect."""
+    _verify_admin(authorization)
+    logger.info("[admin] restart backend solicitado desde el panel")
+    asyncio.get_event_loop().call_later(1.0, _restart_service, "api-eva")
+    return {"success": True, "unit": "api-eva", "note": "reiniciando en 1s"}
+
+
+@app.post("/admin/system/restart/tunnel")
+async def admin_restart_tunnel(authorization: str = Header(None, alias="Authorization")):
+    """Reinicia el túnel cloudflared."""
+    _verify_admin(authorization)
+    result = await asyncio.to_thread(_restart_service, "cloudflared")
+    logger.info(f"[admin] restart tunnel: {result}")
+    return result
+
+
 @app.get("/admin/ota/status")
 async def ota_status(authorization: str = Header(None, alias="Authorization")):
     """Panel admin: estado del bin publicado + versión de cada cámara."""
