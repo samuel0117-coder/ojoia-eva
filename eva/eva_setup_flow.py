@@ -3,8 +3,12 @@ eva_setup_flow.py — Flujo completo de configuración con Eva.
 
 Estados:
 GREETING → BUSINESS_TYPE → CONCERNS → SCHEDULE → RESUMEN → 
-CAMERA_CONNECT → CAMERA_SHOW_FRAME → CAMERA_ZONE → CAMERA_TASKS → 
-CAMERA_MORE → CAMERA_PROMPT → MORE_CAMERAS → FINALIZAR → CHAT_OS
+CAMERA_CONNECT → WIZARD_DISPOSITION → WIZARD_PLACEMENT → WIZARD_ZONES_DRAW → 
+MORE_CAMERAS → CHAT_OS
+
+FASE 1 (WIZARD_PLACEMENT): Eva evalúa el encuadre de la cámara con Qwen
+(nitidez, obstrucción, iluminación, ángulo, cobertura) vía
+/api/cameras/{id}/placement-check antes de dibujar zonas.
 """
 
 import json
@@ -225,11 +229,21 @@ def get_eva_response(phase: str, session: dict, user_message: str) -> dict:
         
         if frame_info and user_message.lower().strip() in ["listo", "ready", "ya", "está listo", "conectada", "ok", "bien", "se ve bien", "perfecto"]:
             session["camera_id"] = frame_info.get("cam_id", "")
-            response_text = "¡Excelente! 🎉 La cámara está funcionando.\n\nAhora viene lo más importante: **vamos a definir las zonas de interés** (la caja, la entrada, la cocina, etc.).\n\n👉 Toca el botón de abajo para ir a Configurar Zonas. Dibuja un rectángulo sobre cada área importante y ponle nombre. Cuando termines, regresa aquí y dime 'listo'."
+            # FASE 1: antes de dibujar zonas, evaluar el encuadre de la cámara.
+            # Eva verifica nitidez/obstrucción/iluminación/ángulo/cobertura con
+            # Qwen y da consejos accionables. El usuario puede reintentar con
+            # "otra vez" tras mover la cámara, o saltar con "se ve bien, sigue".
+            response_text = (
+                "¡Excelente! 🎉 La cámara está funcionando.\n\n"
+                "📷 Ahora déjame evaluar el **encuadre**: estoy viendo varias imágenes "
+                "para comprobar nitidez, iluminación, ángulo y cobertura del área.\n\n"
+                "Espera unos segundos..."
+            )
             return {
                 "response": response_text,
-                "next_phase": "WIZARD_ZONES_DRAW",
-                "data": {"show_camera_frame": True, "camera_id": frame_info.get("cam_id", "")},
+                "next_phase": "WIZARD_PLACEMENT",
+                "data": {"show_camera_frame": True, "camera_id": frame_info.get("cam_id", ""),
+                         "run_placement_check": True},
                 "camera_id": frame_info.get("cam_id", ""),
             }
         
@@ -244,6 +258,45 @@ def get_eva_response(phase: str, session: dict, user_message: str) -> dict:
             "response": "¿Ya ves la imagen de la cámara? Cuando estés listo, di 'listo' y pasaremos a configurar las zonas de interés.",
             "next_phase": "WIZARD_DISPOSITION",
             "data": {},
+        }
+
+    elif phase == "WIZARD_PLACEMENT":
+        # FASE 1: evaluación de encuadre. El frontend (o la siguiente pasada
+        # del chat) llama a /api/cameras/{id}/placement-check; aquí manejamos
+        # la conversación: retry ("otra vez"), skip ("se ve bien"/"sigue"),
+        # o resultado pendiente.
+        user_id = session.get("user_id", "")
+        cam_id = session.get("camera_id", "")
+        msg = user_message.lower().strip()
+
+        if any(w in msg for w in ["otra vez", "otravez", "revisar de nuevo", "volver a revisar", "reintentar"]):
+            return {
+                "response": "Ok, reevaluando el encuadre con las imágenes nuevas... 📷⏳",
+                "next_phase": "WIZARD_PLACEMENT",
+                "data": {"run_placement_check": True, "camera_id": cam_id},
+            }
+
+        if any(w in msg for w in ["se ve bien", "sigue", "continuar", "listo", "ok", "aceptar",
+                                  "perfecto", "ya", "dale", "pasar"]):
+            return {
+                "response": ("¡Perfecto! 👌 Ahora viene lo más importante: **vamos a definir las zonas "
+                             "de interés** (la caja, la entrada, la cocina, etc.).\n\n"
+                             "👉 Toca el botón de abajo para ir a Configurar Zonas. Dibuja un rectángulo "
+                             "sobre cada área importante y ponle nombre. Cuando termines, regresa aquí "
+                             "y dime 'listo'."),
+                "next_phase": "WIZARD_ZONES_DRAW",
+                "data": {"camera_id": cam_id},
+            }
+
+        # Cualquier otro texto: mostrar estado de nuevo y las opciones
+        return {
+            "response": ("Estoy evaluando (o ya evalué) el encuadre de la cámara 📷.\n\n"
+                         "Puedes decirme:\n"
+                         "• **'se ve bien'** para continuar a las zonas\n"
+                         "• **'otra vez'** si moviste la cámara y quieres que revise de nuevo\n"
+                         "• O contarme qué problema ves (muy oscura, borrosa, etc.)"),
+            "next_phase": "WIZARD_PLACEMENT",
+            "data": {"run_placement_check": True, "camera_id": cam_id},
         }
     
     elif phase == "WIZARD_ZONES_DRAW":

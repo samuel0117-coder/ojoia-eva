@@ -3921,6 +3921,173 @@ async def suggest_zones_endpoint(camera_id: str, request: Request):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# FASE 1 — Placement Check: verificación de encuadre de la cámara
+# ═══════════════════════════════════════════════════════════════════════════
+# El usuario posiciona la cámara; Eva evalúa N frames consecutivos y devuelve
+# score 0-100 + checklist + consejos accionables antes de pasar a zonas.
+
+_QWEN_PLACEMENT_PROMPT = (
+    "Eres un instalador experto de cámaras de seguridad evaluando el encuadre "
+    "de una cámara recién instalada en un negocio. Analiza ESTA imagen (frame en vivo).\n\n"
+    "Evalúa estos aspectos:\n"
+    "1. nitidez: ¿la imagen es nítida o borrosa/atajada?\n"
+    "2. obstruccion: ¿hay objetos bloqueando la lente (dedo, cable, reflejo, suciedad)?\n"
+    "3. iluminacion: ¿demasiado oscuro, quemado por luz, o correcto?\n"
+    "4. altura_angulo: ¿se verían caras y torsos (ideal) o solo coronas de cabeza (muy alta)?\n"
+    "5. cobertura: ¿el área importante del negocio (caja/mostrador/entrada) ocupa buena parte del encuadre?\n"
+    "6. estabilidad: ¿la cámara apunta donde debe o está torcida/girada?\n\n"
+    "Responde SOLO JSON válido:\n"
+    '{"score": <0-100>, '
+    '"items": [{"key": "nitidez", "ok": true|false, "detail": "1 frase corta en español"}, '
+    '{"key": "obstruccion", ...}, {"key": "iluminacion", ...}, '
+    '{"key": "altura_angulo", ...}, {"key": "cobertura", ...}, {"key": "estabilidad", ...}], '
+    '"consejo": "1-2 frases con la acción más importante para mejorar el encuadre, en español", '
+    '"veredicto": "perfecto" | "aceptable" | "mejorar"}\n'
+    "score>=85 = perfecto, 60-84 = aceptable, <60 = mejorar. Sé estricto pero justo."
+)
+
+
+async def _placement_check_with_qwen(frames_b64: list, zone: str = "", biz_type: str = "") -> dict:
+    """Evalúa el encuadre con Qwen usando 2-3 frames (el primero + intermedio + último)."""
+    if not frames_b64:
+        return {}
+    # Muestrear hasta 3 frames representativos
+    idxs = sorted({0, len(frames_b64) // 2, len(frames_b64) - 1})
+    sample = [frames_b64[i] for i in idxs]
+
+    ctx = ""
+    if zone:
+        ctx += f"La cámara debe cubrir: {zone}. "
+    if biz_type:
+        ctx += f"Tipo de negocio: {biz_type}. "
+
+    content = []
+    for fb in sample:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{fb}"}})
+    content.append({"type": "text", "text": _QWEN_PLACEMENT_PROMPT + " " + ctx})
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as cl:
+            r = await cl.post("http://localhost:8004/v1/chat/completions",
+                              json={"model": "qwen", "messages": [{"role": "user", "content": content}],
+                                    "max_tokens": 600, "temperature": 0.2})
+            if r.status_code != 200:
+                return {}
+            raw = r.json()["choices"][0]["message"]["content"]
+        import re as _re
+        raw = _re.sub(r'^```json\s*', '', raw.strip())
+        raw = _re.sub(r'\s*```$', '', raw).strip()
+        m = _re.search(r'\{.*\}', raw, _re.DOTALL)
+        if not m:
+            return {}
+        parsed = json.loads(m.group())
+        # Normalizar
+        score = parsed.get("score")
+        try:
+            score = int(max(0, min(100, int(score))))
+        except (TypeError, ValueError):
+            score = 0
+        items = []
+        if isinstance(parsed.get("items"), list):
+            for it in parsed["items"]:
+                if isinstance(it, dict) and it.get("key"):
+                    items.append({
+                        "key": str(it.get("key", ""))[:20],
+                        "ok": bool(it.get("ok", False)),
+                        "detail": str(it.get("detail", ""))[:120],
+                    })
+        veredicto = parsed.get("veredicto", "mejorar")
+        if veredicto not in ("perfecto", "aceptable", "mejorar"):
+            veredicto = "mejorar" if score < 60 else ("aceptable" if score < 85 else "perfecto")
+        return {
+            "score": score,
+            "items": items,
+            "consejo": str(parsed.get("consejo", ""))[:300],
+            "veredicto": veredicto,
+        }
+    except Exception as e:
+        logger.error(f"Placement check Qwen error: {e}")
+        return {}
+
+
+async def _collect_camera_frames(user_id: str, camera_id: str, n_frames: int = 3,
+                                 interval_s: float = 2.5) -> list:
+    """Recolecta N frames distintos de la cámara (por mtime de latest_vigilance/latest_raw).
+
+    Lee el archivo de disco en intervalos: si la cámara transmite, el archivo
+    cambia entre lecturas; si no cambia, se deduplica por hash.
+    """
+    import hashlib
+    frames = []
+    seen_hashes = set()
+    for _ in range(max(1, n_frames) * 3):  # reintentos para conseguir n_frames distintos
+        b64 = await _get_latest_frame_b64(user_id, camera_id)
+        if b64:
+            h = hashlib.md5(b64.encode()).hexdigest()[:12]
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                frames.append(b64)
+                if len(frames) >= max(1, n_frames):
+                    break
+        await asyncio.sleep(interval_s)
+    # Si no logramos frames distintos, usar el único que hay
+    if not frames:
+        b64 = await _get_latest_frame_b64(user_id, camera_id)
+        if b64:
+            frames = [b64]
+    return frames
+
+
+@app.post("/api/cameras/{camera_id}/placement-check")
+async def placement_check_endpoint(camera_id: str, request: Request):
+    """
+    FASE 1 — Verifica el encuadre de la cámara durante la instalación.
+
+    Body: {"user_id": "...", "zone": "...", "business_type": "...", "frames": 3}
+    Devuelve: {"success": true, "score": 0-100, "items": [...], "consejo": "...",
+               "veredicto": "perfecto"|"aceptable"|"mejorar", "frames_used": N}
+    """
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        user_id = body.get("user_id", "")
+        zone = body.get("zone", "")
+        biz_type = body.get("business_type", "")
+        n_frames = int(body.get("frames", 3) or 3)
+        n_frames = max(1, min(6, n_frames))
+
+        if not user_id or not camera_id:
+            return {"success": False, "error": "user_id y camera_id requeridos"}
+
+        frames_b64 = await _collect_camera_frames(user_id, camera_id, n_frames=n_frames)
+        if not frames_b64:
+            return {"success": False,
+                    "error": "La cámara no está enviando imágenes todavía. Verifica que esté conectada y encendida."}
+
+        result = await _placement_check_with_qwen(frames_b64, zone, biz_type)
+        if not result:
+            # Fallback determinista: al menos confirmar que hay frames
+            return {
+                "success": True,
+                "score": 60,
+                "items": [{"key": "senal", "ok": True,
+                           "detail": f"La cámara envía imágenes ({len(frames_b64)} frames). No pude evaluar el encuadre con IA, revísalo visualmente."}],
+                "consejo": "La cámara transmite. Revisa visualmente que el área importante quede centrada en la imagen.",
+                "veredicto": "aceptable",
+                "frames_used": len(frames_b64),
+            }
+
+        result["frames_used"] = len(frames_b64)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Error en placement-check: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # WOW #3 — Prueba de reglas con notificación real
 # ═══════════════════════════════════════════════════════════════════════════
 # Endpoint que permite al usuario probar una regla y recibe una notificación
@@ -7128,6 +7295,59 @@ async def admin_renew_user(user_id: str, request: dict, authorization: str = Hea
     logger.info(f"User renewed: {user_id} plan={plan} end={new_end} amount={amount}")
     _invalidate_ud_ingest_cache(user_id)  # P0-billing
     return {"success": True, "plan": plan, "plan_end": new_end, "payment_id": payment_id}
+
+
+@app.post("/admin/users/{user_id}/payments")
+async def admin_create_payment(user_id: str, request: dict,
+                               authorization: str = Header(None, alias="Authorization")):
+    """P1-billing: registrar un pago PENDIENTE de cobrar (transferencia
+    reportada por el cliente, cheque, etc.). El panel lo muestra en el
+    filtro 'Pago pendiente' y se confirma con el botón existente.
+    Body: {amount, method, notes}"""
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    amount = float(request.get("amount") or 0)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="amount debe ser > 0")
+    method = (request.get("method") or "transfer").strip()[:30]
+    notes = (request.get("notes") or "").strip()[:200]
+    now_ts = int(time.time())
+    payment_id = f"pay_{now_ts}_{secrets.token_hex(4)}"
+    payment = {"id": payment_id, "amount": amount, "method": method,
+               "notes": notes, "status": "pending",
+               "created_at": now_ts, "reported_by": "admin"}
+
+    def _mut(ud):
+        ud.setdefault("payments", []).append(payment)
+    update_user_json(user_id, _mut)
+    logger.info(f"[billing] pago pending creado: {user_id[:8]}… {payment_id} "
+                f"(${amount} {method})")
+    return {"success": True, "payment_id": payment_id, "payment": payment}
+
+
+@app.get("/admin/users/{user_id}/payments")
+async def admin_list_payments(user_id: str, authorization: str = Header(None, alias="Authorization")):
+    """P1-billing: historial de pagos del usuario (para la tabla del panel
+    — reemplaza el dump JSON crudo del detalle)."""
+    _verify_admin(authorization)
+    user_file = find_user_json(user_id)
+    if not user_file or not user_file.exists():
+        raise HTTPException(status_code=404, detail="User not found")
+    with open(user_file) as f:
+        ud = json.load(f)
+    payments = ud.get("payments", [])
+    payments.sort(key=lambda p: p.get("created_at") or p.get("confirmed_at") or 0, reverse=True)
+    confirmed = [p for p in payments if p.get("status") == "confirmed"]
+    return {
+        "payments": payments,
+        "summary": {
+            "total_confirmed": round(sum(p.get("amount", 0) for p in confirmed), 2),
+            "pending_count": len([p for p in payments if p.get("status") == "pending"]),
+            "last_payment": payments[0] if payments else None,
+        }
+    }
 
 
 @app.post("/admin/users/{user_id}/payment/{payment_id}/confirm")

@@ -480,18 +480,28 @@ async def _analyze_frame_for_prompt(b64: str, zone: str, biz_type: str) -> Dict:
     try:
         small = _resize(base64.b64decode(b64), 640)
         small_b64 = base64.b64encode(small).decode()
+        # FASE 1: prompt enriquecido con score 0-100 y checklist de encuadre.
+        # El wizard de instalación (fase ANALYZE) usa estos campos para dar
+        # feedback accionable y medible al usuario.
         prompt = (f"Analiza esta imagen de un {biz_type}. Zona: {zone}.\n"
                   "¿Coincide lo que ves con la zona? Extrae JSON:\n"
                   '{"zona_real":"...","coincide_zona":true/false,"objetos":[...],'
                   '"personas_estimadas":n,"iluminacion":"buena/regular/mala",'
                   '"contraluz":true/false,"orientacion":"correcta/torcida/invertida",'
                   '"visibilidad_objetivo":"buena/regular/mala",'
-                  '"es_zona_correcta":true/false,"sugerencia_posicion":"..."}\n'
+                  '"es_zona_correcta":true/false,"sugerencia_posicion":"...",'
+                  '"placement_score":<0-100 calidad general del encuadre>,'
+                  '"nitidez":"buena/regular/mala",'
+                  '"obstruccion_lente":true/false,'
+                  '"altura_angulo":"ideal/alta_demasiado/baja_demasiado"}\n'
+                  "placement_score: 85+ = encuadre profesional (área clave centrada, "
+                  "caras/torsos visibles, nítido, bien iluminado); 60-84 = aceptable "
+                  "con mejoras; <60 = hay que mover la cámara. Sé estricto pero justo.\n"
                   "Responde SOLO JSON.")
         msgs = [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{small_b64}"}},
             {"type": "text", "text": prompt}]}]
-        result = await _call_qwen(msgs, 400)
+        result = await _call_qwen(msgs, 500)
         d = _parse_json_response(result.get("content", ""))
         return d if d else {}
     except Exception as e:
@@ -590,6 +600,34 @@ def _merge_frame_analyses(analyses: list) -> dict:
     # contraluz: persistente (>= 2 frames) o todos cuando N=1
     cl = [a.get("contraluz") is True for a in analyses]
     out["contraluz"] = sum(cl) >= 2 or (n == 1 and cl[0])
+    # ── FASE 1: fusión de campos de encuadre ──
+    # placement_score: MEDIO de los scores (medible y estable entre frames)
+    scores = []
+    for a in analyses:
+        try:
+            s = int(a.get("placement_score"))
+            if 0 <= s <= 100:
+                scores.append(s)
+        except (TypeError, ValueError):
+            pass
+    if scores:
+        out["placement_score"] = int(sum(scores) / len(scores))
+    # nitidez: pesimista (igual que iluminacion)
+    for key in ("nitidez",):
+        vals = [a.get(key) for a in analyses if a.get(key) in RANK]
+        if vals:
+            bad = [v for v in vals if RANK[v] >= 1]
+            out[key] = max(bad, key=lambda v: RANK[v]) if len(bad) * 2 >= len(vals) else "buena"
+    # obstruccion_lente: persistente (>= 2) o todos cuando N=1
+    ob = [a.get("obstruccion_lente") is True for a in analyses]
+    if any(x is True for x in [a.get("obstruccion_lente") for a in analyses]):
+        out["obstruccion_lente"] = sum(ob) >= 2 or (n == 1 and ob[0])
+    # altura_angulo: el peor veredicto visto en >= mitad de frames
+    ALT = {"ideal": 0, "alta_demasiado": 1, "baja_demasiado": 1}
+    vals_a = [a.get("altura_angulo") for a in analyses if a.get("altura_angulo") in ALT]
+    if vals_a:
+        bad_a = [v for v in vals_a if ALT[v] >= 1]
+        out["altura_angulo"] = bad_a[0] if len(bad_a) * 2 >= len(vals_a) else "ideal"
     # sugerencia: la del análisis más reciente que tenga una
     for a in reversed(analyses):
         if a.get("sugerencia_posicion"):
@@ -2247,6 +2285,11 @@ async def _handle_analyze(session, session_id, first):
     orientacion = img_analysis.get("orientacion","")
     visibilidad = img_analysis.get("visibilidad_objetivo","")
     sugerencia = img_analysis.get("sugerencia_posicion","")
+    # FASE 1: score de encuadre + checklist ampliado
+    placement_score = img_analysis.get("placement_score")
+    nitidez = img_analysis.get("nitidez","")
+    obstruccion = img_analysis.get("obstruccion_lente", False)
+    altura_angulo = img_analysis.get("altura_angulo","")
 
     lines = ["📷 Cámara conectada ✅\n", f"Zona configurada: {zone}"]
     if zona_real: lines.append(f"Zona detectada: {zona_real}")
@@ -2256,12 +2299,31 @@ async def _handle_analyze(session, session_id, first):
     if isinstance(n_frames, int) and n_frames > 1:
         lines.append(f"_(diagnóstico promediado de {n_frames} tomas)_")
 
-    # Feedback de calidad (WOW #1)
+    # FASE 1: score de encuadre (0-100) con veredicto claro
+    if isinstance(placement_score, int):
+        if placement_score >= 85:
+            verdict_emoji, verdict_txt = "🌟", "Excelente encuadre"
+        elif placement_score >= 60:
+            verdict_emoji, verdict_txt = "👍", "Encuadre aceptable"
+        else:
+            verdict_emoji, verdict_txt = "⚠️", "Encuadre mejorable"
+        lines.append(f"\n{verdict_emoji} **Calidad del encuadre: {placement_score}/100 — {verdict_txt}**")
+
+    # Feedback de calidad (WOW #1 + FASE 1)
     quality_notes = []
     if iluminacion and iluminacion != "buena":
         quality_notes.append(f"💡 Iluminación: {iluminacion}")
     if contraluz:
         quality_notes.append("⚠️ Veo contraluz — la cámara está apuntando hacia la luz")
+    if nitidez and nitidez != "buena":
+        quality_notes.append(f"🔎 Nitidez: {nitidez}{' (imagen borrosa)' if nitidez=='mala' else ''}")
+    if obstruccion:
+        quality_notes.append("🚫 Algo obstruye la lente (dedo, cable, suciedad o reflejo) — revísala")
+    if altura_angulo and altura_angulo != "ideal":
+        if altura_angulo == "alta_demasiado":
+            quality_notes.append("📏 Cámara muy alta — se ven coronas de cabeza, no caras. Bájala")
+        elif altura_angulo == "baja_demasiado":
+            quality_notes.append("📏 Cámara muy baja — sube el ángulo para cubrir el área")
     if orientacion and orientacion != "correcta":
         quality_notes.append(f"🔄 Orientación: {orientacion}")
     if visibilidad and visibilidad != "buena":
