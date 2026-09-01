@@ -31,7 +31,7 @@ from fastapi import Query
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Header, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse, FileResponse
 from starlette.status import HTTP_200_OK
 from pydantic import BaseModel
 import httpx
@@ -864,6 +864,165 @@ async def manage_ingest_ips(camera_id: str, request: dict,
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"error: {e}")
     return {"success": True, "action": action, "allowed_ips": cfg.get("ingest_allowed_ips", [])}
+
+
+@app.post("/devices/announce")
+async def devices_announce(request: dict):
+    """F1 — Registro del ESP32 en la red local del usuario.
+    El firmware v9.2.2 lo llama al arrancar: guarda la IP LAN real
+    (local_config_url), firmware, RSSI y uptime. Lo usan: el proxy de
+    comandos (:81), el wizard de Eva y el escáner de red (v9.3.2).
+    Auth implícita: camera_id debe existir; la IP pública queda sujeta al
+    pinning F1-bis en el ingest (aqui solo registramos la IP LAN)."""
+    camera_id = (request.get("camera_id") or request.get("firmware_id") or "").strip()
+    if not camera_id:
+        raise HTTPException(status_code=400, detail="camera_id requerido")
+    _validate_safe_path(camera_id, "camera_id")
+    # localizar dueño
+    user_id = ""
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for user_dir in users_dir.iterdir():
+            if (user_dir / "cameras" / camera_id / "camera.json").exists():
+                user_id = user_dir.name
+                break
+    if not user_id:
+        logger.info(f"[announce] cámara desconocida {camera_id} — ignorado (aún sin registrar)")
+        return {"ok": True, "registered": False}
+
+    def _mut(cfg):
+        cfg["local_ip"] = (request.get("ip") or "")[:45]
+        cfg["local_config_url"] = (request.get("local_config_url") or "")[:100]
+        cfg["last_announce"] = time.time()
+        cfg["rssi"] = request.get("rssi")
+        cfg["uptime_s"] = request.get("uptime")
+        fw = (request.get("firmware") or "").strip()
+        if fw:
+            cfg["firmware_version"] = fw
+    try:
+        cam_path = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+        with open(cam_path) as f:
+            cfg = json.load(f)
+        _mut(cfg)
+        tmp = cam_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+        tmp.replace(cam_path)
+        _invalidate_cam_cfg_cache(user_id, camera_id)
+        # mantener online en user.json (throttled como last_frame)
+        _update_camera_last_frame(user_id, camera_id, request.get("ip", ""))
+    except Exception as e:
+        logger.warning(f"[announce] persist error: {e}")
+        return {"ok": True, "registered": False}
+    logger.info(f"[announce] {camera_id} fw={request.get('firmware')} "
+                f"lan_ip={request.get('ip')} rssi={request.get('rssi')}")
+    return {"ok": True, "registered": True}
+
+
+# ── F1: OTA — el firmware llama /ota/check/{id} cada ~30 min ─────────────────
+# Contrato (v9.2.2 checkOTA): 200 con {"update": true, "size": N} dispara la
+# descarga de /ota/firmware.bin; cualquier otra cosa = no update.
+_OTA_STATE_FILE = STORAGE_ROOT / ".runtime" / "ota_state.json"
+
+
+def _load_ota_state() -> dict:
+    try:
+        if _OTA_STATE_FILE.exists():
+            return json.loads(_OTA_STATE_FILE.read_text())
+    except Exception:
+        pass
+    return {"stable_version": "", "bin_path": "", "rollout": {}, "notes": ""}
+
+
+def _save_ota_state(st: dict):
+    try:
+        _OTA_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _OTA_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(st, indent=2))
+        tmp.replace(_OTA_STATE_FILE)
+    except Exception as e:
+        logger.warning(f"[ota] state save: {e}")
+
+
+@app.get("/ota/check/{camera_id}")
+async def ota_check(camera_id: str, request: Request = None):
+    """F1 — Rollout gradual de firmware. Solo ofrece si la versión que corre
+    la cámara (header X-Firmware) DIFIERE de la estable publicada. Sin esa
+    comparación, la cámara en rollout se actualiza en bucle infinito
+    (detectado en vivo con la lab camera 2026-09-01)."""
+    _validate_safe_path(camera_id, "camera_id")
+    st = _load_ota_state()
+    version = st.get("stable_version") or ""
+    rollout = st.get("rollout") or {}
+    if not version or not rollout.get(camera_id):
+        return {"update": False, "version": version or "none"}
+    current = ""
+    # Fuente de versión: 1) header del check; 2) telemetría guardada de frames
+    # (más confiable — el header del checkOTA del v9.2.2 manda "v9.0" hardcodeado).
+    # Si ambas difieren de la estable → ofrecer.
+    if request is not None:
+        current = (request.headers.get("x-firmware") or "").strip()
+    if not current or current == "v9.0":
+        # fallback: lo que reportó el último frame real (X-Firmware del ingest)
+        try:
+            users_dir = STORAGE_ROOT / "users"
+            if users_dir.is_dir():
+                for user_dir in users_dir.iterdir():
+                    cj = user_dir / "cameras" / camera_id / "camera.json"
+                    if cj.exists():
+                        current = (json.loads(cj.read_text()).get("firmware_version") or "").strip()
+                        break
+        except Exception:
+            pass
+    if current == version:
+        return {"update": False, "version": version, "current": current}
+    bin_path = Path(st.get("bin_path") or "")
+    if not bin_path.exists():
+        logger.warning(f"[ota] bin estable no encontrado: {bin_path}")
+        return {"update": False, "version": version, "error": "bin missing"}
+    logger.info(f"[ota] update OFFERED a {camera_id}: {current or '?'} → {version} "
+                f"({bin_path.stat().st_size} bytes)")
+    return {"update": True, "version": version, "size": bin_path.stat().st_size,
+            "url": "/ota/firmware.bin"}
+
+
+@app.get("/ota/firmware.bin")
+async def ota_firmware():
+    """F1 — Sirve el bin estable. Abierto a la red del túnel como el resto
+    del pipeline; las cámaras lo descargan tras ota/check (que ya validó
+    pertenencia al rollout). El bin es público por diseño (no contiene
+    secretos: ni WiFi ni claves van embebidas — todo se configura por NVS)."""
+    st = _load_ota_state()
+    bin_path = Path(st.get("bin_path") or "")
+    if not st.get("stable_version") or not bin_path.exists():
+        raise HTTPException(status_code=404, detail="sin bin estable publicado")
+    return FileResponse(bin_path, media_type="application/octet-stream",
+                        filename=f"firmware_{st['stable_version']}.bin")
+
+
+@app.post("/admin/ota/publish")
+async def ota_publish(request: dict, authorization: str = Header(None, alias="Authorization")):
+    """F1 — Publicar bin estable + definir rollout (admin).
+    Body: {bin_path: "...", version: "v9.3.2", rollout: ["OJO-D1C560"], notes: ""}
+    Solo cámaras listadas en rollout reciben la actualización."""
+    _verify_admin(authorization)
+    bin_path = Path(request.get("bin_path") or "")
+    version = (request.get("version") or "").strip()
+    rollout = request.get("rollout") or []
+    if not bin_path.is_absolute():
+        bin_path = Path("/home/sam") / bin_path
+    if not bin_path.exists() or bin_path.suffix != ".bin":
+        raise HTTPException(status_code=400, detail="bin_path inválido")
+    if not version.startswith("v"):
+        raise HTTPException(status_code=400, detail="version debe empezar con v")
+    if not isinstance(rollout, list):
+        raise HTTPException(status_code=400, detail="rollout debe ser lista")
+    st = {"stable_version": version, "bin_path": str(bin_path),
+          "rollout": {c: True for c in rollout}, "notes": request.get("notes", ""),
+          "published_at": time.time()}
+    _save_ota_state(st)
+    logger.info(f"[ota] publicado {version} → rollout {len(rollout)} cámara(s): {rollout}")
+    return {"success": True, "version": version, "rollout": rollout,
+            "size": bin_path.stat().st_size}
 
 
 @app.post("/api/auth/token")
