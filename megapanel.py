@@ -135,12 +135,6 @@ def run_cmd(cmd, timeout=8):
 _KNOWN_SYSTEMD_SERVICES = {
     "tunnel.service":      {"name": "Cloudflare Tunnel", "port": 0, "gpu": -1, "kind": "network"},
     "api-eva.service":     {"name": "OjoIA API Eva", "port": 8005, "gpu": -1, "kind": "api"},
-    "qwen.service":        {"name": "Qwen VL-7B (SGLang)", "port": 8004, "gpu": 0, "kind": "llm"},
-    "qwen9b.service":      {"name": "Qwen VL-9B (vLLM)", "port": 8018, "gpu": 0, "kind": "llm"},
-    "qwen35b.service":     {"name": "Qwen 35B (llama.cpp)", "port": 8019, "gpu": 1, "kind": "llm"},
-    "whisper.service":     {"name": "Whisper Turbo ASR", "port": 8008, "gpu": 1, "kind": "asr"},
-    "yolo-server.service": {"name": "YOLO Pose", "port": 8002, "gpu": 1, "kind": "vision"},
-    "qwen14b.service":     {"name": "Qwen 14B (SGLang)", "port": 8015, "gpu": 1, "kind": "llm"},
     "chatrd.service":      {"name": "ChatRD API", "port": 8010, "gpu": -1, "kind": "api"},
     "admin_panel.service": {"name": "ChatRD Admin", "port": 8030, "gpu": -1, "kind": "api"},
     "comfyui.service":     {"name": "ComfyUI (Wan)", "port": 8006, "gpu": 2, "kind": "image"},
@@ -152,20 +146,25 @@ _KNOWN_SYSTEMD_SERVICES = {
     "health-monitor.service": {"name": "Health Monitor", "port": 9000, "gpu": -1, "kind": "infra"},
     "megapanel.service":   {"name": "Megapanel (this)", "port": 9001, "gpu": -1, "kind": "infra"},
     "ojoia-bus.service":   {"name": "OjoIA Service Bus", "port": 8200, "gpu": -1, "kind": "infra"},
-    "ojoia-models.service": {"name": "OjoIA Models", "port": 0, "gpu": -1, "kind": "infra"},
+    "ojoia-models.service": {"name": "OjoIA Models (arranque ordenado)", "port": 0, "gpu": -1, "kind": "infra"},
     "redis-ojoia.service": {"name": "Redis (OjoIA)", "port": 6379, "gpu": -1, "kind": "infra"},
     "project-server.service": {"name": "Project Server", "port": 8012, "gpu": -1, "kind": "api"},
-    "ui-server.service":   {"name": "UI Server", "port": 0, "gpu": -1, "kind": "api"},
-    "ai-arranque.service": {"name": "AI Arranque", "port": 0, "gpu": -1, "kind": "infra"},
+    "ui-server.service":   {"name": "UI Server", "port": 8080, "gpu": -1, "kind": "api"},
+    "ai-arranque.service": {"name": "AI Arranque (legacy)", "port": 0, "gpu": -1, "kind": "infra"},
 }
 
 # Metadata de contenedores Docker conocidos (nombre bonito + puerto + gpu)
+# Layout producción (post reorganización GPU):
+#   GPU 0: qwen-7b (sglang), qwen3vl8b (visión rápida), whisper-turbo, yolo-pose
+#   GPU 1: qwen38-syv (27B kvarn), qwen-9b (manual), qwen-35b-a3b (frío)
 _KNOWN_DOCKER_CONTAINERS = {
-    "qwen-7b":         {"name": "Qwen VL-7B (SGLang)", "port": 8004, "gpu": 0, "kind": "llm", "id": "qwen.service"},
-    "qwen-35b-a3b":    {"name": "Qwen 35B (llama.cpp)", "port": 8019, "gpu": 1, "kind": "llm", "id": "qwen35b.service"},
-    "ai-qwen-9b-1":    {"name": "Qwen VL-9B (vLLM)", "port": 8018, "gpu": 0, "kind": "llm", "id": "qwen9b.service"},
-    "whisper-turbo":   {"name": "Whisper Turbo ASR", "port": 8008, "gpu": 1, "kind": "asr", "id": "whisper.service"},
-    "yolo-pose":       {"name": "YOLO Pose", "port": 8002, "gpu": 1, "kind": "vision", "id": "yolo-server.service"},
+    "qwen-7b":         {"name": "Qwen VL-7B (SGLang)", "port": 8004, "gpu": 0, "kind": "llm", "id": "qwen7b"},
+    "qwen3vl8b":      {"name": "Qwen3-VL-8B (Visión)", "port": 8019, "gpu": 0, "kind": "vision", "id": "qwen3vl8b"},
+    "whisper-turbo":  {"name": "Whisper Turbo ASR", "port": 8008, "gpu": 0, "kind": "asr", "id": "whisper"},
+    "yolo-pose":      {"name": "YOLO Pose", "port": 8002, "gpu": 0, "kind": "vision", "id": "yolo"},
+    "qwen38-syv":     {"name": "Qwen 3.8 27B (vLLM kvarn)", "port": 18020, "gpu": 1, "kind": "llm", "id": "qwen38"},
+    "qwen-9b":        {"name": "Qwen VL-9B (vLLM, manual)", "port": 8018, "gpu": 1, "kind": "llm", "id": "qwen9b"},
+    "qwen-35b-a3b":   {"name": "Qwen 35B (frío)", "port": 8019, "gpu": 1, "kind": "llm", "id": "qwen36-35b-a3b"},
 }
 
 
@@ -233,11 +232,17 @@ for s in SERVICES:
         DOCKER_MAP[s["id"]] = s["container"]
 # Mapeo legacy por si el container no se llama igual que el id
 _LEGACY_DOCKER_MAP = {
-    "qwen9b.service":  "ai-qwen-9b-1",
     "qwen.service":    "qwen-7b",
-    "qwen35b.service": "qwen-35b-a3b",
-    "whisper.service": "whisper-turbo",
+    "qwen9b.service":   "qwen-9b",
+    "qwen35b.service":  "qwen-35b-a3b",
+    "whisper.service":  "whisper-turbo",
     "yolo-server.service": "yolo-pose",
+    "qwen7b":           "qwen-7b",
+    "qwen38":           "qwen38-syv",
+    "qwen9b":           "qwen-9b",
+    "qwen3vl8b":        "qwen3vl8b",
+    "whisper":          "whisper-turbo",
+    "yolo":             "yolo-pose",
 }
 for sid, container in _LEGACY_DOCKER_MAP.items():
     DOCKER_MAP.setdefault(sid, container)

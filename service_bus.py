@@ -53,7 +53,7 @@ BACKENDS = {
     # "qwen35b": {"url": "http://127.0.0.1:8019", "sem": 2,   "backlog": 1000},
     "qwen38":  {"url": "http://127.0.0.1:18020", "sem": 64, "backlog": 5000},
     "qwen3vl8b": {"url": "http://127.0.0.1:8019", "sem": 4,  "backlog": 1000},
-    "whisper": {"url": "http://127.0.0.1:8008", "sem": 12,  "backlog": 5000},
+    "whisper": {"url": "http://127.0.0.1:8008", "sem": 16,  "backlog": 5000},
     "yolo":    {"url": "http://127.0.0.1:8002", "sem": 12,  "backlog": 5000},
 }
 

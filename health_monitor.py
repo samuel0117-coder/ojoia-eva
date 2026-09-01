@@ -43,6 +43,13 @@ API_PORT = int(os.environ.get("HEALTH_MONITOR_PORT", "9000"))
 LOG_FILE = "/home/sam/logs/health_monitor.log"
 INCIDENT_LIMIT = 500
 CHECK_INTERVAL = int(os.environ.get("HEALTH_MONITOR_INTERVAL", "20"))
+# Grace inicial de arranque: durante los primeros N segundos tras arrancar el
+# monitor NO reinicia ningún servicio. En el boot de la PC, docker levanta los
+# containers en paralelo y ojoia-models.service (start-models.sh) reordena la
+# GPU 0 (7b primero, vl8b al final). Si el monitor arranca antes, vería todo
+# "DOWN" y resucitaría containers a mitad de la recuperación de VRAM.
+STARTUP_GRACE_S = float(os.environ.get("HEALTH_MONITOR_STARTUP_GRACE", "180"))
+_STARTED_AT = time.time()
 
 # ComfyUI en modo managed: el operador lo maneja manualmente.
 # El health-monitor NO lo reinicia automáticamente.
@@ -282,6 +289,14 @@ class HealthMonitor:
         # Si está pausado por el operador, NO reiniciar.
         if svc.paused:
             self.log(f"{svc.name}: restart SKIPPED (paused by operator)", "INFO")
+            return False
+
+        # Grace de arranque del sistema: durante los primeros STARTUP_GRACE_S
+        # tras arrancar el monitor, NO auto-reiniciar. En el boot, docker levanta
+        # containers en paralelo y start-models.sh reordena la GPU 0 (7b primero).
+        # Reiniciar a mitad de esa recuperación rompería la reserva de VRAM.
+        if time.time() - _STARTED_AT < STARTUP_GRACE_S:
+            self.log(f"{svc.name}: restart SKIPPED (startup grace del sistema)", "INFO")
             return False
 
         # ── Exclusividad: si tiene exclusivos corriendo en la misma GPU, ──────

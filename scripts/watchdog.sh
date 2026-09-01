@@ -99,7 +99,9 @@ if ! curl -sf --max-time 5 https://api.ojoia.com.do/health >/dev/null 2>&1; then
     sleep 2
 fi
 
-# 3) Modelos IA — qwen-7b PRIMERO, luego qwen-35b solo si 7B está healthy
+# 3) Modelos IA — qwen-7b PRIMERO (GPU0); vl8b SOLO si 7B está healthy.
+# El 7b calcula su VRAM contra la memoria libre: si el vl8b (7GB) carga antes,
+# el 7b entra en crash-loop ("no GPU memory for KV cache"). Orden estricto.
 SEVENB_OK=0
 if is_container_healthy "qwen-7b" "8004"; then
     SEVENB_OK=1
@@ -110,42 +112,70 @@ else
     else
         echo "[$(now)] qwen-7b DOWN — intentando reiniciar..." >> "$LOG"
         if should_restart "qwen-7b"; then
+            # Si el vl8b está corriendo, pausarlo: libera 7GB para que el 7b
+            # pueda reservar su pool de VRAM (lección del crash-loop 2026-08-31).
+            VL8B_ST=$(docker inspect qwen3vl8b --format '{{.State.Status}}' 2>/dev/null)
+            if [ "$VL8B_ST" = "running" ] && ! is_paused_by_operator "qwen3vl8b"; then
+                echo "[$(now)] qwen-7b DOWN — pausando qwen3vl8b para liberar VRAM..." >> "$LOG"
+                docker stop qwen3vl8b 2>/dev/null
+                date +%s > /tmp/.watchdog_vl8b_paused_for_7b
+                sleep 5
+            fi
             docker start qwen-7b 2>/dev/null && echo "[$(now)] qwen-7b reiniciado" >> "$LOG"
             date +%s > "/tmp/.watchdog_last_qwen-7b"
         fi
     fi
 fi
 
-# 4) qwen-35b SOLO si 7B está OK (evita condición de carrera por VRAM)
+# 3b) qwen3vl8b: solo si 7B está OK (entra en la VRAM que dejó el 7b).
+# Si fue pausado por el watchdog para recuperar al 7b (flag de arriba),
+# solo re-arrancarlo cuando el 7b ya esté healthy.
 if [ $SEVENB_OK -eq 1 ]; then
-    if ! is_container_healthy "qwen-35b-a3b" "8019"; then
-        # Verificar si fue detenido intencionalmente por el operador
-        if is_paused_by_operator "qwen35b"; then
-            echo "[$(now)] qwen-35b DOWN — STOPPED intencionalmente por operador, no reiniciar" >> "$LOG"
-        else
-            echo "[$(now)] qwen-35b DOWN pero 7B OK — iniciando 35B..." >> "$LOG"
-            if should_restart "qwen-35b-a3b"; then
-                docker start qwen-35b-a3b 2>/dev/null && echo "[$(now)] qwen-35b iniciado" >> "$LOG"
-                date +%s > "/tmp/.watchdog_last_qwen-35b-a3b"
+    if [ -f /tmp/.watchdog_vl8b_paused_for_7b ]; then
+        rm -f /tmp/.watchdog_vl8b_paused_for_7b
+        echo "[$(now)] 7B OK — re-arrancando qwen3vl8b..." >> "$LOG"
+        docker start qwen3vl8b 2>/dev/null
+        date +%s > "/tmp/.watchdog_last_qwen3vl8b"
+    fi
+    if ! is_container_healthy "qwen3vl8b" "8019"; then
+        st=$(docker inspect qwen3vl8b --format '{{.State.Status}}' 2>/dev/null)
+        if [ "$st" != "running" ]; then
+            if is_paused_by_operator "qwen3vl8b"; then
+                echo "[$(now)] qwen3vl8b DOWN — STOPPED intencionalmente por operador, no reiniciar" >> "$LOG"
+            elif should_restart "qwen3vl8b"; then
+                echo "[$(now)] qwen3vl8b DOWN (7B OK) — iniciando..." >> "$LOG"
+                docker start qwen3vl8b 2>/dev/null && echo "[$(now)] qwen3vl8b iniciado" >> "$LOG"
+                date +%s > "/tmp/.watchdog_last_qwen3vl8b"
             fi
         fi
     fi
 else
-    # 7B no está OK: detener 35B para evitar conflictos de VRAM
-    THIRTYFIVEB_ST=$(docker inspect qwen-35b-a3b --format '{{.State.Status}}' 2>/dev/null)
-    if [ "$THIRTYFIVEB_ST" = "running" ]; then
-        # Verificar si el 35B fue detenido intencionalmente por el operador
-        if is_paused_by_operator "qwen35b"; then
-            echo "[$(now)] qwen-7b DOWN — 35B está PAUSED por operador, dejarlo como está" >> "$LOG"
-        else
-            echo "[$(now)] qwen-7b DOWN — deteniendo 35B para evitar conflictos VRAM..." >> "$LOG"
-            docker stop qwen-35b-a3b 2>/dev/null
+    # 7B no está OK: NO arrancar el vl8b (competiría por la VRAM del 7b)
+    VL8B_ST=$(docker inspect qwen3vl8b --format '{{.State.Status}}' 2>/dev/null)
+    if [ "$VL8B_ST" = "running" ] && ! is_paused_by_operator "qwen3vl8b"; then
+        echo "[$(now)] qwen-7b DOWN — deteniendo qwen3vl8b para evitar conflicto VRAM..." >> "$LOG"
+        docker stop qwen3vl8b 2>/dev/null
+        date +%s > /tmp/.watchdog_vl8b_paused_for_7b
+    fi
+fi
+
+# 4) qwen38-syv (GPU1, dedicado 23.4GB) — reiniciar si está down
+if ! is_container_healthy "qwen38-syv" "18020"; then
+    st=$(docker inspect qwen38-syv --format '{{.State.Status}}' 2>/dev/null)
+    if [ "$st" != "running" ]; then
+        if is_paused_by_operator "qwen38"; then
+            echo "[$(now)] qwen38-syv DOWN — STOPPED intencionalmente por operador, no reiniciar" >> "$LOG"
+        elif should_restart "qwen38-syv"; then
+            echo "[$(now)] qwen38-syv DOWN — reiniciando..." >> "$LOG"
+            docker start qwen38-syv 2>/dev/null && echo "[$(now)] qwen38-syv reiniciado" >> "$LOG"
+            date +%s > "/tmp/.watchdog_last_qwen38-syv"
         fi
     fi
 fi
 
-# 5) Otros modelos IA (yolo, whisper, qwen-9b) — reiniciar si están down
-for entry in "qwen9b:ai-qwen-9b-1:8018" "whisper:whisper-turbo:8008" "yolo:yolo-pose:8002"; do
+# 5) Otros modelos IA (yolo, whisper) — reiniciar si están down
+# (qwen-9b es manual, NO se auto-reinicia; qwen-35b-a3b está frío en disco)
+for entry in "whisper:whisper-turbo:8008" "yolo:yolo-pose:8002"; do
     svc_name=$(echo "$entry" | cut -d: -f1)
     container=$(echo "$entry" | cut -d: -f2)
     port=$(echo "$entry" | cut -d: -f3)
