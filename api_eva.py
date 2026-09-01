@@ -2604,6 +2604,66 @@ async def get_latest_grid(partial: int = 1, camera_id: Optional[str] = None, use
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# FASE 3 (F3.5): KPIs y salud de la cámara
+# ═══════════════════════════════════════════════════════════════════════════
+
+_FROZEN_CAM_THRESHOLD_S = 300  # sin frames > 5 min = cámara congelada/desconectada
+
+
+@app.get("/api/cameras/{camera_id}/health")
+async def camera_health_endpoint(camera_id: str, user_id: Optional[str] = None):
+    """F3.5: KPIs de vigilancia por cámara.
+
+    Devuelve: alertas/24h, eventos/24h, fp_rate, cámara congelada
+    (sin eventos recientes), y actividad del grid en vivo.
+    Playbook 2026: KPIs de confianza del operador (precision-first).
+    """
+    if not user_id or not camera_id:
+        return {"success": False, "error": "user_id y camera_id requeridos"}
+    try:
+        cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        cam_cfg_path = cam_dir / "camera.json"
+        cam = {}
+        if cam_cfg_path.exists():
+            cam = json.loads(cam_cfg_path.read_text())
+        metrics = cam.get("metrics", {}) or {}
+        now = time.time()
+
+        # Cámara congelada: el último frame del grid en vivo + last_event_at
+        grid = orchestrator._get_grid(user_id, camera_id)
+        grid_info = grid.get_grid_info()
+        last_frame_age = None
+        try:
+            latest_raw = cam_dir / "frames" / "latest_raw.jpg"
+            if latest_raw.exists():
+                last_frame_age = int(now - latest_raw.stat().st_mtime)
+        except Exception:
+            pass
+        frozen = (last_frame_age is not None and last_frame_age > _FROZEN_CAM_THRESHOLD_S)
+
+        return {
+            "success": True,
+            "camera_id": camera_id,
+            "alerts_last_24h": metrics.get("alerts_last_24h", 0),
+            "events_last_24h": metrics.get("events_last_24h", 0),
+            "total_alerts": metrics.get("total_alerts", 0),
+            "total_false_positives": metrics.get("total_false_positives", 0),
+            "fp_rate": metrics.get("fp_rate", 0.0),
+            "needs_review": metrics.get("needs_review", False),
+            "last_event_at": metrics.get("last_event_at"),
+            "last_frame_age_s": last_frame_age,
+            "frozen": frozen,
+            "grid_live": {
+                "frame_count": grid_info.get("frame_count", 0),
+                "grid_size": grid_info.get("grid_size", 16),
+            },
+            "zones_count": len(cam.get("zones", []) or []),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ── MJPEG Stream (viewer en tiempo real) ──────────────────────────────────
 # Cache en RAM del último frame por (user_id, camera_id) para evitar disco
 _frame_cache: Dict[str, bytes] = {}

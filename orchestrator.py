@@ -228,7 +228,12 @@ def save_event_to_disk_v2(user_id, camera_id, event_type,
 
 
 def update_camera_metrics(user_id: str, camera_id: str, event_type: str = "normal"):
-    """Actualizar métricas de cámara después de cada evento."""
+    """Actualizar métricas de cámara después de cada evento.
+
+    F3.5: además de los contadores de siempre, trackea KPIs diarios
+    (ventana de 24h en rollo): alertas/día, eventos/día, timestamás recientes
+    para detectar cámara congelada, y mean confidence drift de YOLO.
+    """
     try:
         cam_file = f"{STORAGE_ROOT}/users/{user_id}/cameras/{camera_id}/camera.json"
         if not os.path.exists(cam_file):
@@ -238,8 +243,32 @@ def update_camera_metrics(user_id: str, camera_id: str, event_type: str = "norma
         if "metrics" not in cam:
             cam["metrics"] = {"total_events": 0, "total_alerts": 0, "total_false_positives": 0, "rules": {}, "needs_review": False}
         cam["metrics"]["total_events"] = cam["metrics"].get("total_events", 0) + 1
-        if event_type in ("alert", "violation", "vigilance_alert"):
+        if event_type in ("alert", "violation", "vigilance_alert", "attention"):
             cam["metrics"]["total_alerts"] = cam["metrics"].get("total_alerts", 0) + 1
+
+        # ── F3.5: KPIs diarios (ventana rodante 24h) ──
+        now = time.time()
+        kpi = cam["metrics"].setdefault("kpi_24h", {"window_start": now, "events": [], "alerts_ts": []})
+        # reset si la ventana expiró (>24h desde inicio)
+        if now - kpi.get("window_start", now) > 86400:
+            kpi["window_start"] = now
+            kpi["events"] = []
+            kpi["alerts_ts"] = []
+        kpi["events"].append(now)
+        # mantener solo eventos de las últimas 24h
+        cutoff = now - 86400
+        kpi["events"] = [t for t in kpi["events"] if t > cutoff]
+        kpi["alerts_ts"] = [t for t in kpi.get("alerts_ts", []) if t > cutoff]
+        if event_type in ("alert", "violation", "attention"):
+            kpi["alerts_ts"].append(now)
+        # last_event_at para detectar cámara congelada
+        cam["metrics"]["last_event_at"] = now
+        cam["metrics"]["alerts_last_24h"] = len(kpi["alerts_ts"])
+        cam["metrics"]["events_last_24h"] = len(kpi["events"])
+        false_pos = cam["metrics"].get("total_false_positives", 0)
+        total_alerts_hist = cam["metrics"].get("total_alerts", 0)
+        cam["metrics"]["fp_rate"] = round(false_pos / max(1, total_alerts_hist), 3)
+
         with open(cam_file, "w") as f:
             json.dump(cam, f, indent=2, ensure_ascii=False)
     except Exception as e:
@@ -1507,11 +1536,30 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
                 break
         if skip:
             continue
+        # F3.3: severidad por contenido de la frase. Las frases de bajo riesgo
+        # (actividad rutinaria: cobrar, empacar, abrir cajón en horario) son
+        # 'baja'; presencia/acceso no autorizado o fuera de horario son 'alta';
+        # violencia/armas 'crítica'. Default: 'media'.
+        f_low = hit["frase"].lower()
+        if any(w in f_low for w in ("arma", "pelea", "violencia", "atraco", "agresi")):
+            sev = "critica"
+        elif any(w in f_low for w in ("fuera de horario", "presencia_fuera",
+                                      "restringid", "no autorizad", "intruso",
+                                      "detrás del mostrador", "detras del mostrador",
+                                      "sin autorizacion", "sin autorización")):
+            sev = "alta"
+        elif any(w in f_low for w in ("cobra", "cobró", "cobro", "empaca", "empacó",
+                                      "funda", "cajón", "cajon", "abre la caja",
+                                      "intercambia dinero", "pide producto",
+                                      "llega y pide")):
+            sev = "baja"
+        else:
+            sev = "media"
         anomalias.append({
             "tipo": "attention_hit",
             "descripcion": f"Se observó: {hit['frase']}" + (f" ({hit['momento']})" if hit.get("momento") else ""),
             "observacion": True,
-            "severidad": "observacion",
+            "severidad": sev,
             "source": hit.get("source", "unknown")
         })
 
@@ -1539,9 +1587,9 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
 def _is_scene_unchanged(current_frames: list, previous_frames: list, threshold: float = 0.95) -> bool:
     """Detecta si la escena no cambió significativamente entre grids.
 
-    Compara número de personas, posiciones YOLO y conteo de objetos.
-    Si la escena es esencialmente la misma, no se llama a Qwen.
-    Retorna True si se debe skippear el análisis de Qwen.
+    Compara número de personas, conteo de objetos y (F3.1) la distribución
+    por zonas (zone_assignment de F2.2). Si la escena es esencialmente la
+    misma, no se llama a Qwen. Retorna True si se debe skippear el análisis.
     """
     if not current_frames or not previous_frames:
         return False
@@ -1572,6 +1620,22 @@ def _is_scene_unchanged(current_frames: list, previous_frames: list, threshold: 
             prev_classes.update(c.lower() for c in (f.get("yolo_classes") or []))
         if current_classes == prev_classes:
             return True
+
+    # F3.1: con personas presentes, comparar DISTRIBUCIÓN POR ZONAS.
+    # Si el mismo número de personas estuvo en las mismas zonas (máx por zona
+    # igual entre grids), la escena es la misma (personas en los mismos
+    # lugares → nada nuevo que narrar para el libro de eventos).
+    def _zones_signature(frames_list):
+        sig = {}
+        for f in frames_list:
+            za = f.get("zone_assignment") or {}
+            for zname, n in (za.get("zone_counts") or {}).items():
+                sig[str(zname)] = max(sig.get(str(zname), 0), int(n or 0))
+        return sig
+    cur_sig = _zones_signature(current_frames)
+    prev_sig = _zones_signature(previous_frames)
+    if cur_sig and cur_sig == prev_sig:
+        return True
 
     return False
 
@@ -1735,6 +1799,13 @@ class QwenOrchestrator:
         self._last_notification_ts: Dict[str, float] = {}
         # Configuración de cooldown (en segundos)
         self._notification_cooldown = 300  # 5 minutos entre notificaciones por cámara
+        # F3.1: stats del grid anterior por cámara (para _is_scene_unchanged).
+        # Guardamos la lista de frames del grid previo; la comparación usa
+        # conteos YOLO/clases (ver _is_scene_unchanged).
+        self._prev_grid_stats: Dict[str, list] = {}
+        # F3.4: smoothing 2-grids — hits de severidad baja vistos en el grid
+        # anterior (frase → True) que requieren repetirse para notificar.
+        self._pending_low_hits: Dict[str, set] = {}
         # C4: AsyncClient compartido. Antes se creaba por llamada (pool
         # de conexiones efímero -> overhead TLS + connection setup cada vez).
         # Ahora lazy-init: se crea en el primer uso y se reusa en todas las
@@ -2209,6 +2280,61 @@ class QwenOrchestrator:
                 "count_by_frame": [f.get("yolo_count", 0) for f in frames],
             }
 
+            # ── F3.1: detección de escena estática ANTES de pagar Qwen ──────
+            # Si la escena no cambió desde el grid anterior (mismo #personas,
+            # mismas clases YOLO), NO llamamos al LLM: guardamos un evento
+            # normal ligero. Ahorra GPU y evita eventos duplicados en el libro.
+            # Nunca aplicar cuando hay hits geo pendientes o fuera de horario
+            # (esas alertas SÍ importan aunque la escena no cambie).
+            scene_unchanged = False
+            if not is_after_hours and mode == "normal":
+                try:
+                    _prev = self._prev_grid_stats.get(f"{user_id}_{camera_id}")
+                    scene_unchanged = _is_scene_unchanged(frames, _prev)
+                except Exception:
+                    scene_unchanged = False
+            # Guardar stats de este grid para la próxima comparación
+            self._prev_grid_stats[f"{user_id}_{camera_id}"] = frames
+            if len(self._prev_grid_stats) > 256:
+                # conservar solo las 128 más recientes
+                _keys = list(self._prev_grid_stats.keys())
+                for k in _keys[:len(_keys) - 128]:
+                    self._prev_grid_stats.pop(k, None)
+
+            if scene_unchanged:
+                _zone = cam_cfg.get("zone", camera_id)
+                _evt_id = save_event_to_disk_v2(
+                    user_id=user_id, camera_id=camera_id,
+                    event_type="normal",
+                    frame_bytes=frames[0]["image_bytes"] if frames else b"",
+                    summary=f"Sin novedad en {_zone} (escena sin cambios desde el último análisis).",
+                    qwen_json={"scene_unchanged": True, "mode": mode,
+                               "importance": "normal", "importancia": "normal",
+                               "vision": {}, "summary": f"Sin novedad en {_zone}."},
+                    metadata={
+                        "frames_count": len(frames),
+                        "yolo_count_by_frame": yolo_stats["count_by_frame"],
+                        "yolo_classes": yolo_stats["classes"],
+                        "mode": mode,
+                        "after_hours": is_after_hours,
+                        "skipped_qwen": "scene_unchanged",
+                    },
+                )
+                update_camera_metrics(user_id, camera_id, event_type="normal")
+                logger.info(f"[F3.1] escena sin cambios → Qwen SKIPPED (cam={camera_id}, evt={_evt_id})")
+                return {
+                    "frames_processed": len(frames),
+                    "frame_count": len(frames),
+                    "grid_result": None,
+                    "qwen_json": {"scene_unchanged": True},
+                    "attention_hits": [],
+                    "attention_detected": False,
+                    "mode": mode,
+                    "event_id": _evt_id,
+                    "action_taken": "event_saved_scene_unchanged",
+                    "skipped_qwen": True,
+                }
+
             # ── F2.2: agregado de zone_assignment de TODO el grid ───────────
             # per_detection: {track: [zone..]} — zonas por track a lo largo del
             # grid; zone_counts_max: máximo de personas simultáneas por zona.
@@ -2361,6 +2487,48 @@ class QwenOrchestrator:
                     if h["frase"] in attention_hits
                 ]
 
+            # ── F3.4: smoothing 2-grids para hits de severidad BAJA ──────────
+            # Playbook 2026 (temporal smoothing): un hit rutinario (cobro,
+            # empaque, abrir cajón en horario) debe repetirse en 2 grids
+            # consecutivos para NOTIFICAR. Se registra en el libro igual, pero
+            # la notificación push exige persistencia. Severidades alta/crítica
+            # notifican de inmediato (un solo grid).
+            _cam_pend_key = f"{user_id}_{camera_id}"
+            _prev_low = self._pending_low_hits.get(_cam_pend_key, set())
+            _cur_low = set()
+            _sev_by_frase = {}
+            for a in (rule_result.get("anomalias") or []):
+                if isinstance(a, dict) and a.get("descripcion"):
+                    for h in hits_detail:
+                        if isinstance(h, dict) and h.get("frase") in str(a.get("descripcion", "")):
+                            _sev_by_frase[h["frase"]] = a.get("severidad", "media")
+            demoted_hits = []
+            if attention_detected:
+                keep_hits = []
+                for h in attention_hits:
+                    sev = _sev_by_frase.get(h, "media")
+                    if sev == "baja":
+                        if h in _prev_low:
+                            keep_hits.append(h)   # 2ª aparición → confirma
+                        else:
+                            _cur_low.add(h)       # 1ª aparición → esperar próximo grid
+                            demoted_hits.append(h)
+                    else:
+                        keep_hits.append(h)
+                attention_hits = keep_hits
+                attention_detected = bool(attention_hits)
+                if demoted_hits:
+                    logging.info(f"[F3.4] {len(demoted_hits)} hit(s) baja severidad "
+                                 f"en 1er grid → no notifica hasta repetirse")
+                    qwen_json["low_hits_pending"] = demoted_hits
+                if not attention_detected:
+                    event_type_demoted = True
+                else:
+                    event_type_demoted = False
+            else:
+                event_type_demoted = False
+            self._pending_low_hits[_cam_pend_key] = _cur_low
+
             # ── Cooldown PERSISTENTE por cámara+regla (B3) ───────────────────
             # Clave por regla: dos reglas distintas no se silencian entre sí;
             # la misma regla sí (anti-spam). Persistente en disco: un reinicio
@@ -2373,7 +2541,9 @@ class QwenOrchestrator:
             # ── Datos del evento ─────────────────────────────────────────────────
             user_id = frames[0]["user_id"] if frames else user_id
             camera_id = frames[0]["camera_id"] if frames else "unknown"
-            event_type = "attention" if attention_detected else "normal"
+            # F3.4: 'attention' solo si quedan hits confirmados tras el smoothing.
+            # Hits de baja en 1er grid → evento 'normal' con low_hits_pending.
+            event_type = "attention" if (attention_detected and attention_hits) else "normal"
             summary = qwen_json.get("summary", "") if isinstance(qwen_json, dict) else ""
             if not summary:
                 summary = _build_summary_from_rich_qwen(qwen_json, zone, attention_detected)
