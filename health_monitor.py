@@ -56,6 +56,42 @@ _STARTED_AT = time.time()
 COMFYUI_MANAGED = os.environ.get("COMFYUI_MANAGED", "1") == "1"
 
 
+def _send_alert(title: str, body: str) -> bool:
+    """P1-docker: notificar al operador por FCM (tokens del admin_config)
+    y webhook opcional (OJOIA_ALERT_WEBHOOK=URL de Telegram/Slack genérico).
+    Silencioso: si no hay nada configurado, solo log."""
+    ok = False
+    try:
+        import json as _json, requests
+        cfgp = "/home/sam/storage/admin_config.json"
+        try:
+            cfg = _json.loads(open(cfgp).read())
+        except Exception:
+            cfg = {}
+        key = cfg.get("fcm_server_key") or os.environ.get("FCM_SERVER_KEY", "")
+        tokens = cfg.get("push_tokens") or []
+        if key and tokens:
+            for t in tokens[:5]:
+                try:
+                    requests.post("https://fcm.googleapis.com/fcm/send",
+                                  json={"to": t, "notification": {"title": title, "body": body}},
+                                  headers={"Authorization": f"key={key}"}, timeout=8)
+                    ok = True
+                except Exception:
+                    pass
+        wh = os.environ.get("OJOIA_ALERT_WEBHOOK", "")
+        if wh:
+            try:
+                requests.post(wh, json={"title": title, "body": body,
+                                        "text": f"{title}: {body}"}, timeout=8)
+                ok = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ok
+
+
 @dataclass
 class ServiceDef:
     name: str
@@ -73,6 +109,10 @@ class ServiceDef:
     last_restart: float = 0.0
     disabled_restart: bool = False  # set True for comfyui-managed
     loading_since: float = 0.0  # timestamp since detected "activating" (grace window)
+    # P1-docker (2026-09-01): notificaciones — cuándo empezó a estar DOWN
+    # y cuántas alertas llevamos enviadas (para no repetir spam)
+    down_since: float = 0.0
+    alerts_sent: int = 0
     # PAUSED: cuando el operador hace stop desde el panel, este flag queda en True
     # y el health-monitor NO auto-reinicia. Solo se resetea con /resume o /start.
     paused: bool = False
@@ -548,6 +588,38 @@ class HealthMonitor:
                     if pct > 99:
                         self.log(f"GPU {g['index']}: OOM risk ({pct:.1f}%) — cleaning cache", "WARN")
                         await self._clean_gpu_cache(g["index"])
+
+            # ── P1-docker (2026-09-01): ALERTAS al operador ──────────────────
+            # Antes: el apagón de 6h y 2 caídas de api-eva pasaban invisibles
+            # (solo log). Ahora: un servicio CRÍTICO que lleva >5min DOWN o que
+            # acumula >2 restarts dispara push FCM/webhook al admin — máx 1
+            # alerta por servicio por hora (anti-spam).
+            now = time.time()
+            for svc in self.services.values():
+                if not svc.critical:
+                    continue
+                if svc.last_ok:
+                    svc.down_since = 0.0
+                    svc.alerts_sent = 0
+                    continue
+                if svc.down_since == 0.0:
+                    svc.down_since = now
+                    continue
+                down_min = (now - svc.down_since) / 60
+                needs_alert = (down_min >= 5) or (svc.consecutive_failures >= 2)
+                # anti-spam: 1 alerta/servicio/hora; re-alerta a los 60min
+                if needs_alert and svc.alerts_sent < max(1, int(down_min // 60) + (1 if down_min % 60 >= 5 else 0)):
+                    svc.alerts_sent += 1
+                    mins = int(down_min)
+                    title = f"🚨 {svc.name} caído"
+                    body = (f"{svc.name} lleva {mins} min DOWN"
+                            f" ({svc.consecutive_failures} restarts). "
+                            f"Revisa ojoia.com.do/admin → Sistema.")
+                    self.log(f"ALERT: {title} — {body}", "ERROR")
+                    try:
+                        await asyncio.to_thread(_send_alert, title, body)
+                    except Exception:
+                        pass
 
     async def run(self):
         self._running = True
