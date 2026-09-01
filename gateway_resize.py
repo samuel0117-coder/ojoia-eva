@@ -193,6 +193,11 @@ def reset_frame_counter(camera_id: str = None):
 def create_panels_2x2(frames: list) -> list:
     """Divide lista de frames en panels de 2×2 para análisis secuential.
 
+    B1 (2026-09-01): numeración CONTINUA entre panels — el prompt le dice al
+    modelo "panel 2 = fotogramas 5-8", pero antes cada panel re-numeraba 1-4
+    (el modelo veía dos fotogramas "1"). Ahora el panel N numera sus celdas
+    (N-1)*4+1 .. N*4 y la celda muestra también el panel: "5 ·p2".
+
     Args:
         frames: Lista de dicts con 'image_bytes' o lista de bytes
 
@@ -212,11 +217,19 @@ def create_panels_2x2(frames: list) -> list:
     return panels
 
 
+# B3 (2026-09-01): 320 → 480px por thumb. Panel resultante 960×960 (antes
+# 640×640). Más detalle para manos/bolsillo/dinero — el costo de tokens
+# crece ~2.25x pero Qwen2.5-VL maneja resolución dinámica nativa y el
+# grid sigue siendo una sola imagen.
+_PANEL_THUMB_PX = 480
+
+
 def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
-    """Crea un grid 2×2 de 4 frames con numeración visible."""
+    """Crea un grid 2×2 de 4 frames con numeración visible CONTINUA."""
     from PIL import Image, ImageDraw, ImageFont
     import io
 
+    thumb_px = _PANEL_THUMB_PX
     thumbs = []
     for f in frames_group:
         if f is None:
@@ -229,11 +242,11 @@ def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
             continue
         try:
             img = Image.open(io.BytesIO(data)).convert("RGB")
-            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            img.thumbnail((thumb_px, thumb_px), Image.Resampling.LANCZOS)
             thumbs.append(img)
         except Exception:
             # Placeholder negro si falla
-            thumbs.append(Image.new("RGB", (320, 320), (30, 30, 30)))
+            thumbs.append(Image.new("RGB", (thumb_px, thumb_px), (30, 30, 30)))
 
     if not thumbs:
         return b""
@@ -250,17 +263,19 @@ def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
     positions = [(0, 0), (size, 0), (0, size), (size, size)]
     try:
         font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36
         )
     except Exception:
         font = ImageFont.load_default()
 
+    # B1: numeración continua: panel 2 → celdas 5,6,7,8
+    base_num = (panel_num - 1) * 4
     for idx, (thumb, pos) in enumerate(zip(thumbs, positions)):
         grid.paste(thumb, pos)
         x, y = pos
-        label = f"{idx + 1}"
-        draw.rectangle([x + 3, y + 3, x + 40, y + 40], fill=(0, 0, 0, 200))
-        draw.text((x + 9, y + 5), label, fill="yellow", font=font)
+        label = f"{base_num + idx + 1}"
+        draw.rectangle([x + 3, y + 3, x + 48, y + 42], fill=(0, 0, 0, 200))
+        draw.text((x + 9, y + 6), label, fill="yellow", font=font)
 
     try:
         small_font = ImageFont.truetype(
@@ -268,7 +283,7 @@ def _create_single_grid_2x2(frames_group: list, panel_num: int) -> bytes:
         )
     except Exception:
         small_font = ImageFont.load_default()
-    draw.text((4, size * 2 - 16), f"Panel {panel_num}", fill="gray", font=small_font)
+    draw.text((4, size * 2 - 16), f"Panel {panel_num} (fotogramas {base_num + 1}-{base_num + 4})", fill="gray", font=small_font)
 
     output = io.BytesIO()
     grid.save(output, format="JPEG", quality=90)

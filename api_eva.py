@@ -5381,6 +5381,63 @@ def _adjust_brightness(img_bytes: bytes, target_brightness: int = 80) -> bytes:
     return img_bytes
 
 
+# ── B4 (2026-09-01): alerta de imagen oscura ──────────────────────────────
+# El usuario debe saber cuándo su cámara ve mal (lente sucia, luz apagada,
+# contraluz). Antes _adjust_brightness corregía en silencio y nadie se enteraba
+# de que los análisis corrían sobre imágenes de baja calidad.
+_DARK_ALERT_MIN_BRIGHTNESS = 40.0   # brillo medio RGB < 40 → oscura
+_DARK_ALERT_COOLDOWN_S = 3600.0     # máx 1 alerta de oscuridad / hora / cámara
+_dark_alert_last: Dict[str, float] = {}
+
+
+def _frame_is_too_dark(img_bytes: bytes) -> bool:
+    """B4: brillo medio de la imagen por debajo del umbral."""
+    try:
+        from PIL import Image, ImageStat
+        import io as _io
+        img = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+        stat = ImageStat.Stat(img)
+        return (sum(stat.mean[:3]) / 3) < _DARK_ALERT_MIN_BRIGHTNESS
+    except Exception:
+        return False
+
+
+async def _maybe_alert_dark_frame(user_id: str, camera_id: str, img_bytes: bytes):
+    """B4: registra evento + push (con cooldown por cámara) si el frame es muy oscuro."""
+    now = time.time()
+    key = f"{user_id}_{camera_id}"
+    if now - _dark_alert_last.get(key, 0) < _DARK_ALERT_COOLDOWN_S:
+        return
+    if not _frame_is_too_dark(img_bytes):
+        return
+    _dark_alert_last[key] = now
+    if len(_dark_alert_last) > 512:
+        _dark_alert_last.clear()
+        _dark_alert_last[key] = now
+    try:
+        from orchestrator import save_event_to_disk_v2, send_fcm_notification
+        evt_id = save_event_to_disk_v2(
+            user_id=user_id, camera_id=camera_id, event_type="dark_frame",
+            frame_bytes=img_bytes,
+            summary=f"⚠️ La imagen de la cámara llegó muy oscura. Revisa la iluminación, el lente o el ángulo (contraluz).",
+            qwen_json={"scene": "Frame demasiado oscuro para analizar con calidad.",
+                       "importance": "media", "importancia": "media"},
+            metadata={"skipped_qwen": "too_dark", "brightness_alert": True},
+        )
+        asyncio.create_task(send_fcm_notification(
+            title="📷 Problema de imagen",
+            body=f"La cámara {camera_id} está enviando imágenes muy oscuras. Revisa la iluminación o el lente.",
+            user_id=user_id,
+            image_b64=base64.b64encode(img_bytes).decode()[:80000] if img_bytes else None,
+            link=f"https://ojoia.com.do/#events?alert={evt_id}&camera={camera_id}",
+            event_id=evt_id,
+            notif_type="dark_frame",
+        ))
+        logger.warning(f"[B4] frame oscuro → evento {evt_id} + notif (cam={camera_id})")
+    except Exception as e:
+        logger.warning(f"[B4] dark frame alert falló: {e}")
+
+
 def _resolve_user_id_from_camera(camera_id: str) -> Optional[str]:
     """Resolver user_id buscando en todos los usuarios por camera_id."""
     if not camera_id:
@@ -6172,6 +6229,10 @@ def _assign_zones_to_detections(user_id: str, camera_id: str,
     Devuelve {"per_detection": {track_id|idx: zone_name},
               "zone_counts": {zone_name: n_personas},
               "img_size": [w, h]} — listo para inyectar al frame del grid.
+    B5: para la ASIGNACIÓN DE ZONA se exige conf de persona >= 0.50 (el gate
+    YOLO general queda en 0.35): una persona con detección débil en el borde
+    de una zona no debe contaminar el zone_counts que viaja al prompt como
+    HECHO confirmado.
     """
     out = {"per_detection": {}, "zone_counts": {}, "img_size": [0, 0]}
     if not yolo_detections:
@@ -6195,6 +6256,12 @@ def _assign_zones_to_detections(user_id: str, camera_id: str,
     zone_counts = {}
     for i, det in enumerate(yolo_detections):
         if str(det.get("class", "")).lower() != "person":
+            continue
+        # B5: conf alta para asignación de zona (hecho confirmado al prompt)
+        try:
+            if float(det.get("confidence", 0)) < 0.50:
+                continue
+        except (TypeError, ValueError):
             continue
         z = _detect_zone_for_bbox(det.get("bbox"), img_w, img_h, zones)
         if z:
@@ -6318,6 +6385,15 @@ async def yolo_worker():
                     logger.info(f"YOLO gate: 0 objects → frame REJECTED (frame_id={frame_id})")
                     await frame_bus.ack(msg_id)
                     continue
+
+                # B4: alerta de imagen oscura (con cooldown 1h por cámara).
+                # El gate ya pasó: hay contenido YOLO pero la imagen puede seguir
+                # siendo demasiado oscura para el análisis VLM.
+                try:
+                    if img_bytes:
+                        await _maybe_alert_dark_frame(user_id, camera_id, img_bytes)
+                except Exception as _e_dark:
+                    logger.debug(f"[B4] dark check falló: {_e_dark}")
 
                 # Centinela (movido del endpoint [5]): modo vigilante + detección
                 current_time = datetime.now().strftime("%H:%M")

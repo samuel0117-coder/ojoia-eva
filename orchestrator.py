@@ -1467,46 +1467,101 @@ def _detect_attention_hits(vision: dict, attention_phrases: list, owner_notes: l
 
     hits = []
 
+    # ── A1 (2026-09-01): validación fuzzy del flag/hits contra las reglas ──
+    # del dueño. Antes: Qwen 7B copiaba los EJEMPLOS del schema del prompt
+    # ("cobró a cliente") al campo flag y _detect_attention_hits lo aceptaba
+    # como alerta (source qwen_flag/qwen_explicit) → 21/33 alertas de hoy eran
+    # de una "regla" que el dueño NUNCA pidió. Ahora una frase SOLO es hit si
+    # coincide (fuzzy: sin acentos/mayúsculas, y con normalización de palabras
+    # clave) con una attention_phrase real. Si no coincide, se ignora (la
+    # acción queda narrada en scene/events del evento, no como alerta).
+    import unicodedata as _ud
+
+    def _norm_fuzzy(s: str) -> str:
+        if not s:
+            return ""
+        s = str(s).lower().strip()
+        s = "".join(c for c in _ud.normalize("NFD", s) if _ud.category(c) != "Mn")
+        return " ".join(s.split())
+
+    _phrases_fuzzy = {}
+    for _p in (attention_phrases or []):
+        _phrases_fuzzy[_norm_fuzzy(_p)] = _p
+
+    def _match_phrase(text: str):
+        """Devuelve la attention_phrase real si text la matchea fuzzy, si no None."""
+        if not text or not _phrases_fuzzy:
+            return None
+        t = _norm_fuzzy(text)
+        if t in _phrases_fuzzy:
+            return _phrases_fuzzy[t]
+        # fuzzy por tokens: >=70% de las palabras significativas de la frase
+        # del dueño presentes en el texto reportado (o viceversa), para
+        # capturar variaciones menores del modelo ("el empleado se lleva la
+        # mano al bolsillo tras cobrar" ≈ "empleado se lleva la mano al
+        # bolsillo después de cobrar").
+        _stop = {"de", "la", "el", "los", "las", "a", "en", "que", "se", "y",
+                 "un", "una", "al", "del", "despues", "tras", "es", "su", "sus"}
+        for _nf, _orig in _phrases_fuzzy.items():
+            _pw = {w for w in _nf.split() if w not in _stop and len(w) >= 3}
+            if not _pw:
+                continue
+            _tw = set(t.split())
+            _cov = sum(1 for w in _pw if w in _tw) / len(_pw)
+            if _cov >= 0.7:
+                return _orig
+        return None
+
+    def _is_schema_placeholder(text: str) -> bool:
+        f_low = (text or "").lower()
+        return (
+            f_low == "null"
+            or "frase exacta de attention_phrases" in f_low
+            or "detectaste cumplirse" in f_low
+            or f_low.endswith(" o null")
+        )
+
     # 0. Nuevo: Qwen responde con "flag" = frase exacta detectada (Eje 3C)
     flag = vision.get("flag") if isinstance(vision, dict) else None
     if flag and isinstance(flag, str) and flag.strip():
         flag_text = flag.strip()
-        # Descartar el placeholder descriptivo del schema del prompt: el modelo
-        # puede devolver literalmente "frase exacta de attention_phrases que
-        # detectaste cumplirse, o null" cuando no detecta nada. Solo aceptamos
-        # frases reales (que deben coincidir con una attention_phrase registrada
-        # o ser una descripcion concreta de accion observada).
-        is_placeholder = (
-            flag_text.lower() == "null"
-            or "frase exacta de attention_phrases" in flag_text.lower()
-            or "detectaste cumplirse" in flag_text.lower()
-            or flag_text.lower().endswith(" o null")
-        )
-        if not is_placeholder:
-            hits.append({
-                "frase": flag_text,
-                "momento": "",
-                "source": "qwen_flag",
-                "zone_name": _zone_for_phrase(flag_text),
-            })
+        # A1: el flag SOLO vale si matchea una regla real del dueño.
+        if not _is_schema_placeholder(flag_text):
+            matched_phrase = _match_phrase(flag_text)
+            if matched_phrase:
+                hits.append({
+                    "frase": matched_phrase,
+                    "momento": "",
+                    "source": "qwen_flag",
+                    "zone_name": _zone_for_phrase(matched_phrase),
+                })
+            else:
+                # A3: flag no-regla → NO es alerta. Se registra como
+                # candidato suave en qwen_json.flag_raw para diagnóstico, pero
+                # no genera hit (la acción ya quedó narrada en events[]).
+                logger.info(f"[A1] flag NO matchea regla del dueño → descartado: {flag_text[:80]}")
 
     # 1. Verificar si Qwen reportó attention_hits explícitamente
     if isinstance(attention_hits_raw, list):
         for hit in attention_hits_raw:
             if isinstance(hit, dict) and hit.get("frase"):
                 frase = str(hit.get("frase", "")).strip()
-                if not frase:
+                if not frase or _is_schema_placeholder(frase):
                     continue
-                f_low = frase.lower()
-                if (f_low == "null" or "frase exacta de attention_phrases" in f_low
-                        or "detectaste cumplirse" in f_low or f_low.endswith(" o null")):
-                    continue
-                hits.append({
-                    "frase": frase,
-                    "momento": hit.get("momento", ""),
-                    "source": "qwen_explicit",
-                    "zone_name": _zone_for_phrase(frase),
-                })
+                matched_phrase = _match_phrase(frase)
+                if matched_phrase:
+                    # A3: el hit explícito matchea una regla, pero igual
+                    # requiere verificación B2 antes de notificar (los VLM
+                    # pequeños alucinan cumplimiento de reglas).
+                    hits.append({
+                        "frase": matched_phrase,
+                        "momento": hit.get("momento", ""),
+                        "source": "qwen_explicit",
+                        "needs_verification": True,
+                        "zone_name": _zone_for_phrase(matched_phrase),
+                    })
+                else:
+                    logger.info(f"[A1] attention_hit NO matchea regla → descartado: {frase[:80]}")
 
     # 2. Frases de atención por keywords — B1 (2026-08-31): ya NO son hits
     # directos. El substring matchea también negaciones ("no se observa que el
@@ -1729,7 +1784,16 @@ def _build_vision_summary(vision: dict, zone: str, violation: bool, anomalias: l
 
     if violation or attention_hits:
         if attention_hits:
-            hits_str = ", ".join(attention_hits[:3])
+            # robustez: attention_hits puede venir como lista de dicts
+            # ({frase, momento, source}) desde formatos internos — normalizar
+            # a strings antes del join (crasheaba con "expected str, dict").
+            _hit_strs = []
+            for h in attention_hits[:3]:
+                if isinstance(h, dict):
+                    _hit_strs.append(str(h.get("frase", "")))
+                else:
+                    _hit_strs.append(str(h))
+            hits_str = ", ".join(s for s in _hit_strs if s)
             return f"🔍 Observación relevante: {hits_str}"
         if anomalias:
             anom_tipos = [a.get("tipo", "") for a in (anomalias if isinstance(anomalias, list) else []) if isinstance(a, dict)]
@@ -2113,11 +2177,15 @@ class QwenOrchestrator:
         # ── Eje 3A: preambulo generico (independiente del dueño) ──
         n_panels = len(panels_b64) if isinstance(panels_b64, list) else 0
         preamble = (
-            f"Eres un testigo de seguridad observando {n_frames} fotogramas consecutivos de una cámara de vigilancia.\n"
-            f"Te muestro {n_panels} imágenes: cada una es una CUADRÍCULA 2×2 con 4 fotogramas numerados del 1 al 4 (números amarillos).\n"
-            f"Lee los números amarillos para entender el ORDEN TEMPORAL: panel 1 = fotogramas 1-4, panel 2 = 5-8, etc.\n"
-            f"Describe SOLO lo que ves, como testigo neutral. No juzgues, no inventes, no supongas.\n"
-            f"NO repitas \"en el primer/segundo fotograma\": describe la escena como UNA NARRATIVA CONTINUA del tiempo observado.\n"
+            f"Eres un testigo de seguridad observando UN VIDEO CORTO de {n_frames} fotogramas consecutivos de una cámara de vigilancia.\n"
+            f"Te muestro el video como {n_panels} imágenes: cada una es una CUADRÍCULA 2×2 con 4 fotogramas del video, numerados en amarillo con numeración continua (panel 1 = fotogramas 1-4, panel 2 = 5-8, etc.).\n"
+            f"Los números amarillos indican el ORDEN TEMPORAL de la secuencia.\n"
+            f"Describe SOLO lo que ves, como testigo neutral. No juzgas, no inventas, no supones.\n"
+            # B2: regla dura — el usuario lee los eventos del libro y no quiere
+            # "en el frame 1 pasó X, en el frame 2 pasó Y". El grid ES el video:
+            # hay que contarlo como historia.
+            f"PROHIBIDO mencionar fotogramas, frames, cuadrículas o números en tu narrativa. NO escribas \"en el primer fotograma\" ni \"en el frame 2\": cuenta la secuencia como UNA SOLA HISTORIA continua de lo que pasó, en pasado narrativo (\"el empleado cobró y luego guardó el dinero\").\n"
+            f"ENFOCA la narrativa en las ACCIONES y su ORDEN: quién hizo qué, después de qué. Esa secuencia causal es lo más importante.\n"
             f"Por persona: 1-2 frases máximo (apariencia + qué hace).\n"
             f"Responde SIEMPRE EN ESPAÑOL (todo el JSON debe estar en español).\n"
         )
@@ -2151,6 +2219,11 @@ class QwenOrchestrator:
             vigilance_prompt += f"\nNOTAS DEL DUEÑO (contexto, no alertas): {on_list}\n"
 
         # ── Eje 3C: formato de salida JSON estructurado + clasificaciones P3 ──
+        # A2: sin ejemplos concretos de ACCIONES que el modelo copiaba al flag
+        # ("cobró a cliente" aparecía como alerta de una regla inexistente).
+        # Los descriptores de persons (camiseta verde, jean azul) son de
+        # apariencia, no acciones — no generan este problema y anclan el
+        # formato; se mantienen.
         output_format = (
             "\nResponde EXCLUSIVAMENTE con un JSON válido (sin markdown, sin ```):\n"
             "{\n"
@@ -2167,8 +2240,8 @@ class QwenOrchestrator:
             "      \"zone\": \"nombre_exacto_de_zona_configurada\" | null\n"
             "    }\n"
             "  ],\n"
-            "  \"objects\": [\"lista de objetos relevantes: dinero, platos, bolsas, datáfono, refrescos, etc.\"],\n"
-            "  \"events\": [\"acciones observadas: cobró a cliente, empacó plato, entró dinero en caja, etc.\"],\n"
+            "  \"objects\": [\"objetos relevantes visibles\"],\n"
+            "  \"events\": [\"acciones observadas, con tus palabras\"],\n"
             "  \"flag\": null\n"
             "}\n"
             "Reglas críticas:\n"
@@ -2180,7 +2253,8 @@ class QwenOrchestrator:
             "  - \"id\" usa el track_id si coincide con un track de SENSORES, si no puedes emparejar usa 0\n"
             "  - \"zone\" SIEMPRE: pon el nombre EXACTO de la zona (ej 'Caja', 'Entrada', 'Cocina') si la persona cae en alguna zona definida arriba, o null si está fuera de todas\n"
             "  - Si dos personas estan en la misma zona, pon el mismo nombre de zona a ambas\n"
-            "  - \"flag\": SOLO si alguna de las attention_phrases del dueño (listadas arriba) se cumplió textualmente en la escena, pon ahí esa frase EXACTA. Si ninguna se cumplió, pon null. NO inventes frases, NO pongas aquí descripciones del schema ni repetición texto explicativo; o null o una frase literal de la lista del dueño.\n"
+            "  - \"events\" describe lo que ves CON TUS PROPIAS PALABRAS. NO copies frases de esta instrucción ni de las reglas del dueño: si una regla se cumplió visualmente lo indica SOLO el campo flag.\n"
+            "  - \"flag\": SOLO si alguna de las attention_phrases del dueño (listadas arriba) se cumplió VISUALMENTE en la escena, copia esa frase EXACTA (letra por letra). Si ninguna se cumplió, pon null. NO inventes frases, NO copies ejemplos de estas instrucciones, NO pongas descripciones del schema; o null o una frase literal copiada de la lista del dueño.\n"
         )
 
         full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"
