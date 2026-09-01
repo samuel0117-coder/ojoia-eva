@@ -247,11 +247,26 @@ async def generate_daily_summary(user_id, target_date=None):
 
     camera_health = {}
     user_data = _load_user_data(user_id)
+    now_ts = time.time()
+    # base de eventos por cámara para los huecos
+    events_by_cam = {}
+    for e in today_events:
+        events_by_cam.setdefault(e.get("camera_id", ""), []).append(e)
     for cam in user_data.get("cameras", []):
         cam_id = cam.get("camera_id", "")
-        last_frame = cam.get("last_frame", 0)
-        age_min = (int(time.time() - last_frame)) / 60 if last_frame else 9999
-        cam_events = [e for e in today_events if e.get("camera_id") == cam_id]
+        # RD-2b: latido REAL = mtime de latest_raw.jpg (el last_frame de
+        # user.json está throttled y miente; igual que el fix del panel).
+        raw = STORAGE_ROOT / "users" / user_id / "cameras" / cam_id / "frames" / "latest_raw.jpg"
+        last_frame = raw.stat().st_mtime if raw.exists() else cam.get("last_frame", 0)
+        # si el usuario vive en otro disco (migrado), buscar allí también
+        if last_frame == 0 or (now_ts - last_frame) > 600:
+            dm = user_data.get("disk_mount")
+            if dm:
+                raw2 = Path(dm) / "users" / user_id / "cameras" / cam_id / "frames" / "latest_raw.jpg"
+                if raw2.exists():
+                    last_frame = raw2.stat().st_mtime
+        age_min = (now_ts - last_frame) / 60 if last_frame else 9999
+        cam_events = events_by_cam.get(cam_id, [])
         status = "online" if age_min < 10 else ("stale" if age_min < 60 else "offline")
         # RD-2: huecos de cobertura del día — horas del día sin NINGÚN evento
         # de esta cámara (con eventos YOLO gate: sin personas no hay evt; un
@@ -375,13 +390,24 @@ async def generate_daily_summary(user_id, target_date=None):
 
 
 def _persist_summary(user_id, date_str, summary):
-    summary_dir = STORAGE_ROOT / "users" / user_id / "summaries"
-    summary_dir.mkdir(parents=True, exist_ok=True)
-    path = summary_dir / f"daily_{date_str}.json"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
-    tmp.replace(path)
-    logger.info(f"Daily summary saved: {path}")
+    # RD-4: guardar en el disco ACTUAL del usuario (migraciones) y en el
+    # compat NVMe — patrón dual como user.json.
+    bases = [STORAGE_ROOT / "users" / user_id]
+    try:
+        ud = _load_user_data(user_id)
+        dm = ud.get("disk_mount")
+        if dm and dm != str(STORAGE_ROOT) and not str(dm).endswith("/users"):
+            bases.insert(0, Path(dm) / "users" / user_id)
+    except Exception:
+        pass
+    for base in bases:
+        summary_dir = base / "summaries"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        path = summary_dir / f"daily_{date_str}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        tmp.replace(path)
+    logger.info(f"Daily summary saved: {date_str} (user {user_id[:8]}…)")
 
 
 def load_summary(user_id, date_str):

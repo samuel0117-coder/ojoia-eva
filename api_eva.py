@@ -1660,6 +1660,42 @@ async def admin_scan_trigger(request: dict, authorization: str = Header(None, al
                     "Resultados en camera.json/last_scan.json"}
 
 
+# ── RD-4: resúmenes diarios para la app (aterrizaje del push) ────────────────
+@app.get("/api/user/summaries")
+async def get_user_summaries(user_id: str, limit: int = 14,
+                             authorization: str = Header(None)):
+    """Historial de resúmenes diarios (para la vista de la app y el
+    aterrizaje del push del reporte matutino)."""
+    await _verify_user_token(authorization, user_id)
+    base = user_root(user_id)
+    out = []
+    for sdir in (base / "summaries", STORAGE_ROOT / "users" / user_id / "summaries"):
+        if not sdir.is_dir():
+            continue
+        for f in sorted(sdir.glob("daily_*.json"), reverse=True)[:limit]:
+            try:
+                out.append(json.loads(f.read_text()))
+            except Exception:
+                continue
+        break
+    out.sort(key=lambda s: s.get("date", ""), reverse=True)
+    return {"summaries": out[:limit]}
+
+
+@app.get("/api/user/summaries/{date}")
+async def get_user_summary_date(date: str, user_id: str,
+                                authorization: str = Header(None)):
+    """Un resumen concreto por fecha (deep-link del push: data.date)."""
+    await _verify_user_token(authorization, user_id)
+    _validate_safe_path(date, "date")
+    base = user_root(user_id)
+    for sdir in (base / "summaries", STORAGE_ROOT / "users" / user_id / "summaries"):
+        f = sdir / f"daily_{date}.json"
+        if f.exists():
+            return json.loads(f.read_text())
+    raise HTTPException(status_code=404, detail="Sin resumen para esa fecha")
+
+
 @app.post("/api/auth/token")
 async def issue_user_token(request: dict):
     """
@@ -8324,9 +8360,18 @@ async def admin_migrate_user(user_id: str, request: dict, authorization: str = H
     El ingest empieza a escribir en el nuevo disco apenas cambia el
     disk_mount (caché de 5s)."""
     _verify_admin(authorization)
-    new_disk = request.get("disk_mount", "")
+    new_disk = request.get("disk_mount", "").rstrip("/")
     if not new_disk or not Path(new_disk).exists():
         raise HTTPException(status_code=400, detail="disk_mount inexistente")
+    # ST-3b: sanitizar — solo se acepta un MOUNT registrado en disks_config
+    # (el bug '/mnt/.../users' provenía de formatos inconsistentes)
+    _cfgd = get_disk_config()
+    _valid = [d.get("mount") for d in _cfgd.get("disks", [])]
+    if new_disk not in _valid:
+        raise HTTPException(status_code=400,
+                            detail=f"disk_mount no es un disco registrado: {new_disk} (válidos: {_valid})")
+    if new_disk.endswith("/users"):
+        raise HTTPException(status_code=400, detail="disk_mount no debe incluir /users")
     old_file = find_user_json(user_id)
     if not old_file or not old_file.exists():
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -8350,7 +8395,10 @@ async def admin_migrate_user(user_id: str, request: dict, authorization: str = H
     existing["migrated_at"] = time.time()
     with _get_user_lock(user_id):
         _atomic_write_user_json(new_dir / "user.json", existing)
-        compat = user_root(user_id)
+        # ST-3b: el compat es SIEMPRE en STORAGE_ROOT (el index estable de
+        # user.json) — antes usaba user_root() que ya apuntaba al disco
+        # NUEVO, dejando el NVMe con un user.json desactualizado.
+        compat = STORAGE_ROOT / "users" / user_id
         compat.mkdir(parents=True, exist_ok=True)
         _atomic_write_user_json(compat / "user.json", existing)
     invalidate_user_disk_cache(user_id)
