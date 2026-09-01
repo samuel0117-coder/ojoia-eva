@@ -27,7 +27,7 @@ tok = get_token()
 h = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
 base = os.path.join(os.path.dirname(os.path.abspath(__file__)), '')
 
-config = {'headers':[{'headers':{'Cache-Control':'no-cache, no-store, must-revalidate'},'glob':'**/*.@(js|css|html)'},{'headers':{'Cache-Control':'max-age=86400'},'glob':'**/*.@(png|jpg|jpeg|gif|svg|ico)'}],'rewrites':[{'glob':'/api/**','path':'https://api.ojoia.com.do/'},{'glob':'/admin/**','path':'/admin2/index.html'},{'glob':'/admin2/**','path':'/admin2/index.html'},{'glob':'/**','path':'/index.html'}]}
+config = {'headers':[{'headers':{'Cache-Control':'no-cache, no-store, must-revalidate'},'glob':'**/*.@(js|css|html)'},{'headers':{'Cache-Control':'max-age=86400'},'glob':'**/*.@(png|jpg|jpeg|gif|svg|ico)'}],'rewrites':[{'glob':'/api/**','path':'https://api.ojoia.com.do/'},{'glob':'/admin','path':'/admin2/index.html'},{'glob':'/admin/**','path':'/admin2/index.html'},{'glob':'/admin/','path':'/admin2/index.html'},{'glob':'/admin2/**','path':'/admin2/index.html'},{'glob':'/**','path':'/index.html'}]}
 
 print('[deploy] Creating version...', end=' ', flush=True)
 r = requests.post('https://firebasehosting.googleapis.com/v1beta1/sites/ojoia-67216/versions', headers=h, json={'config': config})
