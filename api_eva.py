@@ -7706,6 +7706,74 @@ def get_retention_config() -> dict:
     return out
 
 
+@app.post("/admin/cleanup/run")
+async def admin_cleanup_run(authorization: str = Header(None, alias="Authorization")):
+    """F-robustez: ejecutar la limpieza AHORA desde el panel (async, no
+    bloquea; corre el mismo cleanup_frames.py del cron)."""
+    _verify_admin(authorization)
+    import subprocess
+
+    def _run():
+        return subprocess.run(
+            ["/opt/ojoia/venv/bin/python", "-u", "/opt/ojoia/code/cleanup_frames.py"],
+            capture_output=True, text=True, timeout=900)
+    try:
+        r = await asyncio.to_thread(_run)
+        ok = r.returncode == 0
+        # extraer la línea final de resumen
+        tail = (r.stdout or "").strip().splitlines()[-8:]
+        return {"success": ok, "message": "Limpieza ejecutada (ver log)",
+                "tail": tail}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cleanup falló: {e}")
+
+
+@app.get("/admin/health/summary")
+async def admin_health_summary(authorization: str = Header(None, alias="Authorization")):
+    """F-robustez: salud integral para el semáforo del panel.
+    Disco (ok/warning/critical), última corrida del cleanup (del log),
+    drops 24h de la cola, cámaras offline >1h y estado de Redis."""
+    _verify_admin(authorization)
+    # disco
+    import os as _os
+    try:
+        st = _os.statvfs(STORAGE_ROOT)
+        free_gb = st.f_bavail * st.f_frsize / 1e9
+        pct = 100 * (1 - st.f_bavail / st.f_blocks)
+        disk = {"free_gb": round(free_gb, 1), "used_pct": round(pct, 1),
+                "level": "critical" if pct > 90 else ("warning" if pct > 80 else "ok")}
+    except Exception as e:
+        disk = {"level": "error", "error": str(e)}
+    # última corrida del cleanup (del log rotativo)
+    cleanup_last = None
+    try:
+        logp = Path("/home/sam/storage/cleanup_frames.log")
+        if logp.exists():
+            for line in reversed(logp.read_text(errors="replace").splitlines()):
+                if "Limpieza v2 completada" in line:
+                    # "[2026-09-01 02:37:13] Limpieza v2 completada."
+                    cleanup_last = line.split("]")[0].lstrip("[")
+                    break
+    except Exception:
+        pass
+    # drops 24h aproximados: desde el estado del bus
+    queue = await frame_bus.stats()
+    # cámaras offline >1h
+    cams = _scan_all_cameras_admin()
+    offline_1h = [c["camera_id"] for c in cams
+                  if not c["online"] and c["last_frame"]
+                  and (time.time() - c["last_frame"]) > 3600]
+    return {
+        "disk": disk,
+        "cleanup": {"last_run": cleanup_last,
+                    "cron": get_retention_config().get("cleanup_cron", "0 3 * * *")},
+        "queue": {"mode": queue.get("mode"), "drops": FRAME_QUEUE_DROPS,
+                  "pending": queue.get("pending", 0)},
+        "cameras_offline_1h": offline_1h,
+        "overall": disk["level"],
+    }
+
+
 @app.get("/admin/retention")
 async def admin_get_retention(authorization: str = Header(None)):
     """Devuelve configuracion de retencion actual (工期days_by_plan, frames_hours_by_plan, cron)."""

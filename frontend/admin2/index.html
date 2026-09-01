@@ -403,6 +403,25 @@
      SISTEMA
      ════════════════════════════════════════════════════════════════════════════ -->
 <div class="panel" id="panel-system">
+    <div class="card" style="grid-column:1/-1">
+      <div class="card-title">🛡️ Salud del sistema</div>
+      <div id="health-summary" style="font-size:0.9rem;line-height:1.7">Cargando…</div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn btn-sm btn-outline" onclick="loadHealthSummary()">🔄 Refrescar</button>
+        <button class="btn btn-sm btn-success" onclick="runCleanupNow()">🧹 Ejecutar limpieza AHORA</button>
+      </div>
+    </div>
+    <div class="card" style="grid-column:1/-1">
+      <div class="card-title">🗓️ Retención por plan (días de eventos)</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap" id="retention-form">
+        <label style="font-size:0.8rem">Activo <input id="ret-active" type="number" min="1" max="90" style="width:60px"></label>
+        <label style="font-size:0.8rem">Trial <input id="ret-trial" type="number" min="1" max="90" style="width:60px"></label>
+        <label style="font-size:0.8rem">Free <input id="ret-free" type="number" min="1" max="90" style="width:60px"></label>
+        <label style="font-size:0.8rem">Expirado <input id="ret-expired" type="number" min="1" max="90" style="width:60px"></label>
+        <button class="btn btn-sm btn-success" onclick="saveRetention()">💾 Guardar</button>
+      </div>
+      <p style="color:var(--text-secondary);font-size:0.75rem;margin-top:6px">Se aplica cada noche a las 3 AM (cron). Los eventos con más días de los indicados se borran automáticamente.</p>
+    </div>
     <div class="grid">
         <div class="card" style="grid-column:1/-1">
             <div class="card-title">🌐 Acceso Remoto</div>
@@ -961,7 +980,7 @@ function switchTab(t) {
     if (t === 'billing') loadBilling();
     if (t === 'storage') loadStorage();
     if (t === 'plans') loadPlans();
-    if (t === 'system') { reloadStatus(); loadEvaPrompt(); loadEvaDocs(); loadAnalysisInterval(); }
+    if (t === 'system') { reloadStatus(); loadEvaPrompt(); loadEvaDocs(); loadAnalysisInterval(); loadHealthSummary(); loadRetention(); }
     if (t === 'support') loadSupportContact();
     if (t === 'ota') loadOTA();
     if (t === 'identity') { checkIdentityHealth(); loadIdentityFaces(); }
@@ -2112,6 +2131,55 @@ function saveEvaPrompt() {
     .catch(() => toast('❌ Error', false));
 }
 // ── Análisis: intervalo de entrada al grid ──
+// ── F-robustez: salud + retención (tab Sistema) ──
+function loadHealthSummary() {
+    apiGetJSON('/admin/health/summary').then(d => {
+        const el = document.getElementById('health-summary');
+        if (!el) return;
+        const disk = d.disk || {};
+        const icon = disk.level === 'ok' ? '🟢' : disk.level === 'warning' ? '🟡' : '🔴';
+        const q = d.queue || {};
+        const off = (d.cameras_offline_1h || []);
+        el.innerHTML =
+            icon + ' <b>Disco:</b> ' + (disk.used_pct != null ? disk.used_pct + '% usado (' + disk.free_gb + ' GB libres)' : '?') + '<br>' +
+            '🧹 <b>Limpieza:</b> última corrida ' + (d.cleanup.last_run || 'desconocida') + ' (cron: ' + (d.cleanup.cron || '0 3 * * *') + ')<br>' +
+            '📦 <b>Cola ' + (q.mode || '?') + ':</b> ' + (q.drops || 0) + ' drops · ' + (q.pending || 0) + ' pendientes<br>' +
+            '📷 <b>Cámaras offline >1h:</b> ' + (off.length ? off.join(', ') : 'ninguna');
+    }).catch(() => {
+        const el = document.getElementById('health-summary');
+        if (el) el.innerHTML = '<span style="color:var(--danger)">Error cargando salud</span>';
+    });
+}
+function loadRetention() {
+    apiGetJSON('/admin/retention').then(d => {
+        const r = d.retention || {};
+        const days = r.days_by_plan || {};
+        if (document.getElementById('ret-active')) document.getElementById('ret-active').value = days.active || 7;
+        if (document.getElementById('ret-trial')) document.getElementById('ret-trial').value = days.trial || 7;
+        if (document.getElementById('ret-free')) document.getElementById('ret-free').value = days.free || 1;
+        if (document.getElementById('ret-expired')) document.getElementById('ret-expired').value = days.expired || 1;
+    }).catch(() => {});
+}
+function saveRetention() {
+    apiFetch('/admin/retention', {method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({days_by_plan: {
+            active: parseInt(document.getElementById('ret-active').value)||7,
+            trial: parseInt(document.getElementById('ret-trial').value)||7,
+            free: parseInt(document.getElementById('ret-free').value)||1,
+            expired: parseInt(document.getElementById('ret-expired').value)||1
+        }})}).then(r => r.json()).then(d => {
+        toast(d.success ? '✅ Retención guardada' : '❌ ' + (d.detail || 'Error'), d.success);
+    }).catch(() => toast('❌ Error', false));
+}
+function runCleanupNow() {
+    if (!confirm('¿Ejecutar la limpieza de eventos ahora? (puede tardar ~1min)')) return;
+    toast('🧹 Ejecutando limpieza…', true);
+    apiFetch('/admin/cleanup/run', {method:'POST'}).then(r => r.json()).then(d => {
+        toast(d.success ? '✅ ' + (d.message || 'Limpieza ejecutada') : '❌ ' + (d.detail || 'Error'), d.success);
+        setTimeout(loadHealthSummary, 2000);
+    }).catch(() => toast('❌ Error', false));
+}
+
 function loadAnalysisInterval() {
     apiFetch('/admin/system/analysis-interval')
         .then(r => r.json()).then(d => {
