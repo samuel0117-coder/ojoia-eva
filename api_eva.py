@@ -2193,14 +2193,24 @@ def get_user_storage_path(user_id: str, plan: str = "founder") -> Path:
     disks = cfg.get("disks", [])
     plans = cfg.get("plans", {})
     selected = None
-    # 1) disk_mount explícito del usuario (persistido por el panel)
+    # 1) disk_mount explícito del usuario (persistido por el panel).
+    # ST-2b SANITIZADO: solo se acepta si matchea un mount REAL de la config
+    # de discos. El bug: disk_mount basura ('/storage/users/users') no
+    # matcheaba nada, Path(dm).exists() era True y se le sumaba 'users/'
+    # OTRA VEZ → rutas compuestas ('/users/users/users/...') acumulándose
+    # en cada rewrite. Ahora: mount inválido = ignorar (caer a plan/más
+    # espacio) y nunca componer user_folder encima de un path que ya lo
+    # trae.
     uf = _compat_user_json_path(user_id)
     if uf and uf.exists():
         try:
             dm = json.loads(uf.read_text()).get("disk_mount")
             if dm:
-                selected = next((d for d in disks if d.get("mount") == dm), None)
-                if selected is None and Path(dm).exists():
+                dm = dm.rstrip("/")
+                sel = next((d for d in disks if d.get("mount") == dm), None)
+                if sel is not None:
+                    selected = sel
+                elif dm == str(STORAGE_ROOT):
                     selected = {"mount": dm, "user_folder": "users"}
         except Exception:
             pass
@@ -7262,6 +7272,36 @@ async def admin_list_events(limit: int = 50, user_id: str = None, event_type: st
                     events.append(ev)
     events.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
     return {"events": events[:limit], "total": len(events)}
+
+
+@app.get("/admin/events/{event_id}")
+async def admin_get_event(event_id: str, user_id: str = None,
+                          authorization: str = Header(None)):
+    """F-panel: detalle de un evento (lo llaman muro/monitoreo/tab eventos
+    del panel — estaba en 404). Busca evt_*.json en todos los usuarios,
+    devuelve el evento + imagen + datos de confirmación si existen."""
+    _verify_admin(authorization)
+    _validate_safe_path(event_id, "event_id")
+    if not event_id.startswith("evt_"):
+        event_id = "evt_" + event_id
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for udir in users_dir.iterdir():
+            if not udir.is_dir() or (user_id and udir.name != user_id):
+                continue
+            for cdir in (udir / "cameras").glob("*/events") if (udir / "cameras").is_dir() else []:
+                ef = cdir / f"{event_id}.json"
+                if ef.exists():
+                    try:
+                        ev = json.loads(ef.read_text())
+                    except Exception:
+                        continue
+                    ev["_user_id"] = udir.name
+                    img = ef.with_suffix(".jpg")
+                    if img.exists():
+                        ev["image_url"] = f"/frames/{udir.name}/{ev.get('camera_id','')}/events/{img.name}"
+                    return ev
+    raise HTTPException(status_code=404, detail="Evento no encontrado")
 
 
 @app.get("/admin/events/stats")
