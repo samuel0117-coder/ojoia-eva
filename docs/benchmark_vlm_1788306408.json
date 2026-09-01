@@ -1,0 +1,231 @@
+{
+ "generated": "2026-09-01T19:46:48",
+ "camera": "OJO-D1CC08",
+ "phrases": [
+  "empleado se lleva la mano al bolsillo después de cobrar",
+  "dinero entra a la caja y cajón se cierre después de cobrar",
+  "cajero empaca platos",
+  "cliente paga antes de recibir pedido"
+ ],
+ "results": {
+  "qwen25vl7b": {
+   "summary": {
+    "n": 6,
+    "avg_flag": 1.0,
+    "avg_json": 1.0,
+    "avg_no_frame": 1.0,
+    "avg_causal": 1.0,
+    "avg_latency": 1.322621504465739,
+    "errors": 0
+   },
+   "details": [
+    {
+     "event": "evt_1788295492_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "el empleado se lleva algo del bolsillo después de recibir dinero",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "un empleado se lleva algo del bolsillo después de recibir dinero, luego un cliente paga antes de recibir su pedido",
+     "latency": 1.8
+    },
+    {
+     "event": "evt_1788295526_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "el empleado se lleva algo del bolsillo después de recibir dinero",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "un empleado se lleva algo del bolsillo después de recibir dinero, luego un cliente paga antes de recibir su pedido",
+     "latency": 1.3
+    },
+    {
+     "event": "evt_1788295557_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "el empleado se lleva algo del bolsillo después de recibir dinero",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "un empleado se lleva algo del bolsillo después de recibir dinero, luego un cliente paga antes de recibir su pedido",
+     "latency": 1.2
+    },
+    {
+     "event": "evt_1788295591_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "el empleado se lleva algo del bolsillo después de recibir dinero",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "un empleado se lleva algo del bolsillo después de recibir dinero, luego un cliente paga antes de recibir su pedido",
+     "latency": 1.2
+    },
+    {
+     "event": "evt_1788295917_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "el empleado se lleva algo del bolsillo después de recibir dinero",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "un empleado se lleva algo del bolsillo después de recibir dinero, luego un cliente paga antes de recibir su pedido",
+     "latency": 1.2
+    },
+    {
+     "event": "evt_1788296180_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "el empleado se lleva algo del bolsillo después de recibir dinero",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "un empleado se lleva algo del bolsillo después de recibir dinero, luego un cliente paga antes de recibir su pedido",
+     "latency": 1.2
+    }
+   ]
+  },
+  "qwen3vl8b": {
+   "summary": {
+    "n": 6,
+    "avg_flag": 2.6666666666666665,
+    "avg_json": 1.0,
+    "avg_no_frame": 1.0,
+    "avg_causal": 1.0,
+    "avg_latency": 2.330590844154358,
+    "errors": 0
+   },
+   "details": [
+    {
+     "event": "evt_1788295492_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "dinero entra a la caja y cajón se cierre después de cobrar",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "Un empleado recibió dinero de un cliente y lo introdujo en la caja registradora. Luego, el cajón se cerró automáticament",
+     "latency": 2.5
+    },
+    {
+     "event": "evt_1788295526_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 1,
+     "flag": "dinero entró a la caja y cajón se cerró después de cobrar",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "Un empleado recogió el dinero de la mesa y lo introdujo en la caja registradora, luego cerró el cajón. Un cliente pagó a",
+     "latency": 2.3
+    },
+    {
+     "event": "evt_1788295557_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "dinero entra a la caja y cajón se cierre después de cobrar",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "Un empleado recibió dinero de un cliente y lo introdujo en la caja registradora. Luego, el cajón se cerró automáticament",
+     "latency": 2.3
+    },
+    {
+     "event": "evt_1788295591_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "dinero entra a la caja y cajón se cierre después de cobrar",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "Un empleado recogió el dinero de una mesa, lo introdujo en la caja registradora y luego cerró el cajón. Después, un caje",
+     "latency": 2.3
+    },
+    {
+     "event": "evt_1788295917_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "dinero entra a la caja y cajón se cierre después de cobrar",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "Un empleado recogió el dinero de una mesa, lo introdujo en la caja registradora y luego cerró el cajón. Después, un caje",
+     "latency": 2.3
+    },
+    {
+     "event": "evt_1788296180_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "dinero entra a la caja y cajón se cierre después de cobrar",
+     "sin_fotograma": 1,
+     "causalidad": 1,
+     "scene_excerpt": "Un empleado recogió el dinero de una mesa y lo introdujo en la caja registradora. Luego, el cajón se cerró con un clic. ",
+     "latency": 2.3
+    }
+   ]
+  },
+  "qwen38_27b": {
+   "summary": {
+    "n": 6,
+    "avg_flag": 3.0,
+    "avg_json": 0.3333333333333333,
+    "avg_no_frame": 0.6666666666666666,
+    "avg_causal": 0.0,
+    "avg_latency": 17.660326321919758,
+    "errors": 0
+   },
+   "details": [
+    {
+     "event": "evt_1788295492_OJO-D1CC08",
+     "json_valido": 0,
+     "flag_score": 3,
+     "flag": "",
+     "sin_fotograma": 0,
+     "causalidad": 0,
+     "scene_excerpt": "The user wants me to act as a security witness observing a short video of 16 consecutive frames from a surveillance came",
+     "latency": 20.5
+    },
+    {
+     "event": "evt_1788295526_OJO-D1CC08",
+     "json_valido": 0,
+     "flag_score": 3,
+     "flag": "",
+     "sin_fotograma": 1,
+     "causalidad": 0,
+     "scene_excerpt": "{\"scene\": \"La vista de la cámara permanece completamente oscura durante toda la secuencia. No se distingue ninguna figur",
+     "latency": 17.9
+    },
+    {
+     "event": "evt_1788295557_OJO-D1CC08",
+     "json_valido": 0,
+     "flag_score": 3,
+     "flag": "",
+     "sin_fotograma": 0,
+     "causalidad": 0,
+     "scene_excerpt": "The user wants me to act as a security witness observing a short video of 16 consecutive frames from a surveillance came",
+     "latency": 18.0
+    },
+    {
+     "event": "evt_1788295591_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "",
+     "sin_fotograma": 1,
+     "causalidad": 0,
+     "scene_excerpt": "La vista de la cámara permaneció completamente oscura y vacía durante toda la observación. No se distinguió ninguna pers",
+     "latency": 15.7
+    },
+    {
+     "event": "evt_1788295917_OJO-D1CC08",
+     "json_valido": 0,
+     "flag_score": 3,
+     "flag": "",
+     "sin_fotograma": 1,
+     "causalidad": 0,
+     "scene_excerpt": "{\"scene\": \"La zona de la vitrina del restaurante permaneció oscura y vacía durante toda la secuencia. No se distinguió n",
+     "latency": 16.6
+    },
+    {
+     "event": "evt_1788296180_OJO-D1CC08",
+     "json_valido": 1,
+     "flag_score": 3,
+     "flag": "",
+     "sin_fotograma": 1,
+     "causalidad": 0,
+     "scene_excerpt": "La zona de la vitrina del restaurante permaneció oscura y sin iluminación apreciable durante toda la secuencia. No se di",
+     "latency": 17.2
+    }
+   ]
+  }
+ }
+}
