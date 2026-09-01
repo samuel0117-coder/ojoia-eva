@@ -454,7 +454,12 @@ class HealthMonitor:
             elif svc.critical:
                 self.log(f"{svc.name}: DOWN — too many failures ({svc.consecutive_failures}), waiting", "ERROR")
             else:
-                self.log(f"{svc.name}: DOWN (non-critical, no auto-restart)", "WARN")
+                # P2 (2026-09-01): log de no-críticos solo en TRANSICIÓN de
+                # estado (ok→down). Antes: 'qwen9b DOWN' cada 20s = 1.294
+                # líneas/día de spam en un log de 285k líneas sin rotación.
+                if getattr(svc, "_last_reported_down", False) is False:
+                    self.log(f"{svc.name}: DOWN (non-critical, no auto-restart)", "WARN")
+                    svc._last_reported_down = True
 
     async def _check_docker(self, svc: ServiceDef):
         """Health check para contenedores Docker."""
@@ -474,13 +479,27 @@ class HealthMonitor:
                 self.log(f"{svc.name} ({svc.container}): RECOVERED after {svc.consecutive_failures} restarts")
                 svc.consecutive_failures = 0
             svc.loading_since = 0.0
+            svc._last_reported_down = False  # P2: permitir próximo aviso de caída
         else:
             state = await self._docker_state(svc)
             now = time.time()
             # Para servicios que NO son modelos pesados, el grace es más corto
-            # (yolo, whisper arrancan en <10s). Solo modelos grandes (qwen-35b)
+            # (yolo, whisper arrancan en <10s). Solo modelos grandes (qwen-38/27B)
             # necesitan 15min de gracia.
             GRACE_SECS = 900 if "qwen" in svc.name.lower() else 60
+
+            # P1-docker (2026-09-01): FIX restarts espurios de qwen38. vLLM
+            # muestra el contenedor "running" MIENTRAS carga el modelo (6+ min
+            # con puerto cerrado) → el grace de 'starting' nunca aplicaba y el
+            # monitor lo reiniciaba en plena carga (4 veces hoy). Ahora: si el
+            # http no responde y estamos dentro de la ventana de arranque del
+            # PROPIO monitor o del contenedor, contamos como 'cargando'.
+            if state in ("running",) and not http_ok and svc.loading_since == 0.0:
+                # primer fallo post-arranque del sistema → asumir carga del modelo
+                if time.time() - _STARTED_AT < GRACE_SECS + 300:
+                    svc.loading_since = now
+                    self.log(f"{svc.name} ({svc.container}): running sin health — asumiendo carga de modelo (grace {GRACE_SECS}s)", "INFO")
+                    return
 
             if state in ("starting", "restarting", "created"):
                 if svc.loading_since == 0.0:
@@ -508,7 +527,9 @@ class HealthMonitor:
             elif svc.critical:
                 self.log(f"{svc.name} ({svc.container}): DOWN — too many failures", "ERROR")
             else:
-                self.log(f"{svc.name} ({svc.container}): DOWN (non-critical)", "WARN")
+                if getattr(svc, "_last_reported_down", False) is False:
+                    self.log(f"{svc.name} ({svc.container}): DOWN (non-critical)", "WARN")
+                    svc._last_reported_down = True
 
     # ---------- main loop ----------
 
