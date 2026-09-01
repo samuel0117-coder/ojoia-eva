@@ -4,11 +4,14 @@
 # que no son manejados por Python (cleanup_frames.log, megapanel.log,
 # service-bus.logs, etc.) — cap 10MB x 5 cada uno.
 #
+# P2 (2026-09-01): incluye /home/sam/logs/*.log (health_monitor.log
+# tenía 285k líneas sin rotación — el spam de qwen9b lo inflaba).
+#
 # Aplicar con sudo:
 #   sudo cp /opt/ojoia/docs/systemd/ojoia.logrotate /etc/logrotate.d/ojoia
 #   sudo logRotate -vf /etc/logrotate.d/ojoia   # rotacion forzada de prueba
 
-/home/sam/storage/*.log /home/sam/storage/**/*.log {
+/home/sam/logs/*.log /home/sam/storage/*.log /home/sam/storage/**/*.log {
     size 10M
     rotate 5
     compress
