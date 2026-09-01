@@ -999,6 +999,137 @@ async def ota_firmware():
                         filename=f"firmware_{st['stable_version']}.bin")
 
 
+# ── F-admin (2026-09-01): endpoints del tab Monitoreo del panel ───────────────
+# El tab llamaba /admin/monitoring/* que NO existían (404 silencioso → tab roto).
+
+def _scan_all_cameras_admin() -> list:
+    """Inventario completo: camera.json + estado de user.json por cámara."""
+    out = []
+    users_dir = STORAGE_ROOT / "users"
+    if not users_dir.is_dir():
+        return out
+    now = time.time()
+    for user_dir in users_dir.is_dir() and users_dir.iterdir() or []:
+        if not user_dir.is_dir():
+            continue
+        ud = {}
+        try:
+            uf = user_dir / "user.json"
+            if uf.exists():
+                ud = json.loads(uf.read_text())
+        except Exception:
+            ud = {}
+        cams_meta = {c.get("camera_id"): c for c in ud.get("cameras", [])}
+        cams_dir = user_dir / "cameras"
+        if cams_dir.is_dir():
+            for c_dir in cams_dir.iterdir():
+                cj = c_dir / "camera.json"
+                if not cj.exists():
+                    continue
+                try:
+                    cfg = json.loads(cj.read_text())
+                except Exception:
+                    continue
+                cam_id = cfg.get("camera_id", c_dir.name)
+                meta = cams_meta.get(cam_id, {})
+                last_frame = cfg.get("last_frame") or meta.get("last_frame") or 0
+                online = (now - last_frame) < 180 if last_frame else False
+                out.append({
+                    "camera_id": cam_id,
+                    "user_id": user_dir.name,
+                    "user_name": ud.get("name", ""),
+                    "business_name": ud.get("business_name", ""),
+                    "name": cfg.get("name", "") or cam_id,
+                    "zone": cfg.get("zone", ""),
+                    "type": cfg.get("type", "esp32"),
+                    "online": online,
+                    "active": online,  # compat con el render actual
+                    "last_frame": last_frame,
+                    "frame_age_s": int(now - last_frame) if last_frame else None,
+                    "latest_frame_url": f"/frames/{user_dir.name}/{cam_id}/latest.jpg",
+                    "firmware_version": cfg.get("firmware_version", ""),
+                    "local_ip": cfg.get("local_ip", ""),
+                    "ingest_key": bool(cfg.get("ingest_key")),
+                })
+    return out
+
+
+@app.get("/admin/monitoring/overview")
+async def admin_monitoring_overview(authorization: str = Header(None, alias="Authorization")):
+    """Tab Monitoreo: contadores globales + alertas de hoy."""
+    _verify_admin(authorization)
+    cams = _scan_all_cameras_admin()
+    online = sum(1 for c in cams if c["online"])
+    day_ago = time.time() - 86400
+    alerts_today = 0
+    for c in cams:
+        edir = STORAGE_ROOT / "users" / c["user_id"] / "cameras" / c["camera_id"] / "events"
+        if not edir.is_dir():
+            continue
+        for ef in edir.glob("evt_*.json"):
+            try:
+                if ef.stat().st_mtime < day_ago:
+                    continue
+                if json.loads(ef.read_text()).get("event_type") in ("violation", "attention", "vigilance"):
+                    alerts_today += 1
+            except Exception:
+                continue
+    return {"cameras_total": len(cams), "cameras_online": online,
+            "cameras_offline": len(cams) - online, "alerts_today": alerts_today}
+
+
+@app.get("/admin/monitoring/cameras")
+async def admin_monitoring_cameras(limit: int = 100, authorization: str = Header(None, alias="Authorization")):
+    """Tab Monitoreo: tarjetas de cámaras con miniatura, estado y métricas."""
+    _verify_admin(authorization)
+    cams = _scan_all_cameras_admin()
+    # métricas por cámara desde el layout real users/{u}/cameras/{cam}/events
+    day_ago = time.time() - 86400
+    for c in cams[:limit]:
+        m = {"today_alerts": 0, "total_events": 0}
+        cdir = STORAGE_ROOT / "users" / c["user_id"] / "cameras" / c["camera_id"] / "events"
+        if cdir.is_dir():
+            try:
+                files = list(cdir.glob("evt_*.json"))
+                m["total_events"] = len(files)
+                m["today_alerts"] = sum(1 for f in files if f.stat().st_mtime >= day_ago)
+            except Exception:
+                pass
+        c["metrics"] = m
+    return {"cameras": cams[:limit]}
+
+
+@app.get("/admin/monitoring/alerts")
+async def admin_monitoring_alerts(limit: int = 12, hours: int = 24, authorization: str = Header(None, alias="Authorization")):
+    """Tab Monitoreo: últimas alertas con imagen y descripción."""
+    _verify_admin(authorization)
+    out = []
+    cutoff = time.time() - hours * 3600
+    for c in _scan_all_cameras_admin():
+        edir = STORAGE_ROOT / "users" / c["user_id"] / "cameras" / c["camera_id"] / "events"
+        if not edir.is_dir():
+            continue
+        for ef in edir.glob("evt_*.json"):
+            try:
+                if ef.stat().st_mtime < cutoff:
+                    continue
+                ev = json.loads(ef.read_text())
+                if ev.get("event_type") not in ("violation", "attention", "vigilance"):
+                    continue
+                ev["_user_id"] = c["user_id"]
+                ev["camera_name"] = c.get("name", "") or ev.get("camera_id", "")
+                # imagen: el jpg hermano del evento
+                img = ef.with_suffix(".jpg")
+                if img.exists():
+                    ev["image_url"] = ("/frames/" + c["user_id"] + "/" + c["camera_id"]
+                                       + "/events/" + img.name)
+                out.append(ev)
+            except Exception:
+                continue
+    out.sort(key=lambda e: e.get("timestamp", 0) or e.get("ts", 0), reverse=True)
+    return {"alerts": out[:limit]}
+
+
 @app.get("/admin/ota/status")
 async def ota_status(authorization: str = Header(None, alias="Authorization")):
     """Panel admin: estado del bin publicado + versión de cada cámara."""
@@ -2014,6 +2145,39 @@ async def support_info():
         }
     except Exception:
         return {"whatsapp": "", "email": "", "phone": "", "bank_info": ""}
+
+
+@app.get("/frames/{user_id}/{camera_id}/latest.jpg")
+async def get_camera_latest_jpg(user_id: str, camera_id: str):
+    """F-admin: miniatura del panel de monitoreo. Sirve latest_raw.jpg de
+    la cámara (lo que está viendo ahora). Public path: la URL no expone nada
+    sin conocer user_id+camera_id (GUIDs no secuenciales)."""
+    _validate_safe_path(user_id, "user_id")
+    _validate_safe_path(camera_id, "camera_id")
+    raw = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "frames" / "latest_raw.jpg"
+    if not raw.exists():
+        raise HTTPException(status_code=404, detail="sin frames")
+    return Response(content=raw.read_bytes(), media_type="image/jpeg")
+
+
+@app.get("/frames/{user_id}/{camera_id}/events/{image_name}")
+async def get_camera_event_image(user_id: str, camera_id: str, image_name: str):
+    """F-admin: imagen de evidencia de un evento para el panel (jpg hermano
+    del evt_*.json). Path validado contra traversal."""
+    _validate_safe_path(user_id, "user_id")
+    _validate_safe_path(camera_id, "camera_id")
+    _validate_safe_path(image_name, "image_name")
+    if not image_name.endswith(".jpg"):
+        raise HTTPException(status_code=400, detail="solo jpg")
+    img = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "events" / image_name
+    if not img.exists():
+        # algunos eventos guardan carpeta evt_*/grid.jpg
+        alt = img.with_suffix("") / "grid.jpg"
+        if alt.exists():
+            img = alt
+        else:
+            raise HTTPException(status_code=404, detail="imagen no encontrada")
+    return Response(content=img.read_bytes(), media_type="image/jpeg")
 
 
 @app.get("/frames/latest")
