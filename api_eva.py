@@ -1025,6 +1025,99 @@ async def ota_publish(request: dict, authorization: str = Header(None, alias="Au
             "size": bin_path.stat().st_size}
 
 
+@app.post("/devices/scan-results")
+async def devices_scan_results(request: dict):
+    """F2 — Recibe los resultados del escáner SSDP del ESP32 (v9.3.2).
+    El dispositivo escaneó SU red local (con consentimiento del usuario,
+    ver F3/F4). Guarda la lista 48h y avisa al wizard de Eva si hay sesión
+    esperando. Privacidad: solo IP/puerto/vendor/modelo de cámaras."""
+    camera_id = (request.get("camera_id") or "").strip()
+    devices = request.get("devices") or []
+    if not camera_id:
+        raise HTTPException(status_code=400, detail="camera_id requerido")
+    _validate_safe_path(camera_id, "camera_id")
+    # localizar dueño
+    user_id = ""
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for user_dir in users_dir.iterdir():
+            if (user_dir / "cameras" / camera_id / "camera.json").exists():
+                user_id = user_dir.name
+                break
+    if not user_id:
+        return {"ok": True, "saved": False, "reason": "cámara sin registrar"}
+    # saneo
+    clean = []
+    for d in devices[:5]:
+        if not isinstance(d, dict):
+            continue
+        clean.append({
+            "ip": str(d.get("ip", ""))[:45],
+            "port": int(d.get("port") or 80),
+            "vendor": str(d.get("vendor", "other"))[:20],
+            "model": str(d.get("model", ""))[:60],
+        })
+    result = {
+        "camera_id": camera_id, "user_id": user_id,
+        "found": len(clean), "devices": clean,
+        "scanned_at": time.time(),
+        "expires_at": time.time() + 48 * 3600,  # purge 48h
+    }
+    # guardar junto al escáner (la cámara que escaneó)
+    try:
+        cam_dir = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id
+        _write_json_atomic(cam_dir / "last_scan.json", result)
+    except Exception as e:
+        logger.warning(f"[scan] persist error: {e}")
+        return {"ok": True, "saved": False}
+    logger.info(f"[scan] {camera_id} (user {user_id[:6]}…) encontró "
+                f"{len(clean)} cámara(s): {[d.get('vendor') for d in clean]}")
+    return {"ok": True, "saved": True, "found": len(clean)}
+
+
+@app.post("/admin/scan/trigger")
+async def admin_scan_trigger(request: dict, authorization: str = Header(None, alias="Authorization")):
+    """F2 — Pedir a una cámara ESP32 que escanee su red local.
+    Marca scan_request:true en su config; el firmware lo ve en su próximo
+    polling (≤10s) y reporta a /devices/scan-results. Uso: wizard de Eva
+    (F3) o admin."""
+    _verify_admin(authorization)
+    camera_id = (request.get("camera_id") or "").strip()
+    if not camera_id:
+        raise HTTPException(status_code=400, detail="camera_id requerido")
+    _validate_safe_path(camera_id, "camera_id")
+    # localizar dueño y marcar el flag en user.json (es lo que el firmware
+    # lee en GET /camera/config/{id})
+    user_id = ""
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for user_dir in users_dir.iterdir():
+            uf = user_dir / "user.json"
+            if uf.exists():
+                try:
+                    ud = json.loads(uf.read_text())
+                    for c in ud.get("cameras", []):
+                        if c.get("camera_id") == camera_id:
+                            user_id = user_dir.name
+                            break
+                except Exception:
+                    pass
+                if user_id:
+                    break
+    if not user_id:
+        raise HTTPException(status_code=404, detail="cámara no encontrada")
+
+    def _mut(ud):
+        for c in ud.get("cameras", []):
+            if c.get("camera_id") == camera_id:
+                c["scan_request"] = True
+    update_user_json(user_id, _mut)  # C1: lock + atómico
+    logger.info(f"[scan] trigger enviado a {camera_id}")
+    return {"success": True, "camera_id": camera_id,
+            "note": "El escaneo se ejecuta en ≤10s (próximo polling). "
+                    "Resultados en camera.json/last_scan.json"}
+
+
 @app.post("/api/auth/token")
 async def issue_user_token(request: dict):
     """
@@ -4219,6 +4312,16 @@ async def get_esp32_config(camera_id: str):
 
     for c in ud.get("cameras", []):
         if c.get("camera_id") == camera_id:
+            # F2 (2026-09-01): trigger de escaneo de red — one-shot. Se
+            # sirve UNA vez y se limpia (el firmware lo parsea en su poll).
+            scan_request = bool(c.get("scan_request"))
+            if scan_request:
+                c["scan_request"] = False
+                update_user_json(user_id, lambda ud2: [
+                    cc.__setitem__("scan_request", False)
+                    for cc in ud2.get("cameras", [])
+                    if cc.get("camera_id") == camera_id
+                ])
             # Devolver solo los campos que el ESP32 entiende
             return {
                 "camera_id": camera_id,
@@ -4232,7 +4335,8 @@ async def get_esp32_config(camera_id: str):
                 "v_flip": c.get("v_flip", False),
                 "brightness": c.get("brightness", 0),
                 "contrast": c.get("contrast", 0),
-                "stream_always": c.get("stream_always", True)
+                "stream_always": c.get("stream_always", True),
+                "scan_request": scan_request,
             }
 
     raise HTTPException(status_code=404, detail="Camera not found in user")
