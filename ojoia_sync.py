@@ -354,10 +354,24 @@ def _sync_set(db, col1, doc1, doc2, data):
 
 
 def _run_future(fut):
-    """Ejecuta una operación Firestore (que devuelve un future) sin bloquear el loop."""
+    """Ejecutar una operación Firestore sin bloquear el event loop.
+
+    FIX (2026-09-02): firebase_admin es SÍNCRONA — .set()/.delete() devuelven
+    un WriteResult YA RESUELTO, no un future. El código anterior llamaba
+    fut.result() sobre ese objeto → 'Unknown field for WriteResult: result'
+    y 'DatetimeWithNanoseconds has no attribute result' en CADA ciclo del
+    poll de control (8,640 errores/día al log desde hace días).
+    Ahora: si ya es resultado, se devuelve tal cual; si es future real
+    (por si la API cambia), se resuelve en el executor."""
     import concurrent.futures
     loop = asyncio.get_running_loop()
-    return loop.run_in_executor(None, lambda: fut.result())
+    if isinstance(fut, concurrent.futures.Future):
+        return loop.run_in_executor(None, fut.result)
+    if hasattr(fut, "result") and not hasattr(fut, "update_time"):
+        # objeto con .result() de verdad (future asyncio) → resolverlo
+        if asyncio.isfuture(fut):
+            return fut
+    return loop.run_in_executor(None, lambda: fut)  # ya resuelto: passthrough
 
 
 # ── Función de arranque sencilla ──
