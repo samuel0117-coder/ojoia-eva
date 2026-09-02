@@ -2684,7 +2684,13 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
     # de 60s el overlay se quedaba pegado al último evento con persona,
     # dibujando bboxes sobre el frame actual como si todavía estuviera.
     try:
-        _yolo_json_path = STORAGE_ROOT / "users" / (user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
+        # FIX (2026-09-02): leer del disco ACTUAL del usuario (user_root —
+        # HDD tras migración), con fallback NVMe. Antes: hardcoded STORAGE_ROOT
+        # → el viewer siempre leía la copia vieja del NVMe (count 0) aunque el
+        # worker acabara de escribir count 2 en el HDD → silueta nunca dibujada.
+        _yolo_json_path = user_root(user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
+        if not _yolo_json_path.exists():
+            _yolo_json_path = STORAGE_ROOT / "users" / (user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
         if _yolo_json_path.exists():
             with open(_yolo_json_path) as _f:
                 _yolo_data = json.load(_f)
