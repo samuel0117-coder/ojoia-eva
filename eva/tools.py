@@ -795,6 +795,12 @@ async def tool_search_events(user_id: str, query: str = "", date: str = None,
             "yolo": _event_yolo(evt),
             "frame_url": f"/api/event-frame/{evt['event_id']}?user_id={user_id}",
             "thumb_url": f"/api/event-thumb/{evt['event_id']}?user_id={user_id}",
+            # D3 (Fase D): clip forense del evento — carrusel de los 16 frames
+            # del grid (+mp4 si ffmpeg lo generó). El chat de Eva lo usa para
+            # responder "el martes vino un cliente con gorra negra" con el
+            # VIDEO del momento, no solo texto.
+            "clip_url": f"/api/event-clip/{evt['event_id']}?user_id={user_id}",
+            "frames_count": evt.get("frames_count", 0),
         })
         if len(results) >= limit:
             break

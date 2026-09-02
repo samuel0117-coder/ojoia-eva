@@ -4677,10 +4677,155 @@ async def get_event_thumb(event_id: str, user_id: str = None):
     raise HTTPException(status_code=404, detail="Image not found")
 
 
+@app.get("/api/event-frame/{event_id}")
+async def get_event_frame_full(event_id: str, user_id: str = None):
+    """D2 (Fase D): frame completo de un evento."""
+    base = Path(STORAGE_ROOT) / "users"
+    search_dirs = []
+    if user_id and user_id != "default":
+        search_dirs.append(base / user_id / "cameras")
+    if not search_dirs:
+        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
+    for cam_base in search_dirs:
+        if not cam_base.exists():
+            continue
+        for cam_dir in cam_base.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            img_file = cam_dir / "events" / f"{event_id}.jpg"
+            if img_file.exists():
+                return Response(content=img_file.read_bytes(), media_type="image/jpeg",
+                                headers={"Cache-Control": "max-age=86400"})
+    raise HTTPException(status_code=404, detail="Image not found")
+
+
+@app.get("/api/event-clip/{event_id}")
+async def get_event_clip(event_id: str, user_id: str = None):
+    """D2 (Fase D): paquete forense del evento para el chat de Eva.
+
+    Devuelve:
+      - frames: lista de URLs de los 16 frames del grid (frame_000.jpg...)
+        guardados en disco por save_event_to_disk_v2 → carrusel tipo video.
+      - grid_url: la imagen 4×4 completa del momento.
+      - summary/description: narrativa del evento.
+      - mp4_url (opcional): clip de video si ffmpeg está disponible.
+    """
+    base = Path(STORAGE_ROOT) / "users"
+    search_dirs = []
+    if user_id and user_id != "default":
+        search_dirs.append(base / user_id / "cameras")
+    if not search_dirs:
+        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
+    for cam_base in search_dirs:
+        if not cam_base.exists():
+            continue
+        for cam_dir in cam_base.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            ev_dir = cam_dir / "events" / event_id
+            ev_json = cam_dir / "events" / f"{event_id}.json"
+            if not ev_json.exists():
+                continue
+            try:
+                ev = json.loads(ev_json.read_text())
+            except Exception:
+                ev = {}
+            frames_dir = ev_dir / "frames"
+            frames = []
+            if frames_dir.exists():
+                for fp in sorted(frames_dir.glob("frame_*.jpg")):
+                    frames.append(f"/api/event-frame-file/{event_id}/{fp.name}?user_id={user_id or ''}")
+            grid_file = ev_dir / "grid.jpg"
+            q = ev.get("qwen_json", {}) if isinstance(ev.get("qwen_json"), dict) else {}
+            vis = q.get("vision", {}) if isinstance(q.get("vision"), dict) else {}
+            # D2: clip mp4 con ffmpeg (si existe) — 2fps = 8s de video
+            mp4_url = ""
+            mp4_file = ev_dir / f"{event_id}.mp4"
+            if not mp4_file.exists() and frames_dir.exists():
+                try:
+                    import shutil as _sh
+                    if _sh.which("ffmpeg"):
+                        def _make_mp4(fd: Path, out: Path):
+                            import subprocess as _sp
+                            _sp.run(["ffmpeg", "-y", "-loglevel", "error",
+                                     "-framerate", "2", "-pattern_type", "glob",
+                                     "-i", str(fd / "frame_*.jpg"),
+                                     "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                                     "-movflags", "+faststart", str(out)],
+                                    timeout=30, check=True)
+                        await asyncio.to_thread(_make_mp4, frames_dir, mp4_file)
+                except Exception as _e_mp4:
+                    logger.debug(f"[D2] ffmpeg clip falló: {_e_mp4}")
+            if mp4_file.exists():
+                mp4_url = f"/api/event-clip-video/{event_id}?user_id={user_id or ''}"
+            return {
+                "success": True,
+                "event_id": event_id,
+                "camera_id": ev.get("camera_id", cam_dir.name),
+                "datetime": ev.get("datetime", ""),
+                "event_type": ev.get("event_type", ""),
+                "summary": ev.get("summary") or ev.get("description") or (vis.get("scene") or ""),
+                "scene": vis.get("scene", ""),
+                "persons": vis.get("persons", []),
+                "frames": frames,
+                "frames_count": len(frames),
+                "grid_url": f"/api/event-frame/{event_id}?user_id={user_id or ''}" if grid_file.exists() or (cam_dir / "events" / f"{event_id}.jpg").exists() else "",
+                "mp4_url": mp4_url,
+            }
+    raise HTTPException(status_code=404, detail="Evento no encontrado")
+
+
+@app.get("/api/event-frame-file/{event_id}/{frame_name}")
+async def get_event_frame_file(event_id: str, frame_name: str, user_id: str = None):
+    """D2: un frame individual del paquete del evento (carrusel)."""
+    # path traversal guard
+    if "/" in frame_name or ".." in frame_name or not frame_name.startswith("frame_"):
+        raise HTTPException(status_code=400, detail="frame inválido")
+    base = Path(STORAGE_ROOT) / "users"
+    search_dirs = []
+    if user_id and user_id != "default":
+        search_dirs.append(base / user_id / "cameras")
+    if not search_dirs:
+        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
+    for cam_base in search_dirs:
+        if not cam_base.exists():
+            continue
+        for cam_dir in cam_base.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            fp = cam_dir / "events" / event_id / "frames" / frame_name
+            if fp.exists():
+                return Response(content=fp.read_bytes(), media_type="image/jpeg",
+                                headers={"Cache-Control": "max-age=86400"})
+    raise HTTPException(status_code=404, detail="Frame no encontrado")
+
+
+@app.get("/api/event-clip-video/{event_id}")
+async def get_event_clip_video(event_id: str, user_id: str = None):
+    """D2: video mp4 del evento (2fps ≈ 8s)."""
+    base = Path(STORAGE_ROOT) / "users"
+    search_dirs = []
+    if user_id and user_id != "default":
+        search_dirs.append(base / user_id / "cameras")
+    if not search_dirs:
+        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
+    for cam_base in search_dirs:
+        if not cam_base.exists():
+            continue
+        for cam_dir in cam_base.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            mp4 = cam_dir / "events" / event_id / f"{event_id}.mp4"
+            if mp4.exists():
+                return Response(content=mp4.read_bytes(), media_type="video/mp4",
+                                headers={"Cache-Control": "max-age=86400"})
+    raise HTTPException(status_code=404, detail="Video no encontrado")
+
+
 @app.get("/api/events/siblings")
 async def get_event_siblings(user_id: str, event_id: str = "", camera_id: Optional[str] = None):
     """Devuelve los eventos vecinos (anterior y siguiente) del actual.
-    
+
     Usado para navegación entre eventos en el viewer.
     NOTA: Debe estar declarado ANTES de /api/events/{event_id} para que no sea
     interceptado por el catch-all.
