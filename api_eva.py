@@ -2123,6 +2123,7 @@ def _validate_safe_path(value: str, name: str = "param") -> str:
 # Rutas PUBLICAS (no pasan por este check - lista explicita):
 PUBLIC_USER_PATHS = {
     "/health", "/api/support-info", "/api/zone-types",
+    "/api/push-config",  # RD-5: vapidKey es pública por diseño (como apiKey del frontend)
     # token generation/verify: el primero crea el token, el segundo usa Firebase
     "/api/auth/token",  # P0 (Bug #5): ahora valida firebase_token internamente vs user_id
     "/auth/firebase/verify",  # Firebase hace su propia verificacion
@@ -3213,6 +3214,15 @@ async def verify_firebase(request: Request):
 # ═══════════════════════════════════════════════════════════════════════════
 # FCM Token Registration
 # ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/push-config")
+async def get_push_config():
+    """RD-5: configuración pública del push web (vapidKey de Firebase
+    Console → ojoia.env PUSH_VAPID_KEY). Sin vapid, Firebase 10.x
+    rechaza getToken silenciosamente → nunca se registra el teléfono."""
+    vk = os.environ.get("PUSH_VAPID_KEY", "")
+    return {"vapid_key": vk, "public": bool(vk)}
+
 
 @app.post("/api/fcm/register")
 async def register_fcm_token(request: dict, authorization: str = Header(None, alias="Authorization")):

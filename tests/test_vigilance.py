@@ -34,10 +34,20 @@ def test_b1_negacion_solo_candidato():
 
 
 def test_b1_qwen_flag_no_requiere_verificacion():
-    vision = {"resumen": "x", "flag": "empleado abre el cajon"}
-    res = _detect_attention_hits(vision, [], [], "caja", False, "normal", {})
+    # A1 (otro agente): el flag de Qwen SOLO vale si matchea una REGLA REAL
+    # del dueño — flag sin reglas ya no es hit directo (mejora de precisión:
+    # 21/33 alertas de hoy eran flag sin regla). Test actualizado al nuevo
+    # contrato: con la regla presente → hit qwen_flag sin verificación;
+    # sin la regla → descartado.
+    vision = {"resumen": "x", "flag": "empleado abre el cajon sin facturar"}
+    res = _detect_attention_hits(vision, ["empleado abre el cajon sin facturar"],
+                                 [], "caja", False, "normal", {})
     assert any(h["source"] == "qwen_flag" and not h.get("needs_verification")
                for h in res["hits_detail"])
+    # flag que NO matchea ninguna regla → descartado (A1)
+    res2 = _detect_attention_hits(vision, ["regla totalmente distinta"],
+                                  [], "caja", False, "normal", {})
+    assert not any(h["source"] == "qwen_flag" for h in res2["hits_detail"])
 
 
 def test_b1_placeholder_schema_filtrado():

@@ -358,6 +358,10 @@ const App = {
         document.getElementById('screen-app').style.display = 'flex';
         this._initPush();
         this._handleInitialRoute();
+        // E2: feedback del push (botón ✅/🚫) se envía con userId listo.
+        if (this._pendingAutoFeedback) {
+            setTimeout(() => this._processPendingFeedback(), 1200);
+        }
     },
 
     logout() {
@@ -481,6 +485,13 @@ c.style.display = '';
         const params = new URLSearchParams(query);
         const eventId = params.get('event') || params.get('alert') || '';
         const cameraId = params.get('camera') || params.get('cam') || '';
+        // E2 (Fase E): el usuario tocó un botón del push (✅/🚫) → el SW
+        // abre el deeplink con feedback=real|false. Al cargar, enviamos el
+        // feedback automáticamente y mostramos confirmación en el evento.
+        const feedbackAction = params.get('feedback') || params.get('action');
+        if (eventId && feedbackAction && (pageName === 'cameras' || pageName === 'events' || pageName === 'eva')) {
+            this._pendingAutoFeedback = { eventId, cameraId, isReal: feedbackAction === 'real' };
+        }
         if (eventId && pageName === 'eva') {
             this._pendingNotificationEventId = eventId;
             this._pendingNotificationCameraId = cameraId;
@@ -499,6 +510,37 @@ c.style.display = '';
         this.go('eva');
     },
 
+    // E2: procesar el feedback del push una vez listo el userId (lo llama
+    // el init después de auth). Registra la respuesta y avisa al usuario.
+    async _processPendingFeedback() {
+        const pf = this._pendingAutoFeedback;
+        if (!pf || !this.userId) return;
+        this._pendingAutoFeedback = null;
+        try {
+            const r = await apiFetch(`${this.API}/api/chat/eva/feedback`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    user_id: this.userId,
+                    event_id: pf.eventId,
+                    is_real: pf.isReal,
+                    notes: pf.isReal ? '' : 'Marcado como falsa alarma desde la notificación push',
+                })
+            });
+            const d = await r.json();
+            if (d.success) {
+                this._toast('', pf.isReal
+                    ? '✅ Gracias — alerta confirmada como correcta'
+                    : '🚫 Falsa alarma registrada. Eva aprenderá de esto.', 'success');
+                if (typeof this._refreshEvents === 'function') this._refreshEvents();
+            } else {
+                this._toast('', 'No pude registrar tu respuesta: ' + (d.error || ''), 'danger');
+            }
+        } catch (e) {
+            console.warn('[feedback] falló envío:', e);
+            this._toast('', 'No pude registrar tu respuesta (sin conexión)', 'danger');
+        }
+    },
+
     _poll(key, fn, ms) {
         if (this._polls[key]) clearInterval(this._polls[key]);
         fn();
@@ -509,22 +551,38 @@ c.style.display = '';
     },
 
     async _initPush() {
+        // RD-5 (2026-09-01): registro de push REPARADO.
+        // Bugs anteriores: (1) getToken sin vapidKey → Firebase 10 lo rechaza
+        // y el catch lo tragaba EN SILENCIO → nunca se registraba el token
+        // (por eso no pedía permiso al entrar). (2) sw registrado en /sw.js
+        // pero Firebase busca /firebase-messaging-sw.js. (3) catch mudo.
         try {
             if (!('Notification' in window)) return;
             const perm = await Notification.requestPermission();
-            if (perm !== 'granted') return;
-            if ('serviceWorker' in navigator) {
-                const reg = await navigator.serviceWorker.register('/sw.js');
-                if (firebase.messaging) {
-                    const msg = firebase.messaging();
-                    const token = await msg.getToken({ serviceWorkerRegistration: reg });
-                    if (token) {
-                        await apiFetch(this.API + '/api/fcm/register', { method: 'POST', body: JSON.stringify({ user_id: this.userId, fcm_token: token }) });
-                    }
-                    msg.onMessage(p => this._toast(p.notification?.title || 'OjoIA', p.notification?.body || '', 'danger'));
-                }
+            if (perm !== 'granted') {
+                console.warn('[push] permiso denegado:', perm);
+                return;
             }
-        } catch(e) { console.log('Push init skipped:', e.message); }
+            if (!('serviceWorker' in navigator) || !firebase.messaging) return;
+            const reg = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
+            await navigator.serviceWorker.register('/sw.js'); // push directo + click
+            const msg = firebase.messaging();
+            const opts = { serviceWorkerRegistration: reg };
+            // vapidKey: el backend la sirve (configurable sin redeploy);
+            // sin ella Firebase 10.x falla silenciosamente en web.
+            try {
+                const cfg = await (await fetch(this.API + '/api/push-config')).json();
+                if (cfg && cfg.vapid_key) opts.vapidKey = cfg.vapid_key;
+            } catch (e) { /* sin config: getToken intentará sin vapid */ }
+            const token = await msg.getToken(opts);
+            if (!token) { console.warn('[push] getToken sin token'); return; }
+            const r = await apiFetch(this.API + '/api/fcm/register', { method: 'POST', body: JSON.stringify({ user_id: this.userId, fcm_token: token }) });
+            console.log('[push] token registrado:', (r && r.ok) ? 'OK' : r);
+            msg.onMessage(p => this._toast(p.notification?.title || 'OjoIA', p.notification?.body || '', 'danger'));
+        } catch (e) {
+            // RD-5: NUNCA mudo — si el push falla, tiene que verse.
+            console.warn('[push] init falló:', e && e.message);
+        }
     },
 
     _toast(title, msg, type = 'info') {
