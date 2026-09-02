@@ -2249,6 +2249,9 @@ c.style.display = '';
 
     async _openEvent(eventId) {
         if (!eventId) return;
+        // un solo modal: quitar el anterior (evita reproductores apilados)
+        this._stopEventPlayback();
+        document.getElementById('event-modal')?.remove();
         try {
             const uid = this.userId || 'default';
             const r = await apiFetch(`${this.API}/api/events/${eventId}?user_id=${uid}`);
@@ -2259,14 +2262,15 @@ c.style.display = '';
             const isSentinel = d.event_type === 'sentinel' || (d.qwen_json?.after_hours && d.qwen_json?.importancia === 'alta');
             const attentionHits = d.attention_hits || [];
             const modal = document.createElement('div');
+            modal.id = 'event-modal';
             modal.style.cssText = 'position:fixed;inset:0;z-index:500;background:#000;display:flex;flex-direction:column;overflow-y:auto';
-            
+
             const header = document.createElement('div');
             header.style.cssText = 'display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--bg-secondary);position:sticky;top:0;z-index:1';
             const closeBtn = document.createElement('button');
             closeBtn.innerHTML = '✕';
             closeBtn.style.cssText = 'background:none;border:none;color:var(--text-secondary);font-size:1.3rem;cursor:pointer;margin-right:12px';
-            closeBtn.onclick = () => modal.remove();
+            closeBtn.onclick = () => { this._stopEventPlayback(); modal.remove(); };
             const title = document.createElement('span');
             title.style.fontWeight = '600';
             title.textContent = d.camera_name || 'Evento';
@@ -2279,24 +2283,16 @@ c.style.display = '';
                 badge.textContent = isSentinel ? '🛡️ Fuera de horario' : (isAttention ? '🔍 Observación' : '🚨 Alerta');
                 header.appendChild(badge);
             }
-            
+
             const content = document.createElement('div');
             content.style.padding = '16px';
-            
-            if (d.frame_b64) {
-                const img = document.createElement('img');
-                img.src = `data:image/jpeg;base64,${d.frame_b64}`;
-                img.style.cssText = 'width:100%;border-radius:10px;display:block;margin-bottom:16px';
-                content.appendChild(img);
-                if (d.camera_id) {
-                    const liveBtn = document.createElement('button');
-                    liveBtn.className = 'btn';
-                    liveBtn.style.cssText = 'width:100%;margin-bottom:16px';
-                    liveBtn.textContent = '📹 Ver cámara en vivo';
-                    liveBtn.onclick = () => { modal.remove(); this._openCameraLive(d.camera_id); };
-                    content.appendChild(liveBtn);
-                }
-            }
+
+            // ── REPRODUCTOR UNIFICADO (2026-09-02): UN solo visor con autoplay.
+            // Antes: 3 bloques duplicados (imagen grande frame_b64 + carrusel
+            // manual + grid 4×4). Ahora: video mp4 si existe, o carrusel de
+            // frames que SE REPRODUCE solo (2 fps), con ▶/⏸ y al terminar
+            // pasa automáticamente al siguiente evento de la lista.
+            const frames = Array.isArray(d.frames) ? d.frames : [];
             if (d.video_file) {
                 const videoCard = document.createElement('div');
                 videoCard.className = 'card';
@@ -2305,20 +2301,22 @@ c.style.display = '';
                 videoTitle.textContent = '🎞️ Video del evento';
                 const video = document.createElement('video');
                 video.controls = true;
-                video.preload = 'metadata';
+                video.autoplay = true;
+                video.muted = true;      // autoplay permitido por políticas del navegador
                 video.playsInline = true;
                 video.src = `${this.API}/api/events/${eventId}/video.mp4?user_id=${uid}`;
                 video.style.cssText = 'width:100%;border-radius:8px;display:block;background:#000';
+                video.onended = () => this._onEventPlaybackEnd(eventId);
                 videoCard.appendChild(videoTitle);
                 videoCard.appendChild(video);
                 content.appendChild(videoCard);
-            }
-            if (Array.isArray(d.frames) && d.frames.length > 1) {
+            } else if (frames.length > 1) {
+                const hasNext = this._hasNextEvent(eventId);
                 const frameCard = document.createElement('div');
                 frameCard.className = 'card';
                 const frameTitle = document.createElement('div');
                 frameTitle.className = 'card-title';
-                frameTitle.textContent = 'Imágenes atrás/adelante';
+                frameTitle.textContent = '🎞️ Reproducción del evento';
                 const frameImg = document.createElement('img');
                 frameImg.id = `event-frame-img-${eventId}`;
                 frameImg.style.cssText = 'width:100%;border-radius:8px;display:block;background:#000';
@@ -2326,12 +2324,14 @@ c.style.display = '';
                 frameStatus.id = `event-frame-status-${eventId}`;
                 frameStatus.className = 'meta';
                 frameStatus.style.textAlign = 'center';
+                if (hasNext) frameStatus.textContent = '0/' + frames.length + ' · al terminar ➡️ siguiente evento';
                 const frameControls = document.createElement('div');
                 frameControls.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:10px';
                 frameControls.innerHTML = `
-                    <button class="btn btn-sm" onclick="App._moveEventFrame('${this._escAttr(eventId)}', ${d.frames.length}, -1)">◀ Atrás</button>
-                    <input id="event-frame-range-${eventId}" type="range" min="0" max="${d.frames.length - 1}" value="0" style="flex:1" oninput="App._showEventFrame('${this._escAttr(eventId)}', ${d.frames.length}, this.value)">
-                    <button class="btn btn-sm" onclick="App._moveEventFrame('${this._escAttr(eventId)}', ${d.frames.length}, 1)">Adelante ▶</button>`;
+                    <button class="btn btn-sm" id="event-play-btn-${this._escAttr(eventId)}" onclick="App._toggleEventPlayback('${this._escAttr(eventId)}', ${frames.length})" style="min-width:44px">⏸</button>
+                    <input id="event-frame-range-${eventId}" type="range" min="0" max="${frames.length - 1}" value="0" style="flex:1" oninput="App._showEventFrame('${this._escAttr(eventId)}', ${frames.length}, this.value)">
+                    <button class="btn btn-sm" onclick="App._moveEventFrame('${this._escAttr(eventId)}', ${frames.length}, -1)">◀</button>
+                    <button class="btn btn-sm" onclick="App._moveEventFrame('${this._escAttr(eventId)}', ${frames.length}, 1)">▶</button>`;
                 frameCard.appendChild(frameTitle);
                 frameCard.appendChild(frameImg);
                 frameCard.appendChild(frameStatus);
@@ -2339,22 +2339,24 @@ c.style.display = '';
                 content.appendChild(frameCard);
                 this._eventFrameIndex = this._eventFrameIndex || {};
                 this._eventFrameIndex[eventId] = 0;
-                this._showEventFrame(eventId, d.frames.length, 0);
+                this._showEventFrame(eventId, frames.length, 0);
+                // AUTOPLAY: reproducir como video (2 fps)
+                this._startEventPlayback(eventId, frames.length);
+            } else if (d.frame_b64) {
+                const img = document.createElement('img');
+                img.src = `data:image/jpeg;base64,${d.frame_b64}`;
+                img.style.cssText = 'width:100%;border-radius:10px;display:block;margin-bottom:16px';
+                content.appendChild(img);
             }
-            if (d.grid_b64) {
-                const gridCard = document.createElement('div');
-                gridCard.className = 'card';
-                const gridTitle = document.createElement('div');
-                gridTitle.className = 'card-title';
-                gridTitle.textContent = '🔲 Sesión completa (grid 4×4)';
-                const gridImg = document.createElement('img');
-                gridImg.src = `data:image/jpeg;base64,${d.grid_b64}`;
-                gridImg.style.cssText = 'width:100%;border-radius:8px;display:block';
-                gridCard.appendChild(gridTitle);
-                gridCard.appendChild(gridImg);
-                content.appendChild(gridCard);
+            if (d.camera_id) {
+                const liveBtn = document.createElement('button');
+                liveBtn.className = 'btn';
+                liveBtn.style.cssText = 'width:100%;margin:12px 0 16px';
+                liveBtn.textContent = '📹 Ver cámara en vivo';
+                liveBtn.onclick = () => { this._stopEventPlayback(); modal.remove(); this._openCameraLive(d.camera_id); };
+                content.appendChild(liveBtn);
             }
-            
+
             const card = document.createElement('div');
             card.className = 'card';
             const cardTitle = document.createElement('div');
@@ -2394,22 +2396,88 @@ c.style.display = '';
             dismissBtn.className = 'btn';
             dismissBtn.style.cssText = 'flex:1;background:var(--bg-tertiary);color:var(--text-secondary)';
             dismissBtn.innerHTML = '✓ Falsa alarma';
-            dismissBtn.onclick = () => { this._dismissEvent(eventId); modal.remove(); };
+            dismissBtn.onclick = () => { this._stopEventPlayback(); this._dismissEvent(eventId); modal.remove(); };
             btnRow.appendChild(dismissBtn);
             if (violation || isAttention) {
                 const confirmBtn = document.createElement('button');
                 confirmBtn.className = 'btn';
                 confirmBtn.style.cssText = 'flex:1;background:var(--accent)';
                 confirmBtn.innerHTML = isAttention ? '🏷️ Marcar como falta real' : '⚠️ Confirmar alerta';
-                confirmBtn.onclick = () => { this._confirmThreat(eventId); modal.remove(); };
+                confirmBtn.onclick = () => { this._stopEventPlayback(); this._confirmThreat(eventId); modal.remove(); };
                 btnRow.appendChild(confirmBtn);
             }
-            
+
             modal.appendChild(header);
             content.appendChild(btnRow);
             modal.appendChild(content);
             document.body.appendChild(modal);
         } catch(e) { console.warn('[App] event modal silent fail:', e); }
+    },
+
+    // ── Reproducción del evento (2026-09-02) ──────────────────────────────
+    // El carrusel de frames corre SOLO a 2 fps (como el video del grid).
+    // Al llegar al último frame → siguiente evento de la lista actual.
+    _startEventPlayback(eventId, total, fps = 2) {
+        this._stopEventPlayback();
+        this._eventPlayback = { eventId, total, playing: true };
+        const btn = document.getElementById(`event-play-btn-${CSS.escape(eventId)}`);
+        if (btn) btn.textContent = '⏸';
+        this._eventPlayback.timer = setInterval(() => {
+            if (!this._eventPlayback || this._eventPlayback.eventId !== eventId) return;
+            const idx = (this._eventFrameIndex?.[eventId] ?? 0) + 1;
+            if (idx >= total) { this._onEventPlaybackEnd(eventId); return; }
+            this._showEventFrame(eventId, total, idx);
+        }, Math.round(1000 / fps));
+    },
+
+    _toggleEventPlayback(eventId, total) {
+        if (this._eventPlayback && this._eventPlayback.playing) {
+            this._stopEventPlayback();  // deja el índice actual (pausa)
+            const btn = document.getElementById(`event-play-btn-${CSS.escape(eventId)}`);
+            if (btn) btn.textContent = '▶';
+        } else {
+            // reanudar (o empezar si venía en pausa en el último frame → reinicia)
+            const idx = this._eventFrameIndex?.[eventId] ?? 0;
+            const from = idx >= total - 1 ? 0 : idx;
+            this._startEventPlayback(eventId, total);
+            if (from === 0) this._showEventFrame(eventId, total, 0);
+        }
+    },
+
+    _stopEventPlayback() {
+        if (this._eventPlayback?.timer) clearInterval(this._eventPlayback.timer);
+        this._eventPlayback = null;
+    },
+
+    _onEventPlaybackEnd(eventId) {
+        this._stopEventPlayback();
+        const next = this._getNextEventId(eventId);
+        if (next) {
+            // pequeño respiro para que se vea que terminó, luego siguiente
+            setTimeout(() => this._openEvent(next), 700);
+        } else {
+            const status = document.getElementById(`event-frame-status-${eventId}`);
+            if (status) status.textContent = 'Fin de la lista de eventos ✓';
+        }
+    },
+
+    // Lista actual de eventos visibles en la pestaña (para saber el siguiente)
+    _visibleEventIds() {
+        return Array.from(document.querySelectorAll('#events-list .event-row'))
+            .map(el => el.getAttribute('onclick') || '')
+            .map(s => (s.match(/_openEvent\('([^']+)'\)/) || [])[1])
+            .filter(Boolean);
+    },
+
+    _hasNextEvent(eventId) {
+        const ids = this._visibleEventIds();
+        return ids.length > 1 && ids.indexOf(eventId) < ids.length - 1;
+    },
+
+    _getNextEventId(eventId) {
+        const ids = this._visibleEventIds();
+        const i = ids.indexOf(eventId);
+        return (i >= 0 && i < ids.length - 1) ? ids[i + 1] : null;
     },
 
     _showEventFrame(eventId, total, rawIndex) {
@@ -2422,12 +2490,19 @@ c.style.display = '';
         const range = document.getElementById(`event-frame-range-${eventId}`);
         if (img) img.src = `${this.API}/api/events/${eventId}/frame/${index}?user_id=${uid}&_=${Date.now()}`;
         if (range) range.value = index;
-        if (status) status.textContent = `${index + 1}/${total}`;
+        const hasNext = this._hasNextEvent(eventId);
+        if (status) status.textContent = hasNext
+            ? `${index + 1}/${total} · al terminar ➡️ siguiente evento`
+            : `${index + 1}/${total}`;
     },
 
     _moveEventFrame(eventId, total, delta) {
+        const wasPlaying = this._eventPlayback?.playing;
+        if (wasPlaying) this._stopEventPlayback();
         const current = this._eventFrameIndex?.[eventId] || 0;
         this._showEventFrame(eventId, total, Math.max(0, Math.min(total - 1, current + delta)));
+        const btn = document.getElementById(`event-play-btn-${CSS.escape(eventId)}`);
+        if (btn) btn.textContent = '▶';
     },
 
     async _dismissEvent(id) {
