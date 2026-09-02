@@ -47,7 +47,12 @@ def _default_model():
         return eng
     return pt
 YOLO_MODEL = _default_model()
-DEFAULT_PERSON_CONF = float(os.getenv("YOLO_PERSON_CONF", "0.35"))
+# FIX (2026-09-02): 0.35 descartaba personas REALES lejanas (caso real: cliente
+# en la vitrina al fondo, conf 0.29, sin silueta ni eventos con la persona
+# visible en cámara). 0.25 alinea con el umbral general y el chequeo de POSE
+# (keypoints coherentes) sigue filtrando ruido: reflejos/maniquíes no tienen
+# pose humana válida. Configurable por env sin redeploy.
+DEFAULT_PERSON_CONF = float(os.getenv("YOLO_PERSON_CONF", "0.25"))
 DEFAULT_MIN_POSE = float(os.getenv("YOLO_MIN_POSE_SCORE", "0.35"))
 TRACK_SMOOTHING = float(os.getenv("TRACK_SMOOTHING", "0.35"))
 
