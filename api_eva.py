@@ -2677,19 +2677,28 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
     yolo_count = grid.get_last_yolo_count()
     yolo_detections = grid.get_last_yolo_detections()
-    # Leer latest_yolo.json si existe (más actualizado, funciona en modo centinela también)
+    # Leer latest_yolo.json si existe (más actualizado, funciona en modo centinela también).
+    # FIX (2026-09-02): ventana estricta: solo confiar en latest_yolo.json si
+    # está a menos de 4 segundos de antigüedad (1 tick completo del worker).
+    # El overlay del live view usa exactamente el frame actual. Con la ventana
+    # de 60s el overlay se quedaba pegado al último evento con persona,
+    # dibujando bboxes sobre el frame actual como si todavía estuviera.
     try:
         _yolo_json_path = STORAGE_ROOT / "users" / (user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
         if _yolo_json_path.exists():
             with open(_yolo_json_path) as _f:
                 _yolo_data = json.load(_f)
-            # Usar datos del JSON si el timestamp es reciente (< 60s)
             _yolo_ts = _yolo_data.get("timestamp", 0)
-            if isinstance(_yolo_ts, (int, float)) and (time.time() - _yolo_ts) < 60:
+            _yolo_age = time.time() - _yolo_ts if isinstance(_yolo_ts, (int, float)) else 999
+            if _yolo_age < 4.0:
                 yolo_detections = _yolo_data.get("detections", [])
                 yolo_count = _yolo_data.get("count", len(yolo_detections))
+            else:
+                yolo_detections = []
+                yolo_count = 0
     except:
-        logger.debug("silent except")
+        yolo_detections = []
+        yolo_count = 0
 
     return {
         "success": bool(frame_bytes),
