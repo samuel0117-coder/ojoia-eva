@@ -1937,6 +1937,29 @@ let _disksData = null;
 function loadStorage() {
     loadDisks();
     loadStorageUsers();
+    loadDisksUsage();  // F3: semáforo real (statvfs) sobre las cards
+}
+
+let _disksUsage = {};
+function loadDisksUsage() {
+    apiGetJSON('/admin/disks/usage').then(d => {
+        _disksUsage = {};
+        (d.disks || []).forEach(x => _disksUsage[x.mount] = x);
+        // refrescar badges en las cards ya renderizadas
+        document.querySelectorAll('[data-disk-mount]').forEach(el => {
+            const u = _disksUsage[el.getAttribute('data-disk-mount')];
+            if (u) {
+                const icon = u.level === 'ok' ? '🟢' : u.level === 'warning' ? '🟡' : '🔴';
+                el.innerHTML = icon + ' <b>' + u.used_pct + '%</b> usado · ' + u.free_gb + ' GB libres' +
+                    (u.level !== 'ok' ? ' <button class="btn btn-sm btn-outline" onclick="checkDiskAlerts()">📧 Avisarme</button>' : '');
+            }
+        });
+    }).catch(() => {});
+}
+function checkDiskAlerts() {
+    apiFetch('/admin/disks/check-alerts', {method: 'POST'}).then(r => r.json()).then(d => {
+        toast(d.alerts_sent ? '✅ Alerta enviada a tu correo' : (d.reason ? '⏳ ' + d.reason : '✅ Sin problemas de disco'), true);
+    }).catch(() => toast('❌ Error', false));
 }
 
 function loadDisks() {
@@ -1952,6 +1975,7 @@ function loadDisks() {
             html += '<div class="plan-header"><h4>🗂️ ' + (disk.label || disk.mount) + (full ? ' <span class="badge badge-err">LLENO</span>' : '') + '</h4>';
             html += (d.disks || []).length > 1 ? '<button class="btn btn-sm btn-danger" onclick="removeDisk(' + i + ')">🗑️</button>' : '';
             html += '</div>';
+            html += '<p data-disk-mount="' + disk.mount + '">💊 uso calculando…</p>';
             html += '<p><strong>Montaje:</strong> ' + disk.mount + '</p>';
             html += '<p><strong>Espacio:</strong> ' + (disk.used_gb || 0) + ' GB / ' + (disk.total_gb || 0) + ' GB</p>';
             html += '<div style="background:var(--bg-primary);border-radius:4px;height:8px;margin:8px 0"><div style="background:' + color + ';border-radius:4px;height:8px;width:' + Math.min(pct, 100) + '%"></div></div>';

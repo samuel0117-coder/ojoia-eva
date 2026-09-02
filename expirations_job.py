@@ -137,6 +137,34 @@ def process_all() -> dict:
     return summary
 
 
+def check_disk_alerts() -> dict:
+    """HOT-COLD F3: alerta de disco al operador (llamado por el cron diario).
+    Usa la misma lógica que /admin/disks/check-alerts (antispam 1h incluido)."""
+    try:
+        import requests
+        ADMIN_TOKEN = os.environ.get("MEGAPANEL_TOKEN", "")
+        if not ADMIN_TOKEN:
+            return {"skipped": "sin token"}
+        r = requests.post(
+            "http://127.0.0.1:8005/admin/auth/login",
+            json={"token": ADMIN_TOKEN}, timeout=10)
+        sess = r.json().get("session_token", "")
+        if not sess:
+            return {"skipped": "login falló"}
+        r2 = requests.post(
+            "http://127.0.0.1:8005/admin/disks/check-alerts",
+            headers={"Authorization": f"Bearer {sess}"}, timeout=30)
+        return r2.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 if __name__ == "__main__":
     s = process_all()
     print(json.dumps(s, ensure_ascii=False, indent=1))
+    # F3: chequeo de disco en el mismo ciclo diario del cron
+    try:
+        d = check_disk_alerts()
+        print("[disk-alerts]", json.dumps(d, ensure_ascii=False)[:200])
+    except Exception as e:
+        print("[disk-alerts] error:", e)

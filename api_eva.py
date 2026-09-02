@@ -2480,18 +2480,47 @@ def find_user_json(user_id: str) -> Optional[Path]:
     return compat if compat.exists() else None
 
 def resolve_user_events_dirs(user_id: str) -> List[tuple]:
-    """Devolver carpetas del usuario (nueva estructura + compat)."""
-    base = get_user_storage_path(user_id, "founder")
+    """Devolver carpetas del usuario (nueva estructura + compat).
+
+    HOT-COLD F2 (2026-09-02): busca en TODOS los discos montados — primero
+    los activos (prioridad de lectura fresca) y después los ARCHIVADOS
+    (histórico legible tras un cambio de disco, sin mover nada). Esto es lo
+    que hace que archivar un disco lleno no 'esconda' los eventos viejos.
+    Deduplica por (cámara, ruta)."""
+    seen = set()
     dirs = []
-    cameras_dir = base / "cameras"
-    if cameras_dir.exists():
-        for cam_id in cameras_dir.iterdir():
-            events = cam_id / "events"
-            if events.is_dir():
-                dirs.append((cam_id.name, events))
-    legacy = base / "events"
-    if legacy.is_dir():
-        dirs.append(("_global", legacy))
+    try:
+        cfg = get_disk_config()
+        disks = cfg.get("disks", [])
+        activos = [d for d in disks if not d.get("archived")]
+        archivados = [d for d in disks if d.get("archived")]
+        bases = []
+        # disco actual del usuario (user_root) primero
+        bases.append(("actual", user_root(user_id)))
+        # resto de discos activos (por si el usuario estuvo ahí antes)
+        for d in activos:
+            bases.append(("activo", Path(d.get("mount", "")) / d.get("user_folder", "users") / user_id))
+        # discos archivados (histórico)
+        for d in archivados:
+            bases.append(("archivado", Path(d.get("mount", "")) / d.get("user_folder", "users") / user_id))
+    except Exception:
+        bases = [("actual", user_root(user_id))]
+    for _, base in bases:
+        try:
+            cameras_dir = base / "cameras"
+            if cameras_dir.exists():
+                for cam_id in cameras_dir.iterdir():
+                    events = cam_id / "events"
+                    key = (cam_id.name, str(events))
+                    if events.is_dir() and key not in seen:
+                        seen.add(key)
+                        dirs.append((cam_id.name, events))
+            legacy = base / "events"
+            if legacy.is_dir() and ("_global", str(legacy)) not in seen:
+                seen.add(("_global", str(legacy)))
+                dirs.append(("_global", legacy))
+        except Exception:
+            continue
     return dirs
 
 def resolve_user_id(camera_id: str, provided_user_id: str, client_ip: str = "unknown") -> str:
@@ -8936,6 +8965,194 @@ async def admin_cleanup_run(authorization: str = Header(None, alias="Authorizati
                 "tail": tail}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"cleanup falló: {e}")
+
+
+# ── HOT-COLD F3: alerta de disco al operador ────────────────────────────────
+_DISK_ALERT_TS = {"last": 0.0}
+
+
+def _disks_usage() -> list:
+    """Uso real (statvfs) de todos los mounts registrados + STORAGE_ROOT."""
+    out = []
+    seen = set()
+    try:
+        cfg = get_disk_config()
+        mounts = [d.get("mount") for d in cfg.get("disks", [])]
+    except Exception:
+        mounts = []
+    for m in mounts + [str(STORAGE_ROOT), "/"]:
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        try:
+            st = os.statvfs(m)
+            total_gb = (st.f_blocks * st.f_frsize) / 1e9
+            free_gb = (st.f_bavail * st.f_frsize) / 1e9
+            if total_gb < 1:
+                continue
+            pct = 100 * (1 - st.f_bavail / st.f_blocks) if st.f_blocks else 0
+            out.append({"mount": m, "total_gb": round(total_gb, 1),
+                        "free_gb": round(free_gb, 1), "used_pct": round(pct, 1),
+                        "level": "critical" if pct > 92 else
+                                 ("warning" if pct > 80 else "ok")})
+        except OSError:
+            continue
+    return out
+
+
+# ── HOT-COLD F2: protocolo de cambio de disco con ARCHIVADO ────────────────
+@app.post("/admin/disks/{mount_path:path}/archive")
+async def admin_archive_disk(mount_path: str, authorization: str = Header(None, alias="Authorization"),
+                             request: dict = None):
+    """HOT-COLD F2: archivar un disco lleno SIN mover TODO.
+
+    Protocolo de cambio de disco (el que pediste: 'cuando se cambie el
+    almacenimiento de un disco a otro no falle el sistema'):
+    1. Marca el disco como archived=True en disks_config (los usuarios
+       siguen RESOLVIENDO a él para LECTURA de eventos históricos — el
+       reader de eventos busca en TODOS los discos no-archivados primero
+       y luego archivados).
+    2. Los usuarios con disk_mount = ese disco se reasignan al disco
+       destino indicado → los eventos NUEVOS van al disco nuevo.
+    3. NO mueve nada: el histórico sigue accesible en el disco viejo
+       (read-only conceptual). El cleanup respeta archivado (no purga
+       huérfanos de discos archivados que sigan montados).
+
+    Body: {target_mount: "/mnt/disco-nuevo"}"""
+    _verify_admin(authorization)
+    mount = "/" + mount_path.lstrip("/")
+    if not Path(mount).is_dir():
+        raise HTTPException(status_code=404, detail=f"montaje no existe: {mount}")
+    return await _archive_disk_impl(mount, authorization,
+                                   (request or {}).get("target_mount"))
+
+
+async def _archive_disk_impl(mount: str, authorization: str = None,
+                             target_mount: Optional[str] = None):
+    cfg = get_disk_config()
+    disks = cfg.get("disks", [])
+    src = next((d for d in disks if d.get("mount") == mount), None)
+    if not src:
+        raise HTTPException(status_code=404, detail="disco no registrado")
+    if src.get("archived"):
+        return {"success": True, "already_archived": True}
+    # disco destino: el de más espacio que no esté archivado
+    if not target_mount:
+        cands = [d for d in disks if not d.get("archived") and d.get("mount") != mount]
+        if not cands:
+            raise HTTPException(status_code=400, detail="no hay disco destino disponible")
+        target_mount = max(cands, key=lambda d: d.get("free_gb", 0)).get("mount")
+    if target_mount == mount:
+        raise HTTPException(status_code=400, detail="destino = origen")
+    tgt = next((d for d in disks if d.get("mount") == target_mount), None)
+    if not tgt:
+        raise HTTPException(status_code=400, detail=f"destino no registrado: {target_mount}")
+
+    # 1) marcar archivado
+    src["archived"] = True
+    src["archived_at"] = time.time()
+    src["archive_target"] = target_mount
+    # 2) reasignar usuarios del disco archivado
+    moved = []
+    users_dir = STORAGE_ROOT / "users"
+    if users_dir.is_dir():
+        for uf in users_dir.glob("*/user.json"):
+            try:
+                ud = json.loads(uf.read_text())
+                if ud.get("disk_mount") == mount:
+                    ud["disk_mount"] = target_mount
+                    uid = uf.parent.name
+                    with _get_user_lock(uid):
+                        _atomic_write_user_json(uf, ud)
+                        # espejo en el disco destino
+                        tdir = Path(target_mount) / "users" / uid
+                        tdir.mkdir(parents=True, exist_ok=True)
+                        _atomic_write_user_json(tdir / "user.json", ud)
+                    invalidate_user_disk_cache(uid)
+                    moved.append(uid)
+            except Exception:
+                continue
+    # 3) persistir config
+    cfg["disks"] = disks
+    save_disk_config(cfg)
+    logger.info(f"[F2] disco {mount} ARCHIVADO → {target_mount}; "
+                f"{len(moved)} usuarios reasignados: {moved[:5]}")
+    return {"success": True, "archived": mount, "target": target_mount,
+            "users_moved": moved,
+            "note": "Eventos históricos siguen legibles en el disco archivado "
+                    "(read-only). Los NUEVOS van al destino."}
+
+
+@app.get("/admin/disks/{mount_path:path}/archive-status")
+async def admin_archive_status(mount_path: str, authorization: str = Header(None, alias="Authorization")):
+    """F2: estado de archivado de un disco + qué usuarios lo usan."""
+    _verify_admin(authorization)
+    mount = "/" + mount_path.lstrip("/")
+    cfg = get_disk_config()
+    d = next((x for x in cfg.get("disks", []) if x.get("mount") == mount), {})
+    users_on = []
+    for uf in (STORAGE_ROOT / "users").glob("*/user.json"):
+        try:
+            if json.loads(uf.read_text()).get("disk_mount") == mount:
+                users_on.append(uf.parent.name)
+        except Exception:
+            pass
+    return {"mount": mount, "archived": d.get("archived", False),
+            "archived_at": d.get("archived_at"), "users_on_disk": users_on}
+
+
+@app.get("/admin/disks/usage")
+async def admin_disks_usage(authorization: str = Header(None, alias="Authorization")):
+    """HOT-COLD F3: uso real por disco con niveles ok/warning/critical
+    (para el semáforo del tab Almacenamiento)."""
+    _verify_admin(authorization)
+    return {"disks": _disks_usage()}
+
+
+@app.post("/admin/disks/check-alerts")
+async def admin_disks_check_alerts(authorization: str = Header(None, alias="Authorization")):
+    """HOT-COLD F3: alerta de disco >80% al email del operador.
+    Anti-spam: máx 1 por hora. Pensado para el cron del health-monitor
+    o el expirations_job diario; también manual desde el panel."""
+    _verify_admin(authorization)
+    disks = _disks_usage()
+    problem = [d for d in disks if d["level"] != "ok"]
+    if not problem:
+        return {"success": True, "alerts_sent": 0, "disks": disks}
+    now = time.time()
+    if now - _DISK_ALERT_TS["last"] < 3600:
+        return {"success": True, "alerts_sent": 0, "reason": "antispam 1h",
+                "disks": disks}
+    _DISK_ALERT_TS["last"] = now
+    lines = [f"⚠️ {d['mount']}: {d['used_pct']}% usado ({d['free_gb']} GB libres) — nivel {d['level']}"
+             for d in problem]
+    title = f"[OjoIA] Disco {'CRÍTICO' if any(d['level']=='critical' for d in problem) else 'al 80%'}"
+    body = "Almacenamiento requiere atención:\n" + "\n".join(lines) + \
+           "\n\nAcciones: ojoia.com.do/admin → Almacenamiento (retención/cleanup), o montar el siguiente disco."
+    sent = False
+    try:
+        from health_monitor import _send_alert
+        sent = await asyncio.to_thread(_send_alert, title, body)
+    except Exception:
+        # fallback directo SMTP (mismo canal de alertas)
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            smtp_user = os.environ.get("ALERT_SMTP_USER", "")
+            if smtp_user:
+                msg = MIMEText(body)
+                msg["Subject"] = title
+                msg["From"] = smtp_user
+                msg["To"] = os.environ.get("ALERT_EMAIL_TO", "samuel0117@gmail.com")
+                with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
+                    s.starttls(); s.login(smtp_user, os.environ.get("ALERT_SMTP_PASS", ""))
+                    s.send_message(msg)
+                sent = True
+        except Exception:
+            pass
+    logger.warning(f"[F3] alerta disco: {problem} (enviada={sent})")
+    return {"success": True, "alerts_sent": 1 if sent else 0,
+            "problems": problem, "channel_ok": sent}
 
 
 @app.get("/admin/health/summary")
