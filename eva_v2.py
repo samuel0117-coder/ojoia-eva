@@ -2646,6 +2646,17 @@ async def _handle_zones(session, session_id, user_id, first, message, storage_ro
             f"Claro, {first}. Vamos a ajustar la cámara. Cuando la hayas movido "
             f"y la tengas en la posición que querés, dime 'listo' y volvemos a analizar la imagen.")
 
+    # FIX (2026-09-01, hallado en test en vivo): cualquier OTRO mensaje (ej: un
+    # saludo "hola eva que tal" mientras el wizard está en ZONES) caía sin
+    # return → None → "Error procesando mensaje" en el chat. Ahora: respuesta
+    # amigable que ancla al paso actual sin perder el wizard.
+    _sessions[session_id] = session
+    _save_session_to_disk(session)
+    return _mk_resp(session,
+        f"Estoy marcando las zonas importantes de tu {zone or 'cámara'}, {first}. "
+        f"¿Confirmas las zonas que marqué, quieres mover la cámara, o prefieres "
+        f"decirme 'listo' para continuar con lo que quieres vigilar?")
+
 
 def _find_pending_camera(user_id: str, storage_root) -> str:
     """Busca una cámara pendiente (nueva, con frames pero sin configurar)."""
@@ -3246,8 +3257,15 @@ async def _handle_test_rules(session, session_id, user_id, message, first, stora
         text = (
             f"🔍 **Vamos a probar las {len(rules)} reglas** que configuraste para tu cámara.\n\n"
             f"Reglas:\n{rules_text}\n\n"
-            f"Por favor, realiza la acción que describo para cada una. "
-            f"Cuando la hagas, dime 'listo' y yo evalúo si la regla se activó.\n\n"
+            # E4 (Fase E): onboarding de CONFIANZA — el dueño VIOLA la regla a
+            # propósito ante la cámara y Eva debe detectarlo en vivo. Si lo
+            # logra el primer día, el dueño confía en las alertas de verdad.
+            f"**Esto es una prueba de confianza**: haz la acción DE VERDAD, frente "
+            f"a la cámara, a propósito — como un simulacro de incendio. "
+            f"Yo estoy mirando y te confirmo si la detecto.\n\n"
+            f"Ejemplo: si la regla dice \"que nadie pase detrás del mostrador\", "
+            f"pásate tú detrás del mostrador ahora mismo.\n\n"
+            f"Cuando la hagas, dime **'listo'** y te muestro el video de lo que vi.\n\n"
             f"**Progreso: 0/{len(rules)} reglas probadas**"
         )
         return _mk_resp(session, text)
@@ -3327,9 +3345,18 @@ async def _handle_test_rules(session, session_id, user_id, message, first, stora
                     f"🎉 **Todas las reglas funcionan. Tu cámara está lista y vigilando, {first}.**"
                 )
             else:
+                # E4: mostrar el CLIP del evento detectado (D2) — el dueño VE
+                # la prueba que acaba de hacer, como evidencia de confianza.
+                clip_hint = ""
+                try:
+                    ev_id = result.get("event_id") if isinstance(result, dict) else None
+                    if ev_id:
+                        clip_hint = f"\n\n📹 Te muestro el video de lo que vi en esa prueba."
+                except Exception:
+                    pass
                 text = (
                     f"✅ **Regla #{current} probada** — ¡Se activó correctamente!\n\n"
-                    f"Recibiste una notificación push con: \"{rule[:60]}\"\n\n"
+                    f"Recibiste una notificación push con: \"{rule[:60]}\"{clip_hint}\n\n"
                     f"Siguiente regla: \"{rules[current][:60]}\" — realiza la acción y dime \"listo\".\n\n"
                     f"**Progreso: {current}/{len(rules)} reglas probadas ✅**"
                 )
@@ -3416,8 +3443,67 @@ async def _handle_os_mode_v2(session, user_id, message, session_id):
     session.setdefault("msgs", [])
     session["msgs"].append({"role":"user","content":message})
     first = session["owner_name"].split()[0] if session.get("owner_name") else "amigo"
-    ud = _load_user_data(user_id)
+    ud = _load_user_data(user_id) or {}
     cam_count = len([c for c in ud.get("cameras",[]) if c.get("active")]) if ud.get("cameras") else 0
+
+    # ── E3 (Fase E): sugerencia de regla pendiente tras 5 falsas alarmas ──
+    # La dejó tool_learn_from_feedback en vigilance.pending_rule_suggestions.
+    # Eva la presenta CON OPCIONES ASISTIDAS. Presupuesto de sutileza:
+    #   - La frase original del dueño NUNCA se borra sola: se archiva en la
+    #     sugerencia y Eva la muestra.
+    #   - Eva ayuda a elegir: propone redacción más precisa (construida de
+    #     los attention_corrections), pero la decisión es del dueño.
+    #   - Si el dueño responde fuera de las opciones, la sugerencia se
+    #     pospone (no insiste).
+    msg_norm_e3 = _normalize_text(message or "")
+    pending_sug = None
+    pend_cam_id = None
+    try:
+        for c in ud.get("cameras", []):
+            if not c.get("active"):
+                continue
+            cam_cfg_p = STORAGE_ROOT / "users" / user_id / "cameras" / c.get("camera_id", "") / "camera.json"
+            if not cam_cfg_p.exists():
+                continue
+            v_p = (json.loads(cam_cfg_p.read_text()).get("vigilance") or {})
+            pend = v_p.get("pending_rule_suggestions") or []
+            if pend:
+                pending_sug = pend[0]
+                pend_cam_id = c.get("camera_id", "")
+                break
+    except Exception as _e_e3:
+        logger.debug(f"[E3] leer sugerencias pendientes falló: {_e_e3}")
+
+    if pending_sug and not msg_norm_e3.startswith("__"):
+        # ¿El usuario está respondiendo a la sugerencia? Solo presentarla UNA
+        # vez por turno de conversación (se consume al presentar).
+        if session.get("_e3_suggestion_shown") != pending_sug.get("ts"):
+            session["_e3_suggestion_shown"] = pending_sug.get("ts")
+            sug_text = (
+                f"💡 **Una ayuda con tus reglas, {first}**\n\n"
+                f"{pending_sug.get('propuesta_eva', '')}\n\n"
+                f"Puedes decirme:\n"
+                f"• **«ajustala: [redacción nueva]»** — reescribo la regla (guardo la\n"
+                f"  original por si quieres volver)\n"
+                f"• **«agrega nota: [aclaración]»** — dejo la regla igual y uso tu aclaración\n"
+                f"  como contexto para no repetir el error\n"
+                f"• **«silenciala»** — la pauso 24h\n"
+                f"• **«dejala asi»** — la mantengo y no vuelvo a molestar\n\n"
+                f"(La regla original fue: «{pending_sug.get('frase','')}»)"
+            )
+            # presentarla y seguir con la conversación normal debajo
+            session["msgs"].append({"role": "assistant", "content": sug_text})
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            # no cortar el flujo: el mensaje del usuario también se procesa;
+            # la sugerencia se muestra primero en la respuesta.
+        # manejo de respuestas a la sugerencia
+        if any(w in msg_norm_e3 for w in ("ajustala", "ajústala", "reescribi", "reescribe")):
+            return await _handle_rule_adjust(session, user_id, pend_cam_id, pending_sug, message, session_id, first)
+        if "silenciala" in msg_norm_e3 or "silencialo" in msg_norm_e3:
+            return await _handle_rule_pause(session, user_id, pend_cam_id, pending_sug, session_id, first)
+        if any(w in msg_norm_e3 for w in ("dejala asi", "déjala así", "mantenla", "mantenerla")):
+            return await _handle_rule_keep(session, user_id, pend_cam_id, pending_sug, session_id, first)
 
     if message == "__daily_summary__":
         suggestions = _get_business_suggestions_list(ud.get("business_type",""), cam_count, first)
@@ -4540,3 +4626,113 @@ def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=Fal
         "heatmap": heatmap or None,
         "heatmap_meta": heatmap_meta or None,
     }
+
+
+# =============================================================================
+# E3 (Fase E) — AJUSTE ASISTIDO DE REGLAS desde el chat
+# =============================================================================
+# Handlers de las opciones que Eva ofrece cuando una regla acumula 5 falsas
+# alarmas. Presupuesto de sutileza: la intención original del dueño JAMÁS se
+# pierde — toda redacción guarda la frase anterior en el historial de la
+# propia sugerencia (rule_history) y en attention_corrections.
+
+async def _e3_clear_suggestion(user_id: str, camera_id: str, suggestion: dict, outcome: str, extra: dict = None):
+    """Consume la sugerencia pendiente y archiva el resultado."""
+    try:
+        cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+        cam_cfg = json.loads(cam_file.read_text())
+        v = cam_cfg.get("vigilance") or {}
+        pend = v.get("pending_rule_suggestions") or []
+        frase = suggestion.get("frase", "")
+        v["pending_rule_suggestions"] = [s for s in pend
+                                         if (s.get("frase") or "").lower() != frase.lower()]
+        # historial de decisiones (auditable, no se borra nada)
+        hist = v.setdefault("rule_history", [])
+        hist.append({**{k: suggestion.get(k) for k in ("frase", "false_alarms")},
+                     "outcome": outcome, "ts": int(time.time()), **(extra or {})})
+        v["rule_history"] = hist[-50:]
+        cam_cfg["vigilance"] = v
+        cam_file.write_text(json.dumps(cam_cfg, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.warning(f"[E3] limpiar sugerencia falló: {e}")
+
+
+async def _handle_rule_adjust(session, user_id, camera_id, suggestion, message, session_id, first):
+    """«ajustala: [redacción nueva]» — reescribe la regla conservando la original."""
+    import re as _re
+    new_text = ""
+    m = _re.search(r"(?:ajustala|ajústala|reescribi|reescribe)[a-z]*\s*[:\-]?\s*(.+)", message or "", _re.IGNORECASE)
+    if m:
+        new_text = m.group(1).strip()
+    if not new_text:
+        text = (f"Claro, {first}. Escribe la redacción nueva después de «ajustala:», "
+                f"por ejemplo: «ajustala: que el cajero se lleve la mano al bolsillo SOLO cuando esté solo detrás del mostrador».")
+        return _mk_resp(session, text)
+    frase_old = suggestion.get("frase", "")
+    try:
+        cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+        cam_cfg = json.loads(cam_file.read_text())
+        v = cam_cfg.get("vigilance") or {}
+        phrases = v.get("attention_phrases") or cam_cfg.get("attention_phrases") or []
+        # reemplazar preservando el resto
+        phrases = [new_text if p.lower() == frase_old.lower() else p for p in phrases]
+        if new_text.lower() not in [p.lower() for p in phrases]:
+            phrases.append(new_text)
+        v["attention_phrases"] = phrases
+        cam_cfg["attention_phrases"] = phrases
+        # reset del contador de falsas alarmas de AMBAS variantes
+        for k in (frase_old.lower(), new_text.lower()):
+            (v.get("false_alarm_counts") or {}).pop(k, None)
+        # owner_note para que B2/verificador tenga el contexto del cambio
+        notes = v.setdefault("owner_notes", [])
+        note = f"El dueño aclaró la regla: antes «{frase_old}», ahora «{new_text}»"
+        if note not in notes:
+            v.setdefault("owner_notes", []).append(note)
+            cam_cfg["vigilance"] = v
+        cam_file.write_text(json.dumps(cam_cfg, indent=2, ensure_ascii=False))
+        # archivar la decisión con la frase original (nunca se pierde).
+        # DESPUÉS del write principal: _e3_clear hace read-modify-write
+        # propio; si corre antes, el write de arriba pisa y revive la sugerencia.
+        await _e3_clear_suggestion(user_id, camera_id, suggestion, "rewritten",
+                                   {"frase_nueva": new_text})
+    except Exception as e:
+        logger.warning(f"[E3] ajustar regla falló: {e}")
+        return _mk_resp(session, f"No pude guardar el cambio ({e}). Intenta de nuevo en un momento.")
+    text = (f"¡Listo, {first}! ✅ Actualicé la regla:\n\n"
+            f"• Antes: «{frase_old}»\n"
+            f"• Ahora: «{new_text}»\n\n"
+            f"Guardé la redacción anterior por si quieres volver. Empecé a vigilar con la nueva versión.")
+    return _mk_resp(session, text)
+
+
+async def _handle_rule_pause(session, user_id, camera_id, suggestion, session_id, first):
+    """«silenciala» — pausa la frase 24h (owner_note temporal con fecha)."""
+    frase = suggestion.get("frase", "")
+    until = time.time() + 86400
+    try:
+        cam_file = STORAGE_ROOT / "users" / user_id / "cameras" / camera_id / "camera.json"
+        cam_cfg = json.loads(cam_file.read_text())
+        v = cam_cfg.get("vigilance") or {}
+        notes = v.setdefault("owner_notes", [])
+        note = f"falso positivo silenciado por 24h (hasta {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}): {frase}"
+        if not any(frase in n for n in notes):
+            notes.append(note)
+        cam_cfg["vigilance"] = v
+        cam_file.write_text(json.dumps(cam_cfg, indent=2, ensure_ascii=False))
+        # DESPUÉS del write (mismo fix que adjust: clear hace su propio rmw)
+        await _e3_clear_suggestion(user_id, camera_id, suggestion, "paused_24h")
+    except Exception as e:
+        logger.warning(f"[E3] pausar regla falló: {e}")
+    until_str = time.strftime('%H:%M de mañana', time.localtime(until))
+    text = (f"Entendido, {first}. Silencié «{frase}» por 24 horas (hasta {until_str}). "
+            f"Si durante ese tiempo ves que extraño algo importante, dímelo y la reactivo.")
+    return _mk_resp(session, text)
+
+
+async def _handle_rule_keep(session, user_id, camera_id, suggestion, session_id, first):
+    """«dejala asi» — mantiene la regla y no se vuelve a sugerir."""
+    frase = suggestion.get("frase", "")
+    await _e3_clear_suggestion(user_id, camera_id, suggestion, "kept")
+    text = (f"Perfecto, {first}. Mantengo «{frase}» tal cual — es tu regla y la respeto. "
+            f"No volveré a molestarte con ella.")
+    return _mk_resp(session, text)

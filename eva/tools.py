@@ -1428,6 +1428,42 @@ async def tool_learn_from_feedback(event_id: str, is_real: bool, notes: str = No
                             notes_list.append(auto_note)
                             vigilance["owner_notes"] = notes_list[-20:]
                             logger.info(f"[B4] auto owner_note tras 3 falsas alarmas: {original_hit[:50]} ({camera_id})")
+
+                    # ── E3 (2026-09-01): a la 5ª falsa alarma de la MISMA frase,
+                    # dejar una SUGERENCIA PENDIENTE para el chat de Eva. El
+                    # próximo turno del chat la presenta al dueño con opciones
+                    # ASISTIDAS (Eva ayuda a reescribir, no borra la intención
+                    # original). Presupuesto de sutileza:
+                    #   - NUNCA se elimina la frase sola: la original queda en
+                    #     attention_phrases y se archiva en la sugerencia.
+                    #   - Eva PROPONE una redacción más precisa construida a
+                    #     partir de los attention_corrections del dueño.
+                    #   - El dueño decide: reescribir / comentar / silenciar /
+                    #     mantener.
+                    if counts[key] == 5:
+                        pend = vigilance.get("pending_rule_suggestions") or []
+                        if not any(s.get("frase", "").lower() == key for s in pend):
+                            # Reconstruir intención a partir de las correcciones
+                            # previas del dueño sobre esta frase
+                            corrections = [c.get("correction_note", "") for c in
+                                           (vigilance.get("attention_corrections") or [])
+                                           if isinstance(c, dict) and
+                                           (c.get("original_hit") or "").lower() == key]
+                            proposal_base = corrections[-1] if corrections else original_hit
+                            pend.append({
+                                "frase": original_hit,
+                                "false_alarms": counts[key],
+                                "camera_id": camera_id,
+                                "propuesta_eva": (f"La regla «{original_hit}» se ha marcado "
+                                                  f"{counts[key]} veces como falsa alarma. "
+                                                  f"Redacción más precisa propuesta por Eva: "
+                                                  f"«{proposal_base}». "
+                                                  f"¿Quieres que la ajuste, que agregue un aclaración, "
+                                                  f"o prefieres mantenerla?"),
+                                "ts": int(time.time()),
+                            })
+                            vigilance["pending_rule_suggestions"] = pend[-10:]
+                            logger.info(f"[E3] sugerencia de regla pendiente tras 5 falsas alarmas: {original_hit[:50]} ({camera_id})")
                     cam_cfg["vigilance"] = vigilance
                     with open(cam_file, "w") as f:
                         json.dump(cam_cfg, f, indent=2, ensure_ascii=False)

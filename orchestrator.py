@@ -460,6 +460,28 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
                 _notif = {"title": title, "body": body}
                 if _img_field:
                     _notif["image"] = _img_field
+                # E1 (2026-09-01): botones de acción en el push para alertas de
+                # vigilancia. Web Push soporta 'actions' — al tocarlas el
+                # service worker abre el deeplink ?action=real|false&event_id=
+                # y el frontend (E2) registra el feedback automáticamente.
+                _webpush_notif = {
+                    "title": title,
+                    "body": body,
+                    "icon": "/img/icon-192.png",
+                    "badge": "/img/icon-192.png",
+                    "require_interaction": True,
+                    "tag": _notif_tag,
+                    **({"image": _img_field} if _img_field else {}),
+                }
+                if notif_type in ("violation", "attention", "vigilance_alert") and _event_id:
+                    _webpush_notif["actions"] = [
+                        {"action": "real",
+                         "title": "✅ Correcta",
+                         **({"icon": "/img/icon-ok.png"} if os.path.exists(STORAGE_ROOT / "img" / "icon-ok.png") else {})},
+                        {"action": "false",
+                         "title": "🚫 Falsa alarma",
+                         **({"icon": "/img/icon-false.png"} if os.path.exists(STORAGE_ROOT / "img" / "icon-false.png") else {})},
+                    ]
                 _payload = {
                     "message": {
                         "token": tok,
@@ -476,15 +498,7 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
                         },
 
                         "webpush": {
-                            "notification": {
-                                "title": title,
-                                "body": body,
-                                "icon": "/img/icon-192.png",
-                                "badge": "/img/icon-192.png",
-                                "require_interaction": True,
-                                "tag": _notif_tag,
-                                **({"image": _img_field} if _img_field else {}),
-                            },
+                            "notification": _webpush_notif,
                             "fcm_options": {"link": link}
                         }
                     }
@@ -2774,11 +2788,13 @@ class QwenOrchestrator:
                             f"🔍 {first_hit}\n\n"
                             f"📝 Contexto: {summary[:100]}\n\n"
                             f"🕐 {now_str} | 📍 {business_name or zone}")
-                    event_link = f"https://ojoia.com.do/#cameras?alert={event_id}&camera={camera_id}"
+                    event_link = f"https://ojoia.com.do/#cameras?alert={event_id}&camera={camera_id}&action=review"
                     _fcm_task = asyncio.create_task(send_fcm_notification(
                         title=title, body=body, user_id=user_id,
                         image_b64=image_to_base64(frames[0]["image_bytes"]) if frames else None,
-                        link=event_link
+                        link=event_link,
+                        event_id=event_id,
+                        notif_type="attention",
                     ))
                     _fcm_task.add_done_callback(
                         lambda t: logging.info(f"FCM sent: {title[:40]}") if not t.exception()
