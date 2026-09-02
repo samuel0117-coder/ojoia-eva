@@ -2631,17 +2631,47 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
     if not frame_bytes and camera_id and user_id:
         try:
             events_dir = user_root(user_id) / "cameras" / camera_id / "events"
-            latest_vig = events_dir / "latest_vigilance.jpg"
-            if latest_vig.exists():
-                frame_bytes = latest_vig.read_bytes()
+            frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
+            live_raw = frames_dir / "latest_raw.jpg"
+            sentinel_jpg = events_dir / "latest_vigilance.jpg"
+
+            # FIX (2026-09-02): el centinela NO debe tapar el live.
+            # Antes: si la cámara de noche no era centinela (no detectaba nada)
+            # o el host reinició y el stream live no había llegado aún,
+            # se servía latest_vigilance.jpg (de la noche anterior, con bbox
+            # dibujado) COMO SI FUERA EL FRAME ACTUAL → el usuario veía una
+            # imagen oscura de 22:15 con overlay "persona 73%" encima de su
+            # negocio clarísimo de 09:17am. Ahora: prioridad al raw live; la
+            # imagen centinela solo se usa si NO hay raw o es MUY vieja (>5 min
+            # = la cámara está apagada y hubo centinela hace poco).
+            live_raw = None
+            sentinel_stale_after_s = 300  # >5min sin live = quizás cámara fuera
+            try:
+                if live_raw.exists():
+                    raw_mtime = live_raw.stat().st_mtime
+                else:
+                    raw_mtime = 0
+            except Exception:
+                raw_mtime = 0
+            sentinel_mtime = 0
+            try:
+                if sentinel_jpg.exists():
+                    sentinel_mtime = sentinel_jpg.stat().st_mtime
+            except Exception:
+                sentinel_mtime = 0
+
+            # usar el más reciente, con la regla de que el centinela SOLO sea
+            # fallback cuando el raw esté viejo (cámara desconectada)
+            if live_raw.exists() and raw_mtime >= sentinel_mtime - sentinel_stale_after_s:
+                frame_bytes = live_raw.read_bytes()
                 last_cam = camera_id
-            else:
-                frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
-                latest_raw = frames_dir / "latest_raw.jpg"
-                if latest_raw.exists():
-                    frame_bytes = latest_raw.read_bytes()
-                    last_cam = camera_id
-        except:
+            elif sentinel_jpg.exists():
+                frame_bytes = sentinel_jpg.read_bytes()
+                last_cam = camera_id
+            elif live_raw.exists():
+                frame_bytes = live_raw.read_bytes()
+                last_cam = camera_id
+        except Exception:
             logger.debug("silent except")
 
     image_b64 = base64.b64encode(frame_bytes).decode() if frame_bytes else ""
