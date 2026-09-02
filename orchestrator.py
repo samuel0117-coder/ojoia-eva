@@ -71,12 +71,19 @@ def get_user_storage_path(user_id: str, plan: str = "founder") -> str:
             with open(uf) as f:
                 dm = json.load(f).get("disk_mount")
             if dm:
+                # ST-3b (2026-09-02): SOLO mounts registrados en disks_config.
+                # El fallback isdir() aceptaba '/mnt/.../users' (colado por
+                # writers viejos) y componía '/users' OTRA VEZ → ruta
+                # '/users/users/...' tercera aparición del mismo bug. Un
+                # disk_mount que no matchea disco registrado = ignorar (caer
+                # a plan/espacio) — igual que el sanitizador de api_eva.
+                dm = dm.rstrip("/")
+                if dm.endswith("/users"):
+                    dm = dm[:-6]  # curar el formato colado al leerlo
                 for d in disks:
                     if d.get("mount") == dm:
                         selected = d
                         break
-                if selected is None and os.path.isdir(dm):
-                    selected = {"mount": dm, "user_folder": "users"}
     except Exception:
         pass
     if selected is None and priority_disk:
