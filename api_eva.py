@@ -5243,7 +5243,7 @@ async def get_camera(camera_id: str, user_id: str = None):
     for c in ud.get("cameras", []):
         if c.get("camera_id") == camera_id:
             # Cargar datos adicionales de camera.json si existe
-            cam_cfg = get_camera_config_static(user_id, camera_id)
+            cam_cfg = get_camera_config_static(user_id, camera_id) or {}
             result = dict(c)
             result["system_prompt"] = cam_cfg.get("system_prompt", ud.get("vigilance_prompt", ""))
             result["rules"] = cam_cfg.get("rules", [])
@@ -5277,7 +5277,7 @@ async def get_camera_vigilance(camera_id: str, user_id: Optional[str] = None):
     cam = next((c for c in ud.get("cameras", []) if c.get("camera_id") == camera_id), None)
     if not cam:
         raise HTTPException(status_code=404, detail="Camara no encontrada")
-    cam_cfg = get_camera_config_static(user_id, camera_id)
+    cam_cfg = get_camera_config_static(user_id, camera_id) or {}
     vigilance = cam_cfg.get("vigilance", ud.get("vigilance", {}))
     schedule = ud.get("schedule", {})
     mode = "vigilante" if _is_vigilante_mode(schedule, vigilance, datetime.now().strftime("%H:%M"), cam_cfg.get("night_mode", False)) else "normal"
@@ -5340,7 +5340,7 @@ async def save_camera_vigilance(camera_id: str, request: dict = None):
     system_prompt = ""
     try:
         from eva.vigilance_prompts import format_vision_prompt as _regen
-        cam_cfg = get_camera_config_static(user_id, camera_id)
+        cam_cfg = get_camera_config_static(user_id, camera_id) or {}
         schedule = ud.get("schedule", {})
         is_after = _is_vigilante_mode(schedule, vigilance or ud.get("vigilance", {}), datetime.now().strftime("%H:%M"), cam_cfg.get("night_mode", False))
         new_prompt = _regen(
@@ -6132,7 +6132,7 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
             logger.error(f"Error guardando frame: {e}")
 
         # ── [2] Leer config y determinar modo centinela ──
-        cam_cfg = get_camera_config_static(user_id, camera_id)
+        cam_cfg = get_camera_config_static(user_id, camera_id) or {}
         vigilance = cam_cfg.get("vigilance", {})
         schedule = cam_cfg.get("schedule") or {}
         if not schedule:
@@ -6517,9 +6517,15 @@ async def yolo_worker():
                 user_id = frame_data.get("user_id")
                 camera_id = frame_data.get("camera_id")
                 img_bytes = frame_data.get("img_bytes")
-                cam_cfg = frame_data.get("cam_cfg") or {}
-                schedule = frame_data.get("schedule") or {}
-                vigilance = frame_data.get("vigilance") or {}
+                # fix (2026-09-01): frames viejos en el stream pueden traer
+                # cam_cfg como string vacío (None serializado) → crash
+                # 'str' object has no attribute get' en el worker entero.
+                _cc = frame_data.get("cam_cfg")
+                cam_cfg = _cc if isinstance(_cc, dict) else {}
+                _sc = frame_data.get("schedule")
+                schedule = _sc if isinstance(_sc, dict) else {}
+                _vg = frame_data.get("vigilance")
+                vigilance = _vg if isinstance(_vg, dict) else {}
                 mode = frame_data.get("mode", "normal")
 
                 # latest_yolo.json para el viewer (por cámara)
