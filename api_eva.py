@@ -110,7 +110,18 @@ def update_user_json(user_id: str, mutator):
             with open(uf) as f:
                 ud = json.load(f)
         mutator(ud)
+        # RD-7 (2026-09-02): DUAL-WRITE bajo el mismo lock. Con usuarios
+        # migrados, uf puede ser el HDD mientras lectores legacy leen el
+        # compat NVMe (STORAGE_ROOT/users/uid) — el registro de tokens FCM
+        # acababa en un solo disco y según quién leyera, el token estaba o
+        # no (bug real visto hoy). Ahora: ambos espejos siempre sincronos.
         _atomic_write_user_json(uf, ud)
+        compat = Path(STORAGE_ROOT) / "users" / user_id / "user.json"
+        if compat != uf:
+            try:
+                _atomic_write_user_json(compat, ud)
+            except Exception as e:
+                logger.warning(f"[RD-7] dual-write compat falló {user_id[:8]}…: {e}")
         return ud
 
 
@@ -3274,17 +3285,13 @@ async def register_fcm_token(request: dict, authorization: str = Header(None, al
                 logger.warning(f"[fcm-register] body parse failed: {e_1989}")
         if not user_id or not fcm_token:
             raise HTTPException(status_code=400, detail="user_id and fcm_token required")
-        uf = find_user_json(user_id)
-        if uf and uf.exists():
-            with open(uf) as f:
-                user_data = json.load(f)
-            tokens = user_data.get("fcm_tokens", [])
-            if fcm_token not in tokens:
-                tokens.append(fcm_token)
-                user_data["fcm_tokens"] = tokens
-                with open(uf, "w") as f:
-                    json.dump(user_data, f, indent=2)
-                logger.info(f"FCM token registered for user {user_id}")
+        # RD-7: update_user_json = lock + atómico + DUAL-WRITE (ambos discos)
+        def _mut_tok(ud):
+            toks = ud.setdefault("fcm_tokens", [])
+            if fcm_token not in toks:
+                toks.append(fcm_token)
+        update_user_json(user_id, _mut_tok)
+        logger.info(f"FCM token registered for user {user_id}")
         return {"success": True}
     except HTTPException:
         raise
@@ -3301,16 +3308,13 @@ async def unregister_fcm_token(request: dict):
         fcm_token = request.get("fcm_token", "") if isinstance(request, dict) else ""
         if not user_id or not fcm_token:
             raise HTTPException(status_code=400, detail="user_id and fcm_token required")
-        uf = find_user_json(user_id)
-        if uf and uf.exists():
-            with open(uf) as f:
-                user_data = json.load(f)
-            tokens = user_data.get("fcm_tokens", [])
-            if fcm_token in tokens:
-                tokens.remove(fcm_token)
-                user_data["fcm_tokens"] = tokens
-                with open(uf, "w") as f:
-                    json.dump(user_data, f, indent=2)
+        # RD-7: mismo patrón dual-write
+        def _mut_rm(ud):
+            toks = ud.get("fcm_tokens", [])
+            if fcm_token in toks:
+                toks.remove(fcm_token)
+                ud["fcm_tokens"] = toks
+        update_user_json(user_id, _mut_rm)
         return {"success": True}
     except HTTPException:
         raise

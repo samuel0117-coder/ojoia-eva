@@ -419,16 +419,29 @@ async def send_fcm_notification(title: str, body: str, token: str = None,
         import requests as _req
         import json as _json
         
-        # Buscar tokens FCM del usuario en user.json
+        # Buscar tokens FCM del usuario en user.json.
+        # RD-7 (2026-09-02): leer AMBOS discos (el usuario puede vivir en
+        # el HDD migrado; antes solo miraba STORAGE_ROOT → tokens "perdidos"
+        # según dónde hubiera caído la última escritura).
         tokens = []
         if token:
             tokens.append(token)
         elif user_id:
-            _uf = f"{STORAGE_ROOT}/users/{user_id}/user.json"
-            if os.path.exists(_uf):
-                with open(_uf) as _f:
-                    _ud = _json.load(_f)
-                tokens = _ud.get("fcm_tokens", [])
+            _seen = set()
+            for _base in (f"{STORAGE_ROOT}/users/{user_id}",
+                          get_user_storage_path(user_id, "free")):
+                _uf = f"{_base}/user.json" if isinstance(_base, str) else str(_base / "user.json")
+                if _uf in _seen or not os.path.exists(_uf):
+                    continue
+                _seen.add(_uf)
+                try:
+                    with open(_uf) as _f:
+                        _ud = _json.load(_f)
+                    for _t in _ud.get("fcm_tokens", []):
+                        if _t not in tokens:
+                            tokens.append(_t)
+                except Exception:
+                    continue
         
         if not tokens:
             _log.info(f"FCM: Sin tokens para user={user_id}")
