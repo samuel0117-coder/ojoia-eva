@@ -551,6 +551,22 @@ c.style.display = '';
         }
     },
 
+    // FIX congelamiento (2026-09-02): al VUELVER a la pestaña (background
+    // mata los MJPEG), marcar todos los streams estancados para que el
+    // próximo tick los reconecte con conexión fresca (cache-buster).
+    _setupVisibilityRescue() {
+        if (this._visRescueSetup) return;
+        this._visRescueSetup = true;
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                Object.keys(this._homeLastFrameTs).forEach(k => {
+                    // forzar streamStale en el próximo tick
+                    if (this._homeLastFrameTs[k] > 0) this._homeLastFrameTs[k] = 1;
+                });
+            }
+        });
+    },
+
     _poll(key, fn, ms) {
         if (this._polls[key]) clearInterval(this._polls[key]);
         fn();
@@ -736,6 +752,7 @@ c.style.display = '';
                 this._fetchFullCamConfig(defaultCamId);
             }
             setTimeout(() => {
+                this._setupVisibilityRescue();
                 this._poll('home_frames', () => this._fetchHomeFrames(), frameInterval);
                 this._poll('home_stats', () => this._fetchStats(), 30000);
                 this._poll('home_cams', () => this._refreshCamStatus(), 15000);
@@ -1178,8 +1195,21 @@ c.style.display = '';
             const watermark = `OJO-${camIdShort} | ${dateText} ${nowText} | ${zone}`;
             this._homeWatermarkTextByCam[camId] = watermark;
 
-            // MJPEG stream en lugar de polling JPEG
-            const streamUrl = `${this.API}/cameras/${camId}/stream?user_id=${uid}&fps=5`;
+            // MJPEG stream en lugar de polling JPEG.
+            // FIX congelamiento (2026-09-02): los navegadores matan la
+            // conexión MJPEG en background (~2-5min sin foco / energía) y el
+            // <img> se queda congelado SIN disparar onerror. El watchdog
+            // (streamStale) reinicia, pero reasignar el MISMO src no reabre
+            // la conexión muerta. Solución: al reiniciar, cancelar la
+            // conexión vieja (src data:) y URL con cache-buster único.
+            const isRestart = this._homeStreamStarted[key] === true && (Date.now() - (this._homeLastFrameTs[key] || 0)) > 15000;
+            const bust = isRestart ? `&_r=${Date.now()}` : '';
+            const streamUrl = `${this.API}/cameras/${camId}/stream?user_id=${uid}&fps=5${bust}`;
+            if (isRestart) {
+                // matar la conexión muerta antes de la nueva
+                const dead = document.querySelector(`#${targetId} img.live-img`);
+                if (dead) { dead.onload = null; dead.onerror = null; dead.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='; }
+            }
             const onImgLoad = () => {
                 this._homeLastFrameTs[key] = Date.now();
                 clearInFlight();
