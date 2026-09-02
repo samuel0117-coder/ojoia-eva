@@ -2480,6 +2480,12 @@ class QwenOrchestrator:
                         "mode": mode,
                         "after_hours": is_after_hours,
                         "skipped_qwen": "scene_unchanged",
+                        # fix (2026-09-02): los eventos scene_unchanged también
+                        # llevan el paquete de frames — el reproductor del evento
+                        # los usa como video. Antes frames/ quedaba vacío y el
+                        # carrusel del chat y la pestaña eventos no mostraban
+                        # nada (solo el thumb).
+                        "grid_frames": [f.get("image_bytes", b"") for f in frames],
                     },
                 )
                 update_camera_metrics(user_id, camera_id, event_type="normal")

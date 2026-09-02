@@ -80,8 +80,18 @@ const App = {
     // y onclick inline. Si el backend devuelve un event_id / camera_id / profile.name
     // con ' o " o <script>, sin este escape tenemos RCE via XSS.
     _escAttr(s) {
-        return String(s == null ? '' : s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
-            .replace(/"/g, '"').replace(/'/g, '\'');
+        // fix (2026-09-02): los replacements eran no-ops (las entidades HTML
+        // se habían perdido en un deploy anterior) → cualquier ' o " en un
+        // event_id/descripción rompía el onclick (SyntaxError: expected
+        // expression). Escapar para atributos entre comillas dobles cuyo
+        // contenido es JS con comillas simples.
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/\\/g, '\\\\')
+            .replace(/'/g, "\\'")
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
     },
     userId: null,
     accessToken: null,

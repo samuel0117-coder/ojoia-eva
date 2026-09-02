@@ -2418,6 +2418,39 @@ def user_root(user_id: str) -> Path:
     return get_user_storage_path(user_id, "free")
 
 
+def user_event_search_dirs(user_id: Optional[str]) -> List[Path]:
+    """ST-3 fix (2026-09-02): carpetas 'cameras' del usuario en TODOS sus discos.
+
+    El usuario puede tener disk_mount en el HDD (panel/migrate) y sus eventos
+    se guardan allí (save_event_to_disk_v2 usa get_user_storage_path), pero
+    los endpoints de artefactos (thumb/frame/clip) buscaban SOLO en
+    STORAGE_ROOT fijo (SSD) → 404 en todos los eventos nuevos + NS_ERROR/
+    ORB en el frontend.
+
+    Devuelve: [disco_real_del_usuario, STORAGE_ROOT] deduplicados — el disco
+    real primero (hit común), SSD como fallback legacy.
+    """
+    dirs = []
+    if user_id and user_id != "default":
+        try:
+            real = user_root(user_id) / "cameras"
+            if real.is_dir():
+                dirs.append(real)
+        except Exception:
+            pass
+    legacy = Path(STORAGE_ROOT) / "users" / (user_id or "") / "cameras"
+    if legacy.is_dir() and legacy not in dirs:
+        dirs.append(legacy)
+    # sin user_id: buscar en todos los usuarios de ambos discos (raro)
+    if not dirs:
+        for base_root in (Path(STORAGE_ROOT) / "users",):
+            if base_root.is_dir():
+                for d in base_root.iterdir():
+                    if d.is_dir() and (d / "cameras").is_dir():
+                        dirs.append(d / "cameras")
+    return dirs
+
+
 def _compat_user_json_path(user_id: str) -> Optional[Path]:
     """user.json de compat (STORAGE_ROOT/users/uid LITERAL, sin resolución) —
     es el que se mantiene sincronizado en todos los writes (patrón dual).
@@ -4653,12 +4686,8 @@ async def get_event_thumb(event_id: str, user_id: str = None):
     """Servir miniatura de un evento"""
     from PIL import Image as PILImage
     import io
-    base = Path(STORAGE_ROOT) / "users"
-    search_dirs = []
-    if user_id and user_id != "default":
-        search_dirs.append(base / user_id / "cameras")
-    if not search_dirs:
-        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
+    # ST-3 fix: buscar en TODOS los discos del usuario (HDD real + SSD legacy)
+    search_dirs = user_event_search_dirs(user_id)
     for cam_base in search_dirs:
         if not cam_base.exists():
             continue
@@ -4690,13 +4719,8 @@ async def get_event_thumb(event_id: str, user_id: str = None):
 @app.get("/api/event-frame/{event_id}")
 async def get_event_frame_full(event_id: str, user_id: str = None):
     """D2 (Fase D): frame completo de un evento."""
-    base = Path(STORAGE_ROOT) / "users"
-    search_dirs = []
-    if user_id and user_id != "default":
-        search_dirs.append(base / user_id / "cameras")
-    if not search_dirs:
-        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
-    for cam_base in search_dirs:
+    # ST-3 fix: multi-disco
+    for cam_base in user_event_search_dirs(user_id):
         if not cam_base.exists():
             continue
         for cam_dir in cam_base.iterdir():
@@ -4720,12 +4744,8 @@ async def get_event_clip(event_id: str, user_id: str = None):
       - summary/description: narrativa del evento.
       - mp4_url (opcional): clip de video si ffmpeg está disponible.
     """
-    base = Path(STORAGE_ROOT) / "users"
-    search_dirs = []
-    if user_id and user_id != "default":
-        search_dirs.append(base / user_id / "cameras")
-    if not search_dirs:
-        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
+    # ST-3 fix: buscar en TODOS los discos del usuario
+    search_dirs = user_event_search_dirs(user_id)
     for cam_base in search_dirs:
         if not cam_base.exists():
             continue
@@ -4791,13 +4811,8 @@ async def get_event_frame_file(event_id: str, frame_name: str, user_id: str = No
     # path traversal guard
     if "/" in frame_name or ".." in frame_name or not frame_name.startswith("frame_"):
         raise HTTPException(status_code=400, detail="frame inválido")
-    base = Path(STORAGE_ROOT) / "users"
-    search_dirs = []
-    if user_id and user_id != "default":
-        search_dirs.append(base / user_id / "cameras")
-    if not search_dirs:
-        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
-    for cam_base in search_dirs:
+    # ST-3 fix: multi-disco
+    for cam_base in user_event_search_dirs(user_id):
         if not cam_base.exists():
             continue
         for cam_dir in cam_base.iterdir():
@@ -4813,13 +4828,8 @@ async def get_event_frame_file(event_id: str, frame_name: str, user_id: str = No
 @app.get("/api/event-clip-video/{event_id}")
 async def get_event_clip_video(event_id: str, user_id: str = None):
     """D2: video mp4 del evento (2fps ≈ 8s)."""
-    base = Path(STORAGE_ROOT) / "users"
-    search_dirs = []
-    if user_id and user_id != "default":
-        search_dirs.append(base / user_id / "cameras")
-    if not search_dirs:
-        search_dirs = [d / "cameras" for d in base.iterdir() if d.is_dir() and (d / "cameras").exists()]
-    for cam_base in search_dirs:
+    # ST-3 fix: multi-disco
+    for cam_base in user_event_search_dirs(user_id):
         if not cam_base.exists():
             continue
         for cam_dir in cam_base.iterdir():

@@ -24,8 +24,16 @@ const EvaChat = {
     // HTML/onclick. Si un camera_id o event_id del backend contiene ' o "
     // o <script>, sin este escape tenemos RCE via onclick inline.
     _escAttr(s) {
-        return String(s || '').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>')
-            .replace(/"/g, '"').replace(/'/g, '\'');
+        // fix (2026-09-02): mismo bug que app-2026.js — los replacements eran
+        // no-ops y una comilla simple en cualquier texto dinámico rompía el
+        // onclick del chip/carrusel (SyntaxError: expected expression).
+        return String(s || '')
+            .replace(/&/g, '&amp;')
+            .replace(/\\/g, '\\\\')
+            .replace(/'/g, "\\'")
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
     },
     sessionId: null,
     history: [],
