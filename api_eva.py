@@ -2684,13 +2684,24 @@ async def get_latest_frame(camera_id: Optional[str] = None, user_id: Optional[st
     # de 60s el overlay se quedaba pegado al último evento con persona,
     # dibujando bboxes sobre el frame actual como si todavía estuviera.
     try:
-        # FIX (2026-09-02): leer del disco ACTUAL del usuario (user_root —
-        # HDD tras migración), con fallback NVMe. Antes: hardcoded STORAGE_ROOT
-        # → el viewer siempre leía la copia vieja del NVMe (count 0) aunque el
-        # worker acabara de escribir count 2 en el HDD → silueta nunca dibujada.
-        _yolo_json_path = user_root(user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
-        if not _yolo_json_path.exists():
-            _yolo_json_path = STORAGE_ROOT / "users" / (user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json"
+        # HOT-COLD (2026-09-02): el viewer lee del HOT primero (path fijo
+        # NVMe — migraciones no lo tocan), luego disco del usuario, luego
+        # layout viejo NVMe. Toma el MÁS FRESCO de los que existan.
+        import os as _os
+        _cands = [
+            hot_dir(user_id or "default", camera_id or "") / "latest_yolo.json",
+            user_root(user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json",
+            STORAGE_ROOT / "users" / (user_id or "default") / "cameras" / (camera_id or "") / "frames" / "latest_yolo.json",
+        ]
+        _yolo_json_path = None
+        _best_mtime = 0
+        for _c in _cands:
+            try:
+                if _c.exists() and _c.stat().st_mtime > _best_mtime:
+                    _yolo_json_path = _c
+                    _best_mtime = _c.stat().st_mtime
+            except OSError:
+                continue
         if _yolo_json_path.exists():
             with open(_yolo_json_path) as _f:
                 _yolo_data = json.load(_f)
@@ -2723,15 +2734,19 @@ async def get_latest_frame_jpg(camera_id: Optional[str] = None, user_id: Optiona
         frame_bytes = b""
     if not frame_bytes and camera_id and user_id:
         try:
-            events_dir = user_root(user_id) / "cameras" / camera_id / "events"
-            latest_vig = events_dir / "latest_vigilance.jpg"
-            if latest_vig.exists():
-                frame_bytes = latest_vig.read_bytes()
-            else:
-                frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
-                latest_raw = frames_dir / "latest_raw.jpg"
-                if latest_raw.exists():
-                    frame_bytes = latest_raw.read_bytes()
+            hot_raw = hot_dir(user_id, camera_id) / "latest_raw.jpg"
+            if hot_raw.exists():
+                frame_bytes = hot_raw.read_bytes()
+            if not frame_bytes:
+                events_dir = user_root(user_id) / "cameras" / camera_id / "events"
+                latest_vig = events_dir / "latest_vigilance.jpg"
+                if latest_vig.exists():
+                    frame_bytes = latest_vig.read_bytes()
+                else:
+                    frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
+                    latest_raw = frames_dir / "latest_raw.jpg"
+                    if latest_raw.exists():
+                        frame_bytes = latest_raw.read_bytes()
         except:
             logger.debug("silent except")
 
@@ -2745,8 +2760,10 @@ async def get_latest_raw_jpg(camera_id: Optional[str] = None, user_id: Optional[
     if not camera_id or not user_id:
         return Response(status_code=204)
     try:
-        frames_dir = user_root(user_id) / "cameras" / camera_id / "frames"
-        latest_raw = frames_dir / "latest_raw.jpg"
+        # HOT-COLD: hot primero (path fijo NVMe), fallback disco del usuario
+        latest_raw = hot_dir(user_id, camera_id) / "latest_raw.jpg"
+        if not latest_raw.exists():
+            latest_raw = user_root(user_id) / "cameras" / camera_id / "frames" / "latest_raw.jpg"
         if latest_raw.exists():
             frame_bytes = latest_raw.read_bytes()
             return Response(content=frame_bytes, media_type="image/jpeg", headers={
@@ -6083,6 +6100,21 @@ def _enforce_ingest_key(request: Request, cam_cfg: dict, camera_id: str, user_id
         raise HTTPException(status_code=401, detail="X-Camera-Key inválida o ausente")
 
 
+# ── HOT-COLD (2026-09-02): lo efímero en NVMe con path FIJO ────────────────────
+# latest_raw.jpg / latest_yolo.json se sobreescriben por frame: no son datos,
+# son ESTADO. Viven en el NVMe (rápido, path fijo) — el viewer/silueta lee
+# aquí SIEMPRE, imposible de romper con migraciones de disco (el bug de hoy
+# x3). Los EVENTOS (lo que crece) siguen en el disco del usuario.
+HOT_ROOT = Path(STORAGE_ROOT) / "hot"
+
+
+def hot_dir(user_id: str, camera_id: str) -> Path:
+    """Path FIJO del hot-storage de una cámara (NVMe). Nunca migra."""
+    d = HOT_ROOT / (user_id or "default") / (camera_id or "unknown")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _write_frame_files(frames_dir_v: Path, img_bytes: bytes, user_id: str, camera_id: str):
     """C7: escritura síncrona del frame (corre en thread pool vía to_thread)."""
     frames_dir_v.mkdir(parents=True, exist_ok=True)
@@ -6166,13 +6198,16 @@ async def _process_ingest(request: Request, camera_id: str, user_id: str, image:
         is_vigilante = False
 
         # ── [1] GUARDAR FRAME ORIGINAL (siempre) ──
-        # C7 (2026-08-31): la escritura a disco va al thread pool. Antes, un
-        # `open+write` bloqueante por frame frenaba el event loop con muchas
-        # cámaras (100 cámaras × 1fps: p99 de ingest llegó a 6.2s por esto).
+        # HOT-COLD: el latest_raw va al HOT (NVMe path fijo — el viewer
+        # siempre lo encuentra ahí) Y al layout del disco del usuario
+        # (transición: durante unos días ambos, hasta confirmar estabilidad).
         async def _save_frame_disk():
             frames_dir_v = user_root(user_id) / "cameras" / camera_id / "frames"
-            await asyncio.to_thread(_write_frame_files, frames_dir_v, img_bytes,
-                                    user_id, camera_id)
+            hot = hot_dir(user_id, camera_id)
+            def _both():
+                _write_frame_files(frames_dir_v, img_bytes, user_id, camera_id)
+                _write_frame_files(hot, img_bytes, user_id, camera_id)
+            await asyncio.to_thread(_both)
         try:
             await _save_frame_disk()
             # Cache en RAM para MJPEG stream
@@ -6587,10 +6622,12 @@ async def yolo_worker():
                 vigilance = _vg if isinstance(_vg, dict) else {}
                 mode = frame_data.get("mode", "normal")
 
-                # latest_yolo.json para el viewer (por cámara)
+                # latest_yolo.json para el viewer — HOT (path fijo NVMe) +
+                # disco del usuario (transición). El bug de la silueta era
+                # el viewer leyendo el disco viejo tras migración: ahora el
+                # hot es la fuente primaria del viewer.
                 try:
-                    frames_dir_v = user_root(user_id) / "cameras" / camera_id / "frames"
-                    await asyncio.to_thread(_write_json_atomic, frames_dir_v / "latest_yolo.json", {
+                    await asyncio.to_thread(_write_json_atomic, hot_dir(user_id, camera_id) / "latest_yolo.json", {
                         "timestamp": time.time(),
                         "count": yolo_count,
                         "detections": yolo_detections,
