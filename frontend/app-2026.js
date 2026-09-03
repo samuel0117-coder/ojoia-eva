@@ -44,14 +44,13 @@ function apiFetch(url, opts = {}) {
     // de inflight = misma Promise. Reduce latencia y carga del backend sin cambiar
     // comportamiento (la response se entrega a todos los awaiters por separado).
     if (method === 'GET' && !opts.body) {
-        const key = url;
-        const existing = _getInflight.get(key);
-        // FIX (2026-09-03): clonar la response para CADA consumidor. El dedup
-        // devolvía el MISMO objeto Response a varios awaiters, pero un body
-        // solo puede leerse UNA vez → el segundo .json() lanzaba 'Body has
-        // already been consumed' → home status/counters silent fail (reportado
-        // por el operador: estados de cámara nunca refrescaban).
-        if (existing) return existing.then(r => r ? r.clone() : r);
+        // FIX v2 (2026-09-03): dedup comparte un pseudo-Response parseado
+        // UNA sola vez — nunca el Response real. Un body solo permite un
+        // .json() y clonarlo después de leído también falla ('Body has
+        // already been consumed', bug reportado por el operador). Se guarda
+        // el texto crudo y cada consumidor recibe su propio .json().
+        const existing = _getInflight.get(url);
+        if (existing) return existing;
     }
     const p = fetch(url, { mode: 'cors', ...opts, headers }).then(r => {
         if (r.status === 401) {
@@ -73,9 +72,21 @@ function apiFetch(url, opts = {}) {
         return r;
     });
     if (method === 'GET' && !opts.body) {
-        _getInflight.set(url, p);
+        // Pseudo-Response compartible: el texto se lee UNA vez, cada
+        // consumidor hace .json() sobre su propia copia del texto.
+        const shared = p.then(async r => {
+            const text = await r.text();
+            return {
+                ok: r.ok, status: r.status, headers: r.headers,
+                url: r.url, redirected: r.redirected,
+                json: async () => JSON.parse(text),
+                text: async () => text,
+            };
+        });
+        _getInflight.set(url, shared);
         // Limpia del map apenas termina (resuelta o rechazada) — un solo turno
-        p.finally(() => _getInflight.delete(url));
+        shared.finally(() => _getInflight.delete(url)).catch(() => {});
+        return shared;
     }
     return p;
 }
