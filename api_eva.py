@@ -1505,7 +1505,7 @@ async def admin_camera_reboot(camera_id: str, authorization: str = Header(None, 
             "note": "La cámara se reinicia en su próximo polling (≤30s)"}
 
 
-@app.get("/admin/ota/publish")
+@app.post("/admin/ota/publish")
 async def ota_publish(request: dict, authorization: str = Header(None, alias="Authorization")):
     """F1 — Publicar bin estable + definir rollout (admin).
     Body: {bin_path: "...", version: "v9.3.2", rollout: ["OJO-D1C560"], notes: ""}
@@ -6638,8 +6638,15 @@ def _auto_led_check(user_id: str, camera_id: str, img_bytes: bytes,
             def _mut(ud):
                 for c in ud.get("cameras", []):
                     if c.get("camera_id") == camera_id:
-                        c["led_auto"] = False   # el server manda, no el firmware
-                        c["led_on"] = on        # one-shot del GET config
+                        # NV-fix: led_auto SIGUE TRUE (la capa A del firmware —
+                        # reacción local por frame, instantánea) y el server
+                        # añade su one-shot led_on como capa B coordinada.
+                        c["led_bright"] = c.get("led_bright") or 200
+                        if on:
+                            c["led_on"] = True    # one-shot: encender ya
+                        # apagar NO se fuerza por one-shot: el firmware
+                        # (autoLED bright>140) lo hace solo al haber luz —
+                        # el server solo asegura brillo del flash.
             update_user_json(user_id, _mut)
         except Exception:
             pass
