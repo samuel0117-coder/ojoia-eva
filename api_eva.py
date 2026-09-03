@@ -5513,12 +5513,14 @@ async def get_esp32_config(camera_id: str):
             # sirve UNA vez y se limpia (el firmware lo parsea en su poll).
             scan_request = bool(c.get("scan_request"))
             reboot_request = bool(c.get("reboot_request"))
-            if scan_request or reboot_request:
+            led_on_shot = bool(c.get("led_on"))
+            if scan_request or reboot_request or led_on_shot:
                 def _clear_flags(ud2):
                     for cc in ud2.get("cameras", []):
                         if cc.get("camera_id") == camera_id:
                             cc["scan_request"] = False
                             cc["reboot_request"] = False
+                            cc["led_on"] = False  # NV one-shot consumido
                 update_user_json(user_id, _clear_flags)
             if scan_request:
                 c["scan_request"] = False
@@ -5535,7 +5537,11 @@ async def get_esp32_config(camera_id: str):
                 "framesize": c.get("framesize", 10),
                 "led_auto": c.get("led_auto", True),
                 "led_bright": c.get("led_bright", 128),
-                "led_on": c.get("led_on", False),
+                # NV (2026-09-03): led_on ONE-SHOT — igual que scan/reboot.
+                # Antes: si el server mandaba led_on:true, el siguiente poll
+                # servía false (default) y lo APAGABA al instante (el firmware
+                # hace if/else if). Ahora: se sirve true UNA vez y se limpia.
+                "led_on": bool(c.get("led_on")),
                 "h_mirror": c.get("h_mirror", False),
                 "v_flip": c.get("v_flip", False),
                 "brightness": c.get("brightness", 0),
@@ -5620,20 +5626,45 @@ async def _resolve_unknown_camera(user_id: str, client_ip: str) -> str:
     return "unknown"
 
 def _adjust_brightness(img_bytes: bytes, target_brightness: int = 80) -> bytes:
-    """Ajustar brillo de imagen si esta muy oscura (brillo < 50)."""
+    """Night-vision (2026-09-03): rescatar frames oscuros con CLAHE + gamma.
+
+    Antes: boost ciego (factor hasta 3x) que amplificaba ruido 3x y
+    quemaba luces. Ahora, si brillo < 60:
+      1. CLAHE (equalización adaptativa) — texturas locales sin amplificar
+         ruido global: el estándar forense.
+      2. Gamma adaptativo según oscuridad real (más oscuro → más gamma,
+         tope 2.2) — levanta SOMBRAS sin tocar altas luces.
+      3. Si tras el rescate aún hay brillo < 45 → devuelve la mejor
+         versión + el caller decide avisar oscuridad REAL.
+    Frames con luz normal (>= 60) van sin tocar — cero degradación.
+    El viewer/silueta/paneles Qwen reciben ESTA versión: mejor calidad
+    visible en toda la app, no solo en el análisis.
+    """
     try:
-        from PIL import Image, ImageStat, ImageEnhance
+        from PIL import Image, ImageStat
         import io
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        stat = ImageStat.Stat(img)
-        avg_brightness = sum(stat.mean[:3]) / 3
-        if avg_brightness < 65:
-            enhancer = ImageEnhance.Brightness(img)
-            factor = target_brightness / max(avg_brightness, 1)
-            factor = min(factor, 3.0)
-            img = enhancer.enhance(factor)
+        stat = ImageStat.Stat(img.convert("L"))
+        avg = stat.mean[0]
+        if avg < 60:
+            # gamma por tabla LUT (rápido) según oscuridad
+            gamma = 1.0 + min(1.2, (60 - avg) / 30.0)   # 27→2.0 | 45→1.5
+            lut = [min(255, int(((i / 255.0) ** (1.0 / gamma)) * 255)) for i in range(256)]
+            out = img.point(lut * 3)
+            # CLAHE en L* (lab) — equalización local
+            try:
+                import cv2, numpy as _np
+                arr = _np.array(out)
+                lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+                l = lab[:, :, 0]
+                l2 = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(l)
+                # limitar ganancia: no quemar lo que ya era visible
+                lab[:, :, 0] = _np.maximum(l2, l)
+                out = Image.fromarray(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB))
+            except ImportError:
+                pass  # sin cv2: solo gamma (fallback válido)
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
+            out.save(buf, format="JPEG", quality=88)
             return buf.getvalue()
     except Exception:
         logger.debug("silent: {exc}", exc=Exception)
@@ -6578,6 +6609,63 @@ async def _run_yolo_detection(img_bytes: bytes) -> tuple:
     return yolo_count, yolo_classes, yolo_detections
 
 
+# ── NV (2026-09-03): Auto-LED con mensaje honesto ────────────────────────────
+_LED_STATE = {}  # cam_key -> {"on": bool, "since": ts, "still_dark": bool}
+
+
+def _auto_led_check(user_id: str, camera_id: str, img_bytes: bytes,
+                    yolo_count: int) -> None:
+    """El worker decide el LED: frame oscuro + personas → encender flash.
+    Frame claro → apagar. Mensaje honesto: si CON LED sigue oscuro, el
+    evento de oscuridad lo dice ('aun con la luz de la cámara encendida').
+    NV: usa el brillo del frame RESCATADO por CLAHE (post _adjust_brightness
+    ya corre antes en el batch) — medimos el raw para la decisión de LED.
+    """
+    try:
+        from PIL import Image, ImageStat
+        import io as _io
+        g = Image.open(_io.BytesIO(img_bytes)).convert("L")
+        avg = ImageStat.Stat(g).mean[0]
+    except Exception:
+        return
+    key = f"{user_id}_{camera_id}"
+    st_ = _LED_STATE.get(key, {"on": False, "since": 0, "still_dark": False})
+    dark = avg < 45
+    bright_enough = avg > 90
+
+    def _set_led(on: bool):
+        try:
+            def _mut(ud):
+                for c in ud.get("cameras", []):
+                    if c.get("camera_id") == camera_id:
+                        c["led_auto"] = False   # el server manda, no el firmware
+                        c["led_on"] = on        # one-shot del GET config
+            update_user_json(user_id, _mut)
+        except Exception:
+            pass
+
+    if dark and yolo_count > 0 and not st_["on"]:
+        # hay personas en la oscuridad → encender la luz de la cámara
+        _set_led(True)
+        st_["on"] = True
+        st_["since"] = time.time()
+        st_["still_dark"] = True  # el frame actual sigue oscuro (pre-LED)
+        logger.info(f"[NV] {camera_id}: oscuro({avg:.0f}) + {yolo_count} personas → "
+                    f"LED ON (mensaje: 'encendí la luz de la cámara')")
+    elif st_["on"] and dark and time.time() - st_["since"] > 120:
+        # LED encendido >2min y SIGUE oscuro → luz insuficiente, avisar
+        st_["still_dark"] = True
+        logger.warning(f"[NV] {camera_id}: LED encendido pero brillo {avg:.0f} — "
+                       f"luz de cámara insuficiente")
+    elif bright_enough and st_["on"]:
+        # ya hay luz (natural o el LED ayudó) → apagar para ahorrar
+        _set_led(False)
+        st_["on"] = False
+        st_["still_dark"] = False
+        logger.info(f"[NV] {camera_id}: brillo {avg:.0f} OK → LED OFF")
+    _LED_STATE[key] = st_
+
+
 async def yolo_worker():
     """F3 — Worker batched: YOLO por tandas + grid + Qwen.
 
@@ -6650,6 +6738,12 @@ async def yolo_worker():
                 _vg = frame_data.get("vigilance")
                 vigilance = _vg if isinstance(_vg, dict) else {}
                 mode = frame_data.get("mode", "normal")
+
+                # NV: auto-LED (oscuridad + personas → flash de la cámara)
+                try:
+                    _auto_led_check(user_id, camera_id, img_bytes, yolo_count)
+                except Exception:
+                    pass
 
                 # latest_yolo.json para el viewer — HOT (path fijo NVMe) +
                 # disco del usuario (transición). El bug de la silueta era
