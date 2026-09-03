@@ -5244,21 +5244,14 @@ async def cam_cmd(camera_id: str, request: dict = None):
 
                 if target_ip:
                     break
-        if not target_ip:
-            return JSONResponse(status_code=503, content={"ok": False, "error": "Camera offline"}, headers=cors_headers)
-        import httpx
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(10.0, connect=5.0, read=5.0, write=5.0),
-                headers={"Connection": "close"},
-                http1=True,
-                http2=False
-            ) as client:
-                resp = await client.post(f"http://{target_ip}:81/config", json=body)
-            return JSONResponse(content={"ok": True}, headers=cors_headers)
-        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError):
-            # Si no se puede conectar directamente, el ESP32 aplicara via polling
-            return JSONResponse(content={"ok": True, "queued": True}, headers=cors_headers)
+        # FIX (2026-09-03): NO intentar POST directo al :81 del ESP32.
+        # target_ip es la IP PÚBLICA del negocio (last_announce_ip) — el
+        # servidor no puede entrar al :81 interno por el router (siempre
+        # fallaba con timeout de 10s por comando = UX lenta + falsa ilusión
+        # de 'se aplicó ya'). El polling (≤30s) es el camino correcto y
+        # suficiente: la config queda persistida arriba.
+        return JSONResponse(content={"ok": True, "queued": True, "via": "polling",
+                                     "applies_in_s": 30}, headers=cors_headers)
     except Exception as e:
         return JSONResponse(status_code=502, content={"ok": False, "error": str(e)}, headers=cors_headers)
 
