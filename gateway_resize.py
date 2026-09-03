@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Gateway para redimensionar imágenes antes de enviar a Qwen"""
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont  # FIX (2026-09-02): ImageDraw/ImageFont
+# NO estaban importados → NameError dentro del try del loop de anotación →
+# el except lo tragaba → 16 placeholders grises = TODOS los grids vacíos
+# desde agosto (2,274 evidencias negras). Bug de una línea, dos meses mudo.
 import io
 import base64
 from typing import List
