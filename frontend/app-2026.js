@@ -46,7 +46,12 @@ function apiFetch(url, opts = {}) {
     if (method === 'GET' && !opts.body) {
         const key = url;
         const existing = _getInflight.get(key);
-        if (existing) return existing;
+        // FIX (2026-09-03): clonar la response para CADA consumidor. El dedup
+        // devolvía el MISMO objeto Response a varios awaiters, pero un body
+        // solo puede leerse UNA vez → el segundo .json() lanzaba 'Body has
+        // already been consumed' → home status/counters silent fail (reportado
+        // por el operador: estados de cámara nunca refrescaban).
+        if (existing) return existing.then(r => r ? r.clone() : r);
     }
     const p = fetch(url, { mode: 'cors', ...opts, headers }).then(r => {
         if (r.status === 401) {
