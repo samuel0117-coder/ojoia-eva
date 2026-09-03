@@ -1528,11 +1528,20 @@ c.style.display = '';
             const cam = (d.cameras || []).find(x => x.camera_id === camId);
             if (!cam) throw new Error('Camera not found');
             cam.cooldown_min = cam.cooldown_min || 5;
+            // FIX rotación: iniciar el selector en la orientación REAL de la
+            // cámara (h_mirror/v_flip del server). Antes empezaba en 0 y cada
+            // 'next' calculaba desde cero → con la cámara ya espejada, el
+            // primer clic aplicaba 90° sobre la vista (doble espejo) y el
+            // segundo 180° — imposible ajustar la orientación con certeza.
+            if (cam.h_mirror === true && cam.v_flip === true) this._configRotation = 2;
+            else if (cam.h_mirror === true) this._configRotation = 1;
+            else if (cam.v_flip === true) this._configRotation = 3;
+            else this._configRotation = 0;
             const fs = cam.active ? 'Online' : 'Offline';
             const returnPage = this._configReturnPage === 'settings' ? 'settings' : 'cameras';
             if (this.page !== 'settings' && this.page !== 'cameras' && this.page !== 'home') return;
 
-            this._configRotation = 0;
+            // _configRotation se fijó arriba con la orientación real (FIX rotación)
 
             c.innerHTML = `
                 <div class="camera-config-page">
@@ -1684,13 +1693,13 @@ c.style.display = '';
 
             // Iniciar polling del viewer
             this._startConfigViewerPoll(camId);
+            // Aplicar valores por defecto si la cámara es nueva (nunca configurada)
+            this._applyCamDefaults(camId, cam);  // FIX: dentro del try (fuera, tras
+            // un error, cam no existía → ReferenceError y ajustes muertos)
         } catch(e) {
             if (this.page !== 'settings' && this.page !== 'cameras' && this.page !== 'home') return;
             c.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:32px;text-align:center;"><div style="font-size:3rem;margin-bottom:16px;">❌</div><div style="font-weight:600;margin-bottom:8px;">Error cargando cámara</div><button class="btn" style="margin-top:16px" onclick="App._openCameraConfig(\''+this._escAttr(camId)+'\')">Reintentar</button></div>';
         }
-
-        // Aplicar valores por defecto si la cámara es nueva (nunca configurada)
-        this._applyCamDefaults(camId, cam);
     },
 
     async _applyCamDefaults(camId, cam) {
