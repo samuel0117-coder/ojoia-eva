@@ -954,8 +954,12 @@ async def devices_announce(request: dict):
         tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
         tmp.replace(cam_path)
         _invalidate_cam_cfg_cache(user_id, camera_id)
-        # mantener online en user.json (throttled como last_frame)
-        _update_camera_last_frame(user_id, camera_id, request.get("ip", ""))
+        # fix (2026-09-04): el announce YA NO escribe last_frame — solo
+        # last_announce. Pisar last_frame hacía que una cámara en ciclo
+        # announce-only (OTA crash-loop, frames muertos por horas) figurara
+        # "En vivo" en la app del usuario. El estado online real ahora
+        # depende exclusivamente del ingest de frames.
+        _update_camera_last_announce(user_id, camera_id, request.get("ip", ""))
     except Exception as e:
         logger.warning(f"[announce] persist error: {e}")
         return {"ok": True, "registered": False}
@@ -1078,8 +1082,15 @@ def _scan_all_cameras_admin() -> list:
                     continue
                 cam_id = cfg.get("camera_id", c_dir.name)
                 meta = cams_meta.get(cam_id, {})
+                # fix (2026-09-04) 'En vivo' falso: last_frame SOLO lo escribe
+                # el ingest real de frames. El announce escribe last_announce
+                # (separado). Antes el announce pisaba last_frame y una cámara
+                # en ciclo announce-only (OTA crash-loop) se veía "online"
+                # aunque no enviara frames desde hacía horas.
                 last_frame = cfg.get("last_frame") or meta.get("last_frame") or 0
+                last_announce = cfg.get("last_announce") or meta.get("last_announce") or 0
                 online = (now - last_frame) < 180 if last_frame else False
+                announce_ok = (now - last_announce) < 120 if last_announce else False
                 out.append({
                     "camera_id": cam_id,
                     "user_id": user_dir.name,
@@ -1089,6 +1100,7 @@ def _scan_all_cameras_admin() -> list:
                     "zone": cfg.get("zone", ""),
                     "type": cfg.get("type", "esp32"),
                     "online": online,
+                    "announce_ok": announce_ok,  # WiFi vivo pero sin frames
                     "active": online,  # compat con el render actual
                     "last_frame": last_frame,
                     "frame_age_s": int(now - last_frame) if last_frame else None,
@@ -1466,7 +1478,8 @@ async def ota_status(authorization: str = Header(None, alias="Authorization")):
                     "local_ip": cfg.get("local_ip", ""),
                     "rssi": cfg.get("rssi"),
                     "uptime_s": cfg.get("uptime_s"),
-                    "last_frame": cfg.get("last_frame", 0) or cfg.get("last_announce", 0),
+                    "last_frame": cfg.get("last_frame", 0),
+                    "last_announce": cfg.get("last_announce", 0),
                     "stream_down": cfg.get("stream_down", False),
                     "ingest_key": bool(cfg.get("ingest_key")),
                     "in_rollout": bool((st.get("rollout") or {}).get(cfg.get("camera_id", c_dir.name))),
@@ -5930,8 +5943,47 @@ _LAST_FRAME_WRITE_TS: Dict[str, float] = {}
 _LAST_FRAME_MIN_S = float(os.environ.get("OJOIA_LAST_FRAME_MIN_S", "5"))
 
 
+def _update_camera_last_announce(user_id: str, camera_id: str, client_ip: str = None):
+    """Registrar el announce de una cámara SIN tocar last_frame.
+
+    fix (2026-09-04) 'En vivo' falso: los announces llegan cada ~20s aunque
+    la cámara NO envíe frames (ej: ciclo OTA announce-only detectado hoy,
+    frames muertos 1h+). Antes el announce pisaba last_frame → panel/app
+    mostraban "En vivo" con la imagen congelada hace horas. Ahora:
+      - last_announce = WiFi/pipeline de control vivo (diagnóstico)
+      - last_frame   = frames reales llegando (estado online)
+    Throttled 30s (el announce es cada ~20s; no necesita más resolución)."""
+    if not user_id:
+        return
+    key = f"ann/{user_id}/{camera_id}"
+    now = time.time()
+    last = _LAST_FRAME_WRITE_TS.get(key, 0)
+    if now - last < 30:
+        return
+    _LAST_FRAME_WRITE_TS[key] = now
+    try:
+        uf = find_user_json(user_id)
+        if uf and uf.exists():
+            with _get_user_lock(user_id):
+                with open(uf) as f:
+                    ud = json.load(f)
+                for c in (ud.get("cameras") or []):
+                    if c.get("camera_id") == camera_id:
+                        c["last_announce"] = int(now)
+                        if client_ip:
+                            c["last_announce_ip"] = client_ip
+                        break
+                tmp = uf.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(ud, indent=2, ensure_ascii=False))
+                tmp.replace(uf)
+    except Exception as e:
+        logger.debug(f"[announce-timestamp] {user_id}/{camera_id}: {e}")
+
+
 def _update_camera_last_frame(user_id: str, camera_id: str, client_ip: str = None):
     """Actualizar last_frame de una cámara en user.json. Auto-registra si no existe.
+
+    fix (2026-09-04): SOLO el ingest real de frames debe llamar esta función.
     F3: throttled — por cámara solo escribe cada _LAST_FRAME_MIN_S (default 5s).
     El estado online usa umbral de 120s; escribir cada frame era I/O+lock x N cámaras."""
     if not user_id:
