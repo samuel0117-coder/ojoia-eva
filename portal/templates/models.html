@@ -1,5 +1,33 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+.media-upload {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 10px; padding: 12px; background: #161b22;
+    border-radius: 8px; border: 1px solid #30363d;
+}
+.media-upload label { font-size: 13px; color: #8b949e; }
+.media-upload input[type="file"] { color: #58a6ff; font-size: 13px; }
+.media-types { font-size: 12px; color: #8b949e; margin-top: 8px; }
+.api-block {
+    background: #0d1117; padding: 16px; border-radius: 8px; margin-top: 20px;
+    border: 1px solid #21262d;
+}
+.api-block h3 { margin-top: 0; color: #58a6ff; }
+.api-block .key-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.api-block code { background: #161b22; padding: 10px 14px; border-radius: 6px;
+    word-break: break-all; flex: 1; display: block; font-size: 13px; }
+.api-block .copy-btn { background: #238636; color: #fff; border: none; padding: 8px 14px;
+    border-radius: 6px; cursor: pointer; font-size: 13px; }
+.api-block .copy-btn:hover { background: #2ea043; }
+.model-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px; }
+.model-card { background: #161b22; padding: 14px; border-radius: 8px; border: 1px solid #21262d; }
+.model-card code { color: #58a6ff; font-size: 13px; }
+.model-card .m-name { font-weight: bold; font-size: 15px; }
+.model-card .m-desc { color: #8b949e; font-size: 13px; margin-top: 5px; }
+.model-card .m-ctx { color: #f0883e; font-size: 12px; margin-top: 4px; }
+</style>
+
 <h2 style="margin-bottom: 20px;">Modelos</h2>
 
 <div class="card">
@@ -7,57 +35,135 @@
     <div class="form-group">
         <label>Modelo</label>
         <select id="model">
-            <option value="qwen35b">Qwen 3.6 35B A3B (más potente)</option>
-            <option value="qwen9b">Qwen 3.5 9B (balanceado)</option>
+            <option value="qwen38">Qwen 3.8 27B A3B+ (máxima calidad, solo texto)</option>
             <option value="qwen7b">Qwen 3 7B (rápido)</option>
+            <option value="qwen3vl8b">Qwen 3 VL 8B (vision/omega)</option>
+            <option value="whisper">Whisper (audio→texto)</option>
         </select>
     </div>
-    <div class="chat-box" id="chatBox"></div>
-    <div style="display: flex; gap: 8px;">
-        <input type="text" id="message" placeholder="Escribe tu mensaje..." style="flex: 1; margin-bottom: 0;">
+
+    <!-- Subida de media -->
+    <div class="media-upload">
+        <label>📎 Adjuntar imagen o video</label>
+        <input type="file" id="mediaFile" accept="image/*,video/*">
+        <span id="mediaStatus" style="font-size: 12px; color: #d29922;">Sin archivo</span>
+    </div>
+    <div class="media-types">Soporta: jpg, png, mp4, mov, m4v — el video se convierte en grid de frames para el modelo</div>
+
+    <div class="chat-box" id="chatBox" style="margin-top: 15px;"></div>
+
+    <div style="display: flex; gap: 8px; margin-top: 10px;">
+        <input type="text" id="message" placeholder='Escribe tu mensaje...' style="flex: 1;">
         <button class="btn" onclick="sendMessage()">Enviar</button>
     </div>
 </div>
 
-<div class="card">
-    <h2>Tu API Key</h2>
-    <code style="background: #0d1117; padding: 12px; display: block; border-radius: 8px; word-break: break-all;">{{ api_key }}</code>
-    <p style="color: #8b949e; margin-top: 12px; font-size: 14px;">
-        Usa esta key para acceder vía API: <code>Authorization: Bearer {{ api_key }}</code>
+<div class="api-block">
+    <h3>🔑 API / Acceso a Kilo Code</h3>
+    <p style="color: #8b949e; font-size: 14px;">Configura tu Kilo Code con estos datos:</p>
+    <div class="key-row">
+        <label style="font-size: 13px; color: #8b949e; min-width: 80px;">Base URL</label>
+        <code id="baseUrl">{{ base_url }}</code>
+        <button class="copy-btn" onclick="copyText('baseUrl')">Copiar</button>
+    </div>
+    <div class="key-row">
+        <label style="font-size: 13px; color: #8b949e; min-width: 80px;">API Key</label>
+        <code id="apiKey">{{ api_key }}</code>
+        <button class="copy-btn" onclick="copyText('apiKey')">Copiar</button>
+    </div>
+    <p style="color: #f0883e; font-size: 13px; margin-top: 12px;">
+        ➕ En Kilo Code: Proveedor → OpenAI-compatible → baseURL = Base URL → apiKey = API key
     </p>
+
+    <div class="model-grid" style="margin-top: 15px;">
+        <div class="model-card">
+            <div class="m-name">qwen38</div>
+            <div class="m-desc">Qwen 3.8 27B A3B+ — máxima calidad, razonamiento avanzado</div>
+            <div class="m-ctx">Context: 150K | Solo texto</div>
+        </div>
+        <div class="model-card">
+            <div class="m-name">qwen7b</div>
+            <div class="m-desc">Qwen 3 7B — rápido, ideal para chat ligero</div>
+            <div class="m-ctx">Context: 16K | Texto + imagen</div>
+        </div>
+        <div class="model-card">
+            <div class="m-name">qwen3vl8b</div>
+            <div class="m-desc">Qwen 3 VL 8B — visión (imágenes y video)</div>
+            <div class="m-ctx">Context: 16K | Texto + imagen + video</div>
+        </div>
+    </div>
 </div>
 
 <script>
 const apiKey = "{{ api_key }}";
+const baseUrl = "{{ base_url }}";
 const chatBox = document.getElementById('chatBox');
-const messageInput = document.getElementById('message');
+
+function copyText(id) {
+    const el = document.getElementById(id);
+    navigator.clipboard.writeText(el.textContent).then(() => {
+        event.target.textContent = '✓ Copiado';
+        setTimeout(() => { event.target.textContent = 'Copiar'; }, 1500);
+    });
+}
 
 async function sendMessage() {
-    const text = messageInput.value.trim();
-    if (!text) return;
+    const input = document.getElementById('message');
     const model = document.getElementById('model').value;
-    
-    // Add user message
-    chatBox.innerHTML += `<div class="message user"><div class="role">Tú</div>${text}</div>`;
-    messageInput.value = '';
-    chatBox.scrollTop = chatBox.scrollHeight;
-    
+    const text = input.value.trim();
+    const mediaFile = document.getElementById('mediaFile').files[0];
+
+    if (!text && !mediaFile) return;
+
+    // Add user message to chat
+    let userMsg = `<div class="message user"><div class="role">Tú</div>${text}`;
+    if (mediaFile) userMsg += ` [📎 ${mediaFile.name}]`;
+    userMsg += `</div>`;
+    chatBox.innerHTML += userMsg;
+    chatBox.style.display = 'block';
+    input.value = '';
+
     try {
-        const resp = await fetch('/api/chat', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({model: model, messages: [{role: 'user', content: text}]})
-        });
+        let resp;
+        if (mediaFile) {
+            const formData = new FormData();
+            formData.append('model', model);
+            if (text) formData.append('text', text);
+            formData.append('image', mediaFile);
+            formData.append('max_tokens', '500');
+
+            resp = await fetch('/api/chat', {
+                method: 'POST',
+                headers: {},
+                body: formData
+            });
+        } else {
+            resp = await fetch('/api/chat', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({model, messages: [{role: 'user', content: text}], max_tokens: 500})
+            });
+        }
+
         const data = await resp.json();
-        const reply = data.choices?.[0]?.message?.content || JSON.stringify(data);
-        chatBox.innerHTML += `<div class="message assistant"><div class="role">IA</div>${reply}</div>`;
+        const reply_text = data.choices?.[0]?.message?.content || data.error?.detail || JSON.stringify(data);
+        chatBox.innerHTML += `<div class="message assistant"><div class="role">IA</div>${reply_text}</div>`;
     } catch (e) {
         chatBox.innerHTML += `<div class="message assistant"><div class="role">Error</div>${e.message}</div>`;
     }
     chatBox.scrollTop = chatBox.scrollHeight;
+    document.getElementById('mediaStatus').textContent = 'Sin archivo';
+    document.getElementById('mediaFile').value = '';
 }
 
-messageInput.addEventListener('keypress', (e) => {
+// Show file name on select
+document.getElementById('mediaFile').addEventListener('change', (e) => {
+    const name = e.target.files[0]?.name || 'Sin archivo';
+    document.getElementById('mediaStatus').textContent = `✓ ${name}`;
+});
+
+// Enter to send
+document.getElementById('message').addEventListener('keypress', (e) => {
     if (e.key === 'Enter') sendMessage();
 });
 </script>

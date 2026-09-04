@@ -38,7 +38,8 @@ from pydantic import BaseModel
 import httpx
 from billing import BillingStore
 from billing_log import (get_requests, get_request_detail, set_rating,
-                          get_stats, get_storage_info, purge_old)
+                          get_stats, get_storage_info, purge_old,
+                          get_alerts, get_capacity_report)
 
 app = FastAPI(title="OjoIA Server Megapanel", version="1.1")
 
@@ -145,7 +146,8 @@ _KNOWN_SYSTEMD_SERVICES = {
     "f5_tts_server.service": {"name": "F5-TTS", "port": 8017, "gpu": 2, "kind": "audio"},
     "health-monitor.service": {"name": "Health Monitor", "port": 9000, "gpu": -1, "kind": "infra"},
     "megapanel.service":   {"name": "Megapanel (this)", "port": 9001, "gpu": -1, "kind": "infra"},
-    "ojoia-bus.service":   {"name": "OjoIA Service Bus", "port": 8200, "gpu": -1, "kind": "infra"},
+    "ojoia-bus.service":   {"name": "OjoIA Service Bus (loopback)", "port": 8200, "gpu": -1, "kind": "infra"},
+    "ojoia-bus-lan.service": {"name": "OjoIA Service Bus LAN (10.0.0.71:8205, clientes)", "port": 8205, "gpu": -1, "kind": "infra"},
     "ojoia-models.service": {"name": "OjoIA Models (arranque ordenado)", "port": 0, "gpu": -1, "kind": "infra"},
     "redis-ojoia.service": {"name": "Redis (OjoIA)", "port": 6379, "gpu": -1, "kind": "infra"},
     "project-server.service": {"name": "Project Server", "port": 8012, "gpu": -1, "kind": "api"},
@@ -836,6 +838,19 @@ async def billing_log_rating(request_id: int, cmd: RatingCmd):
 async def billing_stats(hours: int = 24):
     """Estadisticas agregadas para el dashboard."""
     return get_stats(hours)
+
+
+@app.get("/api/billing/alerts")
+async def billing_alerts():
+    """Alertas activas: abuso de rate (>20 req/min), costo (>$5/h) y
+    modelos con respuestas vacías. Vacío = todo normal."""
+    return {"alerts": get_alerts()}
+
+
+@app.get("/api/billing/capacity")
+async def billing_capacity():
+    """Capacidad de tokens/día del sistema, medida en producción."""
+    return get_capacity_report()
 
 
 @app.get("/api/billing/storage")

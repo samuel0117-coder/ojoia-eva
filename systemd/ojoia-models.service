@@ -1,0 +1,20 @@
+[Unit]
+Description=OjoIA Models - Cascada unificada tras red+tunnel (background, no bloquea desktop)
+# Arranca tras: red disponible → docker listo → tunnel (cloudflared) activo.
+# El script interno sale en segundos; las cargas largas van en subshells
+# despegados, así el escritorio NUNCA espera a los modelos.
+After=network-online.target docker.service tunnel.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=sam
+Group=sam
+# el script sale en ~10s aunque los modelos sigan cargando
+ExecStart=/opt/ojoia/code/start-models.sh
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -79,6 +79,11 @@ PLANS = dict(DEFAULT_PLANS)
 
 REDIS_PREFIX = "ojoia_billing"
 
+# Balance inicial del retry budget (se recarga a este valor tras 1h sin
+# actividad, vía TTL de Redis). ~100k tokens ≈ tolera un prompt mediano
+# reintentando unas veces antes de fail-fast.
+RETRY_BUDGET_START = 100_000
+
 
 class BillingStore:
     """Cliente Redis para billing. Singleton."""
@@ -307,6 +312,51 @@ class BillingStore:
             return False, 0, window_s
         remaining = max(0, rpm - count)
         return True, remaining, window_s
+
+    # ── Retry budget (anti death-spiral) ────────────────────────────────────
+    # Token-bucket por cliente: cada request "paga" prompt_tokens estimados;
+    # los éxitos devuelven la mitad. Cuando el bucket está vacío -> 429.
+    # Así los reintentos de un cliente nunca pueden superar una fracción del
+    # volumen normal, aunque todos sus agentes reintenten a la vez.
+    # Máx ~20% del tráfico en reintentos (AWS retry-quota pattern).
+    def check_retry_budget(self, client_id: str,
+                           prompt_tokens_est: int) -> tuple[bool, int]:
+        """Retorna (permitido, balance_restante). No consume: solo consulta."""
+        bal = int(self.r.get(f"{REDIS_PREFIX}:retrybal:{client_id}") or RETRY_BUDGET_START)
+        return (bal >= min(prompt_tokens_est, RETRY_BUDGET_START), bal)
+
+    # Lua atómico: éxito recarga el bucket (cap al máximo); fallo drena.
+    # El tráfico sano mantiene el bucket lleno — solo los fallos/reintentos
+    # lo agotan. Cuando llega a 0, el cliente recibe 429 fail-fast.
+    _RETRY_BUDGET_LUA = """
+    local key = KEYS[1]
+    local start_bal = tonumber(ARGV[1])
+    local amt = tonumber(ARGV[2])
+    local success = tonumber(ARGV[3])
+    local bal = tonumber(redis.call('GET', key) or start_bal)
+    if success == 1 then
+        bal = math.min(bal + amt, start_bal)
+    else
+        bal = bal - amt
+    end
+    redis.call('SET', key, bal, 'EX', 3600)
+    return bal
+    """
+
+    def consume_retry_budget(self, client_id: str,
+                             prompt_tokens: int, success: bool) -> None:
+        """Actualiza el bucket tras completar un request.
+
+        success=True  -> recarga (cap al máximo): tráfico sano autofinancia.
+        success=False -> drena: los fallos/reintentos agotan el bucket.
+        """
+        key = f"{REDIS_PREFIX}:retrybal:{client_id}"
+        try:
+            self.r.eval(self._RETRY_BUDGET_LUA, 1, key,
+                        RETRY_BUDGET_START, int(prompt_tokens),
+                        1 if success else 0)
+        except Exception:
+            pass
 
     # ── Quota ────────────────────────────────────────────────────────────────
 

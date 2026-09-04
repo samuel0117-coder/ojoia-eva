@@ -289,17 +289,44 @@ def get_stats(hours: int = 24) -> dict:
             ).fetchone()
             total_reqs, total_tokens, total_cost, avg_lat, errors = row
 
-            # Por modelo
+            # Por modelo — extendido: tok/s de generación, latencia p95,
+            # respuestas vacías (completion=0 con status 200), tasa de error
             by_model = {}
             for row_m in conn.execute(
-                """SELECT model, SUM(prompt_tokens+completion_tokens),
-                          SUM(cost_usd), COUNT(*)
+                """SELECT model,
+                          SUM(prompt_tokens+completion_tokens),
+                          SUM(cost_usd),
+                          COUNT(*),
+                          SUM(CASE WHEN status_code>=400 THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status_code<400
+                                    AND COALESCE(completion_tokens,0)=0
+                                    AND COALESCE(prompt_tokens,0)>0
+                                   THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN latency_ms>0 AND completion_tokens>0
+                                   THEN completion_tokens*1000.0/latency_ms ELSE 0 END),
+                          SUM(CASE WHEN latency_ms>0 AND completion_tokens>0 THEN 1 ELSE 0 END)
                    FROM requests WHERE ts>=? GROUP BY model ORDER BY 2 DESC""",
                 (since,),
             ).fetchall():
-                by_model[row_m[0]] = {"tokens": row_m[1] or 0,
-                                      "cost": round(row_m[2] or 0, 4),
-                                      "requests": row_m[3]}
+                n_gen = row_m[7] or 0
+                by_model[row_m[0]] = {
+                    "tokens": row_m[1] or 0,
+                    "cost": round(row_m[2] or 0, 4),
+                    "requests": row_m[3],
+                    "errors": row_m[4] or 0,
+                    "empty_responses": row_m[5] or 0,
+                    # tok/s medio ponderado (solo requests que generaron)
+                    "gen_tok_s": round(row_m[6] / n_gen, 1) if n_gen else 0,
+                }
+            # latencia p95 por modelo (percentil aproximado por orden)
+            for m in by_model:
+                p95 = conn.execute(
+                    """SELECT latency_ms FROM requests
+                       WHERE ts>=? AND model=? AND latency_ms>0
+                       ORDER BY latency_ms DESC LIMIT 1 OFFSET ?""",
+                    (since, m, max(0, int(by_model[m]["requests"] * 0.05))),
+                ).fetchone()
+                by_model[m]["p95_latency_ms"] = int(p95[0]) if p95 else 0
 
             # Por cliente
             by_client = {}
@@ -370,7 +397,6 @@ def get_storage_info() -> dict:
             total = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
         finally:
             conn.close()
-
         # disk free
         disk = os.statvfs(p.parent)
         free_bytes = disk.f_bavail * disk.f_frsize
@@ -398,6 +424,108 @@ def purge_old() -> int:
             cur = conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
             conn.commit()
             return cur.rowcount
+        finally:
+            conn.close()
+
+
+def get_alerts() -> list[dict]:
+    """Detecta abusos y anomalías en la última hora:
+    - client_id con >20 req/min sostenido (ventana 1h, >1200 reqs)
+    - client_id con >$5/hora de consumo
+    - modelo con tasa de respuestas vacías >20% (>10 reqs)
+    Retorna lista de alertas activas (vacía = todo normal).
+    """
+    with _lock:
+        conn = _connect()
+        try:
+            since = time.time() - 3600
+            alerts: list[dict] = []
+
+            # 1) Rate: >1200 reqs/hora por cliente (~20/min sostenido)
+            for r in conn.execute(
+                """SELECT client_id, COUNT(*), SUM(cost_usd)
+                   FROM requests WHERE ts>=? GROUP BY client_id HAVING COUNT(*) > 1200""",
+                (since,),
+            ).fetchall():
+                alerts.append({
+                    "type": "rate_abuse",
+                    "severity": "high",
+                    "client_id": r[0],
+                    "requests_1h": r[1],
+                    "detail": f"{r[0]}: {r[1]} reqs/hora (>20/min) — posible loop o abuso",
+                })
+
+            # 2) Costo: >$5/hora por cliente
+            for r in conn.execute(
+                """SELECT client_id, COUNT(*), SUM(cost_usd)
+                   FROM requests WHERE ts>=? GROUP BY client_id HAVING SUM(cost_usd) > 5.0""",
+                (since,),
+            ).fetchall():
+                alerts.append({
+                    "type": "cost_abuse",
+                    "severity": "high",
+                    "client_id": r[0],
+                    "cost_1h": round(r[2] or 0, 2),
+                    "detail": f"{r[0]}: ${r[2]:.2f}/hora — consumo anormal",
+                })
+
+            # 3) Modelo con muchas respuestas vacías (>20% y >10 reqs)
+            for r in conn.execute(
+                """SELECT model, COUNT(*),
+                          SUM(CASE WHEN status_code<400
+                                   AND COALESCE(completion_tokens,0)=0
+                                   AND COALESCE(prompt_tokens,0)>0
+                              THEN 1 ELSE 0 END)
+                   FROM requests WHERE ts>=? GROUP BY model
+                   HAVING COUNT(*) > 10 AND SUM(CASE WHEN status_code<400
+                                   AND COALESCE(completion_tokens,0)=0
+                                   AND COALESCE(prompt_tokens,0)>0
+                              THEN 1 ELSE 0 END) > COUNT(*)*0.2""",
+                (since,),
+            ).fetchall():
+                pct = int(100 * r[2] / r[1])
+                alerts.append({
+                    "type": "model_empty_responses",
+                    "severity": "medium",
+                    "model": r[0],
+                    "empty": r[2], "total": r[1],
+                    "detail": f"{r[0]}: {r[2]}/{r[1]} respuestas vacías ({pct}%)",
+                })
+
+            return alerts
+        finally:
+            conn.close()
+
+
+def get_capacity_report() -> dict:
+    """Capacidad teórica y real de tokens/día del sistema, por modelo.
+    Basado en throughput medido en producción (billing.db) y ventanas 24h."""
+    with _lock:
+        conn = _connect()
+        try:
+            out = {"models": {}}
+            for r in conn.execute(
+                """SELECT model,
+                          AVG(CASE WHEN latency_ms>0 AND completion_tokens>10
+                                   THEN completion_tokens*1000.0/latency_ms END),
+                          MAX(completion_tokens),
+                          COUNT(*)
+                   FROM requests GROUP BY model""",
+            ).fetchall():
+                model, tok_s, max_out, n = r
+                if not model or not tok_s:
+                    continue
+                # Capacidad teórica: generación 24h sostenida al tok/s medido
+                # (cota superior; la práctica incluye colas y thinking)
+                theo_24h = int(tok_s * 86400)
+                out["models"][model] = {
+                    "measured_gen_tok_s": round(tok_s, 1),
+                    "max_output_seen": max_out or 0,
+                    "requests_seen": n,
+                    "theoretical_tokens_per_day": theo_24h,
+                    "theoretical_Mtok_per_day": round(theo_24h / 1e6, 2),
+                }
+            return out
         finally:
             conn.close()
 
