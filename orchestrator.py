@@ -2219,12 +2219,19 @@ class QwenOrchestrator:
             f"Te muestro el video como {n_panels} imágenes: cada una es una CUADRÍCULA 2×2 con 4 fotogramas del video, numerados en amarillo con numeración continua (panel 1 = fotogramas 1-4, panel 2 = 5-8, etc.).\n"
             f"Los números amarillos indican el ORDEN TEMPORAL de la secuencia.\n"
             f"Describe SOLO lo que ves, como testigo neutral. No juzgas, no inventas, no supones.\n"
+            # A1 (2026-09-04) anti-alucinación: el testigo PUEDE y DEBE admitir
+            # lo que no ve. Antes: sin válvula de escape, con consigna leading
+            # ("ENFOCA las ACCIONES") el modelo inventaba transacciones/acciones
+            # en grids nocturnos casi negros (detectado en vivo 2026-09-03:
+            # "transacción de dinero" con brillo 27).
+            f"REGLA DE HONESTIDAD VISUAL: si la imagen está oscura, borrosa o un detalle no es claramente visible, dilo explícitamente ('no se aprecia', 'visibilidad baja') en vez de adivinar. 'No determinable' es una respuesta VÁLIDA y CORRECTA. Un testigo honesto vale más que uno imaginativo.\n"
+            f"NO describas objetos ni acciones que no puedas ver con certeza en los fotogramas. NO uses tu conocimiento del tipo de negocio para deducir acciones (ej: si la zona se llama 'Caja', eso NO significa que haya una transacción de dinero).\n"
             # B2: regla dura — el usuario lee los eventos del libro y no quiere
             # "en el frame 1 pasó X, en el frame 2 pasó Y". El grid ES el video:
             # hay que contarlo como historia.
             f"PROHIBIDO mencionar fotogramas, frames, cuadrículas o números en tu narrativa. NO escribas \"en el primer fotograma\" ni \"en el frame 2\": cuenta la secuencia como UNA SOLA HISTORIA continua de lo que pasó, en pasado narrativo (\"el empleado cobró y luego guardó el dinero\").\n"
-            f"ENFOCA la narrativa en las ACCIONES y su ORDEN: quién hizo qué, después de qué. Esa secuencia causal es lo más importante.\n"
-            f"Por persona: 1-2 frases máximo (apariencia + qué hace).\n"
+            f"Ordena la narrativa por lo que OCURRE en la escena. Si no ocurre acciones visibles, describe el estado de la escena y qué se distingue con esa visibilidad.\n"
+            f"Por persona: 1-2 frases máximo (apariencia + qué hace, o qué se alcanza a distinguir).\n"
             f"Responde SIEMPRE EN ESPAÑOL (todo el JSON debe estar en español).\n"
         )
 
@@ -2280,6 +2287,7 @@ class QwenOrchestrator:
             "  ],\n"
             "  \"objects\": [\"objetos relevantes visibles\"],\n"
             "  \"events\": [\"acciones observadas, con tus palabras\"],\n"
+            "  \"visibilidad\": \"buena\" | \"baja\" | \"no_determinable\",\n"
             "  \"flag\": null\n"
             "}\n"
             "Reglas críticas:\n"
@@ -2293,6 +2301,7 @@ class QwenOrchestrator:
             "  - Si dos personas estan en la misma zona, pon el mismo nombre de zona a ambas\n"
             "  - \"events\" describe lo que ves CON TUS PROPIAS PALABRAS. NO copies frases de esta instrucción ni de las reglas del dueño: si una regla se cumplió visualmente lo indica SOLO el campo flag.\n"
             "  - \"flag\": SOLO si alguna de las attention_phrases del dueño (listadas arriba) se cumplió VISUALMENTE en la escena, copia esa frase EXACTA (letra por letra). Si ninguna se cumplió, pon null. NO inventes frases, NO copies ejemplos de estas instrucciones, NO pongas descripciones del schema; o null o una frase literal copiada de la lista del dueño.\n"
+            "  - \"visibilidad\": \"buena\" si la escena es claramente visible; \"baja\" si está oscura/tenebrosa pero se distingue lo esencial; \"no_determinable\" si está demasiado oscura o degradada para describir algo con confianza. En \"baja\", restringe persons/events a lo ESENCIAL y dí qué es lo que no se distingue; con \"no_determinable\", scene debe explicar solo eso y persons/objects/events deben ser listas vacías y flag null.\n"
         )
 
         full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"
@@ -2314,7 +2323,13 @@ class QwenOrchestrator:
         payload = {
             "model": "qwen",
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 900
+            "max_tokens": 900,
+            # A1 (2026-09-04): fijar sampling para un "testigo de seguridad".
+            # Antes no se enviaba nada → defaults del backend. Un narrador
+            # factual debe ser determinista-frío: 0.1 (no 0.0 absoluto porque
+            # modelos RL-tuned a veces degeneran con greedy puro en JSON largo).
+            "temperature": 0.1,
+            "top_p": 0.8,
         }
 
         # ── C3 (2026-09-01): narrador principal = Qwen3-VL-8B (:8019, llama.cpp)
@@ -2453,6 +2468,46 @@ class QwenOrchestrator:
                         concern = ud.get("main_concerns", [""])[0] if isinstance(ud.get("main_concerns"), list) else ""
             except Exception:
                 pass
+
+            # ── A2 (2026-09-04): GATE DE VISIBILIDAD pre-Qwen ──────────────────
+            # Anti-alucinación: los frames ya pasaron por CLAHE/_adjust_brightness
+            # en el worker. Si AUN ASÍ el brillo medio del grid es demasiado bajo
+            # (< 22 tras rescate), enviarlo a Qwen es pedirle que describa una
+            # imagen casi negra → narrativa inventada (detectado 2026-09-03:
+            # "transacción de dinero" en grid con brillo 27). En vez de eso se
+            # registra un evento dark_grid honesto ("sin visibilidad") sin
+            # gastar GPU ni generar contenido ficticio.
+            try:
+                from PIL import Image as _PILImage, ImageStat as _PILStat
+                import io as _io
+                _brightness_samples = []
+                for _f in frames[::4]:  # muestrear 4 de los 16 (barato)
+                    _ib = _f.get("image_bytes") or b""
+                    if _ib:
+                        _im = _PILImage.open(_io.BytesIO(_ib)).convert("L")
+                        _brightness_samples.append(_PILStat.Stat(_im).mean[0])
+                _avg_brightness = (sum(_brightness_samples) / len(_brightness_samples)) if _brightness_samples else 100.0
+                if _avg_brightness < 22:
+                    logger.warning(
+                        f"[A2] {camera_id}: grid oscuro tras CLAHE (brillo {_avg_brightness:.1f}) → evento dark_grid sin análisis VLM"
+                    )
+                    _dark_evt = save_event_to_disk_v2(
+                        user_id=user_id,
+                        camera_id=camera_id,
+                        event_type="dark_grid",
+                        frame_bytes=frames[0]["image_bytes"] if frames else b"",
+                        summary="Visibilidad insuficiente: la cámara no distingue la escena (sin luz suficiente). No se generó análisis para evitar información inventada.",
+                        qwen_json={"visibilidad": "no_determinable", "scene": "Sin visibilidad suficiente para describir la escena.", "persons": [], "objects": [], "events": [], "flag": None},
+                        metadata={
+                            "frames_count": len(frames),
+                            "total_yolo_objects": total_yolo_objects,
+                            "avg_brightness": round(_avg_brightness, 2),
+                            "skipped_qwen": "too_dark",
+                        },
+                    )
+                    return {"event_id": _dark_evt, "status": "dark_grid", "avg_brightness": round(_avg_brightness, 2)}
+            except Exception as _e_a2:
+                logger.debug(f"[A2] brightness gate falló (no bloquea): {_e_a2}")
     
             # ── Construir analysis_prompt ────────────────────────────────────────
             after_note = "\nATENCIÓN: Ahora mismo es FUERA DE HORARIO laboral." if is_after_hours else ""
@@ -2586,6 +2641,44 @@ class QwenOrchestrator:
                          zone_assign_grid=zone_assign_grid,
                      )
                     vision_json = _convert_qwen_vision_response(vision_json)
+                    # ── A3 (2026-09-04): cross-check VLM↔YOLO (anti-alucinación) ──
+                    # El VLM puede describir personas/objetos que YOLO no vio en
+                    # NINGÚN frame del grid. Regla de evidencia (estilo POPE/
+                    # GroundCount): lo que el detector no soporta, se tacha —
+                    # se conserva el texto pero marcado "no_verificado" y NO
+                    # cuenta para alerts. El narrador queda anclado a evidencia.
+                    try:
+                        _yolo_persons = tracking_summary.get("unique_persons") if isinstance(tracking_summary, dict) else None
+                        if not _yolo_persons:
+                            _yolo_persons = sum(1 for f in frames if "person" in (f.get("yolo_classes") or []))
+                        _vlm_persons = vision_json.get("persons") if isinstance(vision_json.get("persons"), list) else []
+                        if len(_vlm_persons) > max(int(_yolo_persons or 0), 1) * 2 and len(_vlm_persons) > 2:
+                            logger.warning(
+                                f"[A3] {camera_id}: VLM describe {len(_vlm_persons)} personas, YOLO solo vio {_yolo_persons} → recortando a evidencia"
+                            )
+                            _keep_n = max(int(_yolo_persons or 0), 1)
+                            _dropped = _vlm_persons[_keep_n:]
+                            _dropped_note = "; ".join(
+                                f"no verificado por detector: {p.get('desc', '')[:40]}" for p in _dropped[:3])
+                            vision_json["persons"] = _vlm_persons[:_keep_n]
+                            vision_json.setdefault("anotaciones", []).append(
+                                f"{len(_dropped)} persona(s) descrita(s) por el narrador sin soporte del detector fueron retiradas ({_dropped_note})")
+                        # objetos: el VLM solo puede listar clases que YOLO vio o
+                        # clases 'genéricas' permitidas (no inventa 'cajero' si
+                        # el detector no lo vio nunca en el grid)
+                        _yolo_classes_l = {c for f in frames for c in (f.get("yolo_classes") or [])}
+                        _objs = vision_json.get("objects") if isinstance(vision_json.get("objects"), list) else []
+                        _supported_objs = [
+                            o for o in _objs
+                            if any(k in str(o).lower() for k in _yolo_classes_l)
+                            or any(w in str(o).lower() for w in ("teléfono", "celular", "móvil", "bolsa", "caja", "dinero", "silla", "mesa", "pantalla"))
+                        ]
+                        if len(_supported_objs) < len(_objs):
+                            _removed_objs = [o for o in _objs if o not in _supported_objs]
+                            logger.info(f"[A3] {camera_id}: objetos sin soporte YOLO retirados: {_removed_objs}")
+                            vision_json["objects"] = _supported_objs
+                    except Exception as _e_a3:
+                        logger.debug(f"[A3] cross-check falló (no bloquea): {_e_a3}")
                     logger.info(f"[VISION] Qwen response: persons={len(vision_json.get('persons',[]))} scene={vision_json.get('scene','')[:50]}")
                 except Exception as e:
                     logger.error(f"[VISION] Error: {e}", exc_info=True)
