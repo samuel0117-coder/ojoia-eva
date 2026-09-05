@@ -2757,6 +2757,27 @@ class QwenOrchestrator:
                                 for h in vision_json["attention_hits"])
                             if not _already:
                                 vision_json["attention_hits"].append({"frase": _h, "momento": "fuera de horario"})
+                        # fix (2026-09-05) — BUG F3.2 preexistente: la puerta A1
+                        # (_match_phrase) DESCARTA estos hits geo porque su
+                        # frase no matchea ninguna attention_phrase del dueño
+                        # → la regla de zona restringida nunca llegó a
+                        # notificar (detectado empíricamente por el agente del
+                        # core determinista). Mismo bypass que las reglas del
+                        # dwell engine: los hits geo son HECHO geométrico
+                        # (bbox∩zona restringida + reloj), no requieren
+                        # verificación VLM. Se fusionan post-_detect_attention_hits.
+                        for _h in _hits_geo:
+                            _rh_geo = {
+                                "frase": _h,
+                                "momento": "fuera de horario",
+                                "source": "geo_restricted_after_hours",
+                                "severity": "alta",
+                                "needs_verification": False,
+                            }
+                            _already_f = any(isinstance(h, dict) and h.get("frase") == _h
+                                             for h in _rule_engine_hits)
+                            if not _already_f:
+                                _rule_engine_hits.append(_rh_geo)
                 except Exception as _e_geo:
                     logger.debug(f"[F3.2] regla geo falló: {_e_geo}")
 
@@ -2768,7 +2789,12 @@ class QwenOrchestrator:
             # (la puerta A1 descarta frases que no matchean attention_phrases —
             # las reglas deterministas NO requieren verificación VLM: son hecho
             # geométrico + reloj).
-            _rule_engine_hits = []
+            # fix (2026-09-05): la lista se inicializa ANTES del bloque F3.2 de
+            # arriba — F3.2 ahora también aporta hits geo a esta fusión.
+            try:
+                _rule_engine_hits
+            except NameError:
+                _rule_engine_hits = []
             try:
                 import rule_schema as _rule_schema
                 import dwell_engine as _dwell_engine
