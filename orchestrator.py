@@ -2237,6 +2237,25 @@ class QwenOrchestrator:
                 "apariencia de la imagen si el track ya tiene zona asignada.\n"
             )
 
+        # ── PIEZA 3b: dwells activos (permanencia confirmada por el motor) ──
+        # Hecho temporal del dwell engine (fuera de este grid): una persona
+        # lleva Ns seguidos en una zona. Útil para que el narrador no diga
+        # "pasó por la caja" cuando lleva 2 minutos ahí.
+        try:
+            import dwell_engine as _dwell_engine_ctx
+            _dwells = _dwell_engine_ctx.get_active_dwells(camera_id)
+            if _dwells:
+                _dparts = [
+                    f"track #{d['track_id']} en zona \"{d['zone']}\" hace {d['dwell_s']:.0f}s"
+                    for d in _dwells[:6]
+                ]
+                context_block += (
+                    f"- DWELL ACTIVO (permanencia continua, confirmada geométricamente):\n"
+                    + "\n".join(f"  · {p}" for p in _dparts) + "\n"
+                )
+        except Exception:
+            pass
+
         # ── Eje 3A: preambulo generico (independiente del dueño) ──
         n_panels = len(panels_b64) if isinstance(panels_b64, list) else 0
         preamble = (
@@ -2741,7 +2760,73 @@ class QwenOrchestrator:
                 except Exception as _e_geo:
                     logger.debug(f"[F3.2] regla geo falló: {_e_geo}")
 
+            # ── PIEZA 3a: reglas deterministas del dueño (vigilance.rules[]) ──
+            # Evalúa cada regla activa contra el estado dwell del motor (RAM,
+            # alimentado por-frame por el worker de api_eva). Los hits viajan
+            # como dicts en vision_json["attention_hits"] y ADEMÁS se guardan
+            # en _rule_engine_hits para fusionarse DESPUÉS de _detect_attention_hits
+            # (la puerta A1 descarta frases que no matchean attention_phrases —
+            # las reglas deterministas NO requieren verificación VLM: son hecho
+            # geométrico + reloj).
+            _rule_engine_hits = []
+            try:
+                import rule_schema as _rule_schema
+                import dwell_engine as _dwell_engine
+                _now_ts = time.time()
+                for _rl in _rule_schema.get_rules_for_camera(user_id, camera_id):
+                    _rh = _dwell_engine.eval_rule(_rl, camera_id, _now_ts, is_after_hours)
+                    if not _rh:
+                        continue
+                    _frase_r = f"{_rh['frase']} (regla: {_rh['rule_id']})"
+                    _mom_r = f"dwell {_rh['dwell_s']:.0f}s"
+                    _rule_engine_hits.append({
+                        "frase": _frase_r,
+                        "momento": _mom_r,
+                        "source": "deterministic_rule",
+                        "rule_id": _rh["rule_id"],
+                        "severity": _rh.get("severity", "media"),
+                        "needs_verification": False,
+                    })
+                    if "attention_hits" not in vision_json or not isinstance(vision_json.get("attention_hits"), list):
+                        vision_json["attention_hits"] = []
+                    _already = any(
+                        isinstance(h, dict) and h.get("frase") == _frase_r
+                        for h in vision_json["attention_hits"])
+                    if not _already:
+                        vision_json["attention_hits"].append({"frase": _frase_r, "momento": _mom_r})
+            except Exception as _e_rl:
+                logger.debug(f"[RULES] evaluación de reglas deterministas falló: {_e_rl}")
+
             rule_result = _detect_attention_hits(vision_json, attention_phrases, owner_notes, zone, is_after_hours, mode, attention_phrases_zones)
+
+            # ── PIEZA 3a (cont.): fusionar hits de reglas deterministas ──
+            # _detect_attention_hits (A1) solo acepta frases que matchean
+            # attention_phrases del dueño; las reglas deterministas viven en
+            # vigilance.rules[] (otro namespace). Se fusionan aquí, después
+            # del análisis, como hits estructurados sin verificación.
+            try:
+                if _rule_engine_hits:
+                    for _rh2 in _rule_engine_hits:
+                        if _rh2["frase"] in rule_result["attention_hits"]:
+                            continue
+                        rule_result["attention_hits"].append(_rh2["frase"])
+                        rule_result["attention_hits_zones"].append(_rh2.get("zone_name") or None)
+                        rule_result["hits_detail"].append(_rh2)
+                        rule_result["anomalias"].append({
+                            "tipo": "attention_hit",
+                            "descripcion": f"Se observó: {_rh2['frase']} ({_rh2['momento']})",
+                            "observacion": True,
+                            "severidad": _rh2.get("severity", "media"),
+                            "source": "deterministic_rule",
+                        })
+                        rule_result["evidence"].append(
+                            f"Se observó: {_rh2['frase']} ({_rh2['momento']})")
+                    if rule_result["anomalias"]:
+                        rule_result["violation"] = True
+                        rule_result["importance"] = "alta"
+                        rule_result["importancia"] = "alta"
+            except Exception as _e_merge:
+                logger.debug(f"[RULES] fusión de hits deterministas falló: {_e_merge}")
     
             # ── Armar qwen_json final ─────────────────────────────────────────────
             qwen_json = {
@@ -2842,7 +2927,23 @@ class QwenOrchestrator:
             first_hit_text = attention_hits[0] if attention_hits else ""
             cam_key = self._cooldown_key(user_id, camera_id, first_hit_text)
             last_notif = self._cooldown_get(cam_key)
-            cooldown_ok = (time.time() - last_notif) > self._notification_cooldown
+            # ── PIEZA 3c: cooldown por REGLA determinista ────────────────────
+            # Si el primer hit viene de una regla (vigilance.rules[]), su
+            # cooldown_s propio reemplaza el default de 300s. Determinista:
+            # no hay heurística de frase — se lee directo de la regla.
+            _cooldown_s_eff = self._notification_cooldown
+            try:
+                _m_rid = re.search(r"\(regla: (rul_[0-9a-f]+)\)", first_hit_text or "")
+                if _m_rid:
+                    import rule_schema as _rule_schema_cd
+                    _rl_cd = next(
+                        (r for r in _rule_schema_cd.get_rules_for_camera(user_id, camera_id)
+                         if r.get("id") == _m_rid.group(1)), None)
+                    if _rl_cd and _rl_cd.get("cooldown_s"):
+                        _cooldown_s_eff = int(_rl_cd["cooldown_s"])
+            except Exception:
+                pass
+            cooldown_ok = (time.time() - last_notif) > _cooldown_s_eff
     
             # ── Datos del evento ─────────────────────────────────────────────────
             user_id = frames[0]["user_id"] if frames else user_id
@@ -2948,7 +3049,7 @@ class QwenOrchestrator:
                 except Exception as _fcm_err:
                     logging.error(f"FCM error: {_fcm_err}")
             elif attention_detected:
-                remaining = self._notification_cooldown - (time.time() - last_notif)
+                remaining = _cooldown_s_eff - (time.time() - last_notif)
                 logging.info(f"Notification suppressed for {cam_key} (cooldown, {remaining:.0f}s)")
     
             return {

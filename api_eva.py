@@ -7005,6 +7005,20 @@ async def yolo_worker():
                 except Exception as _e_zone:
                     logger.debug(f"[F2.2] zone assign falló: {_e_zone}")
 
+                # PIEZA 3d: alimentar el dwell engine (reglas deterministas).
+                # Por-frame: trackea permanencia persona↔zona en RAM. Nunca
+                # bloquea el pipeline del worker.
+                try:
+                    import dwell_engine as _dwell_engine
+                    # get_camera_zones_cached (TTL 30s): lectura por frame del
+                    # worker sin re-parsear camera.json cada vez.
+                    _dwell_engine.process_frame(
+                        camera_id, yolo_detections,
+                        camera_zones.get_camera_zones_cached(user_id, camera_id),
+                        800, 600, time.time())
+                except Exception:
+                    pass
+
                 # Grid por cámara (lock → add_frame → capture si lleno)
                 grid = orchestrator._get_grid(user_id, camera_id, grid_size=GRID_SIZE)
                 cam_lock = _get_camera_lock(user_id, camera_id)
