@@ -123,6 +123,73 @@ def ingest_frame_for_eva(frame_bytes: bytes, camera_id: str = "default"):
     _latest_frame[camera_id] = frame_bytes
     _latest_frame_time[camera_id] = time.time()
 
+def _pending_camera_announces(max_age_s: int = 300) -> Dict[str, dict]:
+    """Announces recientes de cámaras nuevas (telemetría del wizard).
+    Proviene de /devices/announce vía eva.pending_cameras — si el import
+    falla (p.ej. despliegue parcial), devolvemos vacío y seguimos."""
+    try:
+        from eva.pending_cameras import list_recent
+        return list_recent(max_age_s)
+    except Exception as e:
+        logger.warning(f"[wizard] pending_cameras no disponible: {e}")
+        return {}
+
+def _announce_telemetry_text(pending: Dict[str, dict]) -> str:
+    """Texto humano con la telemetría de las cámaras nuevas anunciándose."""
+    if not pending:
+        return ("Todavía no veo ninguna cámara nueva en la red — revisa que el LED "
+                "esté parpadeando y esté conectada al WiFi del negocio.")
+    lines = []
+    for cid, info in sorted(pending.items(), key=lambda kv: -kv[1].get("last_seen", 0)):
+        sig = ""
+        if info.get("rssi") is not None:
+            try:
+                sig = f", señal {int(info['rssi'])}" if str(info['rssi']).lstrip('-').isdigit() else f", señal {info['rssi']}"
+            except Exception:
+                sig = ""
+        lines.append(f"Veo una cámara nueva encendiéndose ({cid}{sig}) 📶 — ¿es la que "
+                     "acabas de instalar? Espera un momento a que me envíe la primera imagen.")
+    if len(lines) == 1:
+        return lines[0]
+    return "Estas cámaras nuevas se están anunciando:\n" + "\n".join(f"• {l}" for l in lines)
+
+def _is_real_hw_camera_id(cid: str) -> bool:
+    """True si el id parece de hardware real (OJO-*, IPCAM-*, etc.) y no un
+    sintético legacy (cam_<ts>), un placeholder de red (pending_*) o el id
+    por defecto del buffer de frames."""
+    cid = (cid or "").strip()
+    return bool(cid) and cid != "default" and not cid.startswith(("cam_", "pending_"))
+
+def _resolve_real_camera_id(session: Dict, frame_camera_id: str = "") -> str:
+    """Resuelve el camera_id REAL de hardware. Nunca inventa cam_<ts>.
+
+    Orden: camera_id ya resuelto en sesión > camera_id del frame > cámara
+    anunciándose sin reclamar (solo si hay EXACTAMENTE una). Si no hay nada,
+    devuelve "" — el wizard queda pendiente y se vincula cuando llegue el
+    primer frame/announce (fin del Bug #1: cámaras fantasma cam_<ts>)."""
+    # 1) camera_id de la sesión, si no es sintético (cam_<ts> legacy / pending_*)
+    cam = (session.get("camera_id") or "").strip()
+    if _is_real_hw_camera_id(cam):
+        return cam
+    # 2) camera_id del frame (el hardware que envió la imagen)
+    fcid = (frame_camera_id or "").strip()
+    if _is_real_hw_camera_id(fcid):
+        return fcid
+    # (a) exactamente 1 announce reciente sin reclamar → usar ese camera_id
+    pending = _pending_camera_announces()
+    real = [cid for cid in pending if _is_real_hw_camera_id(cid)]
+    if len(real) == 1:
+        return real[0]
+    return ""
+
+def _claim_pending_camera(camera_id: str):
+    """Marca un camera_id de la cola de nuevas como reclamado."""
+    try:
+        from eva.pending_cameras import claim
+        return claim(camera_id)
+    except Exception:
+        return {}
+
 def _get_frame(camera_id: str = "", user_id: str = "") -> Optional[bytes]:
     global _latest_frame, _latest_frame_time
     # v16: Si se especifica camera_id, usar ese frame primero.
@@ -2174,25 +2241,40 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
     # PRIORIDAD: cámara nueva (no configurada) > cámaras configuradas.
     # Si el usuario está en medio de instalar una cámara NUEVA, debe ver la
     # imagen de ESA cámara, no la de una ya existente.
-    if not session.get("camera_id"):
+    # Bug #2 (2026-09-04): intercalar el announce único de cámara nueva ANTES
+    # del fallback a cámaras ya configuradas — antes, una sesión sin camera_id
+    # heredaba la cámara vieja del usuario (OJO-D1C560) y el announce de la
+    # cámara NUEVA que se estaba instalando quedaba ignorado. Las sesiones
+    # legado con id sintético (cam_*) también se re-resuelven, pero SOLO con
+    # evidencia de cámara nueva (frame no configurado o announce único) —
+    # nunca heredando una cámara vieja: configurar la equivocada sería peor.
+    _legacy_synth = session.get("camera_id", "").startswith("cam_")
+    if not session.get("camera_id") or _legacy_synth:
         # 1) Buscar cámara no configurada con frame reciente (la nueva)
         frame_unconf, cam_unconf = _get_unconfigured_frame(user_id)
         if frame_unconf and cam_unconf:
             session["camera_id"] = cam_unconf
         else:
-            # 2) Fallback: buscar cámara pendiente en el usuario
-            pending_cam = _find_pending_camera(user_id, storage_root)
-            if pending_cam:
-                session["camera_id"] = pending_cam
-            else:
-                ud = _load_user_data(user_id)
-                cams = ud.get("cameras", [])
-                for c in cams:
-                    if c.get("active"):
-                        session["camera_id"] = c.get("camera_id", "")
-                        break
-                if not session.get("camera_id") and cams:
-                    session["camera_id"] = cams[-1].get("camera_id", "")
+            # 2) Announce único de cámara nueva sin reclamar (la que enciende)
+            pending_ann = _pending_camera_announces()
+            real_ann = [cid for cid in pending_ann if _is_real_hw_camera_id(cid)]
+            if len(real_ann) == 1:
+                session["camera_id"] = real_ann[0]
+            elif not _legacy_synth:
+                # 3) Fallback (solo sesiones SIN camera_id): cámara pendiente
+                # en el usuario o última cámara activa.
+                pending_cam = _find_pending_camera(user_id, storage_root)
+                if pending_cam:
+                    session["camera_id"] = pending_cam
+                else:
+                    ud = _load_user_data(user_id)
+                    cams = ud.get("cameras", [])
+                    for c in cams:
+                        if c.get("active"):
+                            session["camera_id"] = c.get("camera_id", "")
+                            break
+                    if not session.get("camera_id") and cams:
+                        session["camera_id"] = cams[-1].get("camera_id", "")
 
     frame = None
     frame_camera_id = ""
@@ -2224,9 +2306,15 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
                 b64, session.get("zone",""), session.get("business_type","negocio"))
         session["phase"] = SetupPhase.ANALYZE.value
         session["wait_attempts"] = 0
+        # Bug #1 (2026-09-04): resolver el camera_id REAL (frame > announce
+        # único) — nunca inventar cam_<ts> (creaba cámaras fantasma que nunca
+        # recibían frames). Si no se puede resolver, el frame se guarda bajo
+        # un id provisional no registrado y el vínculo real llega con el
+        # announce/primer frame (_handle_confirm lo resuelve de nuevo).
         try:
-            cam = session.get("camera_id") or (f"cam_{int(time.time())}" if (frame_camera_id or "").startswith("pending_") else frame_camera_id) or f"cam_{int(time.time())}"
+            cam = _resolve_real_camera_id(session, frame_camera_id) or "pending_frame"
             session["camera_id"] = cam
+            _claim_pending_camera(cam)
             fd = storage_root / "users" / user_id / "cameras" / cam / "frames"
             fd.mkdir(parents=True, exist_ok=True)
             (fd / "first.jpg").write_bytes(frame)
@@ -2247,6 +2335,29 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
         _save_session_to_disk(session)
         return await _handle_analyze(session, session_id, first)
 
+    # Bug #2 (2026-09-04): telemetría del wizard. Cuando no hay frame tras
+    # ≥2 intentos, consultar los announces recientes (/devices/announce de
+    # cámaras desconocidas ahora se registra en eva.pending_cameras) y decir
+    # al usuario SI la cámara encendió — antes solo decía "esperando imagen..."
+    # sin poder distinguir "cámara viva, aún sin imagen" de "ni siquiera encendió".
+    # Va ANTES de la confirmación manual: si el usuario dice "listo" pero Eva
+    # ya ve una cámara anunciándose, prioriza avisar y esperar su primer frame.
+    if attempts >= 2 and not frame and not session.get("image_b64"):
+        pending = _pending_camera_announces()
+        real = [cid for cid in pending if _is_real_hw_camera_id(cid)]
+        if real:
+            tele = _announce_telemetry_text(pending)
+            if attempts > 5:
+                text = f"Llevo rato esperando... 📷\n\n{tele}\n\n¿Ya está conectada? Escríbeme 'ok', 'listo' o dime que sí."
+            else:
+                text = f"Esperando imagen... 📷 (intento {attempts})\n\n{tele}"
+            # Si hay exactamente una anunciándose, pre-vincular su camera_id
+            # real para que el confirm no dependa del frame.
+            if len(real) == 1 and not session.get("camera_id"):
+                session["camera_id"] = real[0]
+            _sessions[session_id] = session
+            return _mk_resp(session, text)
+
     if await _is_intent_confirmed(message, f"Esperando imagen. Usuario dice: {message}") and not frame:
         session["phase"] = SetupPhase.CONTEXT.value
         session["manual_image_confirmed"] = True
@@ -2257,6 +2368,16 @@ async def _handle_wait_image(session, session_id, user_id, first, message, stora
         _sessions[session_id] = session
         _save_session_to_disk(session)
         return _mk_resp(session, _context_question(session, "concern", first))
+
+    if attempts >= 2 and not frame and not session.get("image_b64"):
+        # Sin announces: guiar al usuario con el checklist de encendido/WiFi.
+        tele = _announce_telemetry_text({})
+        if attempts > 5:
+            text = f"Llevo rato esperando... 📷\n\n{tele}\n\n¿Ya está conectada? Escríbeme 'ok', 'listo' o dime que sí."
+        else:
+            text = f"Esperando imagen... 📷 (intento {attempts})\n\n{tele}"
+        _sessions[session_id] = session
+        return _mk_resp(session, text)
 
     if attempts > 5:
         text = "Llevo rato esperando... 📷\n\n¿Ya está conectada? Escríbeme 'ok', 'listo' o dime que sí."
@@ -2869,8 +2990,25 @@ async def _handle_confirm(session, session_id, user_id, message, first, storage_
         _save_session_to_disk(session)
         return _mk_resp(session, f"Claro, {first}. ¿Qué quieres modificar?\n\n• Horario\n• Zona\n• Preocupación\n\nPor ahora puedo cambiar el horario. Dime: horario 08:00 a 22:00")
     if _is_yes(message):
-        cam = session.get("camera_id") or f"cam_{int(time.time())}"
+        # Bug #1 (2026-09-04): NUNCA inventar cam_<ts>. Solo crear la cámara
+        # (save_camera_config) con un camera_id real de hardware — resuelto
+        # del frame, del announce único sin reclamar, o ya vinculado en
+        # sesión. Si no hay: dejar la sesión pendiente y avisar al usuario
+        # (el vínculo llega cuando llegue el primer frame o announce).
+        cam = _resolve_real_camera_id(session)
+        if not cam:
+            session["phase"] = SetupPhase.WAIT_IMAGE.value
+            session["unlinked_camera_pending"] = True
+            session["wait_attempts"] = 0
+            _sessions[session_id] = session
+            _save_session_to_disk(session)
+            return _mk_resp(session, (
+                "No pude vincular todavía ninguna cámara física 🔌\n\n"
+                "Revisa que esté **encendida** (LED parpadeando) y conectada al "
+                "**WiFi del negocio**. En cuanto encienda, la voy a detectar y "
+                "seguimos — tu configuración queda guardada."))
         session["camera_id"] = cam
+        _claim_pending_camera(cam)
         cfg = {
             "camera_id": cam, "name": f"Cámara {session.get('zone','zona')}",
             "zone": session.get("zone",""),
@@ -4598,8 +4736,11 @@ def _mk_resp(session, text, img_b64="", ready_to_confirm=False, camera_saved=Fal
         try:
             small = _resize(base64.b64decode(img_b64), 640)
             uid = session.get("user_id","")
-            cam = session.get("camera_id", f"cam_{int(time.time())}")
-            if uid:
+            # Bug #1: id provisional para cachear la imagen — nunca cam_<ts>
+            # sintético (creaba directorios de cámara fantasma). Si no hay
+            # camera_id real, la imagen se sirve desde /tmp.
+            cam = session.get("camera_id") or ""
+            if uid and _is_real_hw_camera_id(cam):
                 img_dir = STORAGE_ROOT / "users" / uid / "cameras" / cam / "frames"
                 img_dir.mkdir(parents=True, exist_ok=True)
                 (img_dir / "eva_frame.jpg").write_bytes(small)

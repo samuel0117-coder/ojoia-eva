@@ -933,8 +933,33 @@ async def devices_announce(request: dict):
                 user_id = user_dir.name
                 break
     if not user_id:
-        logger.info(f"[announce] cámara desconocida {camera_id} — ignorado (aún sin registrar)")
-        return {"ok": True, "registered": False}
+        # Bug #2 (2026-09-04): antes el announce de una cámara desconocida se
+        # ignoraba sin dejar rastro — el wizard de Eva solo podía decir
+        # "esperando imagen..." sin saber si la cámara siquiera encendió.
+        # Ahora se registra en la cola de cámaras nuevas (en memoria + .runtime,
+        # NO en user.json/camera.json: la cámara aún no está reclamada) para
+        # que el wizard muestre telemetría (rssi/IP) y resuelva el camera_id
+        # real en vez de inventar un cam_<ts> sintético (Bug #1).
+        from eva.pending_cameras import register_announce
+        entry = register_announce(
+            camera_id,
+            rssi=request.get("rssi"),
+            ip_lan=(request.get("ip") or "")[:45],
+            firmware=(request.get("firmware") or "").strip(),
+        )
+        logger.info(f"[announce] cámara desconocida {camera_id} en cola de nuevas "
+                    f"(rssi={entry.get('rssi')} lan_ip={entry.get('ip_lan')} "
+                    f"fw={entry.get('firmware')})")
+        return {"ok": True, "registered": False, "pending": True}
+
+    # Bug #1 (2026-09-04): la cámara ya tiene dueño — si estaba en la cola de
+    # nuevas (se registró por otro camino), sacarla.
+    try:
+        from eva.pending_cameras import claim as _claim_pending_cam
+        if _claim_pending_cam(camera_id):
+            logger.info(f"[announce] {camera_id} reclamada: sale de la cola de nuevas")
+    except Exception as _e:
+        logger.debug(f"[announce] pending_cameras claim skip: {_e}")
 
     def _mut(cfg):
         cfg["local_ip"] = (request.get("ip") or "")[:45]
@@ -3431,6 +3456,18 @@ async def unregister_fcm_token(request: dict):
 # Ver helpers de consolidación al inicio del archivo (_eva_unified_sid,
 # _consolidate_legacy_eva_sessions).
 # ─────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/eva/pending-cameras")
+async def eva_pending_cameras(user_id: str, max_age_s: int = 300,
+                              authorization: str = Header(None)):
+    """Cámaras nuevas detectadas por announce pero aún sin reclamar.
+    Lo usa la app y el wizard de Eva (telemetría de "instalar cámara").
+    La entrada sale de la cola al hacer claim (registro real del camera_id)."""
+    await _verify_user_token(authorization, user_id)
+    from eva.pending_cameras import list_recent
+    pending = list_recent(max_age_s)
+    return {"success": True, "count": len(pending), "pending_cameras": pending}
+
 
 @app.get("/api/chat/eva/history")
 async def get_eva_chat_history(user_id: str, session_id: Optional[str] = None, limit: int = 50):
