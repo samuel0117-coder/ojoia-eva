@@ -2170,6 +2170,31 @@ class QwenOrchestrator:
             except Exception as e:
                 pass  # Si falla, continuamos sin zonas
 
+        # ── Mapa de objetos: OBJETOS FIJOS DEL NEGOCIO (puntos con radio) ──
+        # El dueño etiquetó objetos puntuales (caja registradora, horno, barra)
+        # con su centro en coords 0-1. Regla de proximidad textual para que
+        # Qwen use el objeto como ancla de ubicación en su narrativa.
+        objects_html = ""
+        if user_id and camera_id:
+            try:
+                import camera_zones
+                objs = camera_zones.get_camera_objects(user_id, camera_id)
+                if objs:
+                    objects_html = "\n\n--- OBJETOS FIJOS DEL NEGOCIO (etiquetados por el dueño) ---\n"
+                    for o in objs:
+                        objects_html += f"  • {o.get('name','objeto')} ({o.get('class','otro')}): centro en ({o.get('x',0):.2f},{o.get('y',0):.2f}), radio {o.get('r',0.05):.2f}"
+                        if o.get("parent_zone"):
+                            objects_html += f" — dentro de la zona '{o['parent_zone']}'"
+                        objects_html += "\n"
+                    objects_html += (
+                        "\n  REGLA DE PROXIMIDAD: una persona a distancia <0.15 (euclidiana, "
+                        "en coords normalizadas) de un objeto = está 'en/junto a' ese objeto. "
+                        "Úsalo para describir ubicaciones con precisión "
+                        "(ej: 'en la caja registradora', no 'junto a una mesa').\n"
+                    )
+            except Exception as e:
+                pass  # Si falla, continuamos sin objetos
+
         # ── Eje 2: bloque de datos factual (sensores confirmados) ──
         tracks_desc = ", ".join(
             f"#{t['id']} (visto en {t['frames']}/{n_frames} frames)"
@@ -2304,7 +2329,7 @@ class QwenOrchestrator:
             "  - \"visibilidad\": \"buena\" si la escena es claramente visible; \"baja\" si está oscura/tenebrosa pero se distingue lo esencial; \"no_determinable\" si está demasiado oscura o degradada para describir algo con confianza. En \"baja\", restringe persons/events a lo ESENCIAL y dí qué es lo que no se distingue; con \"no_determinable\", scene debe explicar solo eso y persons/objects/events deben ser listas vacías y flag null.\n"
         )
 
-        full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{output_format}"
+        full_prompt = f"{preamble}\n{context_block}\n{vigilance_prompt}{zones_html}{objects_html}{output_format}"
 
         # LOGGING CRUDO - Capa 1: prompt exacto enviado a Qwen
         logger.info(f"[QWEN_PROMPT] {full_prompt[:800]}")

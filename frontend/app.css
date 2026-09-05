@@ -1312,3 +1312,128 @@ body {
 .zones-list {
     margin-top: 8px;
 }
+
+/* ── MAPA DE OBJETOS POR TURNOS (objmap-*) ──────────────────── */
+/* Reusa el overlay .zone-drawer-*; aquí solo lo específico del wizard */
+
+.objmap-progress {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-primary, #fff);
+    padding: 10px 12px;
+    background: var(--bg-tertiary, #2c2c2e);
+    border-radius: 10px;
+    margin-bottom: 12px;
+}
+
+.objmap-finish {
+    background: var(--accent, #0a84ff);
+    border: none;
+    color: #fff;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: filter 0.15s ease;
+}
+
+.objmap-finish:hover {
+    filter: brightness(1.15);
+}
+
+.objmap-card {
+    background: var(--bg-tertiary, #2c2c2e);
+    border: 1px solid var(--border, #3a3a3c);
+    border-radius: 14px;
+    padding: 14px;
+}
+
+.objmap-card-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.objmap-card-title em {
+    color: var(--accent, #0a84ff);
+    font-style: normal;
+}
+
+.objmap-name-input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-secondary, #1c1c1e);
+    border: 1px solid var(--border, #3a3a3c);
+    border-radius: 10px;
+    color: var(--text-primary, #fff);
+    font-size: 0.9rem;
+    margin-bottom: 12px;
+}
+
+.objmap-card-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.objmap-btn {
+    flex: 1;
+    min-width: 90px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border, #3a3a3c);
+    background: var(--bg-quaternary, #3a3a3c);
+    color: var(--text-primary, #fff);
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.objmap-btn:hover {
+    filter: brightness(1.2);
+}
+
+.objmap-btn.objmap-accept {
+    background: #30d158;
+    border-color: #30d158;
+    color: #04150a;
+    font-weight: 600;
+}
+
+.objmap-btn.objmap-reject {
+    background: rgba(255, 69, 58, 0.15);
+    border-color: rgba(255, 69, 58, 0.4);
+    color: #ff453a;
+}
+
+.objmap-btn.objmap-add {
+    background: transparent;
+    border-style: dashed;
+}
+
+.objmap-btn.objmap-move.active {
+    background: #ffd60a;
+    border-color: #ffd60a;
+    color: #1a1500;
+    font-weight: 600;
+}
+
+/* Punto espejo del candidato actual: animación pulse sobre el frame */
+.objmap-pulse {
+    display: none;
+    position: absolute;
+    border-radius: 50%;
+    border: 2px solid #ffd60a;
+    pointer-events: none;
+    animation: objmapPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes objmapPulse {
+    0%, 100% { transform: scale(1); opacity: 0.9; box-shadow: 0 0 0 0 rgba(255, 214, 10, 0.5); }
+    50% { transform: scale(1.25); opacity: 0.5; box-shadow: 0 0 0 8px rgba(255, 214, 10, 0); }
+}

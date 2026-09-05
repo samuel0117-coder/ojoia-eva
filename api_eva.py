@@ -4182,6 +4182,27 @@ _QWEN_SUGGEST_ZONES_PROMPT = (
     "Enfoca zonas críticas: entradas, cajas, almacenes, áreas restringidas, zonas de tráfico."
 )
 
+# Mapa de objetos: hermano del de zonas — además de las zonas (rectángulos),
+# pide OBJETOS PUNTUALES fijos del negocio (caja registradora, contador de
+# dinero, horno, barra...) con su CENTRO en coords 0-1 y un radio.
+_QWEN_SUGGEST_OBJECTS_PROMPT = (
+    "Además de las zonas, identifica los OBJETOS FIJOS del negocio visibles en la imagen "
+    "(ej: caja registradora, horno, refrigerador, barra de bebidas, puerta de entrada, "
+    "mostrador de cobro, máquina de tarjetas). "
+    "Sugiere hasta 8 objetos, ORDENADOS POR IMPORTANCIA para vigilancia "
+    "(caja registradora / lugar donde se guarda el dinero / entradas PRIMERO, "
+    "sobre todo si el negocio es de comida; luego equipos y mobiliario clave). "
+    "Para cada objeto: un nombre corto en español, una clase "
+    "(cashier/register/money/entrance/appliance/counter/furniture/machine/other), "
+    "la posición relativa (0-1) del CENTRO del objeto como {x, y}, "
+    "un radio r (0.02-0.12) que cubra el objeto, y el nombre de la zona sugerida "
+    "donde cae (parent_zone) o null.\n"
+    "Devuelve el JSON en la forma:\n"
+    '{"objects":[{"name":"Caja registradora","class":"register","x":0.42,"y":0.55,"r":0.06,"parent_zone":"Mostrador principal"}, ...]}\n'
+    "Las coordenadas x, y son el CENTRO del objeto en la imagen (0-1), NO una esquina. "
+    "Solo objetos FIJOS del negocio, no personas ni cosas en movimiento."
+)
+
 
 async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str = "") -> list:
     """Pide a Qwen que sugiera zonas de interés para el frame actual."""
@@ -4200,7 +4221,10 @@ async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str
         ctx = ""
         if zone: ctx += f"La cámara está en: {zone}. "
         if biz_type: ctx += f"Negocio: {biz_type}. "
-        prompt = _QWEN_SUGGEST_ZONES_PROMPT + f" {ctx}"
+        # Mapa de objetos: mismo request, zonas + objetos en un solo JSON
+        prompt = _QWEN_SUGGEST_ZONES_PROMPT + " " + _QWEN_SUGGEST_OBJECTS_PROMPT + f" {ctx}"
+        prompt += ('\nResponde SOLO con un JSON válido único que contenga AMBAS claves: '
+                   '{"zones": [...], "objects": [...]}')
 
         msgs = [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{small_b64}"}},
@@ -4208,7 +4232,7 @@ async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str
 
         async with httpx.AsyncClient(timeout=60) as cl:
             r = await cl.post("http://localhost:8004/v1/chat/completions",
-                              json={"model": "qwen", "messages": msgs, "max_tokens": 500, "temperature": 0.2})
+                              json={"model": "qwen", "messages": msgs, "max_tokens": 900, "temperature": 0.2})
             if r.status_code != 200:
                 return []
             data = r.json()
@@ -4220,11 +4244,14 @@ async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str
         content = _re.sub(r'\s*```$', '', content).strip()
         m = _re.search(r'\{.*\}', content, _re.DOTALL)
         if not m:
-            return []
+            return [], []
         parsed = json.loads(m.group())
         zones = parsed.get("zones", [])
         if not isinstance(zones, list):
-            return []
+            zones = []
+        # Mapa de objetos: sugerencia de objetos puntuales del mismo request
+        raw_objects = parsed.get("objects", [])
+        objects = _normalize_qwen_objects(raw_objects if isinstance(raw_objects, list) else [])
 
         # Normalizar cada zona
         result = []
@@ -4246,14 +4273,40 @@ async def _suggest_zones_with_qwen(image_b64: str, zone: str = "", biz_type: str
                 "suggested_by": "qwen",
                 "created_at": time.time(),
             })
-        return result
+        return result, objects
     except Exception as e:
         logger.error(f"Error sugiriendo zonas con Qwen: {e}")
-        return []
+        return [], []
+
+
+def _normalize_qwen_objects(raw_objects: list) -> list:
+    """Normaliza los objetos sugeridos por Qwen (puntos con radio, no rects)."""
+    result = []
+    for i, o in enumerate(raw_objects or []):
+        if not isinstance(o, dict) or "x" not in o or "y" not in o:
+            continue
+        try:
+            x = max(0.0, min(1.0, float(o.get("x"))))
+            y = max(0.0, min(1.0, float(o.get("y"))))
+            r = max(0.01, min(0.5, float(o.get("r", 0.05))))
+        except (TypeError, ValueError):
+            continue
+        parent = o.get("parent_zone")
+        result.append({
+            "id": f"sugobj_{i}_{int(time.time())}",
+            "name": str(o.get("name", f"Objeto {i+1}"))[:60],
+            "class": str(o.get("class", "other"))[:30],
+            "x": x,
+            "y": y,
+            "r": r,
+            "parent_zone": parent if isinstance(parent, str) and parent else None,
+            "suggested_by": "qwen",
+            "created_at": time.time(),
+        })
+    return result
 
 
 def _zone_color_for_type(zone_type: str) -> str:
-    """Color hex para un tipo de zona (mismo mapping que el drawer)."""
     color_map = {
         "entrance": "#2196f3", "cashier": "#ff9800", "register": "#ff9800",
         "kitchen": "#f44336", "dining": "#4caf50", "inventory": "#9c27b0",
@@ -4308,9 +4361,11 @@ async def _get_latest_frame_b64(user_id: str, camera_id: str) -> str:
 async def suggest_zones_endpoint(camera_id: str, request: Request):
     """
     C1.3 — Sugiere zonas de interés con IA (WOW #2).
+    Mapa de objetos: ahora también devuelve "objects" (objetos fijos del
+    negocio, puntos con radio) para que el wizard haga UNA sola llamada.
 
     Body opcional: {"user_id": "...", "zone": "...", "business_type": "..."}
-    Devuelve: {"success": true, "zones": [...], "image_b64": "..."}
+    Devuelve: {"success": true, "zones": [...], "objects": [...], "image_b64": "..."}
     """
     try:
         body = {}
@@ -4324,25 +4379,90 @@ async def suggest_zones_endpoint(camera_id: str, request: Request):
         biz_type = body.get("business_type", "")
 
         if not user_id or not camera_id:
-            return {"success": False, "error": "user_id y camera_id requeridos", "zones": []}
+            return {"success": False, "error": "user_id y camera_id requeridos", "zones": [], "objects": []}
 
         # Obtener el último frame
         image_b64 = await _get_latest_frame_b64(user_id, camera_id)
         if not image_b64:
-            return {"success": False, "error": "Sin frame disponible para esta cámara", "zones": [], "image_b64": ""}
+            return {"success": False, "error": "Sin frame disponible para esta cámara", "zones": [], "objects": [], "image_b64": ""}
 
-        # Pedir sugerencias a Qwen
-        zones = await _suggest_zones_with_qwen(image_b64, zone, biz_type)
+        # Pedir sugerencias a Qwen (zonas + objetos en el mismo request)
+        zones, objects = await _suggest_zones_with_qwen(image_b64, zone, biz_type)
         return {
             "success": True,
             "zones": zones,
+            "objects": objects,
             "image_b64": image_b64,
             "count": len(zones),
+            "objects_count": len(objects),
             "suggested_by": "qwen",
         }
     except Exception as e:
         logger.error(f"Error en suggest-zones: {e}")
-        return {"success": False, "error": str(e), "zones": [], "image_b64": ""}
+        return {"success": False, "error": str(e), "zones": [], "objects": [], "image_b64": ""}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAPA DE OBJETOS POR TURNOS — objetos fijos del negocio (puntos con radio)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/cameras/{camera_id}/objects")
+async def get_camera_objects_endpoint(camera_id: str, user_id: str):
+    """Lista los objetos fijos mapeados de una cámara."""
+    if not user_id:
+        return {"success": False, "error": "user_id required", "objects": []}
+    try:
+        objects = camera_zones.get_camera_objects(user_id, camera_id)
+        return {
+            "success": True,
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "objects": objects,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "objects": []}
+
+
+@app.post("/api/cameras/{camera_id}/objects")
+async def add_camera_object_endpoint(camera_id: str, user_id: str, request: Request):
+    """Agrega un objeto fijo (upsert por nombre).
+    Body: {"name": "...", "x": 0.5, "y": 0.5, "r": 0.05, "class": "register", "parent_zone": "..."}
+    """
+    if not user_id:
+        return {"success": False, "error": "user_id required"}
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and isinstance(body.get("object"), dict):
+            body = body["object"]
+        if not isinstance(body, dict) or not str(body.get("name", "")).strip():
+            return {"success": False, "error": "Body debe tener 'name' (y 'x','y' 0-1)"}
+        saved = camera_zones.add_or_update_object(user_id, camera_id, body)
+        return {
+            "success": bool(saved),
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "object": saved,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/cameras/{camera_id}/objects/{object_name:path}")
+async def delete_camera_object_endpoint(camera_id: str, user_id: str, object_name: str):
+    """Elimina un objeto fijo por su nombre (path param para soportar espacios)."""
+    if not user_id:
+        return {"success": False, "error": "user_id required"}
+    try:
+        ok = camera_zones.delete_object(user_id, camera_id, object_name)
+        return {
+            "success": ok,
+            "user_id": user_id,
+            "camera_id": camera_id,
+            "object_name": object_name,
+            "remaining_objects": camera_zones.get_camera_objects(user_id, camera_id) if ok else [],
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1593,7 +1593,10 @@ c.style.display = '';
                                 <div class="section-kicker">Zonas</div>
                                 <div class="section-title">🗺️ Zonas de interés (ROI)</div>
                             </div>
-                            <button class="btn btn-sm btn-primary" onclick="App._openZoneDrawer('${this._escAttr(camId)}')">➕ Gestionar zonas</button>
+                            <div style="display:flex;gap:6px;flex-wrap:wrap">
+                                <button class="btn btn-sm btn-primary" onclick="App._openZoneDrawer('${this._escAttr(camId)}')">➕ Gestionar zonas</button>
+                                <button class="btn btn-sm btn-outline" onclick="App._openObjectMapper('${this._escAttr(camId)}')">🗺️ Mapear objetos</button>
+                            </div>
                         </div>
                         <div id="zones-list-${camId}" class="zones-list">
                             <div class="zones-empty">Sin zonas. Haz clic en "Gestionar zonas" para añadir.</div>
@@ -4162,6 +4165,413 @@ c.style.display = '';
         this._zoneEditMode = false;
     },
 
+    // ── MAPA DE OBJETOS POR TURNOS (wizard) ─────────────────────
+    // Reusa el overlay/patrón del zone-drawer pero en modo "turnos":
+    // Qwen propone zonas+objetos (UNA llamada a /suggest-zones), se dibuja
+    // todo tenue de fondo y UNA propuesta de objeto se resalta a la vez.
+    // El dueño confirma/edita/mueve/quita cada candidato por turno.
+    _objMapState: null,
+
+    _objMapLSKey(camId) { return `ojoia_objmap_${camId}`; },
+
+    async _openObjectMapper(camId) {
+        if (document.getElementById('objmap-overlay')) return;
+        this._objMapCamId = camId;
+        const cam = this._currentCamConfig || {};
+        const frameUrl = `${this.API}/frames/latest-raw.jpg?camera_id=${camId}&user_id=${this.userId}&_=${Date.now()}`;
+
+        // Estado del wizard
+        let savedTurn = 0, savedConfirmed = [];
+        try {
+            const saved = JSON.parse(localStorage.getItem(this._objMapLSKey(camId)) || 'null');
+            if (saved && typeof saved.turn === 'number') {
+                savedTurn = saved.turn;
+                savedConfirmed = Array.isArray(saved.confirmed) ? saved.confirmed : [];
+            }
+        } catch (e) {}
+        this._objMapState = {
+            camId,
+            zones: [],          // zonas sugeridas (solo fondo tenue)
+            candidates: [],     // objetos propuestos por Qwen
+            confirmed: savedConfirmed, // objetos fijados por el dueño (retomados si había)
+            turn: 0,            // índice del candidato actual
+            moving: false,     // drag del punto activo
+            savedTurn,
+        };
+
+        const html = `<div class="zone-drawer-overlay active" id="objmap-overlay">
+            <div class="zone-drawer">
+                <div class="zone-drawer-header">
+                    <h3>🗺️ Mapa de objetos — ${cam.name || camId}</h3>
+                    <button class="zone-drawer-close" onclick="App._closeObjectMapper()">✕</button>
+                </div>
+                <div class="zone-drawer-body">
+                    <div class="zone-drawer-frame" id="objmap-frame">
+                        <img src="${frameUrl}" id="objmap-frame-img" style="width:100%;height:100%;object-fit:contain;display:block">
+                        <canvas id="objmap-canvas" width="640" height="360"></canvas>
+                        <div class="objmap-pulse" id="objmap-pulse"></div>
+                    </div>
+                    <div class="objmap-progress" id="objmap-progress">⏳ Eva está analizando la imagen...</div>
+                    <div id="objmap-card-container"></div>
+                </div>
+                <div class="zone-drawer-footer">
+                    <button class="btn btn-sm btn-outline" id="objmap-finish-btn" onclick="App._finishObjectMap('${this._escAttr(camId)}')">🏁 Terminar mapa</button>
+                </div>
+            </div>
+        </div>`;
+        document.body.insertAdjacentHTML('beforeend', html);
+
+        // Canvas sobre el frame (mismo setup de escala que el zone drawer)
+        const canvas = document.getElementById('objmap-canvas');
+        const imgEl = document.getElementById('objmap-frame-img');
+        const frameEl = document.getElementById('objmap-frame');
+        if (imgEl.complete && imgEl.naturalWidth) {
+            this._setupObjMapCanvas(canvas, imgEl, frameEl);
+        } else {
+            imgEl.onload = () => { this._setupObjMapCanvas(canvas, imgEl, frameEl); this._redrawObjMap(); };
+        }
+
+        this._fetchObjMapSuggestions(camId);
+    },
+
+    async _fetchObjMapSuggestions(camId) {
+        const progress = document.getElementById('objmap-progress');
+        try {
+            const cam = this._currentCamConfig || {};
+            const r = await apiFetch(`${this.API}/api/cameras/${camId}/suggest-zones`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    user_id: this.userId,
+                    zone: cam.zone || '',
+                    business_type: cam.business_type || ''
+                })
+            });
+            const d = await r.json();
+            const st = this._objMapState;
+            if (!st) return;
+            if (!d.success) {
+                if (progress) progress.textContent = '❌ ' + (d.error || 'Eva no pudo analizar la imagen ahora.');
+                return;
+            }
+            st.zones = (d.zones || []).map(z => ({...z, dim: true}));
+            st.candidates = (d.objects || []).map(o => ({...o, status: 'pending'}));
+            // Retomar sesión a medias guardada en localStorage
+            if (st.savedTurn > 0 && st.savedTurn < st.candidates.length) {
+                st.turn = st.savedTurn;
+                this._toast('', 'Retomando mapa donde lo dejaste', 'info');
+            }
+            this._renderObjMapTurn();
+            this._redrawObjMap();
+        } catch (e) {
+            if (progress) progress.textContent = '❌ No se pudo analizar la imagen: ' + (e.message || 'error de red');
+        }
+    },
+
+    _setupObjMapCanvas(canvas, imgEl, frameEl) {
+        if (!canvas || !imgEl) return;
+        const dpr = window.devicePixelRatio || 1;
+        const cw = imgEl.clientWidth || imgEl.naturalWidth;
+        const ch = imgEl.clientHeight || imgEl.naturalHeight;
+        canvas.width = Math.max(1, Math.floor(cw * dpr));
+        canvas.height = Math.max(1, Math.floor(ch * dpr));
+        canvas.style.width = `${cw}px`;
+        canvas.style.height = `${ch}px`;
+
+        const scale = Math.min(cw / imgEl.naturalWidth, ch / imgEl.naturalHeight);
+        const drawW = imgEl.naturalWidth * scale;
+        const drawH = imgEl.naturalHeight * scale;
+        const offsetX = (cw - drawW) / 2;
+        const offsetY = (ch - drawH) / 2;
+
+        this._objMapCanvasCtx = canvas.getContext('2d');
+        this._objMapCanvasCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this._objMapScale = scale;
+        this._objMapOffsetX = offsetX;
+        this._objMapOffsetY = offsetY;
+        this._objMapImgEl = imgEl;
+
+        // Drag para mover el objeto del turno actual (botón ✏️ Mover)
+        const getPos = (e) => {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: (e.touches ? e.touches[0].clientX : e.clientX) - rect.left,
+                y: (e.touches ? e.touches[0].clientY : e.clientY) - rect.top,
+            };
+        };
+        let dragging = false;
+        const startDrag = (e) => {
+            const st = this._objMapState;
+            if (!st || !st.moving) return;
+            e.preventDefault();
+            dragging = true;
+        };
+        const moveDrag = (e) => {
+            const st = this._objMapState;
+            if (!st || !st.moving || !dragging) return;
+            e.preventDefault();
+            const p = getPos(e);
+            const obj = this._currentObjMapCandidate();
+            if (!obj) return;
+            const scale = this._objMapScale || 1;
+            const ox = this._objMapOffsetX || 0, oy = this._objMapOffsetY || 0;
+            obj.x = Math.max(0, Math.min(1, (p.x - ox) / (imgEl.naturalWidth * scale)));
+            obj.y = Math.max(0, Math.min(1, (p.y - oy) / (imgEl.naturalHeight * scale)));
+            this._redrawObjMap();
+        };
+        const endDrag = (e) => {
+            const st = this._objMapState;
+            if (!dragging) return;
+            dragging = false;
+            if (e && e.preventDefault) e.preventDefault();
+            if (st) st.moving = false;
+            this._renderObjMapTurn();
+            this._redrawObjMap();
+        };
+        canvas.addEventListener('mousedown', startDrag);
+        canvas.addEventListener('mousemove', moveDrag);
+        canvas.addEventListener('mouseup', endDrag);
+        canvas.addEventListener('mouseleave', endDrag);
+        canvas.addEventListener('touchstart', startDrag, {passive: false});
+        canvas.addEventListener('touchmove', moveDrag, {passive: false});
+        canvas.addEventListener('touchend', endDrag);
+    },
+
+    _currentObjMapCandidate() {
+        const st = this._objMapState;
+        if (!st) return null;
+        return st.candidates[st.turn] || null;
+    },
+
+    _renderObjMapTurn() {
+        const st = this._objMapState;
+        if (!st) return;
+        const progress = document.getElementById('objmap-progress');
+        const container = document.getElementById('objmap-card-container');
+        if (!progress || !container) return;
+
+        const total = st.candidates.length;
+        const obj = this._currentObjMapCandidate();
+
+        if (!total) {
+            progress.textContent = st.zones.length
+                ? 'Eva no encontró objetos fijos. Usa "+ Añadir otro" para etiquetar manualmente.'
+                : '⏳ Esperando sugerencias de Eva...';
+            container.innerHTML = `<button class="objmap-btn objmap-add" onclick="App._objMapAddManual()">+ Añadir otro</button>`;
+            return;
+        }
+
+        progress.innerHTML = `Objeto ${Math.min(st.turn + 1, total)} de ${total}
+            <button class="objmap-finish" onclick="App._finishObjectMap('${this._escAttr(st.camId)}')">🏁 Terminar mapa</button>`;
+
+        if (!obj) {
+            // Turnos agotados: todos revisados
+            progress.innerHTML = `✅ Revisaste las ${total} sugerencias — ${st.confirmed.length} fijado(s)
+                <button class="objmap-finish" onclick="App._finishObjectMap('${this._escAttr(st.camId)}')">🏁 Terminar mapa</button>`;
+            container.innerHTML = `<button class="objmap-btn objmap-add" onclick="App._objMapAddManual()">+ Añadir otro</button>`;
+            return;
+        }
+
+        container.innerHTML = `<div class="objmap-card">
+            <div class="objmap-card-title">¿Es esto <em>${this._escAttr(obj.name)}</em>?</div>
+            <input type="text" class="objmap-name-input" id="objmap-name-input" value="${this._escAttr(obj.name)}"
+                   oninput="App._objMapRename(this.value)">
+            <div class="objmap-card-actions">
+                <button class="objmap-btn objmap-accept" onclick="App._objMapAccept()">✓ Sí, es eso</button>
+                <button class="objmap-btn objmap-move" id="objmap-move-btn" onclick="App._objMapToggleMove(this)">✏️ Mover</button>
+                <button class="objmap-btn objmap-reject" onclick="App._objMapReject()">✕ Quitar</button>
+                <button class="objmap-btn objmap-add" onclick="App._objMapAddManual()">+ Añadir otro</button>
+            </div>
+        </div>`;
+    },
+
+    _objMapRename(name) {
+        const obj = this._currentObjMapCandidate();
+        if (obj) obj.name = name;
+    },
+
+    _objMapToggleMove(btn) {
+        const st = this._objMapState;
+        if (!st) return;
+        st.moving = !st.moving;
+        btn.classList.toggle('active', st.moving);
+        btn.textContent = st.moving ? '👆 Arrastra el punto' : '✏️ Mover';
+        const canvas = document.getElementById('objmap-canvas');
+        if (canvas) canvas.style.cursor = st.moving ? 'grab' : 'default';
+    },
+
+    _objMapAccept() {
+        const st = this._objMapState;
+        const obj = this._currentObjMapCandidate();
+        if (!st || !obj) return;
+        st.confirmed.push({...obj, status: 'confirmed'});
+        this._objMapSaveProgress(st.turn + 1);
+        st.turn++;
+        this._renderObjMapTurn();
+        this._redrawObjMap();
+    },
+
+    _objMapReject() {
+        const st = this._objMapState;
+        const obj = this._currentObjMapCandidate();
+        if (!st || !obj) return;
+        obj.status = 'rejected';
+        this._objMapSaveProgress(st.turn + 1);
+        st.turn++;
+        this._renderObjMapTurn();
+        this._redrawObjMap();
+    },
+
+    _objMapAddManual() {
+        const st = this._objMapState;
+        if (!st) return;
+        // Objeto nuevo en el centro, el dueño lo arrastra con ✏️ Mover
+        st.candidates.push({
+            id: 'man_' + Date.now(),
+            name: 'Objeto ' + (st.confirmed.length + 1),
+            class: 'other',
+            x: 0.5, y: 0.5, r: 0.05,
+            parent_zone: null,
+            status: 'pending',
+        });
+        st.turn = st.candidates.length - 1;
+        st.moving = true;
+        this._objMapSaveProgress(st.turn);
+        this._renderObjMapTurn();
+        this._redrawObjMap();
+    },
+
+    _objMapSaveProgress(turn) {
+        const st = this._objMapState;
+        if (!st) return;
+        try {
+            localStorage.setItem(this._objMapLSKey(st.camId),
+                JSON.stringify({turn, confirmed: st.confirmed}));
+        } catch (e) {}
+    },
+
+    async _finishObjectMap(camId) {
+        const st = this._objMapState;
+        if (!st) return;
+        const n = st.confirmed.length;
+        try {
+            for (const o of st.confirmed) {
+                await apiFetch(`${this.API}/api/cameras/${camId}/objects?user_id=${this.userId}`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        name: o.name, x: o.x, y: o.y, r: o.r,
+                        class: o.class || 'other', parent_zone: o.parent_zone || null,
+                    })
+                });
+            }
+        } catch (e) {
+            this._toast('', 'Error guardando el mapa: ' + e.message, 'danger');
+            return;
+        }
+        try { localStorage.removeItem(this._objMapLSKey(camId)); } catch (e) {}
+        this._closeObjectMapper();
+        this._toast('', `Mapa guardado: ${n} objeto(s)`, 'success');
+    },
+
+    _closeObjectMapper() {
+        const overlay = document.getElementById('objmap-overlay');
+        if (overlay) overlay.remove();
+        this._objMapState = null;
+        this._objMapCamId = null;
+    },
+
+    _redrawObjMap() {
+        const canvas = document.getElementById('objmap-canvas');
+        if (!canvas) return;
+        const ctx = this._objMapCanvasCtx || canvas.getContext('2d');
+        if (!ctx) return;
+        const st = this._objMapState;
+        if (!st) return;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const offsetX = this._objMapOffsetX || 0;
+        const offsetY = this._objMapOffsetY || 0;
+        const scale = this._objMapScale || 1;
+        const imgEl = this._objMapImgEl;
+        const nw = imgEl ? imgEl.naturalWidth : 640;
+        const nh = imgEl ? imgEl.naturalHeight : 360;
+
+        // Zonas sugeridas: rects tenues de fondo (alpha 0.25)
+        (st.zones || []).forEach(z => {
+            const c = z.coords || {};
+            if (c.x === undefined) return;
+            const x = offsetX + c.x * nw * scale;
+            const y = offsetY + c.y * nh * scale;
+            const w = c.w * nw * scale;
+            const h = c.h * nh * scale;
+            ctx.strokeStyle = this._hexToRgba(z.color || '#2196f3', 0.25);
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+            ctx.strokeRect(x, y, w, h);
+            ctx.setLineDash([]);
+            ctx.fillStyle = this._hexToRgba(z.color || '#2196f3', 0.06);
+            ctx.fillRect(x, y, w, h);
+        });
+
+        // Objetos: círculos con etiqueta
+        const drawObj = (o, color, alpha, pulse) => {
+            const cx = offsetX + o.x * nw * scale;
+            const cy = offsetY + o.y * nh * scale;
+            const rad = Math.max(6, o.r * nw * scale);
+            if (pulse) {
+                // Halo de la propuesta resaltada (el pulso real lo da CSS
+                // sobre un elemento DOM espejo — aquí el glow base)
+                ctx.strokeStyle = this._hexToRgba(color, 0.9);
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(cx, cy, rad + 4, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+            ctx.fillStyle = this._hexToRgba(color, alpha);
+            ctx.beginPath();
+            ctx.arc(cx, cy, rad, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = this._hexToRgba(color, Math.min(1, alpha + 0.3));
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            // Punto central + etiqueta
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.font = 'bold 12px sans-serif';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(o.name || 'objeto', cx + 6, cy - rad - 4);
+        };
+
+        // Candidatos pendientes (excepto el del turno): tenues
+        st.candidates.forEach((o, i) => {
+            if (i === st.turn) return;
+            if (o.status === 'pending') drawObj(o, '#9e9e9e', 0.25, false);
+        });
+        // Fijados por el dueño: color sólido
+        st.confirmed.forEach(o => drawObj(o, '#30d158', 0.85, false));
+        // Candidato del turno actual: resaltado con animación pulse
+        const cur = this._currentObjMapCandidate();
+        if (cur) {
+            drawObj(cur, '#ffd60a', 0.6, true);
+            // Espejo DOM del punto para la animación pulse por CSS
+            const pulse = document.getElementById('objmap-pulse');
+            if (pulse) {
+                const cx = offsetX + cur.x * nw * scale;
+                const cy = offsetY + cur.y * nh * scale;
+                const rad = Math.max(6, cur.r * nw * scale);
+                pulse.style.display = 'block';
+                pulse.style.left = (cx - rad) + 'px';
+                pulse.style.top = (cy - rad) + 'px';
+                pulse.style.width = (rad * 2) + 'px';
+                pulse.style.height = (rad * 2) + 'px';
+            }
+        } else {
+            const pulse = document.getElementById('objmap-pulse');
+            if (pulse) pulse.style.display = 'none';
+        }
+    },
+
     // ── PWA INSTALL ──────────────────────────────────────────────
     _deferredPrompt: null,
     _initPWAInstall() {
@@ -4219,4 +4629,9 @@ c.style.display = '';
 document.addEventListener('DOMContentLoaded', () => {
     App._initPWAInstall();
     App.init();
-});// cache-bust-fingerprint: 20260822-z
+});
+
+// Hook para el wizard de Eva (chat-2026.js): cuando la fase de cámara esté
+// lista, Eva puede sugerir abrir el mapa de objetos con App._openObjectMapper(camId).
+window.App = App;
+// cache-bust-fingerprint: 20260904-objmap
