@@ -939,6 +939,18 @@ def _parse_qwen_json(content) -> dict:
             except Exception:
                 return {key: key_match.group(1)}
     # Fallback: extraer cualquier texto como descripción
+    # FIX (2026-09-05) 'description = JSON truncado': cuando max_tokens
+    # agotó la respuesta, este fallback devolvía el JSON crudo cortado a
+    # mitad de cadena como "resumen" — y ese texto feo se guardaba en el
+    # libro como description. Ahora se recupera el contenido legible: si
+    # empieza como JSON, se extraen los valores de strings con regex; si
+    # no, se recorta el prefijo de llaves.
+    if text.startswith("{"):
+        # valor con comilla de cierre O truncado al final del texto
+        vals = re.findall(r'"(?:scene|summary|description)"\s*:\s*"((?:\\.|[^"\\]){20,})', text)
+        if vals:
+            return {"resumen": vals[0].encode().decode("unicode_escape", errors="ignore"),
+                    "scene": vals[0][:200], "persons": []}
     return {"resumen": text[:500], "scene": text[:200], "persons": []}
 
 
@@ -995,7 +1007,50 @@ def _convert_qwen_vision_response(raw: dict) -> dict:
     return {"resumen": raw.get("resumen", ""), "scene": raw.get("scene", ""), "persons": [], "objects": []}
 
 
-def _normalize_rich_qwen_json(qwen_json: dict, mode: str) -> dict:
+def _rgb_a_nombre_color(rgb) -> str:
+    """RGB del torso → nombre de color en español (aproximación HSV).
+
+    FIX 'libro searchable' (2026-09-05): el pipeline guarda el
+    dominant_rgb del torso de cada track (oro de identity.py) pero nadie
+    lo traducía a texto — las búsquedas de Eva por color ('camisa blanca')
+    dependían 100% de que Qwen lo escribiera espontáneamente (21% de
+    eventos). Con esto cada track lleva un color humano verificable.
+    """
+    try:
+        if not isinstance(rgb, (list, tuple)) or len(rgb) < 3:
+            return ""
+        r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+        mx, mn = max(r, g, b), min(r, g, b)
+        v = mx / 255.0
+        s = 0.0 if mx == 0 else (mx - mn) / mx
+        if v < 0.18:
+            return "negro"
+        if s < 0.14:
+            if v > 0.82: return "blanco"
+            if v > 0.55: return "gris claro"
+            if v > 0.3: return "gris"
+            return "gris oscuro"
+        # matiz
+        d = mx - mn
+        if r == mx: h = (60 * (g - b) / d) % 360
+        elif g == mx: h = 60 * (b - r) / d + 120
+        else: h = 60 * (r - g) / d + 240
+        if h < 15 or h >= 345: nombre = "rojo"
+        elif h < 45: nombre = "naranja"
+        elif h < 70: nombre = "amarillo"
+        elif h < 160: nombre = "verde"
+        elif h < 200: nombre = "turquesa"
+        elif h < 260: nombre = "azul"
+        elif h < 300: nombre = "violeta"
+        else: nombre = "magenta"
+        if v < 0.45:
+            return nombre + " oscuro"
+        return nombre
+    except Exception:
+        return ""
+
+
+def _normalize_rich_qwen_json(qwen_json: dict, mode: str, tracking_summary: dict = None) -> dict:
     qwen_json = dict(qwen_json or {})
     qwen_json["mode"] = mode
     qwen_json["importancia"] = qwen_json.get("importance") or qwen_json.get("importancia") or "normal"
@@ -1429,6 +1484,33 @@ def _enrich_qwen_json_from_metadata(qwen_json: dict, metadata: dict, zone: str, 
         details["camera_condition"] = "visible"
     if not details.get("clothing_visible"):
         details["clothing_visible"] = []
+    # FIX (2026-09-05) 'libro searchable': extraer vestuario ESTRUCTURADO de
+    # vision.persons (clothing_top/bottom/head_accessory) que el narrador ya
+    # produce pero nadie copiaba a los campos que la búsqueda lee —
+    # clothing_visible quedaba SIEMPRE [] y el 54% de eventos no tenía
+    # prenda recuperable. Además traduce dominant_rgb del tracking a color
+    # textual por track (backup cuando Qwen no lo describió).
+    try:
+        vision_p = (qwen_json.get("vision") or {}).get("persons") or []
+        for p in (vision_p if isinstance(vision_p, list) else []):
+            if not isinstance(p, dict):
+                continue
+            for k in ("clothing_top", "clothing_bottom", "head_accessory"):
+                v = str(p.get(k) or "").strip().lower()
+                if v and v != "desconocido" and v not in (details["clothing_visible"] or []):
+                    details.setdefault("clothing_visible", []).append(v)
+        if tracking_summary and isinstance(tracking_summary.get("tracks"), list):
+            for tr in tracking_summary["tracks"]:
+                if not isinstance(tr, dict):
+                    continue
+                rgb = tr.get("dominant_rgb")
+                nombre = _rgb_a_nombre_color(rgb)
+                if nombre and nombre not in (details["clothing_visible"] or []):
+                    # solo el color del torso como pista; si Qwen ya
+                    # describió la prenda el texto del narrador manda
+                    details.setdefault("clothing_visible", []).append(nombre)
+    except Exception:
+        pass
     if not isinstance(qwen_json.get("search_tags"), list) or not qwen_json.get("search_tags"):
         tags = []
         if after_hours:
@@ -2367,7 +2449,7 @@ class QwenOrchestrator:
         payload = {
             "model": "qwen",
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 900,
+            "max_tokens": 1200,
             # A1 (2026-09-04): fijar sampling para un "testigo de seguridad".
             # Antes no se enviaba nada → defaults del backend. Un narrador
             # factual debe ser determinista-frío: 0.1 (no 0.0 absoluto porque
@@ -2869,7 +2951,7 @@ class QwenOrchestrator:
                 "search_tags": _build_search_tags(vision_json, rule_result),
                 "mode": mode,
             }
-            qwen_json = _normalize_rich_qwen_json(qwen_json, mode)
+            qwen_json = _normalize_rich_qwen_json(qwen_json, mode, tracking_summary=tracking_summary)
             qwen_json = _enrich_qwen_json_from_metadata(qwen_json, {
                 "frames_count": len(frames),
                 "total_yolo_objects": total_yolo_objects,
