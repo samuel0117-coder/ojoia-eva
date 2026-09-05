@@ -320,38 +320,69 @@ def _evt_sort_key(p):
         return 0
 
 def _iter_events(user_id: str, camera_id: str = None, date_filter: str = None):
-    """Iterador sobre eventos del diario con filtros."""
-    base = STORAGE_ROOT / "users" / user_id / "cameras"
-    if not base.exists():
-        return
-    cam_dirs = [base / camera_id] if camera_id and (base / camera_id).exists() else base.iterdir()
-    for cam_dir in cam_dirs:
-        if not cam_dir.is_dir():
+    """Iterador sobre eventos del diario con filtros.
+
+    FIX (2026-09-05) 'libro congelado': antes solo leía STORAGE_ROOT (NVMe)
+    fijo, pero el pipeline escribe los eventos en el disco del usuario
+    (disk_mount — HDD en producción, ver get_user_storage_path en
+    api_eva.py). Resultado medido por el agente de pruebas: Eva buscaba en
+    una copia congelada desde el 1-sept — 0/24 eventos de hoy visibles,
+    "camisa blanca de hoy" devolvía 0 cuando el HDD tenía 4 matches. Ahora
+    itera TODOS los discos del usuario (NVMe + HDD) deduplicando por
+    event_id, con el disco activo primero (eventos frescos primero).
+    También salta eventos sin narrativa utilizable (dark_frame/dark_grid):
+    en "quien vino hoy" no deben aparecer como personas."""
+    try:
+        from api_eva import user_event_search_dirs  # resolución multi-disco canónica
+        bases = user_event_search_dirs(user_id)
+    except Exception:
+        bases = [STORAGE_ROOT / "users" / user_id / "cameras"]
+    if not bases:
+        bases = [STORAGE_ROOT / "users" / user_id / "cameras"]
+    seen_ids = set()
+    # dedup + orden global por fecha descendente (el disco activo domina)
+    all_files = []
+    for base in bases:
+        if not base or not Path(base).exists():
             continue
-        events_dir = cam_dir / "events"
-        if not events_dir.exists():
+        cam_dirs = [Path(base) / camera_id] if camera_id and (Path(base) / camera_id).exists() \
+            else [d for d in Path(base).iterdir() if d.is_dir()]
+        for cam_dir in cam_dirs:
+            events_dir = cam_dir / "events"
+            if not events_dir.exists():
+                continue
+            for evt_file in events_dir.glob("*.json"):
+                all_files.append((evt_file, _evt_sort_key(evt_file.name)))
+    all_files.sort(key=lambda t: t[1], reverse=True)
+    for evt_file, _ in all_files:
+        try:
+            evt = json.loads(evt_file.read_text(encoding='utf-8', errors='ignore'))
+        except Exception:
+            continue  # saltar archivos JSON corruptos/vacíos
+        eid = evt.get("event_id") or evt_file.stem
+        if eid in seen_ids:
             continue
-        for evt_file in sorted(events_dir.glob("*.json"), key=_evt_sort_key, reverse=True):
-            try:
-                evt = json.loads(evt_file.read_text(encoding='utf-8', errors='ignore'))
-            except Exception:
-                continue  # saltar archivos JSON corruptos/vacíos
-            try:
-                evt_date = evt.get("datetime", "")[:10]
-                evt_ts = int(evt.get("timestamp", 0) or 0)
-                if not evt_date and evt_ts:
-                    evt_date = _date.fromtimestamp(evt_ts).isoformat()
-                if date_filter == "today" and evt_date != _date.today().isoformat():
-                    continue
-                if date_filter == "yesterday" and evt_date != (_date.today() - timedelta(days=1)).isoformat():
-                    continue
-                if date_filter == "recent" and evt_ts < int(time.time()) - 24 * 60 * 60:
-                    continue
-                if date_filter and date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
-                    continue
-                yield evt, cam_dir.name
-            except Exception:
-                pass
+        seen_ids.add(eid)
+        # higiene de búsqueda: eventos de oscuridad no son "personas que vinieron"
+        if evt.get("event_type") in ("dark_frame", "dark_grid"):
+            continue
+        cam_name = evt_file.parent.parent.name
+        try:
+            evt_date = evt.get("datetime", "")[:10]
+            evt_ts = int(evt.get("timestamp", 0) or 0)
+            if not evt_date and evt_ts:
+                evt_date = _date.fromtimestamp(evt_ts).isoformat()
+            if date_filter == "today" and evt_date != _date.today().isoformat():
+                continue
+            if date_filter == "yesterday" and evt_date != (_date.today() - timedelta(days=1)).isoformat():
+                continue
+            if date_filter == "recent" and evt_ts < int(time.time()) - 24 * 60 * 60:
+                continue
+            if date_filter and date_filter not in ("today", "yesterday", "recent") and evt_date != date_filter:
+                continue
+            yield evt, cam_name
+        except Exception:
+            pass
 
 
 def _parse_json_text(value):

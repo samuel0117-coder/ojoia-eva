@@ -1318,6 +1318,54 @@ def _config_summary_text(session, first):
 # HANDLER PRINCIPAL
 # =============================================================================
 
+def _date_from_msg(msg_norm: str):
+    """FIX (2026-09-05) — extraer fecha natural de un mensaje del usuario.
+
+    "el martes vino...", "anteayer", "el 2 de septiembre", "hace 3 días",
+    fechas ISO. Devuelve "today"/"yesterday"/fecha ISO "YYYY-MM-DD", o None
+    si el mensaje no menciona fecha (el caller usa su default).
+    Día de semana en español: busca hacia atrás el último <día> que ya pasó
+    (si hoy es ese día, cuenta la semana pasada — "el martes" en martes =
+    martes pasado)."""
+    import re as _re
+    from datetime import date as _d, timedelta as _td
+    m = _re.search(r"(\d{4})-(\d{2})-(\d{2})", msg_norm)
+    if m:
+        return m.group(0)
+    hoy = _d.today()
+    if "anteayer" in msg_norm or "antier" in msg_norm:
+        return (hoy - _td(days=2)).isoformat()
+    if "ayer" in msg_norm or "anoche" in msg_norm:
+        return "yesterday"
+    m = _re.search(r"hace (\d+) dia", msg_norm) or _re.search(r"hace (\d+) día", msg_norm)
+    if m:
+        n = min(int(m.group(1)), 30)
+        return (hoy - _td(days=n)).isoformat()
+    # "el N de <mes>" — el mes se deduce por proximidad en el año actual
+    m = _re.search(r"(\d{1,2}) de (enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)", msg_norm)
+    if m:
+        meses = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto",
+                 "septiembre","setiembre","octubre","noviembre","diciembre"]
+        try:
+            mes = (meses.index(m.group(2)) + 1) % 12 or 12
+            d = int(m.group(1))
+            cand = _d(hoy.year, mes, d)
+            if cand > hoy:  # aún no llegó este año → era el año pasado
+                cand = _d(hoy.year - 1, mes, d)
+            return cand.isoformat()
+        except ValueError:
+            pass
+    dias = {"lunes":0, "martes":1, "miercoles":2, "miércoles":2, "jueves":3,
+            "viernes":4, "sabado":5, "sábado":5, "domingo":6}
+    for nombre, num in dias.items():
+        if f"el {nombre}" in msg_norm or f"este {nombre}" in msg_norm:
+            delta = (hoy.weekday() - num) % 7
+            if delta == 0:
+                delta = 7  # "el martes" dicho un martes = martes pasado
+            return (hoy - _td(days=delta)).isoformat()
+    return None
+
+
 def _normalize_text(text: str) -> str:
     if not text:
         return ""
@@ -1829,12 +1877,19 @@ async def _detect_intent_and_route(user_id, message, first, recent, cam_count, s
         if "camisa" in msg_norm: cl_parts.append("camisa")
         if "camiseta" in msg_norm: cl_parts.append("camiseta")
         clothing_str = " ".join(cl_parts) if cl_parts else "blanco"
-        result = await tool_search_events(user_id, clothing=clothing_str, date="today", limit=20)
+        # FIX (2026-09-05) 'el martes vino...': el router forzaba date="today"
+        # e ignoraba fechas naturales del usuario — el caso de uso estrella
+        # ("el marte vino un señor con gorra negra") era imposible. Ahora
+        # se extrae la fecha real del mensaje (días de la semana, hoy/ayer,
+        # N días atrás, fechas ISO). _date_from_msg devuelve None si no hay
+        # fecha explícita → mantiene el default "today".
+        date_param = _date_from_msg(msg_norm) or "today"
+        result = await tool_search_events(user_id, clothing=clothing_str, date=date_param, limit=20)
         found = result.get("found", 0)
         events = result.get("events", [])
         if found == 0:
-            return {"text": f"No se han registrado personas con {clothing_str} hoy."}
-        return {"text": f"Se detectaron {found} evento(s) con personas vistiendo {clothing_str} hoy.", "events": events[:5]}
+            return {"text": f"No se han registrado personas con {clothing_str} el {date_param if date_param != 'today' else 'día de hoy'}."}
+        return {"text": f"Se detectaron {found} evento(s) con personas vistiendo {clothing_str} el {date_param if date_param != 'today' else 'día de hoy'}.", "events": events[:5]}
 
     if any(p in msg_norm for p in ["cuantos empleados", "cuántos empleados", "empleados hoy"]):
         from eva.tools import tool_search_events
